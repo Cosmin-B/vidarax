@@ -1,0 +1,16 @@
+/target
+/.beads
+/.smoke-data
+/.vidarax-data
+/.vidarax-models
+/.venv-model-provision
+/.env
+/.env.*
+*.key
+*.pem
+*.p12
+*.crt
+*.cer
+*.der
+*.log
+*.sqlite

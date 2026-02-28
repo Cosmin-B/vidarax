@@ -1,0 +1,10 @@
+{
+  "mode": "balanced",
+  "fps": 1.0,
+  "segmentLength": 60,
+  "maxSummaryLength": 256,
+  "minConfidence": 0.35,
+  "samplingRate": 4,
+  "allowFallback": true,
+  "keepAliveMinutes": 35
+}

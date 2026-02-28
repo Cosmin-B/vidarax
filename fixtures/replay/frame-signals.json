@@ -1,0 +1,47 @@
+[
+  {
+    "frame_index": 0,
+    "pts_ms": 0,
+    "perceptual_hash": 43690,
+    "luma_mean": 0.42,
+    "flicker_score": 0.0,
+    "ghosting_score": 0.0,
+    "noise_variance_score": 0.0
+  },
+  {
+    "frame_index": 1,
+    "pts_ms": 33,
+    "perceptual_hash": 43690,
+    "luma_mean": 0.41,
+    "flicker_score": 0.61,
+    "ghosting_score": 0.0,
+    "noise_variance_score": 0.0
+  },
+  {
+    "frame_index": 2,
+    "pts_ms": 66,
+    "perceptual_hash": 43690,
+    "luma_mean": 0.40,
+    "flicker_score": 0.0,
+    "ghosting_score": 0.71,
+    "noise_variance_score": 0.0
+  },
+  {
+    "frame_index": 3,
+    "pts_ms": 99,
+    "perceptual_hash": 18446744073709551615,
+    "luma_mean": 0.45,
+    "flicker_score": 0.0,
+    "ghosting_score": 0.0,
+    "noise_variance_score": 0.0
+  },
+  {
+    "frame_index": 4,
+    "pts_ms": 132,
+    "perceptual_hash": 18446744073709551615,
+    "luma_mean": 0.48,
+    "flicker_score": 0.0,
+    "ghosting_score": 0.0,
+    "noise_variance_score": 0.67
+  }
+]

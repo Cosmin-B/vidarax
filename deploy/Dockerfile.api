@@ -1,0 +1,28 @@
+FROM rust:1.85.0 AS builder
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY schemas ./schemas
+COPY docs ./docs
+COPY fixtures ./fixtures
+COPY scripts ./scripts
+
+RUN cargo build --release -p vidarax-api
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --home /nonexistent --shell /usr/sbin/nologin vidarax \
+    && mkdir -p /var/lib/vidarax \
+    && chown -R vidarax:vidarax /var/lib/vidarax
+WORKDIR /app
+
+COPY --from=builder /build/target/release/vidarax-api /usr/local/bin/vidarax-api
+EXPOSE 8080 8443/udp
+
+ENV VIDARAX_BIND_ADDR=0.0.0.0:8080
+ENV VIDARAX_H3_BIND_ADDR=0.0.0.0:8443
+ENV VIDARAX_DATA_DIR=/var/lib/vidarax
+
+USER vidarax
+ENTRYPOINT ["/usr/local/bin/vidarax-api"]

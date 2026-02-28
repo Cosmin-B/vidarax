@@ -1,0 +1,630 @@
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use crate::gate::FrameSignal;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputSource {
+    FilePath(String),
+    Url(String),
+}
+
+impl InputSource {
+    pub fn parse_and_validate(input: &str, allowed_file_roots: &[PathBuf]) -> Result<Self, String> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Err("source_uri must not be empty".to_string());
+        }
+
+        if trimmed.contains("://") {
+            let url =
+                reqwest::Url::parse(trimmed).map_err(|err| format!("invalid source_uri: {err}"))?;
+            return match url.scheme() {
+                "http" | "https" => validate_remote_url(url),
+                "file" => validate_file_url(url, allowed_file_roots),
+                other => Err(format!(
+                    "unsupported source_uri scheme '{other}', expected one of: file, http, https"
+                )),
+            };
+        }
+
+        validate_file_path(trimmed, allowed_file_roots)
+    }
+
+    pub fn as_ffmpeg_input(&self) -> &str {
+        match self {
+            InputSource::FilePath(path) | InputSource::Url(path) => path,
+        }
+    }
+}
+
+fn validate_remote_url(url: reqwest::Url) -> Result<InputSource, String> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("source_uri must not contain embedded credentials".to_string());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "source_uri must include a valid host".to_string())?;
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
+        return Err("source_uri host must not target localhost/local domains".to_string());
+    }
+    if let Ok(ip) = lower.parse::<IpAddr>() {
+        if blocked_ip(&ip) {
+            return Err("source_uri host must not be private, loopback, or link-local".to_string());
+        }
+    }
+    Ok(InputSource::Url(url.to_string()))
+}
+
+fn validate_file_url(
+    url: reqwest::Url,
+    allowed_file_roots: &[PathBuf],
+) -> Result<InputSource, String> {
+    if url.host_str().map(|host| !host.is_empty()).unwrap_or(false) {
+        return Err("file:// source_uri must not include a host".to_string());
+    }
+    let path = url
+        .to_file_path()
+        .map_err(|_| "file:// source_uri path is invalid".to_string())?;
+    validate_file_path(path.to_string_lossy().as_ref(), allowed_file_roots)
+}
+
+fn validate_file_path(path: &str, allowed_file_roots: &[PathBuf]) -> Result<InputSource, String> {
+    let canonical = Path::new(path)
+        .canonicalize()
+        .map_err(|err| format!("source_uri file path is invalid: {err}"))?;
+    if !allowed_file_roots
+        .iter()
+        .any(|root| canonical.starts_with(root))
+    {
+        return Err(format!(
+            "source_uri file path is outside configured ingest roots: {}",
+            canonical.to_string_lossy()
+        ));
+    }
+    Ok(InputSource::FilePath(
+        canonical.to_string_lossy().to_string(),
+    ))
+}
+
+fn blocked_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+                || (octets[0] == 169 && octets[1] == 254)
+        }
+        IpAddr::V6(v6) => {
+            let octets = v6.octets();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_multicast()
+                || (octets[0] == 0x20
+                    && octets[1] == 0x01
+                    && octets[2] == 0x0d
+                    && octets[3] == 0xb8)
+        }
+    }
+}
+
+const FFMPEG_PROTOCOL_WHITELIST: &str = "file,http,https,tcp,tls";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FramePacket {
+    pub run_id: String,
+    pub stream_id: String,
+    pub frame_index: u64,
+    pub pts_ms: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: String,
+    pub source_uri: String,
+}
+
+pub struct TimestampNormalizer {
+    base_pts: Option<i64>,
+    last_ms: u64,
+}
+
+impl TimestampNormalizer {
+    pub fn new() -> Self {
+        Self {
+            base_pts: None,
+            last_ms: 0,
+        }
+    }
+
+    /// Normalizes PTS to monotonic milliseconds from the first observed frame.
+    pub fn normalize_pts_ms(&mut self, pts: i64, timebase_num: u32, timebase_den: u32) -> u64 {
+        let base = *self.base_pts.get_or_insert(pts);
+        let delta = pts.saturating_sub(base).max(0) as u128;
+        let num = (timebase_num as u128).saturating_mul(1000);
+        let den = (timebase_den as u128).max(1);
+        let mut ms = delta.saturating_mul(num) / den;
+        if ms < self.last_ms as u128 {
+            ms = self.last_ms as u128;
+        }
+        let ms = ms as u64;
+        self.last_ms = ms;
+        ms
+    }
+}
+
+impl Default for TimestampNormalizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct FramePacketInput<'a> {
+    pub run_id: &'a str,
+    pub stream_id: &'a str,
+    pub frame_index: u64,
+    pub pts_ms: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: &'a str,
+    pub source_uri: &'a str,
+}
+
+pub fn make_frame_packet(input: FramePacketInput<'_>) -> FramePacket {
+    FramePacket {
+        run_id: input.run_id.to_string(),
+        stream_id: input.stream_id.to_string(),
+        frame_index: input.frame_index,
+        pts_ms: input.pts_ms,
+        width: input.width,
+        height: input.height,
+        pixel_format: input.pixel_format.to_string(),
+        source_uri: input.source_uri.to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Mp4DecodeConfig {
+    pub sample_fps: f32,
+    pub max_frames: usize,
+}
+
+impl Default for Mp4DecodeConfig {
+    fn default() -> Self {
+        Self {
+            sample_fps: 2.0,
+            max_frames: 512,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodedMp4Batch {
+    pub source_uri: String,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: String,
+    pub frame_signals: Vec<FrameSignal>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodedJpegFrame {
+    pub frame_index: u64,
+    pub jpeg_bytes: Vec<u8>,
+}
+
+pub fn probe_source_fps(source: &InputSource) -> Option<f32> {
+    let source_uri = source.as_ffmpeg_input();
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            FFMPEG_PROTOCOL_WHITELIST,
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=avg_frame_rate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            source_uri,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(output.stdout).ok()?;
+    parse_ffprobe_frame_rate(raw.trim())
+}
+
+pub fn decode_mp4_to_frame_signals(
+    source: &InputSource,
+    config: Mp4DecodeConfig,
+) -> Result<DecodedMp4Batch, String> {
+    if !config.sample_fps.is_finite() || config.sample_fps <= 0.0 {
+        return Err("sample_fps must be > 0".to_string());
+    }
+    if config.max_frames == 0 {
+        return Err("max_frames must be >= 1".to_string());
+    }
+
+    let source_uri = source.as_ffmpeg_input();
+    let fps_expr = format!("fps={:.3}", config.sample_fps);
+    let output = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            FFMPEG_PROTOCOL_WHITELIST,
+            "-i",
+            source_uri,
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            &fps_expr,
+            "-f",
+            "framemd5",
+            "-",
+        ])
+        .output()
+        .map_err(|err| format!("failed to run ffmpeg: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg decode failed: {}", stderr.trim()));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|err| format!("invalid utf8 from ffmpeg output: {err}"))?;
+    parse_framemd5_to_signals(&text, source_uri, config.max_frames)
+}
+
+pub fn decode_mp4_to_jpeg_frames(
+    source: &InputSource,
+    config: Mp4DecodeConfig,
+) -> Result<Vec<DecodedJpegFrame>, String> {
+    if !config.sample_fps.is_finite() || config.sample_fps <= 0.0 {
+        return Err("sample_fps must be > 0".to_string());
+    }
+    if config.max_frames == 0 {
+        return Err("max_frames must be >= 1".to_string());
+    }
+
+    let source_uri = source.as_ffmpeg_input();
+    let fps_expr = format!("fps={:.3}", config.sample_fps);
+    let output = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            FFMPEG_PROTOCOL_WHITELIST,
+            "-i",
+            source_uri,
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            &fps_expr,
+            "-frames:v",
+            &config.max_frames.to_string(),
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "-",
+        ])
+        .output()
+        .map_err(|err| format!("failed to run ffmpeg: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg jpeg decode failed: {}", stderr.trim()));
+    }
+    parse_jpeg_stream_to_frames(&output.stdout, config.max_frames)
+}
+
+fn parse_framemd5_to_signals(
+    framemd5: &str,
+    source_uri: &str,
+    max_frames: usize,
+) -> Result<DecodedMp4Batch, String> {
+    let mut tb_num = 1u32;
+    let mut tb_den = 1000u32;
+    let mut width = 0u32;
+    let mut height = 0u32;
+    let mut normalizer = TimestampNormalizer::new();
+    let mut frame_signals = Vec::with_capacity(max_frames.min(1024));
+    let mut prev_luma = 0.0f32;
+    let mut prev_hash: Option<u64> = None;
+
+    for line in framemd5.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("#tb ") {
+            if let Some((num, den)) = parse_fraction_suffix(rest) {
+                tb_num = num.max(1);
+                tb_den = den.max(1);
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("#dimensions ") {
+            if let Some((w, h)) = parse_dimensions_suffix(rest) {
+                width = w;
+                height = h;
+            }
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        if frame_signals.len() >= max_frames {
+            break;
+        }
+
+        let fields = line.split(',').map(str::trim).collect::<Vec<_>>();
+        if fields.len() < 6 {
+            return Err(format!("invalid framemd5 row: {line}"));
+        }
+        let pts = fields[2]
+            .parse::<i64>()
+            .map_err(|_| format!("invalid pts in framemd5 row: {line}"))?;
+        let checksum = fields[5];
+        let perceptual_hash = parse_hex_u64_prefix(checksum, 0, 16)?;
+        // We intentionally derive fast proxy features from checksum bits so ingest stays deterministic
+        // without introducing per-frame decode-side pixel scans.
+        let luma_seed = parse_hex_u64_prefix(checksum, 16, 8).unwrap_or(0) as u32;
+        let noise_seed = parse_hex_u64_prefix(checksum, 24, 8).unwrap_or(0) as u32;
+        let luma_mean = (luma_seed as f64 / u32::MAX as f64) as f32;
+        let flicker_score = normalize_unit((luma_mean - prev_luma).abs());
+        let ghosting_score = prev_hash
+            .map(|prev| normalize_unit(1.0 - ((prev ^ perceptual_hash).count_ones() as f32 / 64.0)))
+            .unwrap_or(0.0);
+        let noise_variance_score = (noise_seed as f64 / u32::MAX as f64) as f32;
+        let pts_ms = normalizer.normalize_pts_ms(pts, tb_num, tb_den);
+        let frame_index = frame_signals.len() as u64;
+        frame_signals.push(FrameSignal {
+            frame_index,
+            pts_ms,
+            perceptual_hash,
+            luma_mean: normalize_unit(luma_mean),
+            flicker_score,
+            ghosting_score,
+            noise_variance_score: normalize_unit(noise_variance_score),
+        });
+        prev_luma = luma_mean;
+        prev_hash = Some(perceptual_hash);
+    }
+
+    if frame_signals.is_empty() {
+        return Err("no video frames decoded from source".to_string());
+    }
+
+    Ok(DecodedMp4Batch {
+        source_uri: source_uri.to_string(),
+        width,
+        height,
+        pixel_format: "framemd5".to_string(),
+        frame_signals,
+    })
+}
+
+fn parse_fraction_suffix(value: &str) -> Option<(u32, u32)> {
+    let (_, fraction) = value.split_once(':')?;
+    let (num, den) = fraction.trim().split_once('/')?;
+    Some((num.trim().parse().ok()?, den.trim().parse().ok()?))
+}
+
+fn parse_ffprobe_frame_rate(raw: &str) -> Option<f32> {
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some((num, den)) = raw.split_once('/') {
+        let num = num.trim().parse::<f32>().ok()?;
+        let den = den.trim().parse::<f32>().ok()?;
+        if den <= 0.0 {
+            return None;
+        }
+        let fps = num / den;
+        return fps.is_finite().then_some(fps);
+    }
+    let fps = raw.trim().parse::<f32>().ok()?;
+    fps.is_finite().then_some(fps)
+}
+
+fn parse_dimensions_suffix(value: &str) -> Option<(u32, u32)> {
+    let (_, dimensions) = value.split_once(':')?;
+    let (width, height) = dimensions.trim().split_once('x')?;
+    Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
+}
+
+fn parse_hex_u64_prefix(source: &str, offset: usize, len: usize) -> Result<u64, String> {
+    let end = offset.saturating_add(len);
+    if source.len() < end {
+        return Err(format!(
+            "checksum is too short: expected at least {end} chars, got {}",
+            source.len()
+        ));
+    }
+    u64::from_str_radix(&source[offset..end], 16)
+        .map_err(|err| format!("invalid checksum hex: {err}"))
+}
+
+fn parse_jpeg_stream_to_frames(
+    raw: &[u8],
+    max_frames: usize,
+) -> Result<Vec<DecodedJpegFrame>, String> {
+    let mut frames = Vec::with_capacity(max_frames.min(1024));
+    let mut cursor = 0usize;
+    while cursor + 1 < raw.len() && frames.len() < max_frames {
+        let mut start = None;
+        while cursor + 1 < raw.len() {
+            if raw[cursor] == 0xff && raw[cursor + 1] == 0xd8 {
+                start = Some(cursor);
+                cursor += 2;
+                break;
+            }
+            cursor += 1;
+        }
+        let Some(start) = start else { break };
+
+        let mut end = None;
+        while cursor + 1 < raw.len() {
+            if raw[cursor] == 0xff && raw[cursor + 1] == 0xd9 {
+                end = Some(cursor + 2);
+                cursor += 2;
+                break;
+            }
+            cursor += 1;
+        }
+
+        let Some(end) = end else {
+            return Err("mjpeg stream ended with an incomplete frame".to_string());
+        };
+        frames.push(DecodedJpegFrame {
+            frame_index: frames.len() as u64,
+            jpeg_bytes: raw[start..end].to_vec(),
+        });
+    }
+
+    if frames.is_empty() {
+        return Err("no jpeg frames decoded from source".to_string());
+    }
+    Ok(frames)
+}
+
+#[inline]
+fn normalize_unit(value: f32) -> f32 {
+    if !value.is_finite() || value < 0.0 {
+        0.0
+    } else if value > 1.0 {
+        1.0
+    } else {
+        value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        parse_ffprobe_frame_rate, parse_framemd5_to_signals, parse_jpeg_stream_to_frames,
+        InputSource, Mp4DecodeConfig, TimestampNormalizer,
+    };
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn parses_url_and_file_sources() {
+        let allowed = vec![std::env::temp_dir()];
+        assert!(matches!(
+            InputSource::parse_and_validate("https://example.com/video.mp4", &allowed).unwrap(),
+            InputSource::Url(_)
+        ));
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("vidarax-ingest-test-{nanos}"));
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let video = root.join("video.mp4");
+        fs::write(&video, b"fixture").unwrap();
+        let source = InputSource::parse_and_validate(video.to_string_lossy().as_ref(), &[root])
+            .expect("file path should be valid");
+        assert!(matches!(source, InputSource::FilePath(_)));
+    }
+
+    #[test]
+    fn rejects_private_or_metadata_hosts() {
+        let allowed = vec![std::env::temp_dir()];
+        assert!(InputSource::parse_and_validate("http://127.0.0.1/video.mp4", &allowed).is_err());
+        assert!(InputSource::parse_and_validate(
+            "http://169.254.169.254/latest/meta-data",
+            &allowed
+        )
+        .is_err());
+        assert!(InputSource::parse_and_validate("https://localhost/video.mp4", &allowed).is_err());
+    }
+
+    #[test]
+    fn rejects_paths_outside_allowed_roots() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("vidarax-ingest-root-{nanos}"));
+        let outside = std::env::temp_dir().join(format!("vidarax-ingest-outside-{nanos}.mp4"));
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        fs::write(&outside, b"fixture").unwrap();
+        let result = InputSource::parse_and_validate(outside.to_string_lossy().as_ref(), &[root]);
+        assert!(result.is_err(), "outside path should fail allowlist check");
+    }
+
+    #[test]
+    fn normalizes_pts_monotonically() {
+        let mut n = TimestampNormalizer::new();
+        assert_eq!(n.normalize_pts_ms(300, 1, 30), 0);
+        assert_eq!(n.normalize_pts_ms(330, 1, 30), 1000);
+        // Out-of-order sample should clamp to last_ms for deterministic monotonic output.
+        assert_eq!(n.normalize_pts_ms(320, 1, 30), 1000);
+    }
+
+    #[test]
+    fn parses_framemd5_into_frame_signals() {
+        let framemd5 = r#"
+#format: frame checksums
+#tb 0: 1/25
+#dimensions 0: 320x240
+0,          0,          0,        1,   230400, 0123456789abcdeffedcba9876543210
+0,          1,          1,        1,   230400, fedcba98765432100123456789abcdef
+"#;
+        let decoded = parse_framemd5_to_signals(framemd5, "/tmp/test.mp4", 8).unwrap();
+        assert_eq!(decoded.width, 320);
+        assert_eq!(decoded.height, 240);
+        assert_eq!(decoded.frame_signals.len(), 2);
+        assert_eq!(decoded.frame_signals[0].pts_ms, 0);
+        assert!(decoded.frame_signals[1].pts_ms >= decoded.frame_signals[0].pts_ms);
+        assert!((0.0..=1.0).contains(&decoded.frame_signals[1].flicker_score));
+    }
+
+    #[test]
+    fn decode_config_defaults_are_stable() {
+        let cfg = Mp4DecodeConfig::default();
+        assert!(cfg.sample_fps > 0.0);
+        assert!(cfg.max_frames > 0);
+    }
+
+    #[test]
+    fn parses_ffprobe_fps_format() {
+        let fps = parse_ffprobe_frame_rate("30000/1001").unwrap();
+        assert!((fps - 29.97).abs() < 0.05);
+        assert_eq!(parse_ffprobe_frame_rate(""), None);
+    }
+
+    #[test]
+    fn parses_mjpeg_stream_into_frames() {
+        // Minimal marker-based split test with two synthetic JPEG-like byte ranges.
+        let stream = [
+            0xff, 0xd8, 0x01, 0x02, 0xff, 0xd9, 0x00, 0x11, 0xff, 0xd8, 0x03, 0x04, 0xff, 0xd9,
+        ];
+        let frames = parse_jpeg_stream_to_frames(&stream, 8).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].frame_index, 0);
+        assert_eq!(frames[1].frame_index, 1);
+        assert_eq!(frames[0].jpeg_bytes[0..2], [0xff, 0xd8]);
+        assert_eq!(
+            frames[1].jpeg_bytes[frames[1].jpeg_bytes.len() - 2..],
+            [0xff, 0xd9]
+        );
+    }
+}

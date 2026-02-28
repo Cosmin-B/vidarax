@@ -1,0 +1,200 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vidarax.local/schemas/frame-metadata.schema.json",
+  "title": "FrameMetadata",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "stream_id",
+    "frame_index",
+    "pts_ms",
+    "mode",
+    "model",
+    "window",
+    "annotations",
+    "confidence",
+    "trace",
+    "ordering_key"
+  ],
+  "properties": {
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "stream_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "frame_index": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "pts_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "balanced",
+        "detailed",
+        "efficiency",
+        "custom"
+      ]
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start_ms",
+        "end_ms",
+        "segment_id"
+      ],
+      "properties": {
+        "start_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "segment_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "frame",
+            "segment",
+            "interpolated"
+          ]
+        }
+      }
+    },
+    "annotations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "summary",
+        "objects",
+        "events"
+      ],
+      "properties": {
+        "summary": {
+          "type": "string",
+          "maxLength": 5000
+        },
+        "objects": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "label",
+              "score"
+            ],
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "score": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "bbox": {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                },
+                "minItems": 4,
+                "maxItems": 4
+              }
+            }
+          }
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type",
+              "score"
+            ],
+            "properties": {
+              "type": {
+                "type": "string"
+              },
+              "score": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "description": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "fallback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "used"
+      ],
+      "properties": {
+        "used": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "from_model": {
+          "type": "string"
+        },
+        "to_model": {
+          "type": "string"
+        }
+      }
+    },
+    "trace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "trace_id"
+      ],
+      "properties": {
+        "request_id": {
+          "type": "string"
+        },
+        "trace_id": {
+          "type": "string"
+        },
+        "span_id": {
+          "type": "string"
+        }
+      }
+    },
+    "ordering_key": {
+      "type": "string",
+      "description": "Deterministic key format: run_id:pts_ms:seq"
+    }
+  }
+}
+

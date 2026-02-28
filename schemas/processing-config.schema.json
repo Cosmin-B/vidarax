@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vidarax.local/schemas/processing-config.schema.json",
+  "title": "ProcessingConfig",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "mode",
+    "fps",
+    "segmentLength",
+    "maxSummaryLength",
+    "minConfidence",
+    "samplingRate"
+  ],
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": [
+        "balanced",
+        "detailed",
+        "efficiency",
+        "custom"
+      ]
+    },
+    "fps": {
+      "type": "number",
+      "minimum": 0.2,
+      "maximum": 4.0
+    },
+    "segmentLength": {
+      "type": "integer",
+      "minimum": 5,
+      "maximum": 600
+    },
+    "maxSummaryLength": {
+      "type": "integer",
+      "minimum": 10,
+      "maximum": 500
+    },
+    "minConfidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "samplingRate": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 30
+    },
+    "allowFallback": {
+      "type": "boolean",
+      "default": false
+    },
+    "keepAliveMinutes": {
+      "type": "integer",
+      "minimum": 30,
+      "maximum": 45,
+      "default": 35
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "custom"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "fps",
+          "segmentLength",
+          "maxSummaryLength",
+          "minConfidence",
+          "samplingRate"
+        ]
+      }
+    }
+  ]
+}

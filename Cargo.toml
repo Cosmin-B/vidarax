@@ -1,0 +1,24 @@
+[workspace]
+members = [
+  "crates/vidarax-core",
+  "crates/vidarax-contracts",
+  "crates/vidarax-cli",
+  "crates/vidarax-api",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+authors = ["vidarax contributors"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+opt-level = 3
+
+[profile.dev]
+debug = 1

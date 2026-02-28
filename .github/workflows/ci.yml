@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+        with:
+          toolchain: 1.85.0
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Workspace tests
+        run: cargo test --workspace
+
+      - name: Lint (clippy deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: H3 feature compile check
+        run: cargo check -p vidarax-api --features h3-experimental
+
+      - name: H3 integration tests
+        run: cargo test -p vidarax-api --features h3-experimental
+
+      - name: API smoke test
+        run: ./scripts/smoke_v1.sh
+
+      - name: Staging provider E2E (opt-in)
+        env:
+          VIDARAX_STAGING_VLLM_BASE_URL: ${{ secrets.VIDARAX_STAGING_VLLM_BASE_URL }}
+          VIDARAX_STAGING_SGLANG_BASE_URL: ${{ secrets.VIDARAX_STAGING_SGLANG_BASE_URL }}
+          VIDARAX_STAGING_MODEL: ${{ secrets.VIDARAX_STAGING_MODEL }}
+          VIDARAX_STAGING_PROMPT: ${{ secrets.VIDARAX_STAGING_PROMPT }}
+        run: ./scripts/staging_provider_e2e.sh
+
+      - name: Release gates
+        run: ./scripts/release_gates.sh

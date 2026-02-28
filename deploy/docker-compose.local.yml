@@ -1,0 +1,55 @@
+version: "3.9"
+
+services:
+  vidarax-api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    environment:
+      VIDARAX_BIND_ADDR: 0.0.0.0:8080
+      VIDARAX_DATA_DIR: /var/lib/vidarax
+      VIDARAX_TRANSPORT: h1h2
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - vidarax-data:/var/lib/vidarax
+    depends_on:
+      - victoriametrics
+      - victorialogs
+      - victoriatraces
+
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.108.0
+    command:
+      - --storageDataPath=/storage
+      - --httpListenAddr=:8428
+    ports:
+      - "127.0.0.1:8428:8428"
+    volumes:
+      - vm-data:/storage
+
+  victorialogs:
+    image: victoriametrics/victoria-logs:v1.24.0-victorialogs
+    command:
+      - --storageDataPath=/storage
+      - --httpListenAddr=:9428
+    ports:
+      - "127.0.0.1:9428:9428"
+    volumes:
+      - vlog-data:/storage
+
+  victoriatraces:
+    image: victoriametrics/victoria-traces:v0.24.2
+    command:
+      - --storageDataPath=/storage
+      - --httpListenAddr=:10428
+    ports:
+      - "127.0.0.1:10428:10428"
+    volumes:
+      - vtrace-data:/storage
+
+volumes:
+  vidarax-data:
+  vm-data:
+  vlog-data:
+  vtrace-data:
