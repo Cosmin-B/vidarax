@@ -1,4 +1,4 @@
-use crate::gate::{FrameSignal, GateConfig, GateEngine, GateEventType};
+use crate::gate::{FrameSignal, GateConfig, GateEngine, GateEventType, GateReasonCode};
 
 #[derive(Debug, Clone, Copy)]
 pub struct TwoPassConfig {
@@ -67,7 +67,7 @@ impl TwoPassPipeline {
         for (frame, gate_event) in frames.iter().zip(pass1.iter()) {
             let (novelty, stability) = self.window_metrics(frame.perceptual_hash, frame.luma_mean);
             let motion = self.motion_score(frame.perceptual_hash);
-            let confidence = normalize(0.45 * novelty + 0.35 * (1.0 - stability) + 0.20 * motion);
+            let confidence = (0.45 * novelty + 0.35 * (1.0 - stability) + 0.20 * motion).clamp(0.0, 1.0);
 
             let segment_start_ms = (frame.pts_ms / self.config.segment_ms) * self.config.segment_ms;
             let segment_end_ms = segment_start_ms + self.config.segment_ms;
@@ -75,7 +75,7 @@ impl TwoPassPipeline {
                 frame_index: frame.frame_index,
                 pts_ms: frame.pts_ms,
                 gate_event: gate_event.event_type,
-                scene_cut: gate_event.reason_code == "scene_cut",
+                scene_cut: gate_event.reason_code == GateReasonCode::SceneCut,
                 suspect_artifact: gate_event.event_type == GateEventType::SuspectArtifact,
                 novelty_score: novelty,
                 temporal_stability: stability,
@@ -105,7 +105,7 @@ impl TwoPassPipeline {
             drift += (sample.luma_mean - luma_mean).abs();
         }
         let inv = 1.0 / self.window_len as f32;
-        (normalize(similarity * inv), normalize(drift * inv))
+        ((similarity * inv).clamp(0.0, 1.0), (drift * inv).clamp(0.0, 1.0))
     }
 
     fn motion_score(&self, hash: u64) -> f32 {
@@ -135,17 +135,6 @@ struct WindowSample {
 #[inline]
 fn hamming_similarity(a: u64, b: u64) -> f32 {
     ((a ^ b).count_ones() as f32) / 64.0
-}
-
-#[inline]
-fn normalize(value: f32) -> f32 {
-    if !value.is_finite() || value < 0.0 {
-        0.0
-    } else if value > 1.0 {
-        1.0
-    } else {
-        value
-    }
 }
 
 #[cfg(test)]
