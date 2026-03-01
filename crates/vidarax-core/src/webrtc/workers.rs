@@ -5,9 +5,9 @@
 //! ```text
 //! WebRTC peer (kanal::Receiver<RtpFrame>)
 //!   ↓
-//! decode_workers   — core-pinned; H.264 → YUV → FrameSignal + JPEG
+//! decode_workers   — H.264 → YUV → FrameSignal + JPEG
 //!   ↓ kanal::Sender<StreamFrame>
-//! analysis_workers — core-pinned; TwoPassPipeline + LoopDetector
+//! analysis_workers — TwoPassPipeline + LoopDetector
 //!   ↓ kanal::Sender<KeyframeWork>  (non-blocking; drops if full)
 //! vlm_workers      — N threads; VLM inference → SpacetimeDB events + keyframes
 //! ```
@@ -83,7 +83,10 @@ pub struct StreamFrame {
     /// Gate-engine signal computed from the luma plane.
     pub signal: crate::gate::FrameSignal,
     /// JPEG thumbnail of the decoded frame (`Some` after successful decode).
-    pub jpeg: Option<Vec<u8>>,
+    ///
+    /// Stored as a reference-counted slice so downstream consumers can clone
+    /// the pointer (16 bytes) rather than copying the full JPEG payload.
+    pub jpeg: Option<Arc<[u8]>>,
     /// Presentation timestamp in milliseconds.
     pub pts_ms: u64,
     /// Per-session monotonically increasing frame index (== `signal.frame_index`).
@@ -102,7 +105,9 @@ pub struct KeyframeWork {
     /// Gate confidence score in \[0.0, 1.0\].
     pub confidence: f32,
     /// Raw JPEG bytes — base64-encoded on-demand for VLM, stored raw in SpacetimeDB.
-    pub jpeg_bytes: Vec<u8>,
+    ///
+    /// Shared via `Arc<[u8]>` so cloning this work item copies only a pointer.
+    pub jpeg_bytes: Arc<[u8]>,
     /// Semantic prompt to pass to the VLM.
     pub prompt: String,
 }
@@ -112,12 +117,11 @@ pub struct KeyframeWork {
 /// Spawn `cores` H.264 decode worker threads.
 ///
 /// Each thread:
-/// 1. Is pinned to a physical CPU core (best-effort via `core_affinity`).
-/// 2. Constructs a [`Decoder`] using the selected backend (`gpu` flag).
-/// 3. Decodes every [`RtpFrame`] to planar YUV 4:2:0.
-/// 4. Computes a [`crate::gate::FrameSignal`] from the luma plane.
-/// 5. Encodes a JPEG thumbnail at quality 75.
-/// 6. Sends the [`StreamFrame`] to `frame_tx`.
+/// 1. Constructs a [`Decoder`] using the selected backend (`gpu` flag).
+/// 2. Decodes every [`RtpFrame`] to planar YUV 4:2:0.
+/// 3. Computes a [`crate::gate::FrameSignal`] from the luma plane.
+/// 4. Encodes a JPEG thumbnail at quality 75.
+/// 5. Sends the [`StreamFrame`] to `frame_tx`.
 ///
 /// Threads exit when `rtp_rx` is closed (all senders dropped).
 /// `rtp_rx` is cloned so all `cores` workers share the same channel (MPMC).
@@ -133,21 +137,15 @@ pub fn spawn_decode_workers(
     metrics: Arc<PipelineMetrics>,
     session_span: tracing::Span,
 ) {
-    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-
     for i in 0..cores.max(1) {
         let rtp_rx = rtp_rx.clone();
         let frame_tx = frame_tx.clone();
         let metrics = Arc::clone(&metrics);
         let session_span = session_span.clone();
-        let core_id = core_ids.get(i).copied();
 
         std::thread::Builder::new()
             .name(format!("vx-decode-{i}"))
             .spawn(move || {
-                if let Some(cid) = core_id {
-                    core_affinity::set_for_current(cid);
-                }
 
                 let config = DecoderConfig { gpu_available: gpu };
                 let mut decoder = Decoder::new(&config);
@@ -168,7 +166,8 @@ pub fn spawn_decode_workers(
                         frame.pts_ms,
                         prev_signal.as_ref(),
                     );
-                    let jpeg = yuv_to_jpeg(&yuv, 75);
+                    // Allocate once; all downstream consumers share the Arc pointer.
+                    let jpeg: Arc<[u8]> = Arc::from(yuv_to_jpeg(&yuv, 75));
                     prev_signal = Some(signal);
 
                     metrics.inc_frames_decoded();
@@ -216,8 +215,6 @@ pub fn spawn_analysis_workers(
     metrics: Arc<PipelineMetrics>,
     session_span: tracing::Span,
 ) {
-    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-
     for i in 0..cores.max(1) {
         let frame_rx = frame_rx.clone();
         let vlm_tx = vlm_tx.clone();
@@ -227,14 +224,10 @@ pub fn spawn_analysis_workers(
         let session_id = session_id.clone();
         let metrics = Arc::clone(&metrics);
         let session_span = session_span.clone();
-        let core_id = core_ids.get(i).copied();
 
         std::thread::Builder::new()
             .name(format!("vx-analysis-{i}"))
             .spawn(move || {
-                if let Some(cid) = core_id {
-                    core_affinity::set_for_current(cid);
-                }
 
                 let mut pipeline =
                     TwoPassPipeline::new(TwoPassConfig::default(), GateConfig::default());
@@ -270,10 +263,11 @@ pub fn spawn_analysis_workers(
                         };
 
                         if meta.gate_event == GateEventType::KeepKeyframe {
-                            let jpeg_bytes = sf
+                            // Clone the Arc pointer (16 bytes), not the JPEG payload.
+                            let jpeg_bytes: Arc<[u8]> = sf
                                 .jpeg
                                 .clone()
-                                .unwrap_or_default();
+                                .unwrap_or_else(|| Arc::from([] as [u8; 0]));
 
                             let event_type = if meta.scene_cut {
                                 "scene_cut"
@@ -447,7 +441,7 @@ pub fn spawn_vlm_workers<I>(
                         work.pts_ms,
                         &work.event_type,
                         &description,
-                        &&work.jpeg_bytes,
+                        &work.jpeg_bytes,
                     );
                 }
             })
@@ -531,7 +525,7 @@ mod tests {
                 ghosting_score: 0.0,
                 noise_variance_score: 0.0,
             },
-            jpeg: Some(vec![0xff, 0xd8, 0xff, 0xd9]), // minimal JPEG markers
+            jpeg: Some(Arc::from([0xff_u8, 0xd8, 0xff, 0xd9] as [u8; 4])), // minimal JPEG markers
             pts_ms: seq * 33,
             seq,
         }
@@ -550,7 +544,7 @@ mod tests {
             pts_ms: 0,
             event_type: "scene_cut".into(),
             confidence: 0.9,
-            jpeg_bytes: vec![0xFF, 0xD8, 0xFF, 0xD9],
+            jpeg_bytes: Arc::from([0xFF_u8, 0xD8, 0xFF, 0xD9] as [u8; 4]),
             prompt: String::new(),
         };
         let _ = kw.clone();
@@ -597,7 +591,7 @@ mod tests {
                 ghosting_score: 0.0,
                 noise_variance_score: 0.0,
             },
-            jpeg: Some(vec![0xff, 0xd8, 0xff, 0xd9]),
+            jpeg: Some(Arc::from([0xff_u8, 0xd8, 0xff, 0xd9] as [u8; 4])),
             pts_ms: 0,
             seq: 0,
         };
