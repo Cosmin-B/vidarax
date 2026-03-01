@@ -242,9 +242,16 @@ const EVENT_COLORS: Record<string, string> = {
 function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
 
 function formatPts(ms: number): string {
-  const s = Math.floor(ms / 1000)
-  const rem = ms % 1000
-  return `${s}.${String(rem).padStart(3, '0')}s`
+  // If ms looks like an epoch timestamp (> year 2020 in ms), format as wall-clock time
+  if (ms > 1_577_836_800_000) {
+    return new Date(ms).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  }
+  // Otherwise it's video-relative PTS
+  const totalSec = Math.floor(ms / 1000)
+  const min = Math.floor(totalSec / 60)
+  const sec = totalSec % 60
+  const frac = Math.floor((ms % 1000) / 100)
+  return min > 0 ? `${min}:${String(sec).padStart(2, '0')}.${frac}` : `${sec}.${frac}s`
 }
 
 function formatDate(iso: string): string {

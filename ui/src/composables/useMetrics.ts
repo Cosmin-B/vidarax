@@ -417,9 +417,9 @@ export function generateMockTrace(metrics: MetricsData): Trace {
   const vlmPct = metrics.histograms['VLM']
   const gatePct = metrics.histograms['Gate']
 
-  const baseDecodeMs = decodePct?.p50 ?? metrics.decodeLatencyMs || 0.5
+  const baseDecodeMs = (decodePct?.p50 ?? metrics.decodeLatencyMs) || 0.5
   const baseGateMs = gatePct?.p50 ?? 1.0
-  const baseVlmMs = vlmPct?.p50 ?? metrics.vlmLatencyMs || 350
+  const baseVlmMs = (vlmPct?.p50 ?? metrics.vlmLatencyMs) || 350
 
   const decodeMs = baseDecodeMs * (0.85 + Math.random() * 0.3)
   const gateMs = baseGateMs * (0.8 + Math.random() * 0.4)
