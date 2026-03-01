@@ -56,7 +56,7 @@ pub fn conflict_error(
 pub fn internal_error(state: &AppState, message: impl Into<String>) -> ApiResponse {
     let message = message.into();
     let request_id = state.next_request_id();
-    eprintln!("vidarax-api internal_error request_id={request_id} detail={message}");
+    tracing::error!(request_id, message, "vidarax-api internal error");
     structured_error(
         request_id,
         StatusCode::INTERNAL_SERVER_ERROR,

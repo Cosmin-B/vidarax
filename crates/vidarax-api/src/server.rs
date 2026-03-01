@@ -6,7 +6,7 @@ use crate::config::ServerConfig;
 
 pub async fn serve_h1h2(addr: &str, app: Router) -> io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("vidarax-api h1/h2 listening on {addr}");
+    tracing::info!(addr, "vidarax-api h1/h2 listening");
     axum::serve(listener, app).await
 }
 
@@ -66,14 +66,14 @@ pub async fn serve_h3_experimental(config: &ServerConfig, app: Router) -> io::Re
         DefaultMetrics,
     )?;
 
-    println!("vidarax-api h3 listener on {}", config.h3_bind_addr);
+    tracing::info!(addr = %config.h3_bind_addr, "vidarax-api h3 listening");
 
     let accepted_connection_stream = &mut listeners[0];
     while let Some(conn_res) = accepted_connection_stream.next().await {
         let conn = match conn_res {
             Ok(conn) => conn,
             Err(err) => {
-                eprintln!("vidarax-api h3 accept error: {err}");
+                tracing::error!(%err, "vidarax-api h3 accept error");
                 continue;
             }
         };
@@ -85,7 +85,7 @@ pub async fn serve_h3_experimental(config: &ServerConfig, app: Router) -> io::Re
         tokio::spawn(async move {
             let event_rx = controller.event_receiver_mut();
             if let Err(err) = serve_h3_connection(app, event_rx).await {
-                eprintln!("vidarax-api h3 connection error: {err}");
+                tracing::error!(%err, "vidarax-api h3 connection error");
             }
         });
     }

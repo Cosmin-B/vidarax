@@ -253,9 +253,9 @@ fn decode_selective_jpeg_frames_nvdec(
         .map_err(|_| "failed to run ffmpeg with NVDEC".to_string())?;
 
     if !output.status.success() {
-        eprintln!(
-            "ffmpeg nvdec decode stderr: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+        tracing::warn!(
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "ffmpeg nvdec decode failed"
         );
         return Err("GPU video decode failed".to_string());
     }

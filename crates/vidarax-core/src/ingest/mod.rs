@@ -348,9 +348,9 @@ pub fn decode_mp4_to_frame_signals(
         .output()
         .map_err(|_| "failed to run ffmpeg".to_string())?;
     if !output.status.success() {
-        eprintln!(
-            "ffmpeg decode stderr: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+        tracing::warn!(
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "ffmpeg decode failed"
         );
         return Err("video decode failed".to_string());
     }
@@ -396,9 +396,9 @@ pub fn decode_mp4_to_jpeg_frames(
         .output()
         .map_err(|_| "failed to run ffmpeg".to_string())?;
     if !output.status.success() {
-        eprintln!(
-            "ffmpeg jpeg decode stderr: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+        tracing::warn!(
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "ffmpeg jpeg decode failed"
         );
         return Err("video jpeg decode failed".to_string());
     }
@@ -698,9 +698,9 @@ pub fn decode_selective_jpeg_frames(
         .map_err(|_| "failed to run ffmpeg".to_string())?;
 
     if !output.status.success() {
-        eprintln!(
-            "ffmpeg selective decode stderr: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+        tracing::warn!(
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "ffmpeg selective decode failed"
         );
         return Err("selective video decode failed".to_string());
     }

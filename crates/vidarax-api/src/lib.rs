@@ -16,6 +16,7 @@ mod server;
 pub mod spacetime_client;
 mod state;
 mod tenant_labels;
+pub mod telemetry;
 mod validation;
 mod whip;
 
@@ -25,6 +26,8 @@ pub use state::AppState;
 use vidarax_core::provider::ProviderEndpoints;
 
 pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    telemetry::init_telemetry();
+
     // Install the TLS crypto provider once, before any WebRTC sessions are
     // created.  rustrtc uses rustls for DTLS; it requires an installed
     // CryptoProvider.  `ok()` silences the error when a provider is already
@@ -49,7 +52,7 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
     .map_err(invalid_input)?;
     let app = app_router(state);
 
-    println!("vidarax-api transport={} startup", config.transport.label());
+    tracing::info!(transport = config.transport.label(), "vidarax-api startup");
     match config.transport {
         TransportMode::H1H2 => server::serve_h1h2(&config.bind_addr, app).await?,
         TransportMode::H3Experimental => server::serve_h3_experimental(&config, app).await?,

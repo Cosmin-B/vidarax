@@ -17,10 +17,10 @@ base64 = "0.22"
 tokio = { version = "1", features = ["rt", "time"] }
 
 [features]
-# Extra deps needed only by the rustrtc spike example (tracing output + TLS
-# crypto provider initialisation). rustrtc itself is now a required dep.
+# Extra deps needed only by the rustrtc spike example (TLS crypto provider
+# initialisation). rustrtc itself is now a required dep.
 # Enable with: cargo run --example rustrtc_spike --features rustrtc-spike
-rustrtc-spike = ["dep:tracing", "dep:tracing-subscriber"]
+rustrtc-spike = ["dep:tracing-subscriber"]
 
 # rustrtc: pure-Rust WebRTC transport (session.rs).
 # rustls: TLS crypto provider — caller must call
@@ -34,7 +34,6 @@ version = "0.23.37"
 
 [dependencies.tracing]
 version = "0.1"
-optional = true
 
 [dependencies.tracing-subscriber]
 version = "0.3"
