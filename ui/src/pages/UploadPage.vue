@@ -9,6 +9,7 @@ import { api, ApiError } from '@/lib/api'
 import type { RunStatus } from '@/stores/runs'
 import { ChevronLeft, UploadCloud, CheckCircle, AlertCircle, Upload, Zap } from 'lucide-vue-next'
 import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
+import ProcessingVisualization from '@/components/stream/ProcessingVisualization.vue'
 
 const router = useRouter()
 const runsStore = useRunsStore()
@@ -34,6 +35,83 @@ const semanticInference = ref(localStorage.getItem('vidarax_semantic_inference')
 // Created run
 const createdRunId = ref<string | null>(null)
 const runStatus = ref<RunStatus | null>(null)
+
+// ── Visualization state ────────────────────────────────────────────────────
+const vizTotalFrames    = ref(0)
+const vizProcessed      = ref(0)
+const vizChunkStart     = ref(0)
+const vizChunkEnd       = ref(0)
+const vizFps            = ref(5)
+const vizVlmFrames      = ref<number[]>([])
+const vizKfIndices      = ref<number[]>([])
+let   vizPollTimer: ReturnType<typeof setInterval> | null = null
+
+/** Called once we know the run's fps + chunk_size to set up the strip. */
+function initViz(fps: number, chunkSize: number) {
+  vizFps.value = fps
+  // We don't know total frames yet — seed with one chunk width so the strip
+  // expands naturally as events arrive.
+  vizTotalFrames.value = chunkSize * 4
+}
+
+/** Poll GET /v1/runs/:id/events every second to update the visualization. */
+function startVizPolling(runId: string): void {
+  if (vizPollTimer !== null) return
+
+  async function poll() {
+    try {
+      const res = await api.runs.events(runId)
+      let maxFrame = 0
+      const newVlm: number[] = []
+      const newKf: number[]  = []
+
+      for (const raw of res.events) {
+        const p = raw.payload
+        const startFrame = Number(p.start_frame ?? 0)
+        const endFrame   = Number(p.end_frame   ?? startFrame)
+
+        maxFrame = Math.max(maxFrame, endFrame)
+
+        if (raw.kind === 'chunk_processed' || raw.kind === 'frame_decoded') {
+          vizProcessed.value = Math.max(vizProcessed.value, endFrame)
+          vizChunkStart.value = startFrame
+          vizChunkEnd.value   = endFrame
+        }
+
+        if (raw.kind === 'marker_emitted') {
+          const evtType = String(p.event_type ?? p.kind ?? '')
+          if (evtType === 'keyframe') newKf.push(startFrame)
+          if (evtType === 'vlm_description') newVlm.push(startFrame)
+        }
+      }
+
+      if (maxFrame > 0) {
+        vizTotalFrames.value = Math.max(vizTotalFrames.value, maxFrame + 1)
+      }
+
+      // Derive processed count from event count when no explicit frame events
+      if (vizProcessed.value === 0 && activeEvents.value.length > 0) {
+        const lastEvt = activeEvents.value[activeEvents.value.length - 1]
+        if (lastEvt) vizProcessed.value = lastEvt.frame_index
+      }
+
+      if (newVlm.length) vizVlmFrames.value = newVlm
+      if (newKf.length)  vizKfIndices.value  = newKf
+    } catch {
+      // transient — keep polling
+    }
+  }
+
+  poll()
+  vizPollTimer = setInterval(poll, 1000)
+}
+
+function stopVizPolling(): void {
+  if (vizPollTimer !== null) {
+    clearInterval(vizPollTimer)
+    vizPollTimer = null
+  }
+}
 
 const MODELS = [
   { id: 'Qwen/Qwen3-VL-8B-Instruct',    label: 'Qwen3-VL 8B'    },
@@ -153,6 +231,10 @@ async function startUpload(): Promise<void> {
     eventsStore.setActiveRunId(run.run_id)
     connectEvents(run.run_id)
 
+    // ── Initialize visualization ──────────────────────────────────────────
+    initViz(fps, chunkSize)
+    startVizPolling(run.run_id)
+
     uploadState.value = 'analyzing'
 
     // ── Step 4: Run analysis (blocks until complete) ───────────────────────
@@ -165,6 +247,7 @@ async function startUpload(): Promise<void> {
       chunk_size: chunkSize,
     })
 
+    stopVizPolling()
     uploadState.value = 'done'
 
   } catch (err) {
