@@ -62,6 +62,16 @@ pub struct EmitEventRequest {
     pub description: String,
 }
 
+/// Arguments for the `submit_feedback` reducer.
+#[derive(Debug, Clone)]
+pub struct SubmitFeedbackRequest {
+    pub run_id: String,
+    pub session_id: String,
+    pub rating: u32,
+    pub category: String,
+    pub feedback: String,
+}
+
 /// Arguments for the `store_keyframe` reducer.
 #[derive(Debug, Clone)]
 pub struct StoreKeyframeRequest {
@@ -90,6 +100,19 @@ pub struct AgentEvent {
     pub confidence: f32,
     pub description: String,
     /// Wall-clock time in microseconds since the Unix epoch.
+    pub timestamp_micros: i64,
+}
+
+/// Row from the `feedback` table.
+#[derive(Debug, Clone)]
+pub struct FeedbackRow {
+    pub id: u64,
+    pub agent_id: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub rating: u64,
+    pub category: String,
+    pub feedback: String,
     pub timestamp_micros: i64,
 }
 
@@ -274,6 +297,52 @@ impl SpacetimeClient {
         let sql = build_select("keyframe_store", run_id);
         let rows = self.sql_async(&sql).await?;
         rows.into_iter().map(parse_keyframe).collect()
+    }
+
+    /// Call the `submit_feedback` reducer (async).
+    pub async fn submit_feedback_async(
+        &self,
+        req: &SubmitFeedbackRequest,
+    ) -> Result<(), SpacetimeError> {
+        let body = serde_json::json!([
+            req.run_id,
+            req.session_id,
+            req.rating,
+            req.category,
+            req.feedback,
+        ]);
+        let mut rb = self
+            .inner
+            .async_client
+            .post(self.reducer_url("submit_feedback"))
+            .header("Content-Type", "application/json")
+            .json(&body);
+        if let Some(auth) = self.auth_header() {
+            rb = rb.header("Authorization", auth);
+        }
+        let resp = rb
+            .send()
+            .await
+            .map_err(|e| SpacetimeError::Http(e.to_string()))?;
+        self.store_token_from_headers(resp.headers());
+        let status = resp.status().as_u16();
+        if status != 200 {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(SpacetimeError::BadResponse(status, text));
+        }
+        Ok(())
+    }
+
+    /// Query the `feedback` table (async).
+    ///
+    /// If `run_id` is `Some`, only rows for that run are returned.
+    pub async fn query_feedback_async(
+        &self,
+        run_id: Option<&str>,
+    ) -> Result<Vec<FeedbackRow>, SpacetimeError> {
+        let sql = build_select("feedback", run_id);
+        let rows = self.sql_async(&sql).await?;
+        rows.into_iter().map(parse_feedback).collect()
     }
 
     async fn sql_async(&self, sql: &str) -> Result<Vec<Value>, SpacetimeError> {
@@ -588,5 +657,20 @@ fn parse_keyframe(row: Value) -> Result<StoredKeyframe, SpacetimeError> {
         description: col_str(&row, 6)?,
         jpeg_b64: col_str(&row, 7)?,
         timestamp_micros: col_timestamp(&row, 8)?,
+    })
+}
+
+/// Column order from `SELECT * FROM feedback`:
+/// id | agent_id | run_id | session_id | rating | category | feedback | timestamp
+fn parse_feedback(row: Value) -> Result<FeedbackRow, SpacetimeError> {
+    Ok(FeedbackRow {
+        id: col_u64(&row, 0)?,
+        agent_id: col_identity(&row, 1)?,
+        run_id: col_str(&row, 2)?,
+        session_id: col_str(&row, 3)?,
+        rating: col_u64(&row, 4)?,
+        category: col_str(&row, 5)?,
+        feedback: col_str(&row, 6)?,
+        timestamp_micros: col_timestamp(&row, 7)?,
     })
 }

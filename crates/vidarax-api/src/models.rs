@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateRunRequest {
@@ -16,6 +17,8 @@ pub struct InferRequest {
     pub timeout_ms: Option<u64>,
     pub allow_fallback: Option<bool>,
     pub primary_provider: Option<String>,
+    #[serde(default)]
+    pub output_schema: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +74,8 @@ pub struct RealtimeReasonRequest {
     pub second_pass_model: Option<String>,
     pub second_pass_threshold: Option<f32>,
     pub trace_id: Option<String>,
+    #[serde(default)]
+    pub output_schema: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +86,8 @@ pub struct InferResponse {
     pub model: String,
     pub fallback_used: bool,
     pub output_text: String,
+    pub finish_reason: Option<String>,
+    pub inference_latency_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,6 +184,7 @@ pub struct AnalyzeFrameMetadata {
     pub fallback: AnalyzeFallback,
     pub trace: AnalyzeTrace,
     pub ordering_key: String,
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -242,6 +250,13 @@ impl SamplingPolicy {
             Self::Fixed => "fixed",
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FeedbackRequest {
+    pub rating: u32,
+    pub category: String,
+    pub feedback: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

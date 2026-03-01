@@ -1666,6 +1666,7 @@ async fn validate_infer_request(
             temperature,
             timeout_ms,
             allow_fallback: payload.allow_fallback.unwrap_or(true),
+            output_schema: payload.output_schema,
         },
         primary_provider,
     })
@@ -1750,6 +1751,8 @@ async fn execute_infer_request(
         model: result.model,
         fallback_used: result.fallback_used,
         output_text: result.output_text,
+        finish_reason: result.finish_reason,
+        inference_latency_ms: result.inference_latency_ms,
     })
 }
 
@@ -1783,6 +1786,84 @@ fn infer_execution_error_to_response(state: &AppState, err: InferExecutionError)
         );
     }
     internal_error(state, err.message)
+}
+
+#[tracing::instrument(name = "api.submit_feedback", skip_all)]
+pub async fn submit_feedback(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(payload): Json<crate::models::FeedbackRequest>,
+) -> impl IntoResponse {
+    if let Some(error) = validate_run_id_or_error(&state, &run_id, "invalid feedback request") {
+        return error;
+    }
+
+    if payload.rating > 10 {
+        return validation_error(
+            &state,
+            "invalid feedback payload",
+            vec![field_error("rating", "rating must be between 0 and 10".to_string())],
+        );
+    }
+    if payload.category.is_empty() {
+        return validation_error(
+            &state,
+            "invalid feedback payload",
+            vec![field_error("category", "category must not be empty".to_string())],
+        );
+    }
+
+    let Some(stdb) = state.spacetime_client() else {
+        return internal_error(&state, "spacetimedb client not configured");
+    };
+
+    let req = crate::spacetime_client::SubmitFeedbackRequest {
+        run_id: run_id.clone(),
+        session_id: String::new(),
+        rating: payload.rating,
+        category: payload.category,
+        feedback: payload.feedback.unwrap_or_default(),
+    };
+    if let Err(err) = stdb.submit_feedback_async(&req).await {
+        return internal_error(&state, format!("spacetimedb submit_feedback failed: {err}"));
+    }
+
+    ok(json!({
+        "request_id": state.next_request_id(),
+        "run_id": run_id,
+        "status": "submitted"
+    }))
+}
+
+#[tracing::instrument(name = "api.list_feedback", skip_all)]
+pub async fn list_feedback(State(state): State<AppState>) -> impl IntoResponse {
+    let Some(stdb) = state.spacetime_client() else {
+        return internal_error(&state, "spacetimedb client not configured");
+    };
+
+    match stdb.query_feedback_async(None).await {
+        Ok(rows) => {
+            let items: Vec<Value> = rows
+                .into_iter()
+                .map(|r| {
+                    json!({
+                        "id": r.id,
+                        "run_id": r.run_id,
+                        "session_id": r.session_id,
+                        "rating": r.rating,
+                        "category": r.category,
+                        "feedback": r.feedback,
+                        "timestamp_micros": r.timestamp_micros,
+                    })
+                })
+                .collect();
+            ok(json!({
+                "request_id": state.next_request_id(),
+                "feedback": items
+            }))
+        }
+        Err(err) => internal_error(&state, format!("spacetimedb query feedback failed: {err}")),
+    }
 }
 
 fn validate_run_id_or_error(
@@ -2035,6 +2116,7 @@ async fn infer_chunk_semantics(
         temperature: 0.0,
         timeout_ms,
         allow_fallback: true,
+        output_schema: None,
     };
 
     let first_result = match tokio::task::spawn_blocking({
@@ -2073,6 +2155,7 @@ async fn infer_chunk_semantics(
                 temperature: 0.0,
                 timeout_ms,
                 allow_fallback: true,
+                output_schema: None,
             };
             match tokio::task::spawn_blocking(move || {
                 infer_with_endpoints(&endpoints, primary_provider, &second_request)
