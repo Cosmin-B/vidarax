@@ -137,8 +137,11 @@ pub fn yuv_to_frame_signal(
 
 /// Encode a YUV 4:2:0 frame as a JPEG byte buffer.
 ///
-/// Converts YUV to RGB using BT.601 coefficients, then encodes with
-/// `jpeg-encoder` at the requested quality level (1–100, higher = better).
+/// Builds interleaved YCbCr directly from the planar YUV420 data — no
+/// float-point BT.601 conversion. The jpeg-encoder accepts YCbCr natively
+/// so it skips its internal RGB→YCbCr transform too. Net effect: replaces
+/// 6 float ops/pixel with a single nearest-neighbor integer lookup for the
+/// chroma upsample.
 ///
 /// # Panics
 ///
@@ -147,29 +150,25 @@ pub fn yuv_to_frame_signal(
 pub fn yuv_to_jpeg(yuv: &YuvFrame, quality: u8) -> Vec<u8> {
     let w = yuv.width as usize;
     let h = yuv.height as usize;
+    let half_w = w / 2;
 
-    // Convert YUV420 to packed RGB.
-    let mut rgb = Vec::with_capacity(w * h * 3);
+    // Interleave Y, Cb (U), Cr (V) at full resolution via nearest-neighbor
+    // upsample of the chroma planes. Integer-only, no float math.
+    let mut ycbcr = Vec::with_capacity(w * h * 3);
     for py in 0..h {
+        let y_row = py * w;
+        let c_row = (py / 2) * half_w;
         for px in 0..w {
-            let y_val = yuv.y[py * w + px] as f32;
-            let u_val = yuv.u[(py / 2) * (w / 2) + (px / 2)] as f32 - 128.0;
-            let v_val = yuv.v[(py / 2) * (w / 2) + (px / 2)] as f32 - 128.0;
-
-            // BT.601 YCbCr → RGB
-            let r = (y_val + 1.402 * v_val).clamp(0.0, 255.0) as u8;
-            let g = (y_val - 0.344_136 * u_val - 0.714_136 * v_val).clamp(0.0, 255.0) as u8;
-            let b = (y_val + 1.772 * u_val).clamp(0.0, 255.0) as u8;
-            rgb.push(r);
-            rgb.push(g);
-            rgb.push(b);
+            ycbcr.push(yuv.y[y_row + px]);
+            ycbcr.push(yuv.u[c_row + px / 2]);
+            ycbcr.push(yuv.v[c_row + px / 2]);
         }
     }
 
     let mut buf = Vec::new();
     let encoder = jpeg_encoder::Encoder::new(&mut buf, quality);
     encoder
-        .encode(&rgb, yuv.width as u16, yuv.height as u16, jpeg_encoder::ColorType::Rgb)
+        .encode(&ycbcr, yuv.width as u16, yuv.height as u16, jpeg_encoder::ColorType::Ycbcr)
         .expect("JPEG encoding failed");
     buf
 }
