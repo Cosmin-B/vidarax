@@ -6,7 +6,7 @@
 
 import { Vidarax } from '../packages/vidarax-sdk/src/index'
 
-const API_URL = process.env.VIDARAX_API || 'http://192.0.2.11:8080'
+const API_URL = process.env.VIDARAX_API || 'http://localhost:8080'
 
 async function main() {
   // ── 1. Connect ─────────────────────────────────────────────────────

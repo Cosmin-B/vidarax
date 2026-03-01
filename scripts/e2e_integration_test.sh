@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # --- Configuration ---
-VIDARAX_API="${VIDARAX_API:-http://192.0.2.11:8080}"
-SPACETIMEDB_URL="${SPACETIMEDB_URL:-http://192.0.2.10:3000}"
+VIDARAX_API="${VIDARAX_API:-http://localhost:8080}"
+SPACETIMEDB_URL="${SPACETIMEDB_URL:-http://localhost:3000}"
 SPACETIMEDB_DB="${SPACETIMEDB_DB:-vidarax}"
 MODEL="${MODEL:-Qwen/Qwen3-VL-2B-Instruct}"
 FIRST_PASS="${FIRST_PASS:-Qwen/Qwen3-VL-2B-Instruct}"
@@ -42,7 +42,7 @@ python3 "$SCRIPT_DIR/e2e_test_video.py" /tmp/vidarax-e2e-test.mp4
 # Copy to Hetzner if vidarax runs remotely
 if [[ "$VIDARAX_API" == *"100.125"* ]]; then
     echo "Copying video to Hetzner..."
-    scp -i ~/.ssh/hetzner_linux_new /tmp/vidarax-e2e-test.mp4 user@192.0.2.11:/tmp/vidarax-e2e-test.mp4
+    scp -i ~/.ssh/hetzner_linux_new /tmp/vidarax-e2e-test.mp4 ${HETZNER_HOST}:/tmp/vidarax-e2e-test.mp4
 fi
 echo ""
 

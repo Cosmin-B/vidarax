@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Remote HTTP bench: MacBook → vidarax endpoint (macOS-compatible)
-# Usage: VIDARAX_BASE_URL=http://192.0.2.11:8080 ./scripts/bench_remote_http.sh
+# Usage: VIDARAX_BASE_URL=http://localhost:8080 ./scripts/bench_remote_http.sh
 set -euo pipefail
 
-BASE_URL="${VIDARAX_BASE_URL:-http://192.0.2.11:8080}"
+BASE_URL="${VIDARAX_BASE_URL:-http://localhost:8080}"
 ITERATIONS="${VIDARAX_BENCH_ITERATIONS:-50}"
 WARMUP="${VIDARAX_BENCH_WARMUP:-5}"
 

@@ -9,7 +9,7 @@ Usage:
     python3 scripts/integration_test_full.py
 
 Configuration:
-    VIDARAX_API   - API base URL (default http://192.0.2.11:8080)
+    VIDARAX_API   - API base URL (default http://localhost:8080)
     TEST_VIDEO    - Local path to test MP4 (default /tmp/vidarax-e2e-test.mp4)
     SKIP_REASON   - Set to "1" to skip the /reason full-flow test (slow, ~30 s)
 """
@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Configuration
 # ---------------------------------------------------------------------------
 
-API_BASE = os.environ.get("VIDARAX_API", "http://192.0.2.11:8080").rstrip("/")
+API_BASE = os.environ.get("VIDARAX_API", "http://localhost:8080").rstrip("/")
 TEST_VIDEO_PATH = os.environ.get("TEST_VIDEO", "/tmp/vidarax-e2e-test.mp4")
 SKIP_REASON = os.environ.get("SKIP_REASON", "0") == "1"
 

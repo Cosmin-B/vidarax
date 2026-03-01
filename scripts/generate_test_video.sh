@@ -15,9 +15,9 @@
 set -euo pipefail
 
 OUTPUT="${1:-/tmp/vidarax-e2e-test.mp4}"
-HETZNER_HOST="user@192.0.2.11"
+HETZNER_HOST="user@localhost"
 SSH_KEY="${HETZNER_SSH_KEY:-$HOME/.ssh/hetzner_linux_new}"
-VIDARAX_API="${VIDARAX_API:-http://192.0.2.11:8080}"
+VIDARAX_API="${VIDARAX_API:-http://localhost:8080}"
 
 # Check for ffmpeg
 if ! command -v ffmpeg >/dev/null 2>&1; then

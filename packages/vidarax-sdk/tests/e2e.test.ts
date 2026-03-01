@@ -35,7 +35,7 @@ import type {
 // ─── Configuration ────────────────────────────────────────────────────────────
 
 const API_URL =
-  process.env["VIDARAX_API_URL"] ?? "http://192.0.2.11:8080";
+  process.env["VIDARAX_API_URL"] ?? "http://localhost:8080";
 
 /** The small model available on the test server. */
 const SMALL_MODEL = "Qwen/Qwen3-VL-2B-Instruct";

@@ -4,7 +4,7 @@
  * ```typescript
  * import { Vidarax } from 'vidarax'
  *
- * const v = new Vidarax('http://192.0.2.11:8080')
+ * const v = new Vidarax('http://localhost:8080')
  * const result = await v.analyze('video.mp4', { prompt: 'Describe what happens' })
  * for await (const event of result.events()) {
  *   console.log(event.kind, event.payload)
