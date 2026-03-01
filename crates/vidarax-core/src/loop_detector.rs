@@ -25,14 +25,15 @@ impl LoopDetector {
     /// are within `threshold` hamming distance of the given hash.
     #[inline]
     pub fn check(&mut self, hash: u64) -> bool {
-        let matches = self.recent_hashes.iter()
-            .filter(|&&h| (h ^ hash).count_ones() < self.threshold)
-            .count();
+        let mut matches: u32 = 0;
+        for &h in &self.recent_hashes {
+            matches += ((h ^ hash).count_ones() < self.threshold) as u32;
+        }
 
         self.recent_hashes[self.cursor % 8] = hash;
         self.cursor = self.cursor.wrapping_add(1);
 
-        matches >= self.repeat_trigger
+        matches as usize >= self.repeat_trigger
     }
 
     /// Reset the detector state.
