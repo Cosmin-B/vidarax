@@ -13,8 +13,11 @@ const DEFAULTS = {
   apiEndpoint: 'http://localhost:8080',
   apiKey: '',
   spacetimeEndpoint: 'http://localhost:3000',
+  turnUrl: '',
   fps: 5,
   chunkSize: 30,
+  tokenRateCap: 0,
+  clipMode: false,
   semanticInference: true,
   semanticFramesPerChunk: 4,
   sceneCutHammingThreshold: 10,
@@ -47,6 +50,7 @@ const form = reactive({
   apiEndpoint:       authStore.apiEndpoint,
   apiKey:            authStore.apiKey,
   spacetimeEndpoint: authStore.spacetimeEndpoint,
+  turnUrl:           ls('vidarax_turn_url', DEFAULTS.turnUrl),
   // Models
   defaultModel:      ls('vidarax_default_model',    DEFAULTS.defaultModel),
   firstPassModel:    ls('vidarax_first_pass_model',  DEFAULTS.firstPassModel),
@@ -54,6 +58,8 @@ const form = reactive({
   // Stream
   fps:                    lsNum('vidarax_fps', DEFAULTS.fps),
   chunkSize:              lsNum('vidarax_chunk_size', DEFAULTS.chunkSize),
+  tokenRateCap:           lsNum('vidarax_token_rate_cap', DEFAULTS.tokenRateCap),
+  clipMode:               lsBool('vidarax_clip_mode', DEFAULTS.clipMode),
   semanticInference:      lsBool('vidarax_semantic_inference', DEFAULTS.semanticInference),
   semanticFramesPerChunk: lsNum('vidarax_semantic_frames_per_chunk', DEFAULTS.semanticFramesPerChunk),
   // Gate engine
@@ -148,6 +154,7 @@ function saveSettings(): void {
   authStore.setApiEndpoint(form.apiEndpoint)
   authStore.setApiKey(form.apiKey)
   authStore.setSpacetimeEndpoint(form.spacetimeEndpoint)
+  localStorage.setItem('vidarax_turn_url', form.turnUrl)
 
   // Models
   localStorage.setItem('vidarax_default_model',    form.defaultModel)
@@ -157,6 +164,8 @@ function saveSettings(): void {
   // Stream
   localStorage.setItem('vidarax_fps',                      String(form.fps))
   localStorage.setItem('vidarax_chunk_size',               String(form.chunkSize))
+  localStorage.setItem('vidarax_token_rate_cap',           String(form.tokenRateCap))
+  localStorage.setItem('vidarax_clip_mode',                String(form.clipMode))
   localStorage.setItem('vidarax_semantic_inference',       String(form.semanticInference))
   localStorage.setItem('vidarax_semantic_frames_per_chunk', String(form.semanticFramesPerChunk))
 
@@ -179,11 +188,14 @@ function resetToDefaults(): void {
     apiEndpoint:               DEFAULTS.apiEndpoint,
     apiKey:                    DEFAULTS.apiKey,
     spacetimeEndpoint:         DEFAULTS.spacetimeEndpoint,
+    turnUrl:                   DEFAULTS.turnUrl,
     defaultModel:              DEFAULTS.defaultModel,
     firstPassModel:            DEFAULTS.firstPassModel,
     secondPassModel:           DEFAULTS.secondPassModel,
     fps:                       DEFAULTS.fps,
     chunkSize:                 DEFAULTS.chunkSize,
+    tokenRateCap:              DEFAULTS.tokenRateCap,
+    clipMode:                  DEFAULTS.clipMode,
     semanticInference:         DEFAULTS.semanticInference,
     semanticFramesPerChunk:    DEFAULTS.semanticFramesPerChunk,
     sceneCutHammingThreshold:  DEFAULTS.sceneCutHammingThreshold,
@@ -318,6 +330,21 @@ function toggle(section: SectionKey): void {
             data-testid="spacetime-endpoint"
             type="url"
             placeholder="http://localhost:3000"
+            class="w-full px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] placeholder-[#475569] outline-none transition-colors duration-200"
+            style="background: #050507; border: 1px solid #1e2633;"
+          />
+        </div>
+
+        <!-- TURN server URL -->
+        <div class="space-y-1.5">
+          <label class="text-[#94a3b8] text-xs font-medium" for="turn-url">TURN Server URL</label>
+          <div class="text-[#475569] text-xs">Optional — required behind symmetric NATs</div>
+          <input
+            id="turn-url"
+            v-model="form.turnUrl"
+            data-testid="turn-url"
+            type="url"
+            placeholder="turn:turn.example.com:3478?transport=tcp"
             class="w-full px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] placeholder-[#475569] outline-none transition-colors duration-200"
             style="background: #050507; border: 1px solid #1e2633;"
           />
@@ -493,6 +520,47 @@ function toggle(section: SectionKey): void {
           <div class="flex justify-between text-xs text-[#475569] mono">
             <span>5</span><span>120</span>
           </div>
+        </div>
+
+        <!-- Token rate cap -->
+        <div class="space-y-2">
+          <div class="flex items-center justify-between">
+            <label class="text-[#94a3b8] text-xs font-medium">Token Rate Cap <span class="text-[#475569]">(tokens/s, 0 = unlimited)</span></label>
+            <span class="mono text-[#f59e0b] text-sm" data-testid="token-rate-cap-value">{{ form.tokenRateCap === 0 ? '∞' : form.tokenRateCap }}</span>
+          </div>
+          <input
+            v-model.number="form.tokenRateCap"
+            data-testid="token-rate-cap"
+            type="range" min="0" max="500" step="10"
+            class="w-full accent-[#2dd4bf] cursor-pointer"
+          />
+          <div class="flex justify-between text-xs text-[#475569] mono">
+            <span>unlimited</span><span>500 t/s</span>
+          </div>
+        </div>
+
+        <!-- Clip mode toggle -->
+        <div class="flex items-center justify-between">
+          <div>
+            <div class="text-[#94a3b8] text-xs font-medium">Clip Mode</div>
+            <div class="text-[#475569] text-xs mt-0.5">Send temporal multi-frame clips to VLM</div>
+          </div>
+          <button
+            data-testid="clip-mode-toggle"
+            class="relative rounded-full transition-colors duration-200 shrink-0"
+            style="width:40px;height:22px;"
+            :style="form.clipMode ? 'background:#2dd4bf;' : 'background:#1e2633;'"
+            :aria-pressed="form.clipMode"
+            role="switch"
+            :aria-checked="form.clipMode"
+            @click="form.clipMode = !form.clipMode"
+          >
+            <div
+              class="absolute rounded-full bg-white transition-transform duration-200"
+              style="top:3px;width:16px;height:16px;"
+              :style="form.clipMode ? 'transform:translateX(21px)' : 'transform:translateX(3px)'"
+            />
+          </button>
         </div>
 
         <!-- Semantic inference toggle -->

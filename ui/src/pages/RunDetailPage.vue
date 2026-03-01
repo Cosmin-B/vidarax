@@ -117,7 +117,7 @@ async function deleteRun(): Promise<void> {
 // ── Feedback ──────────────────────────────────────────────────────────
 
 const showFeedback = ref(false)
-const feedbackRating = ref(5)
+const feedbackRating = ref(-1)
 const feedbackCategory = ref('quality')
 const feedbackText = ref('')
 const feedbackSubmitting = ref(false)
@@ -481,7 +481,7 @@ function formatDate(iso: string): string {
           <button
             class="px-4 py-2 rounded-[8px] text-xs font-medium transition-all duration-200"
             style="background: rgba(45,212,191,0.12); border: 1px solid rgba(45,212,191,0.3); color: #2dd4bf;"
-            :disabled="feedbackSubmitting"
+            :disabled="feedbackSubmitting || feedbackRating < 0"
             @click="submitFeedback"
           >
             <span v-if="feedbackSubmitting">Submitting…</span>

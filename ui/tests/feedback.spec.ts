@@ -128,11 +128,24 @@ test.describe('Run detail — feedback panel', () => {
     await expect(textarea).toHaveValue('Latency was excellent')
   })
 
-  test('"Submit feedback" button is visible and enabled', async ({ page }) => {
+  test('"Submit feedback" button is visible but disabled before rating is selected', async ({ page }) => {
     await page.getByRole('button', { name: /rate this analysis/i }).click()
 
     const submitBtn = page.getByRole('button', { name: /submit feedback/i })
     await expect(submitBtn).toBeVisible()
+    // No rating has been selected yet (initial value = -1)
+    await expect(submitBtn).toBeDisabled()
+  })
+
+  test('"Submit feedback" button is enabled after selecting a rating', async ({ page }) => {
+    await page.getByRole('button', { name: /rate this analysis/i }).click()
+
+    // Submit is disabled before any rating
+    const submitBtn = page.getByRole('button', { name: /submit feedback/i })
+    await expect(submitBtn).toBeDisabled()
+
+    // Select rating 7
+    await page.getByRole('button', { name: '7', exact: true }).click()
     await expect(submitBtn).not.toBeDisabled()
   })
 
@@ -150,6 +163,8 @@ test.describe('Run detail — feedback panel', () => {
 
   test('submit feedback shows success message and removes rating button', async ({ page }) => {
     await page.getByRole('button', { name: /rate this analysis/i }).click()
+    // Must select a rating before submit becomes enabled
+    await page.getByRole('button', { name: '8', exact: true }).click()
     await page.getByRole('button', { name: /submit feedback/i }).click()
 
     await expect(page.getByText(/feedback submitted/i)).toBeVisible({ timeout: 5_000 })

@@ -21,11 +21,12 @@ test.describe('Settings panel', () => {
 
   test('all accordion sections are visible', async ({ page }) => {
     await page.goto('/settings')
-    await expect(page.getByRole('button', { name: /connection/i })).toBeVisible()
-    await expect(page.getByRole('button', { name: /models/i })).toBeVisible()
-    await expect(page.getByRole('button', { name: /stream/i })).toBeVisible()
-    await expect(page.getByRole('button', { name: /gate engine/i })).toBeVisible()
-    await expect(page.getByRole('button', { name: /advanced/i })).toBeVisible()
+    // Use exact names to avoid ambiguity with "Test Connection" button
+    await expect(page.getByRole('button', { name: 'Connection', exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Models', exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Stream', exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Gate Engine', exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Advanced', exact: true })).toBeVisible()
   })
 
   test('save button is visible', async ({ page }) => {
@@ -201,5 +202,88 @@ test.describe('Settings panel', () => {
 
     expect(storedEndpoint).toBe(CUSTOM_ENDPOINT)
     expect(storedFps).toBe('20')
+  })
+
+  // ── TURN server field ─────────────────────────────────────────────────────
+
+  test('connection section: TURN server URL field is present', async ({ page }) => {
+    await page.goto('/settings')
+    // Connection section is open by default
+    await expect(page.getByTestId('turn-url')).toBeVisible()
+  })
+
+  test('TURN server URL field accepts input and persists after save', async ({ page }) => {
+    const TURN_URL = 'turn:turn.example.com:3478?transport=tcp'
+    await page.goto('/settings')
+
+    await page.getByTestId('turn-url').fill(TURN_URL)
+    await page.getByTestId('save-button').click()
+    await expect(page.getByTestId('save-button')).toContainText('Saved')
+
+    await page.reload()
+    await expect(page.getByTestId('turn-url')).toHaveValue(TURN_URL)
+  })
+
+  // ── Token rate cap slider ─────────────────────────────────────────────────
+
+  test('stream section: token rate cap slider is present', async ({ page }) => {
+    await page.goto('/settings')
+    await page.getByRole('button', { name: /^stream$/i }).click()
+    await expect(page.getByTestId('token-rate-cap')).toBeVisible()
+  })
+
+  test('token rate cap value display updates with slider', async ({ page }) => {
+    await page.goto('/settings')
+    await page.getByRole('button', { name: /^stream$/i }).click()
+
+    await page.getByTestId('token-rate-cap').fill('200')
+    await expect(page.getByTestId('token-rate-cap-value')).toContainText('200')
+  })
+
+  test('token rate cap persists after save and reload', async ({ page }) => {
+    await page.goto('/settings')
+    await page.getByRole('button', { name: /^stream$/i }).click()
+
+    await page.getByTestId('token-rate-cap').fill('100')
+    await page.getByTestId('save-button').click()
+
+    await page.reload()
+    await page.getByRole('button', { name: /^stream$/i }).click()
+    await expect(page.getByTestId('token-rate-cap-value')).toContainText('100')
+  })
+
+  // ── Clip mode toggle ──────────────────────────────────────────────────────
+
+  test('stream section: clip mode toggle is present', async ({ page }) => {
+    await page.goto('/settings')
+    await page.getByRole('button', { name: /^stream$/i }).click()
+    await expect(page.getByTestId('clip-mode-toggle')).toBeVisible()
+  })
+
+  test('clip mode toggle changes aria-checked when clicked', async ({ page }) => {
+    await page.goto('/settings')
+    await page.getByRole('button', { name: /^stream$/i }).click()
+
+    const toggle = page.getByTestId('clip-mode-toggle')
+    const initial = await toggle.getAttribute('aria-checked')
+
+    await toggle.click()
+    const updated = await toggle.getAttribute('aria-checked')
+    expect(updated).not.toBe(initial)
+  })
+
+  test('clip mode toggle state persists after save and reload', async ({ page }) => {
+    await page.goto('/settings')
+    await page.getByRole('button', { name: /^stream$/i }).click()
+
+    const toggle = page.getByTestId('clip-mode-toggle')
+    // Default is false — click once to enable
+    await toggle.click()
+    await expect(toggle).toHaveAttribute('aria-checked', 'true')
+
+    await page.getByTestId('save-button').click()
+    await page.reload()
+    await page.getByRole('button', { name: /^stream$/i }).click()
+    await expect(page.getByTestId('clip-mode-toggle')).toHaveAttribute('aria-checked', 'true')
   })
 })
