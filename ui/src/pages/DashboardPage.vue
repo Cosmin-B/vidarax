@@ -223,7 +223,7 @@ function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
               <span class="badge badge-muted hidden sm:inline-flex">{{ run.mode }}</span>
             </div>
             <div class="text-[#475569] text-xs mt-0.5 truncate">
-              {{ run.model }} &middot; {{ formatRelative(run.created_at) }}
+              {{ run.model }} &middot; {{ run.created_at ? formatRelative(run.created_at) : '—' }}
             </div>
           </div>
           <!-- Event count -->

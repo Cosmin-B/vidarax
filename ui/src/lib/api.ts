@@ -70,9 +70,9 @@ export interface RunResponse {
   status: string
   mode: string
   model: string
-  source_uri: string
-  created_at: string
-  updated_at: string
+  source_uri?: string
+  created_at?: string
+  updated_at?: string
 }
 
 export interface ReasonRequest {
@@ -87,8 +87,11 @@ export interface ReasonRequest {
 
 export interface ModelInfo {
   id: string
-  name: string
-  provider: string
+  name?: string
+  provider?: string
+  tier?: string
+  availability?: string
+  providers_available?: string[]
   context_length?: number
 }
 
@@ -151,7 +154,20 @@ export const api = {
       return request<RunResponse>('POST', '/v1/runs', data)
     },
     reason(runId: string, data: ReasonRequest): Promise<RunResponse> {
-      return request<RunResponse>('POST', `/v1/runs/${validateId(runId)}/reason`, data)
+      // Map frontend-friendly names to backend field names.
+      const body: Record<string, unknown> = {
+        source_uri: data.source_uri,
+        model: data.model,
+        semantic_inference: data.semantic_inference,
+        chunk_size: data.chunk_size,
+        semantic_frames_per_chunk: data.semantic_frames_per_chunk,
+      }
+      if (data.prompt) body.semantic_prompt = data.prompt
+      if (data.fps !== undefined) {
+        body.fixed_fps = data.fps
+        body.sampling_policy = 'fixed'
+      }
+      return request<RunResponse>('POST', `/v1/runs/${validateId(runId)}/reason`, body)
     },
     stop(runId: string): Promise<void> {
       return request<void>('POST', `/v1/runs/${validateId(runId)}/stop`)
@@ -174,13 +190,21 @@ export const api = {
   },
 
   stream: {
-    whipOffer(offerSdp: string): Promise<{ answer_sdp: string; session_id: string; location: string }> {
-      return request<{ answer_sdp: string; session_id: string; location: string }>(
-        'POST',
-        '/v1/stream/whip',
-        offerSdp,
-        { 'Content-Type': 'application/sdp', 'x-api-key': useAuthStore().apiKey },
-      )
+    async whipOffer(offerSdp: string): Promise<{ answer_sdp: string; session_id: string; location: string }> {
+      // WHIP (RFC 9725): POST raw SDP text, response is 201 + SDP body + Location header.
+      const auth = useAuthStore()
+      const url = `${auth.apiEndpoint}/v1/stream/whip`
+      const headers: Record<string, string> = { 'Content-Type': 'application/sdp' }
+      if (auth.apiKey) headers['x-api-key'] = auth.apiKey
+      const res = await fetch(url, { method: 'POST', headers, body: offerSdp })
+      if (!res.ok) {
+        const text = await res.text().catch(() => res.statusText)
+        throw new ApiError(res.status, text)
+      }
+      const answer_sdp = await res.text()
+      const location = res.headers.get('location') ?? '/v1/stream/whip/unknown'
+      const session_id = location.split('/').pop() ?? ''
+      return { answer_sdp, session_id, location }
     },
     whipIce(sessionId: string, candidate: string): Promise<void> {
       return request<void>('PATCH', `/v1/stream/whip/${validateId(sessionId)}`, candidate, {

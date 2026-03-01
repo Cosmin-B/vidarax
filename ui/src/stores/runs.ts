@@ -9,9 +9,9 @@ export interface Run {
   status: RunStatus
   mode: RunMode
   model: string
-  source_uri: string
-  created_at: string
-  updated_at: string
+  source_uri?: string
+  created_at?: string
+  updated_at?: string
   frame_count?: number
   event_count?: number
   duration_ms?: number
@@ -23,7 +23,7 @@ export interface RunSummary {
   status: RunStatus
   mode: RunMode
   model: string
-  created_at: string
+  created_at?: string
   event_count?: number
 }
 
@@ -35,9 +35,11 @@ export const useRunsStore = defineStore('runs', () => {
   const error = ref<string | null>(null)
 
   const sortedRuns = computed(() =>
-    [...runs.value].sort(
-      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-    )
+    [...runs.value].sort((a, b) => {
+      const ta = a.created_at ? new Date(a.created_at).getTime() : 0
+      const tb = b.created_at ? new Date(b.created_at).getTime() : 0
+      return tb - ta
+    })
   )
 
   const activeRunStatus = computed(() => activeRun.value?.status ?? null)

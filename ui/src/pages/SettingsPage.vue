@@ -126,7 +126,7 @@ async function testConnection(): Promise<void> {
 }
 
 async function pingApi(): Promise<void> {
-  const res = await fetch(`${form.apiEndpoint}/health`, {
+  const res = await fetch(`${form.apiEndpoint}/v1/health`, {
     headers: form.apiKey ? { 'x-api-key': form.apiKey } : {},
     signal: AbortSignal.timeout(5000),
   })
