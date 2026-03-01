@@ -869,7 +869,8 @@ pub async fn analyze_run(
 
     let mut marker_inputs = Vec::with_capacity(analyzed.len());
     let metadata = analyzed
-        .into_iter()
+        .iter()
+        .copied()
         .map(|m| {
             let (metadata, marker_input) = compose_frame_metadata(
                 &state,
@@ -1234,7 +1235,7 @@ pub async fn reason_realtime_run(
     let mut chunk_preps: Vec<ChunkPrep> = Vec::new();
     for (chunk_idx, chunk) in decoded.frame_signals.chunks(chunk_size).enumerate() {
         let started = Instant::now();
-        let analyzed = pipeline.analyze_batch(chunk);
+        let analyzed = pipeline.analyze_batch(chunk).to_vec();
         let frame_offset = chunk_idx * chunk_size;
         let chunk_jpegs: Vec<DecodedJpegFrame> = decoded_jpegs
             .as_ref()

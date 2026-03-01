@@ -1,4 +1,4 @@
-use crate::gate::{FrameSignal, GateConfig, GateEngine, GateEventType, GateReasonCode};
+use crate::gate::{FrameSignal, GateConfig, GateEngine, GateEvent, GateEventType, GateReasonCode};
 
 #[derive(Debug, Clone, Copy)]
 pub struct TwoPassConfig {
@@ -37,6 +37,8 @@ pub struct TwoPassPipeline {
     window_len: usize,
     cursor: usize,
     previous_hash: Option<u64>,
+    pass1_buf: Vec<GateEvent>,
+    out_buf: Vec<FrameMetadata>,
 }
 
 impl TwoPassPipeline {
@@ -52,31 +54,40 @@ impl TwoPassPipeline {
             window_len: 0,
             cursor: 0,
             previous_hash: None,
+            pass1_buf: Vec::new(),
+            out_buf: Vec::new(),
         }
     }
 
-    pub fn analyze_batch(&mut self, frames: &[FrameSignal]) -> Vec<FrameMetadata> {
-        // Pass 1: compute deterministic gate events first.
-        let mut pass1 = Vec::with_capacity(frames.len());
+    pub fn analyze_batch(&mut self, frames: &[FrameSignal]) -> &[FrameMetadata] {
+        // Pass 1: compute deterministic gate events; reuse allocation.
+        self.pass1_buf.clear();
         for frame in frames {
-            pass1.push(self.gate.process(*frame));
+            self.pass1_buf.push(self.gate.process(*frame));
         }
 
         // Pass 2: derive contextual metadata from a bounded sliding window.
-        let mut out = Vec::with_capacity(frames.len());
-        for (frame, gate_event) in frames.iter().zip(pass1.iter()) {
+        // Index-based loop avoids holding a borrow on pass1_buf across mutable
+        // calls to window_metrics / push_window.
+        self.out_buf.clear();
+        for i in 0..frames.len() {
+            let frame = &frames[i];
+            // Both fields are Copy enums — no reference retained.
+            let event_type = self.pass1_buf[i].event_type;
+            let reason_code = self.pass1_buf[i].reason_code;
+
             let (novelty, stability) = self.window_metrics(frame.perceptual_hash, frame.luma_mean);
             let motion = self.motion_score(frame.perceptual_hash);
             let confidence = (0.45 * novelty + 0.35 * (1.0 - stability) + 0.20 * motion).clamp(0.0, 1.0);
 
             let segment_start_ms = (frame.pts_ms / self.config.segment_ms) * self.config.segment_ms;
             let segment_end_ms = segment_start_ms + self.config.segment_ms;
-            out.push(FrameMetadata {
+            self.out_buf.push(FrameMetadata {
                 frame_index: frame.frame_index,
                 pts_ms: frame.pts_ms,
-                gate_event: gate_event.event_type,
-                scene_cut: gate_event.reason_code == GateReasonCode::SceneCut,
-                suspect_artifact: gate_event.event_type == GateEventType::SuspectArtifact,
+                gate_event: event_type,
+                scene_cut: reason_code == GateReasonCode::SceneCut,
+                suspect_artifact: event_type == GateEventType::SuspectArtifact,
                 novelty_score: novelty,
                 temporal_stability: stability,
                 motion_score: motion,
@@ -89,7 +100,7 @@ impl TwoPassPipeline {
             self.previous_hash = Some(frame.perceptual_hash);
         }
 
-        out
+        &self.out_buf
     }
 
     /// Fused single-pass over the sliding window: computes both novelty
@@ -139,7 +150,7 @@ fn hamming_similarity(a: u64, b: u64) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameMetadata, TwoPassConfig, TwoPassPipeline};
+    use super::{TwoPassConfig, TwoPassPipeline};
     use crate::gate::{FrameSignal, GateConfig, GateEventType};
 
     fn frame(frame_index: u64, hash: u64, luma: f32) -> FrameSignal {
@@ -187,7 +198,7 @@ mod tests {
     #[test]
     fn metadata_values_are_normalized() {
         let mut p = TwoPassPipeline::new(TwoPassConfig::default(), GateConfig::default());
-        let out: Vec<FrameMetadata> = p.analyze_batch(&[frame(0, 1, 0.0), frame(1, 2, 1.0)]);
+        let out = p.analyze_batch(&[frame(0, 1, 0.0), frame(1, 2, 1.0)]);
         for m in out {
             assert!((0.0..=1.0).contains(&m.novelty_score));
             assert!((0.0..=1.0).contains(&m.temporal_stability));

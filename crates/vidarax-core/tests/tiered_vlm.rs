@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use vidarax_core::tiered_vlm::TieredVlmConfig;
 
 #[test]
@@ -53,7 +55,7 @@ fn keyframe_work_has_prompt_field() {
         pts_ms: 0,
         event_type: "scene_cut".into(),
         confidence: 0.9,
-        jpeg_bytes: Vec::new(),
+        jpeg_bytes: Arc::from([] as [u8; 0]),
         prompt: "Describe this frame.".into(),
     };
     assert_eq!(kw.prompt, "Describe this frame.");
