@@ -20,7 +20,7 @@
  *   />
  */
 
-import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
+import { computed, ref, watch, onUnmounted } from 'vue'
 
 // ── Props ──────────────────────────────────────────────────────────────────────
 

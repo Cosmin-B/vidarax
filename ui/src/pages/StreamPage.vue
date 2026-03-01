@@ -8,6 +8,7 @@ import { useEventStream } from '@/composables/useEventStream'
 import type { StreamSourceType } from '@/stores/stream'
 import { Monitor, Camera, Radio, FileVideo, Clock, Play, Check, Zap, AlertCircle } from 'lucide-vue-next'
 import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
+import ProcessingVisualization from '@/components/stream/ProcessingVisualization.vue'
 import type { Component } from 'vue'
 
 const route = useRoute()
@@ -63,6 +64,36 @@ const bitrateKbps = computed(() => {
   // rough estimate from bytes sent
   return Math.round(streamStore.bytesTransferred * 8 / 1000)
 })
+
+// ── Visualization data from stream metrics ────────────────────────────────
+const streamVizFps = computed(() => Math.max(Math.round(streamStore.fps), 1) || 30)
+
+const streamVizProcessed = computed(() => streamStore.frameCount)
+
+/** Estimate total frames: keep a rolling 120-second window at current fps */
+const streamVizTotal = computed(() =>
+  Math.max(streamVizProcessed.value + streamVizFps.value * 10, 60)
+)
+
+/** Model the chunk window as last 30 frames */
+const streamVizChunkStart = computed(() =>
+  Math.max(0, streamVizProcessed.value - 30)
+)
+const streamVizChunkEnd = computed(() => streamVizProcessed.value)
+
+const streamVizEvents = computed(() => eventsStore.activeEvents)
+
+const streamVizVlmFrames = computed(() =>
+  streamVizEvents.value
+    .filter(e => e.event_type === 'vlm_description')
+    .map(e => e.frame_index)
+)
+
+const streamVizKfIndices = computed(() =>
+  streamVizEvents.value
+    .filter(e => e.event_type === 'keyframe')
+    .map(e => e.frame_index)
+)
 
 // ── Actions ───────────────────────────────────────────────────────────────────
 
@@ -195,6 +226,21 @@ function formatPts(pts: number): string {
       >
         {{ streamStore.error }}
       </div>
+
+      <!-- Processing visualization (visible during live stream) -->
+      <ProcessingVisualization
+        v-if="isStreaming"
+        :total-frames="streamVizTotal"
+        :processed-frames="streamVizProcessed"
+        :keyframe-count="streamVizKfIndices.length"
+        :event-count="streamVizEvents.length"
+        :current-chunk-start="streamVizChunkStart"
+        :current-chunk-end="streamVizChunkEnd"
+        :fps="streamVizFps"
+        :is-processing="isStreaming"
+        :vlm-frames="streamVizVlmFrames"
+        :keyframe-indices="streamVizKfIndices"
+      />
 
       <!-- Main layout: video + events side-by-side on large screens -->
       <div class="grid grid-cols-1 xl:grid-cols-[1fr_320px] gap-4">

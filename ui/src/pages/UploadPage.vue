@@ -251,6 +251,7 @@ async function startUpload(): Promise<void> {
     uploadState.value = 'done'
 
   } catch (err) {
+    stopVizPolling()
     const msg = err instanceof ApiError
       ? `API ${err.status}: ${err.message}`
       : err instanceof Error ? err.message : 'Upload failed'
@@ -316,16 +317,25 @@ async function pollRunStatus(runId: string): Promise<void> {
 
 function reset(): void {
   disconnectEvents()
+  stopVizPolling()
   selectedFile.value = null
   uploadState.value = 'idle'
   uploadProgress.value = 0
   uploadError.value = null
   createdRunId.value = null
   runStatus.value = null
+  vizProcessed.value = 0
+  vizChunkStart.value = 0
+  vizChunkEnd.value = 0
+  vizVlmFrames.value = []
+  vizKfIndices.value = []
   if (fileInputRef.value) fileInputRef.value.value = ''
 }
 
-onUnmounted(disconnectEvents)
+onUnmounted(() => {
+  disconnectEvents()
+  stopVizPolling()
+})
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -634,6 +644,21 @@ function formatPts(ms: number) {
             {{ stdbConnected ? 'Events streaming in real-time via SpacetimeDB.' : 'Events will appear when connected.' }}
           </span>
         </p>
+
+        <!-- Stream processing visualization -->
+        <ProcessingVisualization
+          v-if="uploadState === 'analyzing'"
+          :total-frames="vizTotalFrames"
+          :processed-frames="vizProcessed"
+          :keyframe-count="activeKeyframes.length"
+          :event-count="activeEvents.length"
+          :current-chunk-start="vizChunkStart"
+          :current-chunk-end="vizChunkEnd"
+          :fps="vizFps"
+          :is-processing="true"
+          :vlm-frames="vizVlmFrames"
+          :keyframe-indices="vizKfIndices"
+        />
 
         <!-- Inline live event feed during analysis -->
         <div v-if="uploadState === 'analyzing' && activeEvents.length > 0">

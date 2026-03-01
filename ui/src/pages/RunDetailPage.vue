@@ -18,6 +18,7 @@ import type { RunStatus } from '@/stores/runs'
 import type { AgentEvent } from '@/stores/events'
 import { ChevronLeft, Image, Radio, Zap } from 'lucide-vue-next'
 import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
+import ProcessingVisualization from '@/components/stream/ProcessingVisualization.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -230,6 +231,53 @@ const keyframes = computed(() => eventsStore.keyframesForRun(runId.value))
 
 const isProcessing = computed(() =>
   run.value?.status === 'processing' || run.value?.status === 'pending'
+)
+
+// ── Visualization props derived from run + event data ─────────────────────
+
+const vizFps = computed(() => {
+  const stored = Number(localStorage.getItem('vidarax_fps') ?? '5')
+  return stored > 0 ? stored : 5
+})
+
+const vizTotalFrames = computed(() => {
+  // activeRun (type Run) has frame_count; RunSummary does not
+  const fc = runsStore.activeRun?.frame_count
+  if (fc && fc > 0) return fc
+  if (events.value.length === 0) return 0
+  const maxFrame = Math.max(...events.value.map(e => e.frame_index))
+  return maxFrame + 1
+})
+
+const vizProcessedFrames = computed(() => {
+  if (!isProcessing.value && events.value.length > 0) return vizTotalFrames.value
+  if (events.value.length === 0) return 0
+  return Math.max(...events.value.map(e => e.frame_index))
+})
+
+const vizChunkStart = computed(() => {
+  if (events.value.length === 0) return 0
+  const sorted = [...events.value].sort((a, b) => a.frame_index - b.frame_index)
+  const last = sorted[sorted.length - 1]
+  const chunkSize = Number(localStorage.getItem('vidarax_chunk_size') ?? '30')
+  return Math.max(0, (last?.frame_index ?? 0) - chunkSize)
+})
+
+const vizChunkEnd = computed(() => {
+  if (events.value.length === 0) return 0
+  return Math.max(...events.value.map(e => e.frame_index))
+})
+
+const vizVlmFrames = computed(() =>
+  events.value
+    .filter(e => e.event_type === 'vlm_description')
+    .map(e => e.frame_index)
+)
+
+const vizKfIndices = computed(() =>
+  events.value
+    .filter(e => e.event_type === 'keyframe')
+    .map(e => e.frame_index)
 )
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -570,6 +618,23 @@ function formatTime(ms: number): string {
 
       <!-- Tab: Player (video + marker timeline + event list) ─────────────── -->
       <div v-if="activeTab === 'player'" class="space-y-3">
+
+        <!-- Stream processing visualization (shown while processing, collapses when done) -->
+        <Transition name="pv-collapse">
+          <ProcessingVisualization
+            v-if="isProcessing && vizTotalFrames > 0"
+            :total-frames="vizTotalFrames"
+            :processed-frames="vizProcessedFrames"
+            :keyframe-count="keyframes.length"
+            :event-count="events.length"
+            :current-chunk-start="vizChunkStart"
+            :current-chunk-end="vizChunkEnd"
+            :fps="vizFps"
+            :is-processing="isProcessing"
+            :vlm-frames="vizVlmFrames"
+            :keyframe-indices="vizKfIndices"
+          />
+        </Transition>
 
         <!-- Video player -->
         <div class="card-skeuo overflow-hidden" style="background: #050507;">
@@ -1041,3 +1106,19 @@ function formatTime(ms: number): string {
     </template>
   </div>
 </template>
+
+<style scoped>
+/* Collapse transition for the processing visualization */
+.pv-collapse-enter-active,
+.pv-collapse-leave-active {
+  transition: opacity 300ms ease, max-height 400ms cubic-bezier(0.4, 0, 0.2, 1), margin-bottom 300ms ease;
+  max-height: 200px;
+  overflow: hidden;
+}
+.pv-collapse-enter-from,
+.pv-collapse-leave-to {
+  opacity: 0;
+  max-height: 0;
+  margin-bottom: 0;
+}
+</style>
