@@ -3,6 +3,19 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+/// Apply restrictive file permissions (owner read/write only) on Unix (C-4).
+#[cfg(unix)]
+fn apply_restrictive_permissions(opts: &mut OpenOptions) -> &mut OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+    opts.mode(0o600)
+}
+
+/// No-op on non-Unix platforms.
+#[cfg(not(unix))]
+fn apply_restrictive_permissions(opts: &mut OpenOptions) -> &mut OpenOptions {
+    opts
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimelineEvent {
     pub seq: u64,
@@ -76,7 +89,10 @@ pub struct WalWriter {
 impl WalWriter {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, TimelineError> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        apply_restrictive_permissions(&mut opts);
+        let file = opts.open(&path)?;
         Ok(Self { path, file })
     }
 
@@ -92,10 +108,10 @@ impl WalWriter {
 }
 
 pub fn append_event(path: impl AsRef<Path>, event: &TimelineEvent) -> Result<(), TimelineError> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path.as_ref())?;
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    apply_restrictive_permissions(&mut opts);
+    let mut file = opts.open(path.as_ref())?;
     writeln!(file, "{}", event.encode_line())?;
     file.flush()?;
     Ok(())
