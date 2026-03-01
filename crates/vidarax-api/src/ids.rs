@@ -1,16 +1,20 @@
-pub fn random_run_id(fallback_seq: u64) -> String {
+/// Generate a cryptographically random run ID.
+///
+/// Panics if the OS CSPRNG is unavailable. A missing RNG indicates a severely
+/// degraded system state where generating predictable IDs would be a security
+/// risk (enumerable run IDs, session prediction). Failing hard is the correct
+/// choice -- callers must not silently fall back to sequential counters.
+pub fn random_run_id() -> String {
     let mut bytes = [0u8; 16];
-    if getrandom::fill(&mut bytes).is_ok() {
-        let mut id = String::with_capacity(4 + 32);
-        id.push_str("run-");
-        for b in &bytes {
-            id.push(hex_char(b >> 4));
-            id.push(hex_char(b & 0x0f));
-        }
-        return id;
+    getrandom::fill(&mut bytes)
+        .expect("OS CSPRNG unavailable -- cannot generate secure run IDs");
+    let mut id = String::with_capacity(4 + 32);
+    id.push_str("run-");
+    for b in &bytes {
+        id.push(hex_char(b >> 4));
+        id.push(hex_char(b & 0x0f));
     }
-    // Fallback preserves availability if OS RNG is temporarily unavailable.
-    format!("run-{fallback_seq:016x}")
+    id
 }
 
 pub fn validate_run_id(run_id: &str) -> bool {

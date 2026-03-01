@@ -227,8 +227,10 @@ impl AppState {
     }
 
     pub fn next_run_id(&self) -> String {
-        let next = self.run_seq.fetch_add(1, Ordering::AcqRel) + 1;
-        random_run_id(next)
+        // Sequence counter is still incremented for monotonic ordering; it is
+        // no longer used as an ID fallback (M-11).
+        self.run_seq.fetch_add(1, Ordering::AcqRel);
+        random_run_id()
     }
 
     pub fn next_request_id(&self) -> String {
