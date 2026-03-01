@@ -21,10 +21,10 @@ impl InputSource {
             let url =
                 reqwest::Url::parse(trimmed).map_err(|err| format!("invalid source_uri: {err}"))?;
             return match url.scheme() {
-                "http" | "https" => validate_remote_url(url),
+                "http" | "https" | "rtsp" => validate_remote_url(url),
                 "file" => validate_file_url(url, allowed_file_roots),
                 other => Err(format!(
-                    "unsupported source_uri scheme '{other}', expected one of: file, http, https"
+                    "unsupported source_uri scheme '{other}', expected one of: file, http, https, rtsp"
                 )),
             };
         }
@@ -118,7 +118,7 @@ fn blocked_ip(ip: &IpAddr) -> bool {
     }
 }
 
-const FFMPEG_PROTOCOL_WHITELIST: &str = "file,http,https,tcp,tls";
+const FFMPEG_PROTOCOL_WHITELIST: &str = "file,http,https,tcp,tls,rtsp,rtp,udp";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FramePacket {
