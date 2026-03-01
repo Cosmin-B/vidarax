@@ -20,6 +20,8 @@ import {
   type ApiErrorBody,
 } from "./errors.js";
 
+import { InferResult } from "./types.js";
+
 import type {
   AgentEvent,
   AnalyzeFramesRequest,
@@ -79,6 +81,14 @@ function clamp(value: number, min: number, max: number): number {
  */
 function isRetryable(status: number): boolean {
   return status === 429 || status >= 500;
+}
+
+/** Coerce the raw finish_reason string from the API into the typed union. */
+function normaliseFinishReason(
+  raw: string | null | undefined,
+): "stop" | "length" | "content_filter" | null {
+  if (raw === "stop" || raw === "length" || raw === "content_filter") return raw;
+  return null;
 }
 
 // ─── Vidarax class ────────────────────────────────────────────────────────────
@@ -479,19 +489,58 @@ export class Vidarax {
   /**
    * Run a single prompt through the configured inference provider.
    *
-   * @param prompt   The prompt text.
-   * @param options  Optional inference parameters (model, temperature, etc.).
+   * Supply `output_schema` to request structured JSON output from the model.
+   * The schema is forwarded to the backend as `guided_json`.  On success,
+   * `InferResult.result` contains a JSON string; use `result.resultJson<T>()`
+   * to parse it into a typed object.
+   *
+   * @param options  Request options — `model` and `prompt` are required.
+   *
+   * @example
+   * const result = await v.infer({
+   *   model: 'Qwen/Qwen3-VL-2B-Instruct',
+   *   prompt: 'Count the people in the frame',
+   *   output_schema: {
+   *     type: 'object',
+   *     properties: { count: { type: 'number' }, description: { type: 'string' } },
+   *     required: ['count'],
+   *   },
+   * })
+   * if (result.ok) {
+   *   const data = result.resultJson<{ count: number }>()
+   *   console.log('People count:', data.count)
+   * }
    */
-  async infer(
-    prompt: string,
-    options: InferOptions & { model?: string } = {},
-  ): Promise<InferResponse> {
-    const body: InferRequest = {
-      model: "llama3.2-vision:11b",
-      ...options,
+  async infer(options: InferOptions): Promise<InferResult> {
+    const { model, prompt, output_schema, ...rest } = options;
+
+    const body: InferRequest & { guided_json?: Record<string, unknown> } = {
+      model: model ?? "llama3.2-vision:11b",
       prompt,
+      ...rest,
     };
-    return this.post<InferResponse>("/v1/infer", body);
+
+    // Forward output_schema to the backend field name expected by vllm / sglang.
+    if (output_schema !== undefined) {
+      body.guided_json = output_schema;
+    }
+
+    const started = Date.now();
+    const raw = await this.post<InferResponse>("/v1/infer", body);
+    const total_latency_ms = Date.now() - started;
+
+    return new InferResult({
+      result: raw.output_text,
+      ok: true,
+      error: null,
+      finish_reason: normaliseFinishReason(raw.finish_reason),
+      inference_latency_ms: raw.inference_latency_ms,
+      total_latency_ms: raw.total_latency_ms ?? total_latency_ms,
+      id: raw.request_id,
+      model_name: raw.model,
+      model_backend: raw.model_backend ?? raw.provider,
+      prompt,
+    });
   }
 
   /**

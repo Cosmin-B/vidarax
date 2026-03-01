@@ -184,13 +184,67 @@ for await (const marker of v.streamMarkers(runId, { status: 'confirmed' })) {
 Single prompt:
 
 ```typescript
-const result = await v.infer('What objects are visible?', {
+const result = await v.infer({
   model: 'llama3.2-vision:11b',
+  prompt: 'What objects are visible?',
   max_tokens: 512,
   temperature: 0.2,
 })
-console.log(result.output_text)
+
+if (result.ok) {
+  console.log(result.result)          // plain text output
+  console.log(result.model_name)      // e.g. "llama3.2-vision:11b"
+  console.log(result.inference_latency_ms)
+} else {
+  console.error(result.error)
+}
 ```
+
+### Structured output with `output_schema`
+
+Pass a JSON Schema to get a typed JSON object back from the model.  The SDK
+forwards the schema to the backend as `guided_json` and wraps the raw string in
+`InferResult`.  Call `result.resultJson<T>()` to parse it:
+
+```typescript
+const v = new Vidarax('http://localhost:8080')
+
+const result = await v.infer({
+  model: 'Qwen/Qwen3-VL-2B-Instruct',
+  prompt: 'Count the people in the frame',
+  output_schema: {
+    type: 'object',
+    properties: {
+      count: { type: 'number' },
+      description: { type: 'string' }
+    },
+    required: ['count']
+  }
+})
+
+if (result.ok) {
+  const data = result.resultJson<{ count: number; description?: string }>()
+  console.log('People count:', data.count)
+} else {
+  console.error('Inference failed:', result.error)
+}
+```
+
+`InferResult` exposes all fields you need to handle success and failure paths
+without wrapping everything in try/catch:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `result` | `string` | Model output — plain text, or a JSON string when `output_schema` was used. |
+| `ok` | `boolean` | `true` when inference succeeded (HTTP 200). |
+| `error` | `string \| null` | Error message when `ok` is `false`, otherwise `null`. |
+| `finish_reason` | `'stop' \| 'length' \| 'content_filter' \| null` | Why the model stopped generating. |
+| `inference_latency_ms` | `number` | Time from request dispatch to first token. |
+| `total_latency_ms` | `number` | End-to-end round-trip time. |
+| `id` | `string` | Unique result ID (matches `request_id` from the API). |
+| `model_name` | `string` | Model identifier that served this request. |
+| `model_backend` | `string` | Inference backend, e.g. `"vllm"` or `"sglang"`. |
+| `prompt` | `string` | The prompt that was submitted. |
 
 Batch (results ordered to match input, failures are per-item rather than throwing):
 

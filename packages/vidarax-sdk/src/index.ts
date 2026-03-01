@@ -15,6 +15,9 @@
 // ─── Main client ──────────────────────────────────────────────────────────────
 export { Vidarax } from "./client.js";
 
+// ─── Result classes ───────────────────────────────────────────────────────────
+export { InferResult } from "./types.js";
+
 // ─── Error classes ────────────────────────────────────────────────────────────
 export {
   VidaraxError,

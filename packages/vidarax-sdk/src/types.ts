@@ -308,7 +308,7 @@ export interface InferRequest {
   output_schema?: Record<string, unknown>;
 }
 
-/** Response body from POST /v1/infer. Maps to `InferResponse`. */
+/** Raw response body from POST /v1/infer. Maps to `InferResponse`. */
 export interface InferResponse {
   request_id: string;
   run_id: string | null;
@@ -318,6 +318,98 @@ export interface InferResponse {
   output_text: string;
   finish_reason: string | null;
   inference_latency_ms: number;
+  total_latency_ms?: number;
+  model_backend?: string;
+}
+
+/**
+ * High-level result handle returned by `Vidarax.infer()`.
+ *
+ * Mirrors the shape used by Overshoot-compatible clients, exposing a flat set
+ * of fields that cover both success and failure paths without forcing callers
+ * to dig into nested objects.
+ *
+ * @example
+ * const result = await v.infer({
+ *   model: 'Qwen/Qwen3-VL-2B-Instruct',
+ *   prompt: 'Count the people in the frame',
+ *   output_schema: { type: 'object', properties: { count: { type: 'number' } }, required: ['count'] }
+ * })
+ * if (result.ok) {
+ *   const data = result.resultJson<{ count: number }>()
+ *   console.log('People count:', data.count)
+ * }
+ */
+export class InferResult {
+  /** Model output — plain text, or a JSON string when `output_schema` was supplied. */
+  readonly result: string;
+
+  /** `true` when inference succeeded (HTTP 200). */
+  readonly ok: boolean;
+
+  /** Error message when `ok` is `false`, otherwise `null`. */
+  readonly error: string | null;
+
+  /** The reason the model stopped generating. */
+  readonly finish_reason: "stop" | "length" | "content_filter" | null;
+
+  /** Time from request dispatch to first token in milliseconds. */
+  readonly inference_latency_ms: number;
+
+  /** End-to-end round-trip time in milliseconds. */
+  readonly total_latency_ms: number;
+
+  /** Unique result identifier (matches `request_id` from the API). */
+  readonly id: string;
+
+  /** Model identifier that served this request. */
+  readonly model_name: string;
+
+  /** Inference backend that executed the request, e.g. `"vllm"` or `"sglang"`. */
+  readonly model_backend: string;
+
+  /** The prompt that was submitted to the model. */
+  readonly prompt: string;
+
+  constructor(fields: {
+    result: string;
+    ok: boolean;
+    error: string | null;
+    finish_reason: "stop" | "length" | "content_filter" | null;
+    inference_latency_ms: number;
+    total_latency_ms: number;
+    id: string;
+    model_name: string;
+    model_backend: string;
+    prompt: string;
+  }) {
+    this.result = fields.result;
+    this.ok = fields.ok;
+    this.error = fields.error;
+    this.finish_reason = fields.finish_reason;
+    this.inference_latency_ms = fields.inference_latency_ms;
+    this.total_latency_ms = fields.total_latency_ms;
+    this.id = fields.id;
+    this.model_name = fields.model_name;
+    this.model_backend = fields.model_backend;
+    this.prompt = fields.prompt;
+  }
+
+  /**
+   * Parse `result` as JSON and cast it to `T`.
+   *
+   * Use this when the request included an `output_schema` and you expect a
+   * structured JSON object in `result`.
+   *
+   * @throws `SyntaxError` when `result` is not valid JSON.
+   *
+   * @example
+   * const data = result.resultJson<{ count: number; description: string }>()
+   * console.log(data.count)
+   */
+  resultJson<T>(): T {
+    return JSON.parse(this.result) as T;
+  }
 }
 
 /** Request body for POST /v1/infer/batch. Maps to `InferBatchRequest`. */
@@ -449,8 +541,42 @@ export interface AnalyzeOptions {
   maxFrames?: number;
 }
 
-/** Options accepted by `Vidarax.infer()`. */
-export type InferOptions = Omit<InferRequest, "model" | "prompt">;
+/**
+ * Options accepted by `Vidarax.infer()`.
+ *
+ * `model` and `prompt` are required.  All other fields are optional and map
+ * directly to the `InferRequest` body sent to the API.
+ *
+ * Supply `output_schema` with a JSON Schema object to request structured JSON
+ * output from the model.  The schema is forwarded to the backend as
+ * `guided_json`.  Parse the structured response with `InferResult.resultJson()`.
+ */
+export interface InferOptions {
+  /** Model to use for inference. */
+  model: string;
+  /** Prompt text to send to the model. */
+  prompt: string;
+  /** Maximum number of tokens to generate. */
+  max_tokens?: number;
+  /** Sampling temperature (0–2). */
+  temperature?: number;
+  /** Request timeout override in milliseconds. */
+  timeout_ms?: number;
+  /**
+   * JSON Schema for structured output.
+   *
+   * When provided the model is guided to return a JSON object that conforms to
+   * this schema.  Retrieve the parsed object via `InferResult.resultJson<T>()`.
+   *
+   * @example
+   * output_schema: {
+   *   type: 'object',
+   *   properties: { count: { type: 'number' }, description: { type: 'string' } },
+   *   required: ['count'],
+   * }
+   */
+  output_schema?: Record<string, unknown>;
+}
 
 /** Options accepted by `Vidarax.inferBatch()`. */
 export type InferBatchOptions = Pick<InferBatchRequest, "max_parallel">;
@@ -482,7 +608,10 @@ export type ProgressCallback = (loaded: number, total: number) => void;
  * High-level result handle returned by `Vidarax.analyze()`.
  *
  * Provides convenience async-iterable access to events and markers stored
- * against the underlying run.
+ * against the underlying run.  Each metadata item in `analyzeResponse` carries
+ * the same rich result fields (`finish_reason`, `model`, etc.) that are
+ * available on `InferResult` so callers can handle success and failure paths
+ * uniformly.
  */
 export interface AnalysisResult {
   runId: string;
