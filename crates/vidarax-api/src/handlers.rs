@@ -14,8 +14,8 @@ use vidarax_contracts::models::{
 };
 use vidarax_core::gate::{FrameSignal, GateConfig, GateEventType};
 use vidarax_core::ingest::{
-    decode_mp4_to_frame_signals, decode_mp4_to_jpeg_frames, probe_source_fps, DecodedJpegFrame,
-    InputSource, Mp4DecodeConfig,
+    compute_semantic_frame_indices, decode_mp4_to_frame_signals, decode_selective_jpeg_frames,
+    probe_source_fps, DecodedJpegFrame, InputSource, Mp4DecodeConfig,
 };
 use vidarax_core::pipeline::{FrameMetadata, TwoPassConfig, TwoPassPipeline};
 use vidarax_core::provider::{
@@ -1110,9 +1110,27 @@ pub async fn reason_realtime_run(
                 sample_fps,
                 max_frames: max_frames as usize,
             };
+            // Pass 1: frame signals (cheap, no encoding)
             let decoded = decode_mp4_to_frame_signals(&decode_source, decode_config)?;
+
+            // Pre-compute which frames go to VLM (pure math, zero I/O)
             let decoded_jpegs = if semantic_decode_enabled {
-                Some(decode_mp4_to_jpeg_frames(&decode_source, decode_config)?)
+                let indices = compute_semantic_frame_indices(
+                    decoded.frame_signals.len(),
+                    chunk_size,
+                    semantic_frames_per_chunk,
+                );
+                // Pass 2: selective JPEG — only the ~4% of frames needed
+                let jpegs = decode_selective_jpeg_frames(
+                    &decode_source,
+                    sample_fps,
+                    &indices,
+                    max_frames as usize,
+                )?;
+                // Build lookup by frame_index for O(1) access during chunking
+                let lookup: std::collections::HashMap<u64, DecodedJpegFrame> =
+                    jpegs.into_iter().map(|f| (f.frame_index, f)).collect();
+                Some(lookup)
             } else {
                 None
             };
@@ -1196,12 +1214,14 @@ pub async fn reason_realtime_run(
         let started = Instant::now();
         let analyzed = pipeline.analyze_batch(chunk);
         let frame_offset = chunk_idx * chunk_size;
-        let chunk_jpegs = decoded_jpegs
+        let chunk_jpegs: Vec<DecodedJpegFrame> = decoded_jpegs
             .as_ref()
-            .map(|frames| {
-                let start = frame_offset.min(frames.len());
-                let end = (frame_offset + chunk.len()).min(frames.len());
-                frames[start..end].to_vec()
+            .map(|lookup| {
+                let mut jpegs: Vec<DecodedJpegFrame> = (frame_offset..frame_offset + chunk.len())
+                    .filter_map(|idx| lookup.get(&(idx as u64)).cloned())
+                    .collect();
+                jpegs.sort_by_key(|f| f.frame_index);
+                jpegs
             })
             .unwrap_or_default();
         chunk_preps.push(ChunkPrep {
