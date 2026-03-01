@@ -256,3 +256,222 @@ async fn models_response_contains_request_id() {
         "response should include 'request_id'"
     );
 }
+
+// ─── Semantic search ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn search_returns_200_with_empty_hits_when_wal_is_empty() {
+    let router = app_router(AppState::with_wal_for_tests(tmp_wal("search-empty")));
+
+    let res = router
+        .oneshot(post_json(
+            "/v1/search",
+            json!({ "query": "person walking" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = collect_json(res.into_body()).await;
+    assert!(body["request_id"].is_string());
+    assert_eq!(body["scanned"].as_u64().unwrap_or(1), 0);
+    assert_eq!(body["total_hits"].as_u64().unwrap_or(1), 0);
+    assert!(body["hits"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn search_rejects_empty_query() {
+    let router = app_router(AppState::with_wal_for_tests(tmp_wal("search-empty-q")));
+
+    let res = router
+        .oneshot(post_json("/v1/search", json!({ "query": "" })))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn search_rejects_zero_limit() {
+    let router = app_router(AppState::with_wal_for_tests(tmp_wal("search-zero-limit")));
+
+    let res = router
+        .oneshot(post_json(
+            "/v1/search",
+            json!({ "query": "test", "limit": 0 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn search_rejects_limit_over_500() {
+    let router = app_router(AppState::with_wal_for_tests(tmp_wal("search-big-limit")));
+
+    let res = router
+        .oneshot(post_json(
+            "/v1/search",
+            json!({ "query": "test", "limit": 501 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn search_with_run_id_rejects_invalid_run_id() {
+    let router = app_router(AppState::with_wal_for_tests(tmp_wal("search-bad-run")));
+
+    let res = router
+        .oneshot(post_json(
+            "/v1/search",
+            json!({ "query": "person", "run_id": "not-a-valid-run-id" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn search_finds_matching_descriptions_in_wal() {
+    // Seed the WAL with a timeline event that contains a description field.
+    use vidarax_core::timeline::{TimelineEvent, append_event};
+
+    let wal = tmp_wal("search-match");
+    let event = TimelineEvent {
+        seq: 1,
+        run_id: "run-aabbccddeeff0011".to_string(),
+        stream_id: "stream-0".to_string(),
+        pts_ms: 1000,
+        kind: "semantic_chunk_inferred".to_string(),
+        payload: serde_json::json!({
+            "description": "a person walking through a doorway",
+            "event_type": "scene_cut",
+            "chunk_index": 0
+        })
+        .to_string(),
+    };
+    append_event(&wal, &event).unwrap();
+
+    let state = AppState::with_wal_for_tests(wal);
+    // Register the run so it is known.
+    state
+        .append_run_event(
+            "run-aabbccddeeff0011",
+            "run_created",
+            serde_json::json!({ "principal_key": "public" }),
+        )
+        .unwrap();
+
+    let router = app_router(state);
+
+    let res = router
+        .oneshot(post_json(
+            "/v1/search",
+            json!({ "query": "person walking" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = collect_json(res.into_body()).await;
+    let hits = body["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "expected exactly one hit: {body}");
+    assert_eq!(
+        hits[0]["description"].as_str().unwrap(),
+        "a person walking through a doorway"
+    );
+    assert_eq!(hits[0]["kind"].as_str().unwrap(), "semantic_chunk_inferred");
+}
+
+#[tokio::test]
+async fn search_is_case_insensitive() {
+    use vidarax_core::timeline::{TimelineEvent, append_event};
+
+    let wal = tmp_wal("search-case");
+    let event = TimelineEvent {
+        seq: 1,
+        run_id: "run-aabbccddeeff0022".to_string(),
+        stream_id: "stream-0".to_string(),
+        pts_ms: 500,
+        kind: "semantic_chunk_inferred".to_string(),
+        payload: serde_json::json!({ "description": "FORKLIFT moving pallets" }).to_string(),
+    };
+    append_event(&wal, &event).unwrap();
+
+    let router = app_router(AppState::with_wal_for_tests(wal));
+
+    let res = router
+        .oneshot(post_json("/v1/search", json!({ "query": "forklift" })))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = collect_json(res.into_body()).await;
+    let hits = body["hits"].as_array().unwrap();
+    assert!(!hits.is_empty(), "case-insensitive match should return a hit");
+}
+
+#[tokio::test]
+async fn search_respects_limit() {
+    use vidarax_core::timeline::{TimelineEvent, append_event};
+
+    let wal = tmp_wal("search-limit");
+    for i in 0u64..10 {
+        let event = TimelineEvent {
+            seq: i + 1,
+            run_id: "run-aabbccddeeff0033".to_string(),
+            stream_id: "stream-0".to_string(),
+            pts_ms: i * 100,
+            kind: "semantic_chunk_inferred".to_string(),
+            payload: serde_json::json!({ "description": format!("car on road frame {i}") })
+                .to_string(),
+        };
+        append_event(&wal, &event).unwrap();
+    }
+
+    let router = app_router(AppState::with_wal_for_tests(wal));
+
+    let res = router
+        .oneshot(post_json(
+            "/v1/search",
+            json!({ "query": "car on road", "limit": 3 }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = collect_json(res.into_body()).await;
+    let hits = body["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 3, "limit should cap results at 3");
+}
+
+#[tokio::test]
+async fn search_no_match_returns_empty_hits() {
+    use vidarax_core::timeline::{TimelineEvent, append_event};
+
+    let wal = tmp_wal("search-no-match");
+    let event = TimelineEvent {
+        seq: 1,
+        run_id: "run-aabbccddeeff0044".to_string(),
+        stream_id: "stream-0".to_string(),
+        pts_ms: 0,
+        kind: "semantic_chunk_inferred".to_string(),
+        payload: serde_json::json!({ "description": "empty parking lot at night" }).to_string(),
+    };
+    append_event(&wal, &event).unwrap();
+
+    let router = app_router(AppState::with_wal_for_tests(wal));
+
+    let res = router
+        .oneshot(post_json("/v1/search", json!({ "query": "bicycle" })))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = collect_json(res.into_body()).await;
+    assert_eq!(
+        body["total_hits"].as_u64().unwrap_or(1),
+        0,
+        "no match should return zero hits"
+    );
+}
