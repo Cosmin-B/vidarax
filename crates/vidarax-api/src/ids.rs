@@ -1,6 +1,6 @@
 pub fn random_run_id(fallback_seq: u64) -> String {
     let mut bytes = [0u8; 16];
-    if getrandom::getrandom(&mut bytes).is_ok() {
+    if getrandom::fill(&mut bytes).is_ok() {
         let mut id = String::with_capacity(4 + 32);
         id.push_str("run-");
         for b in &bytes {

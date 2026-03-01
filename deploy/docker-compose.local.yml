@@ -39,7 +39,7 @@ services:
       - vlog-data:/storage
 
   victoriatraces:
-    image: victoriametrics/victoria-traces:v0.24.2
+    image: victoriametrics/victoria-traces:v0.7.1
     command:
       - --storageDataPath=/storage
       - --httpListenAddr=:10428

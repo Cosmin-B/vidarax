@@ -148,35 +148,35 @@ const ROUTE_MANIFEST: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "POST",
-        path: "/v1/runs/:run_id/ingest",
+        path: "/v1/runs/{run_id}/ingest",
     },
     RouteSpec {
         method: "POST",
-        path: "/v1/runs/:run_id/analyze",
+        path: "/v1/runs/{run_id}/analyze",
     },
     RouteSpec {
         method: "POST",
-        path: "/v1/runs/:run_id/reason",
+        path: "/v1/runs/{run_id}/reason",
     },
     RouteSpec {
         method: "POST",
-        path: "/v1/runs/:run_id/stop",
+        path: "/v1/runs/{run_id}/stop",
     },
     RouteSpec {
         method: "POST",
-        path: "/v1/runs/:run_id/keepalive",
+        path: "/v1/runs/{run_id}/keepalive",
     },
     RouteSpec {
         method: "GET",
-        path: "/v1/runs/:run_id/events",
+        path: "/v1/runs/{run_id}/events",
     },
     RouteSpec {
         method: "GET",
-        path: "/v1/runs/:run_id/markers",
+        path: "/v1/runs/{run_id}/markers",
     },
     RouteSpec {
         method: "GET",
-        path: "/v1/runs/:run_id/state",
+        path: "/v1/runs/{run_id}/state",
     },
     RouteSpec {
         method: "POST",
