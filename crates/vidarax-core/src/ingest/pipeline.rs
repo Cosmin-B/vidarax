@@ -5,10 +5,14 @@
 //! - `NvdecCuda`: ffmpeg -hwaccel nvdec + CUDA JPEG encoder (Hetzner GPU)
 //! - `Mlx`: MLX Framework for Apple Silicon (Mac)
 
+use std::sync::OnceLock;
+
 use crate::ingest::{
     decode_mp4_to_frame_signals, decode_selective_jpeg_frames, DecodedJpegFrame,
     DecodedMp4Batch, InputSource, Mp4DecodeConfig,
 };
+
+static DETECTED_BACKEND: OnceLock<PipelineBackend> = OnceLock::new();
 
 /// Which hardware backend to use for video decode + JPEG encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,33 +37,35 @@ impl PipelineBackend {
         }
     }
 
-    /// Auto-detect best available backend.
+    /// Auto-detect best available backend (result cached after first call).
     pub fn auto_detect() -> Self {
-        // Check for NVIDIA GPU
-        if std::process::Command::new(super::nvidia_smi_path())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            return Self::NvdecCuda;
-        }
-        // Check for Apple Silicon MLX
-        #[cfg(target_os = "macos")]
-        {
-            if std::process::Command::new("python3")
-                .args(["-c", "import mlx.core"])
+        *DETECTED_BACKEND.get_or_init(|| {
+            // Check for NVIDIA GPU
+            if std::process::Command::new(super::nvidia_smi_path())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
                 .map(|s| s.success())
                 .unwrap_or(false)
             {
-                return Self::Mlx;
+                return Self::NvdecCuda;
             }
-        }
-        Self::CpuFfmpeg
+            // Check for Apple Silicon MLX
+            #[cfg(target_os = "macos")]
+            {
+                if std::process::Command::new("python3")
+                    .args(["-c", "import mlx.core"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+                {
+                    return Self::Mlx;
+                }
+            }
+            Self::CpuFfmpeg
+        })
     }
 
     pub fn label(self) -> &'static str {

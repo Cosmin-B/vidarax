@@ -56,6 +56,25 @@ pub enum GateReasonCode {
     NoTrigger,
 }
 
+impl GateReasonCode {
+    /// Return the canonical string label for this reason code.
+    ///
+    /// Preserves the same byte sequence as the old `&'static str` field so
+    /// that external consumers (schemas, FNV hashes, etc.) remain compatible.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InitialFrame => "initial_frame",
+            Self::SceneCut => "scene_cut",
+            Self::PeriodicKeepalive => "periodic_keepalive",
+            Self::ExposureShift => "exposure_shift",
+            Self::FlickerSuspected => "flicker_suspected",
+            Self::GhostingSuspected => "ghosting_suspected",
+            Self::NoiseVarianceSpike => "noise_variance_spike",
+            Self::NoTrigger => "no_trigger",
+        }
+    }
+}
+
 /// Gate decision for a single frame.
 ///
 /// Size: 32 bytes (was 48 bytes with `&'static str` reason_code).

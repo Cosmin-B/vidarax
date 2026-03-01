@@ -51,7 +51,7 @@ fn fnv_events(events: &[GateEvent]) -> u64 {
             .as_code()
             .bytes()
             .chain([b':'])
-            .chain(event.reason_code.bytes())
+            .chain(event.reason_code.as_str().bytes())
         {
             hash ^= b as u64;
             hash = hash.wrapping_mul(1099511628211);

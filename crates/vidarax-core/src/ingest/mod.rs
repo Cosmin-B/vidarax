@@ -3,28 +3,39 @@ pub mod pipeline;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use crate::gate::FrameSignal;
 
-/// Return the configured ffmpeg binary path.
+static FFMPEG_PATH: OnceLock<String> = OnceLock::new();
+static FFPROBE_PATH: OnceLock<String> = OnceLock::new();
+static NVIDIA_SMI_PATH: OnceLock<String> = OnceLock::new();
+
+/// Return the configured ffmpeg binary path (cached after first call).
 ///
 /// Checks `VIDARAX_FFMPEG_PATH` env var first, falls back to `"ffmpeg"`.
-pub fn ffmpeg_path() -> String {
-    std::env::var("VIDARAX_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string())
+pub fn ffmpeg_path() -> &'static str {
+    FFMPEG_PATH.get_or_init(|| {
+        std::env::var("VIDARAX_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string())
+    })
 }
 
-/// Return the configured ffprobe binary path.
+/// Return the configured ffprobe binary path (cached after first call).
 ///
 /// Checks `VIDARAX_FFPROBE_PATH` env var first, falls back to `"ffprobe"`.
-pub fn ffprobe_path() -> String {
-    std::env::var("VIDARAX_FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string())
+pub fn ffprobe_path() -> &'static str {
+    FFPROBE_PATH.get_or_init(|| {
+        std::env::var("VIDARAX_FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string())
+    })
 }
 
-/// Return the configured nvidia-smi binary path.
+/// Return the configured nvidia-smi binary path (cached after first call).
 ///
 /// Checks `VIDARAX_NVIDIA_SMI_PATH` env var first, falls back to `"nvidia-smi"`.
-pub fn nvidia_smi_path() -> String {
-    std::env::var("VIDARAX_NVIDIA_SMI_PATH").unwrap_or_else(|_| "nvidia-smi".to_string())
+pub fn nvidia_smi_path() -> &'static str {
+    NVIDIA_SMI_PATH.get_or_init(|| {
+        std::env::var("VIDARAX_NVIDIA_SMI_PATH").unwrap_or_else(|_| "nvidia-smi".to_string())
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -518,8 +529,13 @@ fn parse_framemd5_to_signals(
             break;
         }
 
-        let fields = line.split(',').map(str::trim).collect::<Vec<_>>();
-        if fields.len() < 6 {
+        let mut fields = [""; 6];
+        let mut field_count = 0usize;
+        for part in line.split(',').take(6) {
+            fields[field_count] = part.trim();
+            field_count += 1;
+        }
+        if field_count < 6 {
             return Err(format!("invalid framemd5 row: {line}"));
         }
         let pts = fields[2]
