@@ -276,6 +276,9 @@ impl WebRtcSession {
                         let seq = Arc::clone(&seq_counter);
 
                         tokio::spawn(async move {
+                            // Reuse a single allocation across frames; grows to the
+                            // largest NAL seen and is never freed until the task exits.
+                            let mut nals_buf: Vec<u8> = Vec::new();
                             loop {
                                 match track.recv().await {
                                     Ok(MediaSample::Video(frame)) => {
@@ -283,15 +286,16 @@ impl WebRtcSession {
 
                                         // rustrtc delivers NAL payload WITHOUT Annex B
                                         // start codes.  Prepend 0x00 0x00 0x00 0x01.
-                                        let mut nals = Vec::with_capacity(4 + frame.data.len());
-                                        nals.extend_from_slice(&ANNEX_B_START);
-                                        nals.extend_from_slice(&frame.data);
+                                        nals_buf.clear();
+                                        nals_buf.reserve(4 + frame.data.len());
+                                        nals_buf.extend_from_slice(&ANNEX_B_START);
+                                        nals_buf.extend_from_slice(&frame.data);
 
                                         // RTP timestamp is on a 90 kHz clock → ms.
                                         let pts_ms = frame.rtp_timestamp as u64 / 90;
 
                                         let rtp_frame = RtpFrame {
-                                            nals,
+                                            nals: nals_buf.clone(),
                                             pts_ms,
                                             seq: nal_seq,
                                         };
