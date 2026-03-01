@@ -5,6 +5,14 @@
 
 import { useAuthStore } from '@/stores/auth'
 
+/** Validate that an ID contains only safe characters (alphanumeric, dash, underscore). */
+function validateId(id: string): string {
+  if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+    throw new Error(`Invalid ID format: ${id}`)
+  }
+  return id
+}
+
 export class ApiError extends Error {
   readonly status: number
 
@@ -110,22 +118,22 @@ export const api = {
       return request<RunResponse[]>('GET', '/v1/runs')
     },
     get(runId: string): Promise<RunResponse> {
-      return request<RunResponse>('GET', `/v1/runs/${runId}`)
+      return request<RunResponse>('GET', `/v1/runs/${validateId(runId)}`)
     },
     create(data: CreateRunRequest): Promise<RunResponse> {
       return request<RunResponse>('POST', '/v1/runs', data)
     },
     reason(runId: string, data: ReasonRequest): Promise<RunResponse> {
-      return request<RunResponse>('POST', `/v1/runs/${runId}/reason`, data)
+      return request<RunResponse>('POST', `/v1/runs/${validateId(runId)}/reason`, data)
     },
     stop(runId: string): Promise<void> {
-      return request<void>('POST', `/v1/runs/${runId}/stop`)
+      return request<void>('POST', `/v1/runs/${validateId(runId)}/stop`)
     },
     delete(runId: string): Promise<void> {
-      return request<void>('DELETE', `/v1/runs/${runId}`)
+      return request<void>('DELETE', `/v1/runs/${validateId(runId)}`)
     },
     keepalive(runId: string): Promise<void> {
-      return request<void>('POST', `/v1/runs/${runId}/keepalive`)
+      return request<void>('POST', `/v1/runs/${validateId(runId)}/keepalive`)
     },
   },
 
@@ -139,15 +147,15 @@ export const api = {
       )
     },
     whipIce(sessionId: string, candidate: string): Promise<void> {
-      return request<void>('PATCH', `/v1/stream/whip/${sessionId}`, candidate, {
+      return request<void>('PATCH', `/v1/stream/whip/${validateId(sessionId)}`, candidate, {
         'Content-Type': 'application/trickle-ice-sdpfrag',
       })
     },
     whipTerminate(sessionId: string): Promise<void> {
-      return request<void>('DELETE', `/v1/stream/whip/${sessionId}`)
+      return request<void>('DELETE', `/v1/stream/whip/${validateId(sessionId)}`)
     },
     attachToRun(runId: string, data: { session_id: string; model?: string; prompt?: string }): Promise<void> {
-      return request<void>('POST', `/v1/runs/${runId}/stream`, data)
+      return request<void>('POST', `/v1/runs/${validateId(runId)}/stream`, data)
     },
     uploadFile(file: File): Promise<{ file_path: string }> {
       const auth = useAuthStore()

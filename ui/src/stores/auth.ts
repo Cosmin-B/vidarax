@@ -19,11 +19,19 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   function setApiEndpoint(url: string) {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error('Only http and https protocols are allowed')
+    }
     apiEndpoint.value = url
     localStorage.setItem('vidarax_endpoint', url)
   }
 
   function setSpacetimeEndpoint(url: string) {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error('Only http and https protocols are allowed')
+    }
     spacetimeEndpoint.value = url
     localStorage.setItem('vidarax_spacetime_endpoint', url)
   }

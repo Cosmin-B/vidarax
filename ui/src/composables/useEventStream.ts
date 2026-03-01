@@ -15,6 +15,7 @@
 import { ref, onUnmounted } from 'vue'
 import { useEventsStore } from '@/stores/events'
 import { useAuthStore } from '@/stores/auth'
+import { logger } from '@/lib/logger'
 import type { AgentEvent, KeyframeEntry } from '@/stores/events'
 
 // ── SpacetimeDB v1 JSON protocol types ────────────────────────────────────────
@@ -152,7 +153,7 @@ export function useEventStream() {
     try {
       msg = JSON.parse(raw) as ServerMessage
     } catch {
-      console.warn('[SpacetimeDB] Failed to parse message:', raw.slice(0, 200))
+      logger.warn('[SpacetimeDB] Failed to parse message:', raw.slice(0, 200))
       return
     }
 
@@ -246,7 +247,7 @@ export function useEventStream() {
       isConnected.value = true
       connectionError.value = null
       eventsStore.setConnectionStatus(true)
-      console.info('[SpacetimeDB] Connected to', wsUrl)
+      logger.info('[SpacetimeDB] Connected to', wsUrl)
 
       // If the server doesn't send IdentityToken (no-auth mode), subscribe now
       // A real server will send IdentityToken first, which triggers sendSubscribe
@@ -269,12 +270,12 @@ export function useEventStream() {
     ws.onclose = (ev) => {
       isConnected.value = false
       eventsStore.setConnectionStatus(false)
-      console.info(`[SpacetimeDB] Disconnected (code=${ev.code})`)
+      logger.info(`[SpacetimeDB] Disconnected (code=${ev.code})`)
 
       // Auto-reconnect after 3 s if we still have an active run
       if (activeRunId) {
         reconnectTimer = setTimeout(() => {
-          console.info('[SpacetimeDB] Attempting reconnect…')
+          logger.info('[SpacetimeDB] Attempting reconnect…')
           _openWebSocket()
         }, 3000)
       }

@@ -13,6 +13,7 @@
 
 import { useEventsStore } from '@/stores/events'
 import { useAuthStore } from '@/stores/auth'
+import { logger } from '@/lib/logger'
 import type { AgentEvent, KeyframeEntry } from '@/stores/events'
 
 const MODULE_NAME = 'vidarax'
@@ -51,7 +52,7 @@ export class SpacetimeConnection {
         this._connected = true
         eventsStore.setConnectionStatus(true)
         if (token) authStore.setSpacetimeToken(token)
-        console.info('[SpacetimeDB] Connected to', this.wsUrl)
+        logger.info('[SpacetimeDB] Connected to', this.wsUrl)
         resolve()
       }
 
@@ -88,7 +89,7 @@ export class SpacetimeConnection {
       this.ws.close(1000, 'Singleton disconnect')
       this.ws = null
     }
-    console.info('[SpacetimeDB] Disconnected')
+    logger.info('[SpacetimeDB] Disconnected')
   }
 
   isConnected(): boolean {
