@@ -1,64 +1,153 @@
 /**
- * SpacetimeDB connection singleton placeholder.
- * Will be wired to @clockworklabs/spacetimedb-sdk in x05.3.
+ * SpacetimeDB connection singleton.
+ *
+ * The useEventStream composable (src/composables/useEventStream.ts) owns the
+ * reactive WebSocket lifecycle for component trees.  This singleton acts as a
+ * lighter convenience layer used by one-shot callers (e.g. app boot, auth flow)
+ * that don't live inside a Vue component.
+ *
+ * When the full @clockworklabs/spacetimedb-sdk generated bindings are ready
+ * (after `spacetime generate` runs against the deployed Vidarax module), replace
+ * the WebSocket block inside SpacetimeConnection.connect() with the SDK builder.
  */
 
 import { useEventsStore } from '@/stores/events'
 import { useAuthStore } from '@/stores/auth'
 import type { AgentEvent, KeyframeEntry } from '@/stores/events'
 
-let connectionInstance: SpacetimeConnection | null = null
+const MODULE_NAME = 'vidarax'
+
+function toWsUrl(baseUrl: string): string {
+  const url = new URL(baseUrl.replace(/\/$/, ''))
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+  url.pathname = `/v1/database/${MODULE_NAME}/subscribe`
+  return url.toString()
+}
 
 export class SpacetimeConnection {
-  private url: string
-  private connected = false
+  private wsUrl: string
+  private ws: WebSocket | null = null
+  private _connected = false
 
-  constructor(url: string) {
-    this.url = url
+  constructor(baseUrl: string) {
+    this.wsUrl = toWsUrl(baseUrl)
   }
 
   async connect(token?: string): Promise<void> {
     const eventsStore = useEventsStore()
     const authStore = useAuthStore()
 
-    try {
-      // Placeholder: real SDK connection wired in x05.3
-      console.info('[SpacetimeDB] Connecting to', this.url)
-      this.connected = true
-      eventsStore.setConnectionStatus(true)
-
-      if (token) {
-        authStore.setSpacetimeToken(token)
+    return new Promise((resolve, reject) => {
+      try {
+        this.ws = new WebSocket(this.wsUrl, ['v1.json.spacetimedb'])
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'WS open failed'
+        eventsStore.setConnectionStatus(false, msg)
+        reject(new Error(msg))
+        return
       }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Connection failed'
-      eventsStore.setConnectionStatus(false, msg)
-      throw err
-    }
+
+      this.ws.onopen = () => {
+        this._connected = true
+        eventsStore.setConnectionStatus(true)
+        if (token) authStore.setSpacetimeToken(token)
+        console.info('[SpacetimeDB] Connected to', this.wsUrl)
+        resolve()
+      }
+
+      this.ws.onerror = () => {
+        const msg = 'WebSocket connection error'
+        this._connected = false
+        eventsStore.setConnectionStatus(false, msg)
+        reject(new Error(msg))
+      }
+
+      this.ws.onmessage = (ev) => {
+        if (typeof ev.data !== 'string') return
+        try {
+          const msg = JSON.parse(ev.data) as Record<string, unknown>
+          if ('TransactionUpdate' in msg || 'InitialSubscription' in msg) {
+            this._dispatchTableRows(msg)
+          }
+        } catch { /* ignore parse errors */ }
+      }
+
+      this.ws.onclose = () => {
+        this._connected = false
+        eventsStore.setConnectionStatus(false)
+      }
+    })
   }
 
   disconnect(): void {
-    this.connected = false
+    this._connected = false
     const eventsStore = useEventsStore()
     eventsStore.setConnectionStatus(false)
+    if (this.ws) {
+      this.ws.onclose = null
+      this.ws.close(1000, 'Singleton disconnect')
+      this.ws = null
+    }
     console.info('[SpacetimeDB] Disconnected')
   }
 
   isConnected(): boolean {
-    return this.connected
+    return this._connected && this.ws?.readyState === WebSocket.OPEN
   }
 
-  // Called by useEventStream composable when SDK fires onInsert
+  /** Direct injection for SDK callbacks (used by useEventStream). */
   handleEventInsert(event: AgentEvent): void {
-    const store = useEventsStore()
-    store.addEvent(event)
+    useEventsStore().addEvent(event)
   }
 
   handleKeyframeInsert(kf: KeyframeEntry): void {
-    const store = useEventsStore()
-    store.addKeyframe(kf)
+    useEventsStore().addKeyframe(kf)
+  }
+
+  private _dispatchTableRows(msg: Record<string, unknown>): void {
+    const eventsStore = useEventsStore()
+    const tables: Array<{ table_name: string; updates: { inserts: Array<{ row: unknown }> } }> = []
+
+    // Extract from InitialSubscription
+    const initial = msg['InitialSubscription'] as
+      | { database_update?: { tables: typeof tables } }
+      | undefined
+    if (initial?.database_update?.tables) {
+      tables.push(...initial.database_update.tables)
+    }
+
+    // Extract from TransactionUpdate (both status shapes)
+    const tu = msg['TransactionUpdate'] as
+      | { database_update?: { tables: typeof tables }; status?: { Committed?: { tables: typeof tables } } }
+      | undefined
+    if (tu?.database_update?.tables) tables.push(...tu.database_update.tables)
+    if (tu?.status && typeof tu.status === 'object') {
+      const committed = (tu.status as { Committed?: { tables: typeof tables } }).Committed
+      if (committed?.tables) tables.push(...committed.tables)
+    }
+
+    for (const table of tables) {
+      if (!table.updates?.inserts) continue
+      for (const { row } of table.updates.inserts) {
+        if (!row || typeof row !== 'object') continue
+        const r = row as Record<string, unknown>
+        if (table.table_name === 'AgentEvents' || table.table_name === 'agent_events') {
+          if (typeof r.run_id === 'string') {
+            eventsStore.addEvent(r as unknown as AgentEvent)
+          }
+        } else if (table.table_name === 'KeyframeStore' || table.table_name === 'keyframe_store') {
+          if (typeof r.run_id === 'string') {
+            eventsStore.addKeyframe(r as unknown as KeyframeEntry)
+          }
+        }
+      }
+    }
   }
 }
+
+// ── Singleton management ──────────────────────────────────────────────────────
+
+let connectionInstance: SpacetimeConnection | null = null
 
 export function getSpacetimeConnection(url?: string): SpacetimeConnection {
   const authStore = useAuthStore()
