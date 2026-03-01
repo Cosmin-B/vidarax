@@ -19,8 +19,8 @@ pub struct InferenceRequest {
     pub temperature: f32,
     pub timeout_ms: u64,
     pub allow_fallback: bool,
-    /// Optional JSON schema string forwarded as `guided_json` in the request
-    /// body (vLLM / SGLang constrained decoding).
+    /// Optional JSON schema string for constrained decoding.
+    /// Sent as `response_format.json_schema` for vLLM ≥0.15 compatibility.
     pub guided_json: Option<String>,
 }
 
@@ -305,7 +305,14 @@ fn build_payload(model: &str, request: &InferenceRequest) -> String {
         "temperature": request.temperature
     });
     if let Some(schema) = &request.guided_json {
-        body["guided_json"] = Value::String(schema.clone());
+        // vLLM ≥0.15 requires response_format (not extra_body.guided_json)
+        body["response_format"] = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "teacher_label",
+                "schema": serde_json::from_str::<Value>(schema).unwrap_or(Value::Null)
+            }
+        });
     }
     body.to_string()
 }

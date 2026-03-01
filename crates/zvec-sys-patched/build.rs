@@ -292,6 +292,10 @@ fn link_libraries(zvec_lib: &Path, wrapper_build: &Path) {
         println!("cargo:rustc-link-lib=c++");
     } else {
         println!("cargo:rustc-link-lib=stdc++");
+        // ICU libs required by boost_locale (pulled in by zvec's Arrow dependency)
+        println!("cargo:rustc-link-lib=icui18n");
+        println!("cargo:rustc-link-lib=icuuc");
+        println!("cargo:rustc-link-lib=icudata");
     }
     println!("cargo:rustc-link-lib=pthread");
     println!("cargo:rustc-link-lib=dl");

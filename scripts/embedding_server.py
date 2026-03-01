@@ -109,7 +109,12 @@ async def lifespan(app: FastAPI):
 
     _processor = AutoProcessor.from_pretrained(_model_id)
     _model = AutoModel.from_pretrained(_model_id).to(_device).eval()
-    logger.info("Model loaded. Embedding dim: %d", _model.config.hidden_size)
+    # SiglipConfig nests hidden_size under vision_config; fall back for flat configs
+    _cfg = _model.config
+    _emb_dim = getattr(_cfg, "hidden_size", None) or getattr(
+        getattr(_cfg, "vision_config", None), "hidden_size", 768
+    )
+    logger.info("Model loaded. Embedding dim: %d", _emb_dim)
     yield
     logger.info("Shutting down embedding server")
 
