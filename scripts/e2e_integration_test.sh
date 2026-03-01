@@ -57,7 +57,7 @@ echo ""
 
 # --- Step 4: Run /reason ---
 echo "--- Step 4: Run /reason (model=$MODEL, tiered: $FIRST_PASS → $SECOND_PASS) ---"
-start_time=$(date +%s%3N)
+start_ms=$(python3 -c "import time; print(int(time.time() * 1000))")
 
 # Include tiered fields in payload — ignored by current API, honoured once x12.3 lands.
 reason_resp=$(curl -sS -X POST "$VIDARAX_API/v1/runs/$run_id/reason" \
@@ -74,8 +74,8 @@ reason_resp=$(curl -sS -X POST "$VIDARAX_API/v1/runs/$run_id/reason" \
         \"second_pass_threshold\": $THRESHOLD
     }")
 
-end_time=$(date +%s%3N)
-elapsed=$((end_time - start_time))
+end_ms=$(python3 -c "import time; print(int(time.time() * 1000))")
+elapsed=$((end_ms - start_ms))
 
 echo "$reason_resp" | python3 -c '
 import sys, json
