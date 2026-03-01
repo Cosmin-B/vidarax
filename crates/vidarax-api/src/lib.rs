@@ -21,6 +21,7 @@ mod validation;
 mod whip;
 
 pub use config::{assert_route_parity, resolve_wal_path, ServerConfig, TransportMode};
+pub use models::AttachStreamRequest;
 pub use router::app_router;
 pub use state::AppState;
 use vidarax_core::provider::ProviderEndpoints;

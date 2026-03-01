@@ -334,3 +334,107 @@ pub struct AttachStreamRequest {
     /// temporal windows for multi-image VLM inference instead of per-keyframe.
     pub clip_mode: Option<ClipConfig>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── AttachStreamRequest deserialization ─────────────────────────────────
+
+    #[test]
+    fn attach_stream_request_parses_max_output_tokens_per_second() {
+        let raw = r#"{"max_output_tokens_per_second": 64}"#;
+        let parsed: AttachStreamRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.max_output_tokens_per_second, Some(64u32));
+    }
+
+    #[test]
+    fn attach_stream_request_token_rate_absent_is_none() {
+        let raw = r#"{}"#;
+        let parsed: AttachStreamRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            parsed.max_output_tokens_per_second, None,
+            "absent field should deserialise as None"
+        );
+    }
+
+    #[test]
+    fn attach_stream_request_parses_prompt_field() {
+        let raw = r#"{"prompt": "describe the scene"}"#;
+        let parsed: AttachStreamRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.prompt.as_deref(), Some("describe the scene"));
+    }
+
+    #[test]
+    fn attach_stream_request_prompt_absent_is_none() {
+        let raw = r#"{}"#;
+        let parsed: AttachStreamRequest = serde_json::from_str(raw).unwrap();
+        assert!(parsed.prompt.is_none(), "absent 'prompt' should be None");
+    }
+
+    #[test]
+    fn attach_stream_request_parses_all_fields() {
+        let raw = r#"{
+            "prompt": "what is happening?",
+            "max_output_tokens_per_second": 32,
+            "clip_mode": {
+                "target_fps": 8,
+                "clip_length_seconds": 1.5,
+                "delay_seconds": 0.25
+            }
+        }"#;
+        let parsed: AttachStreamRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.prompt.as_deref(), Some("what is happening?"));
+        assert_eq!(parsed.max_output_tokens_per_second, Some(32u32));
+        let clip = parsed.clip_mode.unwrap();
+        assert_eq!(clip.target_fps, 8);
+        assert!((clip.clip_length_seconds - 1.5).abs() < 1e-5);
+        assert!((clip.delay_seconds - 0.25).abs() < 1e-5);
+    }
+
+    #[test]
+    fn attach_stream_request_clip_mode_absent_is_none() {
+        let raw = r#"{"prompt": "hello"}"#;
+        let parsed: AttachStreamRequest = serde_json::from_str(raw).unwrap();
+        assert!(
+            parsed.clip_mode.is_none(),
+            "absent 'clip_mode' should be None"
+        );
+    }
+
+    // ─── SamplingPolicy parsing ───────────────────────────────────────────────
+
+    #[test]
+    fn sampling_policy_parses_adaptive_aliases() {
+        assert_eq!(
+            SamplingPolicy::parse(Some("source_fps_adaptive")),
+            Ok(SamplingPolicy::SourceFpsAdaptive)
+        );
+        assert_eq!(
+            SamplingPolicy::parse(Some("adaptive")),
+            Ok(SamplingPolicy::SourceFpsAdaptive)
+        );
+    }
+
+    #[test]
+    fn sampling_policy_parses_fixed() {
+        assert_eq!(
+            SamplingPolicy::parse(Some("fixed")),
+            Ok(SamplingPolicy::Fixed)
+        );
+    }
+
+    #[test]
+    fn sampling_policy_defaults_to_adaptive_when_none() {
+        assert_eq!(
+            SamplingPolicy::parse(None),
+            Ok(SamplingPolicy::SourceFpsAdaptive)
+        );
+    }
+
+    #[test]
+    fn sampling_policy_rejects_unknown_value() {
+        let result = SamplingPolicy::parse(Some("random"));
+        assert!(result.is_err());
+    }
+}

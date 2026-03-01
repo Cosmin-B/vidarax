@@ -332,3 +332,164 @@ fn parse_csv_env(var: &str) -> Vec<String> {
         })
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vidarax_core::webrtc::session::WebRtcConfig;
+
+    // ─── TransportMode parsing ────────────────────────────────────────────────
+
+    #[test]
+    fn transport_mode_accepts_all_h1h2_aliases() {
+        for alias in &["h1", "h2", "h1h2", "http", "http2"] {
+            assert_eq!(
+                TransportMode::parse(Some(alias)),
+                Ok(TransportMode::H1H2),
+                "alias '{alias}' should map to H1H2"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_mode_accepts_h3_aliases() {
+        for alias in &["h3", "http3"] {
+            assert_eq!(
+                TransportMode::parse(Some(alias)),
+                Ok(TransportMode::H3Experimental),
+                "alias '{alias}' should map to H3Experimental"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_mode_defaults_to_h1h2_when_none() {
+        assert_eq!(TransportMode::parse(None), Ok(TransportMode::H1H2));
+    }
+
+    #[test]
+    fn transport_mode_rejects_unknown_value() {
+        let result = TransportMode::parse(Some("grpc"));
+        assert!(result.is_err(), "unknown transport mode should be rejected");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("grpc"),
+            "error message should mention the unknown value: {msg}"
+        );
+    }
+
+    // ─── WebRtcConfig defaults (STUN / token-rate) ───────────────────────────
+
+    #[test]
+    fn webrtc_config_default_stun_is_google() {
+        let wc = WebRtcConfig::default();
+        assert_eq!(
+            wc.stun_servers,
+            vec!["stun:stun.l.google.com:19302"],
+            "default STUN should point to Google"
+        );
+    }
+
+    #[test]
+    fn webrtc_config_default_has_no_turn_servers() {
+        let wc = WebRtcConfig::default();
+        assert!(
+            wc.turn_servers.is_empty(),
+            "default WebRtcConfig should have no TURN servers"
+        );
+    }
+
+    #[test]
+    fn webrtc_config_default_token_rate_is_128() {
+        let wc = WebRtcConfig::default();
+        assert_eq!(
+            wc.max_output_tokens_per_second, 128,
+            "default token-rate cap should be 128 t/s"
+        );
+    }
+
+    // ─── ServerConfig TURN/STUN field round-trip ─────────────────────────────
+
+    #[test]
+    fn server_config_turn_fields_roundtrip() {
+        use vidarax_core::ingest::pipeline::PipelineBackend;
+        let cfg = ServerConfig {
+            bind_addr: "127.0.0.1:8080".into(),
+            h3_bind_addr: "127.0.0.1:8443".into(),
+            h3_tls_cert_path: "dev.crt".into(),
+            h3_tls_key_path: "dev.key".into(),
+            data_dir: "/tmp".into(),
+            ingest_file_roots: vec![],
+            inference_vllm_base_url: None,
+            inference_sglang_base_url: None,
+            security_require_api_key: false,
+            security_api_keys: vec![],
+            security_require_tenant_id: false,
+            security_global_rps: None,
+            security_tenant_rps: None,
+            security_tenant_slots: 128,
+            security_metrics_require_api_key: false,
+            cors_allowed_origins: vec![],
+            stream_ttl_secs: 3600,
+            active_stream_limit: 5,
+            transport: TransportMode::H1H2,
+            decode_backend: PipelineBackend::CpuFfmpeg,
+            webrtc_stun_servers: vec!["stun:custom.example.com:3478".into()],
+            webrtc_turn_url: Some("turn:relay.example.com:3478".into()),
+            webrtc_turn_username: Some("alice".into()),
+            webrtc_turn_credential: Some("secret".into()),
+            webrtc_max_output_tokens_per_second: 64,
+        };
+
+        assert_eq!(
+            cfg.webrtc_turn_url.as_deref(),
+            Some("turn:relay.example.com:3478")
+        );
+        assert_eq!(cfg.webrtc_turn_username.as_deref(), Some("alice"));
+        assert_eq!(cfg.webrtc_turn_credential.as_deref(), Some("secret"));
+        assert_eq!(cfg.webrtc_max_output_tokens_per_second, 64);
+        assert_eq!(cfg.webrtc_stun_servers, vec!["stun:custom.example.com:3478"]);
+    }
+
+    #[test]
+    fn server_config_turn_absent_fields_are_none() {
+        use vidarax_core::ingest::pipeline::PipelineBackend;
+        let cfg = ServerConfig {
+            bind_addr: "127.0.0.1:8080".into(),
+            h3_bind_addr: "127.0.0.1:8443".into(),
+            h3_tls_cert_path: "dev.crt".into(),
+            h3_tls_key_path: "dev.key".into(),
+            data_dir: "/tmp".into(),
+            ingest_file_roots: vec![],
+            inference_vllm_base_url: None,
+            inference_sglang_base_url: None,
+            security_require_api_key: false,
+            security_api_keys: vec![],
+            security_require_tenant_id: false,
+            security_global_rps: None,
+            security_tenant_rps: None,
+            security_tenant_slots: 128,
+            security_metrics_require_api_key: false,
+            cors_allowed_origins: vec![],
+            stream_ttl_secs: 3600,
+            active_stream_limit: 5,
+            transport: TransportMode::H1H2,
+            decode_backend: PipelineBackend::CpuFfmpeg,
+            webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".into()],
+            webrtc_turn_url: None,
+            webrtc_turn_username: None,
+            webrtc_turn_credential: None,
+            webrtc_max_output_tokens_per_second: 128,
+        };
+
+        assert!(cfg.webrtc_turn_url.is_none(), "turn_url should be None");
+        assert!(
+            cfg.webrtc_turn_username.is_none(),
+            "turn_username should be None"
+        );
+        assert!(
+            cfg.webrtc_turn_credential.is_none(),
+            "turn_credential should be None"
+        );
+    }
+}
