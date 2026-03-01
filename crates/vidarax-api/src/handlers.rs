@@ -31,6 +31,7 @@ use crate::models::{
     CreateRunRequest, CreateRunResponse, FieldError, InferBatchItemError, InferBatchItemResult,
     InferBatchRequest, InferBatchResponse, InferRequest, InferResponse, ModelCatalogItem,
     ModelCatalogResponse, RealtimeReasonRequest, RealtimeReasonResponse, SamplingPolicy,
+    SearchHit, SearchRequest, SearchResponse,
 };
 use crate::response::{
     conflict_error, internal_error, not_found_error, ok, validation_error, ApiResponse,

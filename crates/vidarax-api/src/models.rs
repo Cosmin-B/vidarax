@@ -275,6 +275,58 @@ pub struct CreateRunResponse {
     pub model: Option<String>,
 }
 
+// ─── Semantic search ─────────────────────────────────────────────────────────
+
+/// Request body for `POST /v1/search`.
+///
+/// Performs a substring search over stored VLM descriptions in the WAL.
+/// Matches are returned ordered by WAL sequence (ascending).
+///
+/// # Example
+///
+/// ```json
+/// { "query": "person walking", "run_id": "run-abc123", "limit": 10 }
+/// ```
+#[derive(Debug, Deserialize)]
+pub struct SearchRequest {
+    /// Query string.  All WAL events whose VLM description contains this
+    /// substring (case-insensitive) are returned.
+    pub query: String,
+    /// Restrict results to a single run.  When absent all runs are searched.
+    pub run_id: Option<String>,
+    /// Maximum number of results to return (1–500, default 50).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// A single search result hit.
+#[derive(Debug, Serialize)]
+pub struct SearchHit {
+    /// WAL sequence number of the matching event.
+    pub seq: u64,
+    /// Run the event belongs to.
+    pub run_id: String,
+    /// Presentation timestamp of the event in milliseconds.
+    pub pts_ms: u64,
+    /// WAL event kind (`"semantic_chunk_inferred"`, `"vlm"`, etc.).
+    pub kind: String,
+    /// The matched VLM description excerpt.
+    pub description: String,
+    /// Index name tag, if the event was produced by a named analysis pass.
+    pub index_name: Option<String>,
+}
+
+/// Response body for `POST /v1/search`.
+#[derive(Debug, Serialize)]
+pub struct SearchResponse {
+    pub request_id: String,
+    /// Total number of events scanned.
+    pub scanned: usize,
+    /// Number of matching events found (before `limit` is applied).
+    pub total_hits: usize,
+    pub hits: Vec<SearchHit>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct FieldError {
     pub field: &'static str,
