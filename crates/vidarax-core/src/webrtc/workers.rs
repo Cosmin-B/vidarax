@@ -149,7 +149,7 @@ pub fn spawn_decode_workers(
             .name(format!("vx-decode-{i}"))
             .spawn(move || {
 
-                let config = DecoderConfig { gpu_available: gpu };
+                let config = DecoderConfig { gpu_available: gpu, width: 1920, height: 1080 };
                 let mut decoder = Decoder::new(&config);
                 let mut prev_signal: Option<crate::gate::FrameSignal> = None;
 
@@ -305,22 +305,37 @@ pub fn spawn_analysis_workers(
 
 // ─── VLM workers ──────────────────────────────────────────────────────────────
 
+/// Event routed from VLM worker threads to the dedicated SpacetimeDB writer.
+enum SinkEvent {
+    Emit {
+        run_id: Arc<str>,
+        session_id: Arc<str>,
+        frame_index: u64,
+        pts_ms: u64,
+        event_type: &'static str,
+        confidence: f32,
+        description: String,
+    },
+    StoreKeyframe {
+        run_id: Arc<str>,
+        frame_index: u64,
+        pts_ms: u64,
+        event_type: String,
+        description: String,
+        jpeg_bytes: Arc<[u8]>,
+    },
+}
+
 /// Spawn `n` VLM inference worker threads with optional tiered routing.
 ///
 /// When `config.is_tiered()`, workers call the first-pass model first, then
 /// re-infer with the second-pass model if confidence is below threshold.
 ///
-/// Each thread:
-/// 1. Pulls [`KeyframeWork`] from the shared `vlm_rx` channel.
-/// 2. Enforces `max_output_tokens_per_second` backpressure per session.
-/// 3. Calls `provider.infer()` with the first-pass model.
-/// 4. If tiered and confidence is low, re-infers with the second-pass model.
-/// 5. Emits a `vlm` or `vlm_tiered` agent event to SpacetimeDB.
-/// 6. Stores the keyframe (JPEG + description) in SpacetimeDB.
+/// SpacetimeDB writes are fire-and-forget: VLM threads send [`SinkEvent`]s to
+/// a bounded kanal channel; a dedicated writer thread drains it sequentially,
+/// so inference latency is never stalled by SpacetimeDB HTTP round-trips.
 ///
-/// VLM inference errors are logged as the description text rather than
-/// crashing the worker, so a transient provider failure does not interrupt
-/// the pipeline.  Threads exit when `vlm_rx` is closed.
+/// Threads exit when `vlm_rx` is closed.
 pub fn spawn_vlm_workers<I>(
     n: usize,
     vlm_rx: kanal::Receiver<KeyframeWork>,
@@ -333,10 +348,40 @@ pub fn spawn_vlm_workers<I>(
 ) where
     I: InferenceProvider + 'static,
 {
+    // FIFO channel between VLM workers and the SpacetimeDB writer.
+    let (event_tx, event_rx) = kanal::bounded::<SinkEvent>(512);
+
+    // Dedicated writer thread: drains the FIFO and calls blocking sink methods.
+    std::thread::Builder::new()
+        .name("vx-stdb-writer".to_string())
+        .spawn(move || {
+            while let Ok(event) = event_rx.recv() {
+                match event {
+                    SinkEvent::Emit {
+                        run_id, session_id, frame_index, pts_ms,
+                        event_type, confidence, description,
+                    } => {
+                        let _ = stdb.emit_event_sync(
+                            &run_id, &session_id, frame_index, pts_ms,
+                            event_type, confidence, &description,
+                        );
+                    }
+                    SinkEvent::StoreKeyframe {
+                        run_id, frame_index, pts_ms, event_type, description, jpeg_bytes,
+                    } => {
+                        let _ = stdb.store_keyframe_sync(
+                            &run_id, frame_index, pts_ms, &event_type, &description, &jpeg_bytes,
+                        );
+                    }
+                }
+            }
+        })
+        .expect("stdb writer thread spawn failed");
+
     for i in 0..n.max(1) {
         let vlm_rx = vlm_rx.clone();
         let provider = Arc::clone(&provider);
-        let stdb = Arc::clone(&stdb);
+        let event_tx = event_tx.clone();
         let config = config.clone();
         let metrics = Arc::clone(&metrics);
         let session_span = session_span.clone();
@@ -383,7 +428,8 @@ pub fn spawn_vlm_workers<I>(
                         prompt: prompt.clone(),
                         input_images: vec![InferenceImage {
                             media_type: "image/jpeg",
-                            data_base64: base64::engine::general_purpose::STANDARD.encode(&work.jpeg_bytes),
+                            data_base64: base64::engine::general_purpose::STANDARD
+                                .encode(&work.jpeg_bytes),
                         }],
                         max_tokens: 128,
                         temperature: 0.0,
@@ -429,24 +475,27 @@ pub fn spawn_vlm_workers<I>(
 
                     let event_type = if used_second_pass { "vlm_tiered" } else { "vlm" };
 
-                    let _ = stdb.emit_event_sync(
-                        &work.run_id,
-                        &work.session_id,
-                        work.frame_index,
-                        work.pts_ms,
+                    // Fire-and-forget: VLM threads don't block on SpacetimeDB HTTP.
+                    let _ = event_tx.send(SinkEvent::Emit {
+                        run_id: Arc::clone(&work.run_id),
+                        session_id: Arc::clone(&work.session_id),
+                        frame_index: work.frame_index,
+                        pts_ms: work.pts_ms,
                         event_type,
-                        work.confidence,
-                        &description,
-                    );
-                    let _ = stdb.store_keyframe_sync(
-                        &work.run_id,
-                        work.frame_index,
-                        work.pts_ms,
-                        &work.event_type,
-                        &description,
-                        &work.jpeg_bytes,
-                    );
+                        confidence: work.confidence,
+                        description: description.clone(),
+                    });
+                    let _ = event_tx.send(SinkEvent::StoreKeyframe {
+                        run_id: Arc::clone(&work.run_id),
+                        frame_index: work.frame_index,
+                        pts_ms: work.pts_ms,
+                        event_type: work.event_type.clone(),
+                        description,
+                        jpeg_bytes: Arc::clone(&work.jpeg_bytes),
+                    });
                 }
+                // event_tx clone is dropped here; once all worker clones drop,
+                // the outer event_tx also drops, closing the writer channel.
             })
             .expect("vlm thread spawn failed");
     }

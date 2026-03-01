@@ -2,7 +2,7 @@ use vidarax_core::webrtc::decode::{Decoder, DecoderConfig, YuvFrame};
 
 #[test]
 fn software_decoder_creates_without_panic() {
-    let config = DecoderConfig { gpu_available: false };
+    let config = DecoderConfig { gpu_available: false, width: 1280, height: 720 };
     let decoder = Decoder::new(&config);
     assert!(matches!(decoder, Decoder::Software { .. }));
 }

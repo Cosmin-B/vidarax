@@ -10,7 +10,7 @@
 //! ```no_run
 //! use vidarax_core::webrtc::decode::{Decoder, DecoderConfig};
 //!
-//! let config = DecoderConfig { gpu_available: false };
+//! let config = DecoderConfig { gpu_available: false, width: 1280, height: 720 };
 //! let mut decoder = Decoder::new(&config);
 //! // Feed a raw H.264 NAL unit (Annex B or AVCC bytes):
 //! // let frame = decoder.decode(&nal_bytes).unwrap();
@@ -39,13 +39,17 @@ pub struct YuvFrame {
 pub struct DecoderConfig {
     /// When `true`, the NVDEC GPU path is used; otherwise openh264 CPU.
     pub gpu_available: bool,
+    /// Frame width passed to the NVDEC ffmpeg pipeline.  Ignored for software decode.
+    pub width: u32,
+    /// Frame height passed to the NVDEC ffmpeg pipeline.  Ignored for software decode.
+    pub height: u32,
 }
 
 impl DecoderConfig {
     /// Auto-detect GPU availability by probing `nvidia-smi`.
     ///
     /// Falls back to CPU (`gpu_available: false`) if the binary is not found
-    /// or returns a non-zero exit status.
+    /// or returns a non-zero exit status.  Defaults to 1920×1080 for NVDEC.
     pub fn auto_detect() -> Self {
         let gpu_available = Command::new(crate::ingest::nvidia_smi_path())
             .stdout(Stdio::null())
@@ -53,7 +57,11 @@ impl DecoderConfig {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        Self { gpu_available }
+        Self {
+            gpu_available,
+            width: 1920,
+            height: 1080,
+        }
     }
 }
 
@@ -85,7 +93,7 @@ impl Decoder {
     /// for NVDEC, or openh264 library init failure for software).
     pub fn new(config: &DecoderConfig) -> Self {
         if config.gpu_available {
-            Self::new_nvdec(1920, 1080)
+            Self::new_nvdec(config.width, config.height)
         } else {
             Self::new_software()
         }
