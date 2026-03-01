@@ -21,9 +21,18 @@ impl<T> Slot<T> {
 // Slots are concurrently accessed by exactly one producer and one consumer.
 unsafe impl<T: Send> Sync for Slot<T> {}
 
+/// Cache-line-separated ring buffer control block.
+///
+/// `head` (read by consumer, written by producer) and `tail` (written by
+/// producer, read by consumer) each occupy their own 64-byte cache line so
+/// that the two threads never invalidate each other's L1 cache entries
+/// (false sharing / cache-line ping-pong).
+#[repr(C)]
 struct Inner<T, const N: usize> {
     head: AtomicUsize,
+    _pad0: [u8; 56], // pad head to its own 64-byte cache line
     tail: AtomicUsize,
+    _pad1: [u8; 56], // pad tail to its own 64-byte cache line
     slots: [Slot<T>; N],
 }
 
@@ -32,7 +41,9 @@ impl<T, const N: usize> Inner<T, N> {
         assert!(N > 0, "SPSC channel capacity must be > 0");
         Self {
             head: AtomicUsize::new(0),
+            _pad0: [0u8; 56],
             tail: AtomicUsize::new(0),
+            _pad1: [0u8; 56],
             slots: array::from_fn(|_| Slot::new()),
         }
     }
