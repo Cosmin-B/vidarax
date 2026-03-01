@@ -25,7 +25,7 @@ const uploadState = ref<'idle' | 'uploading' | 'creating' | 'analyzing' | 'done'
 const uploadError = ref<string | null>(null)
 
 // Config for the run
-const selectedModel = ref(localStorage.getItem('vidarax_default_model') ?? 'qwen2.5-vl-7b')
+const selectedModel = ref(localStorage.getItem('vidarax_default_model') ?? 'Qwen/Qwen3-VL-4B-Instruct')
 const prompt = ref('')
 const semanticInference = ref(localStorage.getItem('vidarax_semantic_inference') !== 'false')
 
@@ -34,9 +34,11 @@ const createdRunId = ref<string | null>(null)
 const runStatus = ref<RunStatus | null>(null)
 
 const MODELS = [
-  { id: 'qwen2.5-vl-7b',  label: 'Qwen2.5-VL 7B'  },
-  { id: 'qwen2.5-vl-2b',  label: 'Qwen2.5-VL 2B'  },
-  { id: 'llava-1.6-7b',   label: 'LLaVA 1.6 7B'   },
+  { id: 'Qwen/Qwen3-VL-8B-Instruct',    label: 'Qwen3-VL 8B'    },
+  { id: 'Qwen/Qwen3-VL-4B-Instruct',    label: 'Qwen3-VL 4B'    },
+  { id: 'Qwen/Qwen3-VL-2B-Instruct',    label: 'Qwen3-VL 2B'    },
+  { id: 'OpenGVLab/InternVL3_5-4B',     label: 'InternVL3.5 4B' },
+  { id: 'LiquidAI/LFM2.5-VL-1.6B',     label: 'LFM2.5-VL 1.6B' },
 ]
 
 const acceptedTypes = ['video/mp4', 'video/webm', 'video/quicktime']
@@ -149,8 +151,17 @@ async function startUpload(): Promise<void> {
 
     uploadState.value = 'analyzing'
 
-    // ── Step 4: Poll run status until finished ────────────────────────────
-    await pollRunStatus(run.run_id)
+    // ── Step 4: Run analysis (blocks until complete) ───────────────────────
+    await api.runs.reason(run.run_id, {
+      source_uri: filePath,
+      model: selectedModel.value,
+      prompt: prompt.value || undefined,
+      semantic_inference: semanticInference.value,
+      fps,
+      chunk_size: chunkSize,
+    })
+
+    uploadState.value = 'done'
 
   } catch (err) {
     const msg = err instanceof ApiError

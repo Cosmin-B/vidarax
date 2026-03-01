@@ -1183,6 +1183,24 @@ pub async fn reason_realtime_run(
         .unwrap_or_else(|| format!("trace-{}", &request_id[4..]));
     let stream_id = payload.stream_id.unwrap_or_else(|| "stream-0".to_string());
     let tenant_id = header_value(&headers, HEADER_TENANT_ID);
+
+    if let Err(err) = state
+        .append_run_event_async(
+            &run_id,
+            "ingest_received",
+            json!({
+                "request_id": request_id,
+                "source_uri": payload.source_uri.as_str(),
+            }),
+        )
+        .await
+    {
+        return internal_error(
+            &state,
+            format!("failed to append ingest_received event: {err}"),
+        );
+    }
+
     let marker_config = MarkerConfig {
         correction_window_frames: payload.marker_correction_window_frames.unwrap_or(3),
         ..MarkerConfig::default()
@@ -1416,6 +1434,25 @@ pub async fn reason_realtime_run(
         return internal_error(
             &state,
             format!("failed to append analysis_generated event: {err}"),
+        );
+    }
+
+    if let Err(err) = state
+        .append_run_event_async(
+            &run_id,
+            "run_completed",
+            json!({
+                "request_id": request_id,
+                "stream_id": stream_id,
+                "frames": metadata.len(),
+                "markers": markers.len(),
+            }),
+        )
+        .await
+    {
+        return internal_error(
+            &state,
+            format!("failed to append run_completed event: {err}"),
         );
     }
 

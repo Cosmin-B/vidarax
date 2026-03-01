@@ -1,9 +1,11 @@
-//! WebRTC session wrapper — rustrtc peer connection for inbound H.264 streams.
+//! WebRTC session wrapper — rustrtc peer connection for inbound video streams.
 //!
 //! [`WebRtcSession`] manages the full lifecycle of a single WebRTC peer
 //! connection: SDP offer/answer negotiation, trickle ICE, and media ingestion.
-//! Decoded H.264 NAL units are forwarded through a [`kanal`] channel to the
-//! downstream decode workers.
+//! Video payload bytes are forwarded through a [`kanal`] channel to the
+//! downstream decode workers.  Both H.264 and VP8 codecs are supported; the
+//! active codec is detected from the SDP offer and tagged on every [`RtpFrame`]
+//! so the correct decode backend is chosen automatically.
 //!
 //! # Example
 //!
@@ -28,7 +30,7 @@
 //!     // consume frames on another thread:
 //!     std::thread::spawn(move || {
 //!         while let Ok(frame) = frame_rx.recv() {
-//!             println!("seq={} pts={}ms nals={}", frame.seq, frame.pts_ms, frame.nals.len());
+//!             println!("seq={} pts={}ms payload={}", frame.seq, frame.pts_ms, frame.nals.len());
 //!         }
 //!     });
 //! }
@@ -45,29 +47,41 @@ use rustrtc::{
     peer_connection::{PeerConnection, PeerConnectionEvent},
 };
 
-/// Annex B start code prepended to every NAL unit.
+use crate::webrtc::decode::VideoCodec;
+
+/// Annex B start code prepended to every H.264 NAL unit.
 ///
 /// rustrtc delivers H.264 NAL payloads **without** start codes; openh264 and
-/// ffmpeg expect them prepended.
+/// ffmpeg expect them prepended.  VP8 payloads are passed through unchanged
+/// (no start code wrapping).
 const ANNEX_B_START: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-/// A single H.264 NAL unit ready for the decode pipeline.
+/// A single video access unit ready for the decode pipeline.
 ///
-/// `nals` always begins with the 4-byte Annex B start code `00 00 00 01`
-/// followed by the raw NAL data.  The `seq` counter is per-session and
-/// monotonically increasing — it is NOT the RTP sequence number.
+/// For H.264, `nals` always begins with the 4-byte Annex B start code
+/// `00 00 00 01` followed by the raw NAL data.
+/// For VP8, `nals` contains the raw VP8 bitstream payload exactly as
+/// delivered by rustrtc (no framing added).
+///
+/// The `seq` counter is per-session and monotonically increasing — it is
+/// NOT the RTP sequence number.
 #[derive(Debug, Clone)]
 pub struct RtpFrame {
-    /// H.264 NAL bytes with Annex B start code prepended.
+    /// Video payload bytes.
+    ///
+    /// - H.264: Annex B encoded (starts with `00 00 00 01`).
+    /// - VP8: raw bitstream payload.
     pub nals: Vec<u8>,
     /// Presentation timestamp derived from the 90 kHz RTP clock (in ms).
     pub pts_ms: u64,
     /// Per-session monotonically increasing sequence number.
     pub seq: u64,
+    /// Codec of the video track this frame originated from.
+    pub codec: VideoCodec,
 }
 
 /// TURN server credentials for ICE relay negotiation.

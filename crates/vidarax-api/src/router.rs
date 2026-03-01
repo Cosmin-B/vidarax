@@ -19,7 +19,10 @@ pub fn app_router(state: AppState) -> Router {
         // Existing run/analysis routes
         .route("/v1/runs", get(list_runs).post(create_run))
         .route("/v1/runs/{run_id}", get(get_run).delete(delete_run))
-        .route("/v1/upload", post(upload_file))
+        .route(
+            "/v1/upload",
+            post(upload_file).layer(DefaultBodyLimit::max(200 * 1024 * 1024)),
+        )
         .route("/v1/runs/{run_id}/ingest", post(ingest_run))
         .route("/v1/runs/{run_id}/analyze", post(analyze_run))
         .route("/v1/runs/{run_id}/reason", post(reason_realtime_run))

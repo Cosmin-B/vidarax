@@ -26,9 +26,9 @@ const DEFAULTS = {
   loopRepeatTrigger: 3,
   gpuDecode: 'auto',
   vlmWorkers: 4,
-  defaultModel: 'qwen2.5-vl-7b',
-  firstPassModel: 'qwen2.5-vl-2b',
-  secondPassModel: 'qwen2.5-vl-7b',
+  defaultModel: 'Qwen/Qwen3-VL-4B-Instruct',
+  firstPassModel: 'Qwen/Qwen3-VL-2B-Instruct',
+  secondPassModel: 'Qwen/Qwen3-VL-4B-Instruct',
 } as const
 
 function ls(key: string, fallback: string): string {
@@ -75,9 +75,11 @@ const form = reactive({
 // ── Models fetched from API ───────────────────────────────────────────────────
 
 const availableModels = ref<Array<{ id: string; name: string }>>([
-  { id: 'qwen2.5-vl-7b', name: 'Qwen2.5-VL 7B' },
-  { id: 'qwen2.5-vl-2b', name: 'Qwen2.5-VL 2B' },
-  { id: 'llava-1.6-7b',  name: 'LLaVA 1.6 7B'  },
+  { id: 'Qwen/Qwen3-VL-8B-Instruct',  name: 'Qwen3-VL 8B'    },
+  { id: 'Qwen/Qwen3-VL-4B-Instruct',  name: 'Qwen3-VL 4B'    },
+  { id: 'Qwen/Qwen3-VL-2B-Instruct',  name: 'Qwen3-VL 2B'    },
+  { id: 'OpenGVLab/InternVL3_5-4B',   name: 'InternVL3.5 4B' },
+  { id: 'LiquidAI/LFM2.5-VL-1.6B',   name: 'LFM2.5-VL 1.6B' },
 ])
 const modelsLoading = ref(false)
 
