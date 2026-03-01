@@ -35,12 +35,12 @@
 //! ```
 
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicU64, Ordering},
 };
 
 use rustrtc::{
-    RtcConfiguration, SdpType, SessionDescription,
+    IceServer, RtcConfiguration, SdpType, SessionDescription,
     media::{MediaKind, MediaSample, MediaStreamTrack},
     peer_connection::{PeerConnection, PeerConnectionEvent},
 };
@@ -70,13 +70,38 @@ pub struct RtpFrame {
     pub seq: u64,
 }
 
-/// Configuration for a [`WebRtcSession`].
-///
-/// Currently empty; fields will be added for STUN server URIs, ICE gather
-/// timeouts, etc.
+/// TURN server credentials for ICE relay negotiation.
 #[derive(Debug, Clone, Default)]
+pub struct TurnServer {
+    /// TURN server URL, e.g. `"turn:turn.example.com:3478"`.
+    pub url: String,
+    /// TURN username.
+    pub username: String,
+    /// TURN credential (shared secret or password).
+    pub credential: String,
+}
+
+/// Configuration for a [`WebRtcSession`].
+#[derive(Debug, Clone)]
 pub struct WebRtcConfig {
-    // Future: stun_servers: Vec<String>, gather_timeout_secs: u64, …
+    /// STUN server URIs used during ICE gathering.
+    ///
+    /// Defaults to `["stun:stun.l.google.com:19302"]`.
+    pub stun_servers: Vec<String>,
+    /// Optional TURN relay servers for NAT traversal.
+    pub turn_servers: Vec<TurnServer>,
+    /// Maximum VLM output tokens per second for this session (backpressure).
+    pub max_output_tokens_per_second: u32,
+}
+
+impl Default for WebRtcConfig {
+    fn default() -> Self {
+        Self {
+            stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+            turn_servers: Vec::new(),
+            max_output_tokens_per_second: 128,
+        }
+    }
 }
 
 /// An active WebRTC peer connection managing a single inbound media stream.
@@ -88,6 +113,10 @@ pub struct WebRtcConfig {
 /// connection closes when all handles are dropped.
 pub struct WebRtcSession {
     pc: PeerConnection,
+    /// Dynamic VLM prompt; updated via `PATCH /v1/stream/whip/{sess_id}/prompt`.
+    pub prompt: Arc<RwLock<String>>,
+    /// Token output rate cap (tokens/s) for backpressure in VLM workers.
+    pub max_output_tokens_per_second: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -120,9 +149,21 @@ impl WebRtcSession {
     /// ```
     pub async fn new(
         offer_sdp: &str,
-        _config: &WebRtcConfig,
+        config: &WebRtcConfig,
     ) -> Result<(Self, String), String> {
-        let pc = PeerConnection::new(RtcConfiguration::default());
+        let mut rtc_config = RtcConfiguration::default();
+        for url in &config.stun_servers {
+            rtc_config
+                .ice_servers
+                .push(IceServer::new(vec![url.clone()]));
+        }
+        for turn in &config.turn_servers {
+            rtc_config.ice_servers.push(
+                IceServer::new(vec![turn.url.clone()])
+                    .with_credential(turn.username.clone(), turn.credential.clone()),
+            );
+        }
+        let pc = PeerConnection::new(rtc_config);
 
         let offer = SessionDescription::parse(SdpType::Offer, offer_sdp)
             .map_err(|e| format!("SDP parse: {e}"))?;
@@ -153,7 +194,14 @@ impl WebRtcSession {
         let local = pc.local_description().expect("local description was just set");
         let answer_sdp = local.to_sdp_string();
 
-        Ok((Self { pc }, answer_sdp))
+        Ok((
+            Self {
+                pc,
+                prompt: Arc::new(RwLock::new(String::new())),
+                max_output_tokens_per_second: config.max_output_tokens_per_second,
+            },
+            answer_sdp,
+        ))
     }
 
     /// Forward a trickle ICE candidate received from the browser.
@@ -269,6 +317,29 @@ impl WebRtcSession {
         }
     }
 
+    /// Update the VLM analysis prompt for this session.
+    ///
+    /// Called by `PATCH /v1/stream/whip/{sess_id}/prompt`.  The new prompt is
+    /// picked up by analysis workers on the next keyframe decision.
+    pub fn update_prompt(&self, text: String) {
+        if let Ok(mut guard) = self.prompt.write() {
+            *guard = text;
+        }
+    }
+
+    /// Read the current VLM prompt (empty string means use the default).
+    pub fn read_prompt(&self) -> String {
+        self.prompt
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Clone the prompt handle for sharing with analysis workers.
+    pub fn prompt_arc(&self) -> Arc<RwLock<String>> {
+        Arc::clone(&self.prompt)
+    }
+
     /// Close the peer connection.
     ///
     /// After this call any active `run` task will exit on its next poll cycle
@@ -314,7 +385,26 @@ mod tests {
 
     #[test]
     fn webrtc_config_default_constructs() {
-        let _cfg = WebRtcConfig::default();
+        let cfg = WebRtcConfig::default();
+        assert_eq!(cfg.stun_servers, vec!["stun:stun.l.google.com:19302"]);
+        assert!(cfg.turn_servers.is_empty());
+        assert_eq!(cfg.max_output_tokens_per_second, 128);
+    }
+
+    #[test]
+    fn webrtc_config_custom_stun() {
+        let cfg = WebRtcConfig {
+            stun_servers: vec!["stun:stun.example.com:3478".to_string()],
+            turn_servers: vec![super::TurnServer {
+                url: "turn:turn.example.com:3478".to_string(),
+                username: "user".to_string(),
+                credential: "pass".to_string(),
+            }],
+            max_output_tokens_per_second: 64,
+        };
+        assert_eq!(cfg.stun_servers.len(), 1);
+        assert_eq!(cfg.turn_servers.len(), 1);
+        assert_eq!(cfg.max_output_tokens_per_second, 64);
     }
 
     #[test]

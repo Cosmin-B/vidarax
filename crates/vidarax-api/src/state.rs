@@ -18,6 +18,7 @@ use crate::security::SecurityPolicy;
 use crate::spacetime_client::SpacetimeClient;
 use crate::tenant_labels::{LabelMapResult, TenantLabelMaps};
 use vidarax_core::metrics::PipelineMetrics;
+use vidarax_core::webrtc::session::WebRtcConfig;
 
 /// Maximum number of concurrent WebRTC sessions to prevent memory exhaustion.
 const MAX_WEBRTC_SESSIONS: usize = 100;
@@ -44,6 +45,8 @@ pub struct AppState {
     spacetime_client: Option<SpacetimeClient>,
     /// Active WebRTC peer connections indexed by session ID.
     sessions: SessionMap,
+    /// WebRTC configuration (STUN/TURN servers, token rate limit).
+    webrtc_config: WebRtcConfig,
 }
 
 impl AppState {
@@ -54,6 +57,7 @@ impl AppState {
         security_policy: SecurityPolicy,
         stream_ttl_secs: u64,
         active_stream_limit: usize,
+        webrtc_config: WebRtcConfig,
     ) -> Result<Self, String> {
         let existing_events = read_all_events(&wal_path).map_err(|err| err.to_string())?;
         let run_registry = Arc::new(ArcSwap::from(build_run_registry(&existing_events)));
@@ -88,6 +92,7 @@ impl AppState {
             active_stream_limit: active_stream_limit.max(1),
             spacetime_client: None,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            webrtc_config,
         })
     }
 
@@ -108,6 +113,7 @@ impl AppState {
             active_stream_limit: 5,
             spacetime_client: None,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            webrtc_config: WebRtcConfig::default(),
         }
     }
 
@@ -143,6 +149,7 @@ impl AppState {
             active_stream_limit: 5,
             spacetime_client: None,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            webrtc_config: WebRtcConfig::default(),
         }
     }
 
@@ -169,6 +176,7 @@ impl AppState {
             active_stream_limit: active_stream_limit.max(1),
             spacetime_client: None,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            webrtc_config: WebRtcConfig::default(),
         }
     }
 
@@ -354,6 +362,11 @@ impl AppState {
     /// a background thread (e.g. WHIP drain task).
     pub fn pipeline_metrics_arc(&self) -> &std::sync::Arc<PipelineMetrics> {
         &self.pipeline_metrics
+    }
+
+    /// Return the WebRTC configuration (STUN/TURN servers, token rate limit).
+    pub fn webrtc_config(&self) -> &WebRtcConfig {
+        &self.webrtc_config
     }
 
     pub fn map_event_label(&self, tenant_id: Option<&str>, label: &str) -> LabelMapResult {

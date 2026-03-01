@@ -41,6 +41,11 @@ async fn staging_live_provider_e2e_opt_in() {
         active_stream_limit: 5,
         transport: TransportMode::H1H2,
         decode_backend: PipelineBackend::CpuFfmpeg,
+        webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+        webrtc_turn_url: None,
+        webrtc_turn_username: None,
+        webrtc_turn_credential: None,
+        webrtc_max_output_tokens_per_second: 128,
     };
 
     let server_task = tokio::spawn(async move { run(config).await.map_err(|e| e.to_string()) });

@@ -24,6 +24,7 @@ pub use config::{assert_route_parity, resolve_wal_path, ServerConfig, TransportM
 pub use router::app_router;
 pub use state::AppState;
 use vidarax_core::provider::ProviderEndpoints;
+use vidarax_core::webrtc::session::{TurnServer, WebRtcConfig};
 
 pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     telemetry::init_telemetry();
@@ -41,6 +42,7 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
     let wal_path = resolve_wal_path(&config).map_err(invalid_input)?;
     let inference_endpoints = infer_provider_endpoints(&config).map_err(invalid_input)?;
     let security_policy = security::SecurityPolicy::from_config(&config).map_err(invalid_input)?;
+    let webrtc_config = build_webrtc_config(&config);
     let state = AppState::from_wal(
         wal_path,
         config.ingest_file_roots.clone(),
@@ -48,6 +50,7 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
         security_policy,
         config.stream_ttl_secs,
         config.active_stream_limit,
+        webrtc_config,
     )
     .map_err(invalid_input)?;
     let app = app_router(state);
@@ -62,6 +65,28 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
 
 pub fn invalid_input(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn build_webrtc_config(config: &ServerConfig) -> WebRtcConfig {
+    let mut turn_servers = Vec::new();
+    if let Some(url) = &config.webrtc_turn_url {
+        turn_servers.push(TurnServer {
+            url: url.clone(),
+            username: config
+                .webrtc_turn_username
+                .clone()
+                .unwrap_or_default(),
+            credential: config
+                .webrtc_turn_credential
+                .clone()
+                .unwrap_or_default(),
+        });
+    }
+    WebRtcConfig {
+        stun_servers: config.webrtc_stun_servers.clone(),
+        turn_servers,
+        max_output_tokens_per_second: config.webrtc_max_output_tokens_per_second,
+    }
 }
 
 fn infer_provider_endpoints(config: &ServerConfig) -> Result<Option<ProviderEndpoints>, String> {
@@ -1410,6 +1435,11 @@ mod tests {
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
             decode_backend: PipelineBackend::CpuFfmpeg,
+            webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+            webrtc_turn_url: None,
+            webrtc_turn_username: None,
+            webrtc_turn_credential: None,
+            webrtc_max_output_tokens_per_second: 128,
         })
         .unwrap();
         let app = app_router(test_state_with_endpoints_and_policy(None, policy));
@@ -1456,6 +1486,11 @@ mod tests {
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
             decode_backend: PipelineBackend::CpuFfmpeg,
+            webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+            webrtc_turn_url: None,
+            webrtc_turn_username: None,
+            webrtc_turn_credential: None,
+            webrtc_max_output_tokens_per_second: 128,
         })
         .unwrap();
         let app = app_router(test_state_with_endpoints_and_policy(None, policy));
@@ -1499,6 +1534,11 @@ mod tests {
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
             decode_backend: PipelineBackend::CpuFfmpeg,
+            webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+            webrtc_turn_url: None,
+            webrtc_turn_username: None,
+            webrtc_turn_credential: None,
+            webrtc_max_output_tokens_per_second: 128,
         })
         .unwrap();
         let app = app_router(test_state_with_endpoints_and_policy(None, policy));
@@ -1546,6 +1586,11 @@ mod tests {
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
             decode_backend: PipelineBackend::CpuFfmpeg,
+            webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+            webrtc_turn_url: None,
+            webrtc_turn_username: None,
+            webrtc_turn_credential: None,
+            webrtc_max_output_tokens_per_second: 128,
         })
         .unwrap();
         let app = app_router(test_state_with_endpoints_and_policy(None, policy));
@@ -1677,6 +1722,11 @@ mod tests {
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
             decode_backend: PipelineBackend::CpuFfmpeg,
+            webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+            webrtc_turn_url: None,
+            webrtc_turn_username: None,
+            webrtc_turn_credential: None,
+            webrtc_max_output_tokens_per_second: 128,
         };
         assert!(infer_provider_endpoints(&config).is_err());
 
@@ -1707,6 +1757,11 @@ mod tests {
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
             decode_backend: PipelineBackend::CpuFfmpeg,
+            webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+            webrtc_turn_url: None,
+            webrtc_turn_username: None,
+            webrtc_turn_credential: None,
+            webrtc_max_output_tokens_per_second: 128,
         };
         assert!(infer_provider_endpoints(&config).unwrap().is_some());
 
@@ -1762,6 +1817,11 @@ mod tests {
             active_stream_limit: 5,
             transport: TransportMode::H3Experimental,
             decode_backend: PipelineBackend::CpuFfmpeg,
+            webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+            webrtc_turn_url: None,
+            webrtc_turn_username: None,
+            webrtc_turn_credential: None,
+            webrtc_max_output_tokens_per_second: 128,
         };
 
         let server_task =
@@ -1885,6 +1945,11 @@ mod tests {
             active_stream_limit: 5,
             transport: TransportMode::H3Experimental,
             decode_backend: PipelineBackend::CpuFfmpeg,
+            webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+            webrtc_turn_url: None,
+            webrtc_turn_username: None,
+            webrtc_turn_credential: None,
+            webrtc_max_output_tokens_per_second: 128,
         };
 
         let server_task =

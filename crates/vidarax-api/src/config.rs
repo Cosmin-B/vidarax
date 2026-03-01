@@ -50,6 +50,16 @@ pub struct ServerConfig {
     pub active_stream_limit: usize,
     pub transport: TransportMode,
     pub decode_backend: PipelineBackend,
+    /// STUN server URIs (comma-separated). Defaults to Google's public STUN server.
+    pub webrtc_stun_servers: Vec<String>,
+    /// Optional TURN relay URL (`VIDARAX_WEBRTC_TURN_URL`).
+    pub webrtc_turn_url: Option<String>,
+    /// TURN username (`VIDARAX_WEBRTC_TURN_USERNAME`).
+    pub webrtc_turn_username: Option<String>,
+    /// TURN credential (`VIDARAX_WEBRTC_TURN_CREDENTIAL`).
+    pub webrtc_turn_credential: Option<String>,
+    /// VLM output token rate cap per session in tokens/s (`VIDARAX_WEBRTC_MAX_OUTPUT_TOKENS_PER_SECOND`).
+    pub webrtc_max_output_tokens_per_second: u32,
 }
 
 impl ServerConfig {
@@ -90,6 +100,19 @@ impl ServerConfig {
             return Err("VIDARAX_STREAM_TTL_SECS must be in [60, 86400]".to_string());
         }
         let active_stream_limit = parse_usize_env("VIDARAX_ACTIVE_STREAM_LIMIT", 5)?.clamp(1, 1024);
+        let webrtc_stun_servers = {
+            let v = parse_csv_env("VIDARAX_WEBRTC_STUN_SERVERS");
+            if v.is_empty() {
+                vec!["stun:stun.l.google.com:19302".to_string()]
+            } else {
+                v
+            }
+        };
+        let webrtc_turn_url = env::var("VIDARAX_WEBRTC_TURN_URL").ok();
+        let webrtc_turn_username = env::var("VIDARAX_WEBRTC_TURN_USERNAME").ok();
+        let webrtc_turn_credential = env::var("VIDARAX_WEBRTC_TURN_CREDENTIAL").ok();
+        let webrtc_max_output_tokens_per_second =
+            parse_usize_env("VIDARAX_WEBRTC_MAX_OUTPUT_TOKENS_PER_SECOND", 128)? as u32;
         Ok(Self {
             bind_addr,
             h3_bind_addr,
@@ -111,6 +134,11 @@ impl ServerConfig {
             active_stream_limit,
             transport,
             decode_backend,
+            webrtc_stun_servers,
+            webrtc_turn_url,
+            webrtc_turn_username,
+            webrtc_turn_credential,
+            webrtc_max_output_tokens_per_second,
         })
     }
 }
