@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 
+use crate::dedup::DedupFilter;
 use crate::gate::{GateConfig, GateEventType};
 use crate::loop_detector::LoopDetector;
 use crate::metrics::PipelineMetrics;
@@ -117,6 +118,11 @@ pub struct KeyframeWork {
     pub jpeg_bytes: Arc<[u8]>,
     /// Semantic prompt to pass to the VLM.
     pub prompt: String,
+    /// When `true` the analysis worker detected an active visual loop at the
+    /// time this work item was queued.  VLM workers use this flag to skip
+    /// inference entirely (the scene has not changed), avoiding redundant
+    /// calls and their associated cost.
+    pub loop_active: bool,
 }
 
 // ─── Decode workers ───────────────────────────────────────────────────────────
@@ -263,22 +269,35 @@ pub fn spawn_analysis_workers(
                 let mut pipeline =
                     TwoPassPipeline::new(TwoPassConfig::default(), GateConfig::default());
                 let mut loop_det = LoopDetector::new(6, 3);
+                // True while the loop detector considers the stream stuck.
+                // Cleared when the detector stops firing for a full window.
+                let mut loop_active = false;
 
                 while let Ok(sf) = frame_rx.recv() {
                     let _guard = session_span.enter();
 
                     // ── Loop detection (always active) ───────────────────
-                    if loop_det.check(sf.signal.perceptual_hash) {
-                        metrics.inc_loop_detected();
-                        let _ = stdb.emit_event_sync(
-                            &run_id,
-                            &session_id,
-                            sf.signal.frame_index,
-                            sf.pts_ms,
-                            "loop_detected",
-                            0.9,
-                            "loop detected via perceptual-hash ring buffer",
-                        );
+                    let loop_fired = loop_det.check(sf.signal.perceptual_hash);
+                    if loop_fired {
+                        // Only emit the event the first time we enter a loop
+                        // to avoid flooding the sink with repeated notices.
+                        if !loop_active {
+                            metrics.inc_loop_detected();
+                            let _ = stdb.emit_event_sync(
+                                &run_id,
+                                &session_id,
+                                sf.signal.frame_index,
+                                sf.pts_ms,
+                                "loop_detected",
+                                0.9,
+                                "loop detected via perceptual-hash ring buffer",
+                            );
+                        }
+                        loop_active = true;
+                    } else {
+                        // LoopDetector returns false when the window no longer
+                        // has enough repeated hashes — the scene has changed.
+                        loop_active = false;
                     }
 
                     if let Some(ref clip_tx) = clip_tx {
@@ -315,6 +334,7 @@ pub fn spawn_analysis_workers(
                                 confidence: meta.confidence,
                                 jpeg_bytes,
                                 prompt: String::new(),
+                                loop_active,
                             };
 
                             // Non-blocking: drop if VLM queue is full to avoid
@@ -463,8 +483,22 @@ pub fn spawn_vlm_workers<I>(
                         None
                     };
 
+                // Per-worker dedup filter: suppresses emitting identical VLM
+                // descriptions so that a stuck loop doesn't pollute the store
+                // with repeated identical events.
+                let mut dedup = DedupFilter::new();
+
                 while let Ok(work) = vlm_rx.recv() {
                     let _guard = session_span.enter();
+
+                    // ── Loop suppression ────────────────────────────────
+                    // The analysis worker already fired `loop_detected`; skip
+                    // the expensive VLM inference call entirely while the scene
+                    // is stuck in a loop.
+                    if work.loop_active {
+                        metrics.inc_keyframes_dropped();
+                        continue;
+                    }
 
                     // Token rate limit: skip this frame if the session has
                     // already exceeded the per-second output token budget.
@@ -592,16 +626,23 @@ pub fn spawn_vlm_workers<I>(
 
                     let event_type = if used_second_pass { "vlm_tiered" } else { "vlm" };
 
-                    // Fire-and-forget: VLM threads don't block on SpacetimeDB HTTP.
-                    let _ = event_tx.send(SinkEvent::Emit {
-                        run_id: Arc::clone(&work.run_id),
-                        session_id: Arc::clone(&work.session_id),
-                        frame_index: work.frame_index,
-                        pts_ms: work.pts_ms,
-                        event_type,
-                        confidence: work.confidence,
-                        description: description.clone(),
-                    });
+                    // ── Dedup filter ─────────────────────────────────────
+                    // Skip emitting when the VLM produced the same description
+                    // as the last one (e.g. a near-static scene between scene
+                    // cuts). The keyframe is still stored so the JPEG archive
+                    // remains complete; only the event is suppressed.
+                    if dedup.should_emit(&description) {
+                        // Fire-and-forget: VLM threads don't block on SpacetimeDB HTTP.
+                        let _ = event_tx.send(SinkEvent::Emit {
+                            run_id: Arc::clone(&work.run_id),
+                            session_id: Arc::clone(&work.session_id),
+                            frame_index: work.frame_index,
+                            pts_ms: work.pts_ms,
+                            event_type,
+                            confidence: work.confidence,
+                            description: description.clone(),
+                        });
+                    }
                     let _ = event_tx.send(SinkEvent::StoreKeyframe {
                         run_id: Arc::clone(&work.run_id),
                         frame_index: work.frame_index,
@@ -833,6 +874,7 @@ mod tests {
             confidence: 0.9,
             jpeg_bytes: Arc::from([0xFF_u8, 0xD8, 0xFF, 0xD9] as [u8; 4]),
             prompt: String::new(),
+            loop_active: false,
         };
         let _ = kw.clone();
         let _ = format!("{:?}", kw);
