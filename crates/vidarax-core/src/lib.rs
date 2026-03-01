@@ -10,6 +10,7 @@ pub mod pipeline;
 pub mod provider;
 pub mod tiered_vlm;
 pub mod timeline;
+pub mod training_data;
 
 #[cfg(test)]
 mod tests {

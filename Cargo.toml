@@ -30,3 +30,9 @@ opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "trace"] }
 
 [profile.dev]
 debug = 1
+
+# zvec-sys 0.2.1 ships a C++ wrapper with an extra argument in AddColumn that
+# doesn't match the vendored zvec C++ API.  Patch with a local copy that removes
+# the spurious `column_schema->ptr->name()` argument.
+[patch.crates-io]
+zvec-sys = { path = "crates/zvec-sys-patched" }

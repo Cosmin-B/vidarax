@@ -1666,6 +1666,7 @@ async fn validate_infer_request(
             temperature,
             timeout_ms,
             allow_fallback: payload.allow_fallback.unwrap_or(true),
+            guided_json: None,
         },
         primary_provider,
     })
@@ -2035,6 +2036,7 @@ async fn infer_chunk_semantics(
         temperature: 0.0,
         timeout_ms,
         allow_fallback: true,
+        guided_json: None,
     };
 
     let first_result = match tokio::task::spawn_blocking({
@@ -2073,6 +2075,7 @@ async fn infer_chunk_semantics(
                 temperature: 0.0,
                 timeout_ms,
                 allow_fallback: true,
+                guided_json: None,
             };
             match tokio::task::spawn_blocking(move || {
                 infer_with_endpoints(&endpoints, primary_provider, &second_request)

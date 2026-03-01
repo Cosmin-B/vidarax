@@ -1,0 +1,17 @@
+
+include(${CMAKE_SOURCE_DIR}/cmake/bazel.cmake)
+include(${CMAKE_SOURCE_DIR}/cmake/option.cmake)
+
+file(GLOB_RECURSE ALL_TEST_SRCS *_test.cc)
+
+foreach(CC_SRCS ${ALL_TEST_SRCS})
+  get_filename_component(CC_TARGET ${CC_SRCS} NAME_WE)
+  cc_gtest(
+    NAME ${CC_TARGET} STRICT
+    LIBS zvec_ailego
+    Arrow::arrow_depends
+    Arrow::parquet_static
+    SRCS ${CC_SRCS}
+  )
+  cc_test_suite(zvec_ailego ${CC_TARGET})
+endforeach()

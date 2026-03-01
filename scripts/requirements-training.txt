@@ -1,0 +1,19 @@
+# Core training dependencies
+torch>=2.4
+transformers>=4.57
+trl>=0.15
+peft>=0.14
+accelerate>=1.2
+datasets>=3.0
+pillow>=11.0
+
+# Embedding server
+fastapi>=0.115
+uvicorn>=0.32
+
+# Optional: GPU acceleration (uncomment if CUDA available)
+# flash-attn>=2.7
+
+# Optional: Apple Silicon training (uncomment on Mac)
+# mlx>=0.22
+# mlx-vlm>=0.1

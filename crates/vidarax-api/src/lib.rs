@@ -48,6 +48,7 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
         security_policy,
         config.stream_ttl_secs,
         config.active_stream_limit,
+        config.distillation.clone(),
     )
     .map_err(invalid_input)?;
     let app = app_router(state);
@@ -123,6 +124,7 @@ mod tests {
         TransportMode,
     };
     use vidarax_core::ingest::pipeline::PipelineBackend;
+    use vidarax_core::tiered_vlm::DistillationConfig;
     use crate::security::SecurityPolicy;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -1410,6 +1412,7 @@ mod tests {
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
             decode_backend: PipelineBackend::CpuFfmpeg,
+            distillation: DistillationConfig::default(),
         })
         .unwrap();
         let app = app_router(test_state_with_endpoints_and_policy(None, policy));
@@ -1456,6 +1459,7 @@ mod tests {
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
             decode_backend: PipelineBackend::CpuFfmpeg,
+            distillation: DistillationConfig::default(),
         })
         .unwrap();
         let app = app_router(test_state_with_endpoints_and_policy(None, policy));
@@ -1499,6 +1503,7 @@ mod tests {
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
             decode_backend: PipelineBackend::CpuFfmpeg,
+            distillation: DistillationConfig::default(),
         })
         .unwrap();
         let app = app_router(test_state_with_endpoints_and_policy(None, policy));
@@ -1546,6 +1551,7 @@ mod tests {
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
             decode_backend: PipelineBackend::CpuFfmpeg,
+            distillation: DistillationConfig::default(),
         })
         .unwrap();
         let app = app_router(test_state_with_endpoints_and_policy(None, policy));
@@ -1677,6 +1683,7 @@ mod tests {
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
             decode_backend: PipelineBackend::CpuFfmpeg,
+            distillation: DistillationConfig::default(),
         };
         assert!(infer_provider_endpoints(&config).is_err());
 
@@ -1707,6 +1714,7 @@ mod tests {
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
             decode_backend: PipelineBackend::CpuFfmpeg,
+            distillation: DistillationConfig::default(),
         };
         assert!(infer_provider_endpoints(&config).unwrap().is_some());
 
@@ -1762,6 +1770,7 @@ mod tests {
             active_stream_limit: 5,
             transport: TransportMode::H3Experimental,
             decode_backend: PipelineBackend::CpuFfmpeg,
+            distillation: DistillationConfig::default(),
         };
 
         let server_task =
@@ -1885,6 +1894,7 @@ mod tests {
             active_stream_limit: 5,
             transport: TransportMode::H3Experimental,
             decode_backend: PipelineBackend::CpuFfmpeg,
+            distillation: DistillationConfig::default(),
         };
 
         let server_task =

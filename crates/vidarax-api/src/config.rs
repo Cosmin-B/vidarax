@@ -2,6 +2,7 @@ use std::env;
 use std::path::PathBuf;
 
 use vidarax_core::ingest::pipeline::PipelineBackend;
+use vidarax_core::tiered_vlm::DistillationConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportMode {
@@ -50,6 +51,7 @@ pub struct ServerConfig {
     pub active_stream_limit: usize,
     pub transport: TransportMode,
     pub decode_backend: PipelineBackend,
+    pub distillation: DistillationConfig,
 }
 
 impl ServerConfig {
@@ -90,6 +92,7 @@ impl ServerConfig {
             return Err("VIDARAX_STREAM_TTL_SECS must be in [60, 86400]".to_string());
         }
         let active_stream_limit = parse_usize_env("VIDARAX_ACTIVE_STREAM_LIMIT", 5)?.clamp(1, 1024);
+        let distillation = parse_distillation_config()?;
         Ok(Self {
             bind_addr,
             h3_bind_addr,
@@ -111,6 +114,7 @@ impl ServerConfig {
             active_stream_limit,
             transport,
             decode_backend,
+            distillation,
         })
     }
 }
@@ -303,4 +307,39 @@ fn parse_csv_env(var: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn parse_f32_env(var: &str, default: f32) -> Result<f32, String> {
+    match env::var(var) {
+        Ok(raw) => raw
+            .parse::<f32>()
+            .map_err(|_| format!("{var} must be a floating-point number")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_distillation_config() -> Result<DistillationConfig, String> {
+    use vidarax_core::tiered_vlm::DistillationConfig;
+
+    let enabled = parse_bool_env("VIDARAX_DISTILL_ENABLED", false)?;
+    let embedding_server_url = env::var("VIDARAX_DISTILL_EMBEDDING_URL").ok();
+    let teacher_model = env::var("VIDARAX_DISTILL_TEACHER_MODEL")
+        .unwrap_or_else(|_| "Qwen/Qwen3-VL-8B-Instruct".to_string());
+    let max_pairs_per_tenant =
+        parse_usize_env("VIDARAX_DISTILL_MAX_PAIRS", 10_000)?.clamp(100, 1_000_000);
+    let collection_rate = parse_f32_env("VIDARAX_DISTILL_COLLECTION_RATE", 0.1)?
+        .clamp(0.0, 1.0);
+    let distance_threshold = parse_f32_env("VIDARAX_DISTILL_DISTANCE_THRESHOLD", 0.2)?
+        .clamp(0.0, 2.0);
+    let knn_k = parse_usize_env("VIDARAX_DISTILL_KNN_K", 7)?.clamp(1, 100);
+
+    Ok(DistillationConfig {
+        enabled,
+        embedding_server_url,
+        teacher_model,
+        max_pairs_per_tenant,
+        collection_rate,
+        distance_threshold,
+        knn_k,
+    })
 }

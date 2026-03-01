@@ -19,6 +19,44 @@ pub struct InferenceRequest {
     pub temperature: f32,
     pub timeout_ms: u64,
     pub allow_fallback: bool,
+    /// Optional JSON schema string forwarded as `guided_json` in the request
+    /// body (vLLM / SGLang constrained decoding).
+    pub guided_json: Option<String>,
+}
+
+/// Structured label emitted by the teacher VLM.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct TeacherLabel {
+    pub event_type: String,
+    pub confidence: f32,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub reasoning: Option<String>,
+}
+
+/// JSON schema string for constrained teacher-label decoding.
+///
+/// Pass this as `guided_json` in an [`InferenceRequest`] to force vLLM/SGLang
+/// to emit a valid [`TeacherLabel`] object.
+pub fn teacher_label_schema() -> &'static str {
+    r#"{
+  "type": "object",
+  "properties": {
+    "event_type":   { "type": "string" },
+    "confidence":   { "type": "number", "minimum": 0, "maximum": 1 },
+    "description":  { "type": "string" },
+    "reasoning":    { "type": "string" }
+  },
+  "required": ["event_type", "confidence"]
+}"#
+}
+
+/// Parse a [`TeacherLabel`] from raw VLM output text.
+///
+/// Returns `None` if the text is not valid JSON or does not match the schema.
+pub fn parse_teacher_label(text: &str) -> Option<TeacherLabel> {
+    serde_json::from_str(text).ok()
 }
 
 #[derive(Debug, Clone)]
@@ -260,13 +298,16 @@ fn build_payload(model: &str, request: &InferenceRequest) -> String {
         }
         Value::Array(content)
     };
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": user_content}],
         "max_tokens": request.max_tokens,
         "temperature": request.temperature
-    })
-    .to_string()
+    });
+    if let Some(schema) = &request.guided_json {
+        body["guided_json"] = Value::String(schema.clone());
+    }
+    body.to_string()
 }
 
 fn parse_completion_text(raw: &str) -> Result<String, ProviderError> {
@@ -380,6 +421,7 @@ mod tests {
             temperature: 0.0,
             timeout_ms: 500,
             allow_fallback: true,
+            guided_json: None,
         }
     }
 

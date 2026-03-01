@@ -7,3 +7,7 @@ authors.workspace = true
 
 [dependencies]
 vidarax-contracts = { path = "../vidarax-contracts" }
+vidarax-core = { path = "../vidarax-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

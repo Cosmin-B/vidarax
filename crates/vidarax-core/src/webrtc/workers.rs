@@ -24,7 +24,7 @@
 //! indefinitely; they are called from worker threads that must keep up with
 //! the frame rate.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 
@@ -33,7 +33,8 @@ use crate::loop_detector::LoopDetector;
 use crate::metrics::PipelineMetrics;
 use crate::pipeline::{TwoPassConfig, TwoPassPipeline};
 use crate::provider::{InferenceImage, InferenceProvider, InferenceRequest};
-use crate::tiered_vlm::TieredVlmConfig;
+use crate::tiered_vlm::{DistillationConfig, TieredVlmConfig};
+use crate::training_data::TrainingStore;
 use crate::webrtc::decode::{Decoder, DecoderConfig};
 use crate::webrtc::session::RtpFrame;
 use crate::webrtc::signals::{yuv_to_frame_signal, yuv_to_jpeg};
@@ -302,17 +303,23 @@ pub fn spawn_analysis_workers(
 
 // ─── VLM workers ──────────────────────────────────────────────────────────────
 
-/// Spawn `n` VLM inference worker threads with optional tiered routing.
+/// Spawn `n` VLM inference worker threads with 3-tier routing + training pair collection.
 ///
-/// When `config.is_tiered()`, workers call the first-pass model first, then
-/// re-infer with the second-pass model if confidence is below threshold.
+/// **Tier 1 — KNN cache** (when `distillation.enabled` and embedding server is reachable):
+/// Fetches a SigLIP2 embedding for the frame, then asks the `TrainingStore` for the
+/// nearest-neighbour label.  If a confident match is found, the KNN result is used
+/// directly and the VLM call is skipped.
 ///
-/// Each thread:
-/// 1. Pulls [`KeyframeWork`] from the shared `vlm_rx` channel.
-/// 2. Calls `provider.infer()` with the first-pass model.
-/// 3. If tiered and confidence is low, re-infers with the second-pass model.
-/// 4. Emits a `vlm` or `vlm_tiered` agent event to SpacetimeDB.
-/// 5. Stores the keyframe (JPEG + description) in SpacetimeDB.
+/// **Tier 2 — specialist / fast VLM** (`config.first_pass_model`):
+/// Called when KNN misses or is disabled.  Quick, low-cost inference.
+///
+/// **Tier 3 — teacher / accurate VLM** (`config.second_pass_model`):
+/// Called when the specialist confidence is below `config.second_pass_threshold`.
+///
+/// **Training pair collection**: After any inference, if `distillation.enabled`,
+/// the frame embedding and label are stored in the `TrainingStore` according to
+/// `collection_rate` (deterministic per-frame sampling).  Oldest pairs are
+/// evicted automatically when `max_pairs_per_tenant` is exceeded.
 ///
 /// VLM inference errors are logged as the description text rather than
 /// crashing the worker, so a transient provider failure does not interrupt
@@ -325,6 +332,8 @@ pub fn spawn_vlm_workers<I>(
     config: TieredVlmConfig,
     metrics: Arc<PipelineMetrics>,
     session_span: tracing::Span,
+    training_store: Option<Arc<Mutex<TrainingStore>>>,
+    distillation: DistillationConfig,
 ) where
     I: InferenceProvider + 'static,
 {
@@ -335,10 +344,24 @@ pub fn spawn_vlm_workers<I>(
         let config = config.clone();
         let metrics = Arc::clone(&metrics);
         let session_span = session_span.clone();
+        let training_store = training_store.clone();
+        let distillation = distillation.clone();
 
         std::thread::Builder::new()
             .name(format!("vx-vlm-{i}"))
             .spawn(move || {
+                // One HTTP client per thread, reused across frames.
+                let embed_url = distillation.embedding_server_url.clone();
+                let http_client: Option<reqwest::blocking::Client> =
+                    if embed_url.is_some() {
+                        reqwest::blocking::Client::builder()
+                            .timeout(std::time::Duration::from_secs(2))
+                            .build()
+                            .ok()
+                    } else {
+                        None
+                    };
+
                 while let Ok(work) = vlm_rx.recv() {
                     let _guard = session_span.enter();
                     metrics.inc_vlm_inferences();
@@ -348,43 +371,83 @@ pub fn spawn_vlm_workers<I>(
                         work.prompt.clone()
                     };
 
-                    // First pass (fast model)
-                    let first_request = InferenceRequest {
-                        model: config.first_pass_model.clone(),
-                        prompt: prompt.clone(),
-                        input_images: vec![InferenceImage {
-                            media_type: "image/jpeg".to_string(),
-                            data_base64: work.jpeg_b64.clone(),
-                        }],
-                        max_tokens: 128,
-                        temperature: 0.0,
-                        timeout_ms: 5_000,
-                        allow_fallback: true,
+                    // ── Step 1: fetch embedding (used by KNN + training collection) ──
+                    let embedding = fetch_frame_embedding(
+                        http_client.as_ref(),
+                        embed_url.as_deref(),
+                        &work.jpeg_b64,
+                    );
+
+                    // ── Tier 1: KNN classification ───────────────────────────────────
+                    let knn_result = if distillation.enabled {
+                        embedding.as_ref().and_then(|emb| {
+                            training_store.as_ref()?.lock().ok().and_then(|store| {
+                                store
+                                    .knn_classify(
+                                        &work.run_id,
+                                        emb,
+                                        distillation.knn_k,
+                                        distillation.distance_threshold,
+                                    )
+                                    .unwrap_or(None)
+                            })
+                        })
+                    } else {
+                        None
                     };
 
-                    let (description, used_second_pass) = match provider.infer(&first_request) {
-                        Ok(result) => {
-                            let first_conf = parse_confidence_from_output(&result.output_text);
-                            if config.needs_second_pass(first_conf) {
-                                // Second pass (accurate model)
-                                let second_request = InferenceRequest {
-                                    model: config.second_pass_model.clone(),
-                                    prompt,
-                                    input_images: first_request.input_images,
-                                    max_tokens: config.second_pass_max_tokens,
-                                    temperature: 0.0,
-                                    timeout_ms: 10_000,
-                                    allow_fallback: true,
-                                };
-                                match provider.infer(&second_request) {
-                                    Ok(second) => (second.output_text, true),
-                                    Err(_) => (result.output_text, false), // fallback to first
+                    let (description, used_second_pass) = if let Some(knn) = knn_result {
+                        tracing::info!(
+                            run_id = %work.run_id,
+                            label = %knn.label,
+                            avg_distance = knn.avg_distance,
+                            votes = knn.votes,
+                            total = knn.total,
+                            "tier1_knn_hit: skipping vlm inference"
+                        );
+                        (knn.label, false)
+                    } else {
+                        // ── Tiers 2+3: VLM inference ────────────────────────────────
+                        let first_request = InferenceRequest {
+                            model: config.first_pass_model.clone(),
+                            prompt: prompt.clone(),
+                            input_images: vec![InferenceImage {
+                                media_type: "image/jpeg".to_string(),
+                                data_base64: work.jpeg_b64.clone(),
+                            }],
+                            max_tokens: 128,
+                            temperature: 0.0,
+                            timeout_ms: 5_000,
+                            allow_fallback: true,
+                            guided_json: None,
+                        };
+
+                        match provider.infer(&first_request) {
+                            Ok(result) => {
+                                let first_conf =
+                                    parse_confidence_from_output(&result.output_text);
+                                if config.needs_second_pass(first_conf) {
+                                    // Tier 3: accurate / teacher model
+                                    let second_request = InferenceRequest {
+                                        model: config.second_pass_model.clone(),
+                                        prompt,
+                                        input_images: first_request.input_images,
+                                        max_tokens: config.second_pass_max_tokens,
+                                        temperature: 0.0,
+                                        timeout_ms: 10_000,
+                                        allow_fallback: true,
+                                        guided_json: None,
+                                    };
+                                    match provider.infer(&second_request) {
+                                        Ok(second) => (second.output_text, true),
+                                        Err(_) => (result.output_text, false),
+                                    }
+                                } else {
+                                    (result.output_text, false)
                                 }
-                            } else {
-                                (result.output_text, false)
                             }
+                            Err(err) => (format!("vlm_error: {err:?}"), false),
                         }
-                        Err(err) => (format!("vlm_error: {err:?}"), false),
                     };
 
                     let event_type = if used_second_pass { "vlm_tiered" } else { "vlm" };
@@ -406,11 +469,29 @@ pub fn spawn_vlm_workers<I>(
                         &description,
                         &work.jpeg_b64,
                     );
+
+                    // ── Training pair collection ─────────────────────────────────────
+                    if distillation.enabled {
+                        if let Some(emb) = &embedding {
+                            if sample_frame(work.frame_index, distillation.collection_rate) {
+                                collect_training_pair(
+                                    &work,
+                                    emb,
+                                    &description,
+                                    event_type,
+                                    &distillation,
+                                    training_store.as_ref(),
+                                );
+                            }
+                        }
+                    }
                 }
             })
             .expect("vlm thread spawn failed");
     }
 }
+
+// ─── VLM worker helpers ────────────────────────────────────────────────────────
 
 /// Try to extract a confidence float from VLM JSON output.
 ///
@@ -424,6 +505,105 @@ fn parse_confidence_from_output(text: &str) -> f32 {
     }
     // Default: assume low confidence to trigger second pass when tiered.
     0.5
+}
+
+/// POST `jpeg_b64` to the SigLIP2 embedding server and return a 768-dim vector.
+///
+/// Returns `None` on any error (unreachable server, timeout, malformed response).
+/// Callers should treat `None` as "embedding unavailable" and skip KNN / training
+/// collection gracefully.
+fn fetch_frame_embedding(
+    client: Option<&reqwest::blocking::Client>,
+    url: Option<&str>,
+    jpeg_b64: &str,
+) -> Option<[f32; 768]> {
+    let (client, url) = (client?, url?);
+    let endpoint = format!("{url}/embed");
+    let resp: serde_json::Value = client
+        .post(&endpoint)
+        .json(&serde_json::json!({"image_b64": jpeg_b64}))
+        .send()
+        .ok()?
+        .json()
+        .ok()?;
+    let arr = resp.get("embedding")?.as_array()?;
+    if arr.len() != 768 {
+        return None;
+    }
+    let mut emb = [0f32; 768];
+    for (i, v) in arr.iter().enumerate() {
+        emb[i] = v.as_f64()? as f32;
+    }
+    Some(emb)
+}
+
+/// Deterministic per-frame sampling: returns `true` for approximately
+/// `rate * 100%` of frames, determined by `frame_index % 1000`.
+fn sample_frame(frame_index: u64, rate: f32) -> bool {
+    if rate <= 0.0 {
+        return false;
+    }
+    if rate >= 1.0 {
+        return true;
+    }
+    (frame_index % 1000) < (rate * 1000.0) as u64
+}
+
+/// Write one `(frame, label, embedding)` training triple to the store.
+///
+/// Evicts the oldest pairs when the tenant's count exceeds `max_pairs_per_tenant`.
+/// All errors are logged as warnings rather than propagated — training collection
+/// must never interrupt the real-time pipeline.
+fn collect_training_pair(
+    work: &KeyframeWork,
+    embedding: &[f32; 768],
+    description: &str,
+    event_type: &str,
+    distillation: &DistillationConfig,
+    training_store: Option<&Arc<Mutex<TrainingStore>>>,
+) {
+    let store = match training_store {
+        Some(s) => s,
+        None => return,
+    };
+    let jpeg_bytes = match base64::engine::general_purpose::STANDARD.decode(&work.jpeg_b64) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let label_json = serde_json::json!({
+        "event_type": event_type,
+        "description": description,
+    })
+    .to_string();
+
+    match store.lock() {
+        Ok(guard) => {
+            match guard.store_pair(
+                &work.run_id,
+                &jpeg_bytes,
+                &label_json,
+                &distillation.teacher_model,
+                work.confidence,
+                embedding,
+            ) {
+                Ok(_row_id) => {
+                    let _ = guard.evict_oldest(&work.run_id, distillation.max_pairs_per_tenant);
+                    let pairs_count = guard.pair_count(&work.run_id).unwrap_or(0);
+                    tracing::info!(
+                        tenant_id = %work.run_id,
+                        pairs_count,
+                        "training pair stored"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("failed to store training pair: {e}");
+                }
+            }
+        }
+        Err(_) => {
+            tracing::warn!("training store mutex poisoned; skipping pair collection");
+        }
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
