@@ -2,7 +2,7 @@
 import { computed } from 'vue'
 import { Cpu, SlidersHorizontal, Zap, Database } from 'lucide-vue-next'
 import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
-import type { MetricsData } from '@/composables/useMetrics'
+import type { MetricsData, HistogramPercentiles } from '@/composables/useMetrics'
 
 const props = defineProps<{
   metrics: MetricsData
@@ -45,6 +45,12 @@ function formatLatency(ms: number): string {
   if (ms >= 1)    return `${ms.toFixed(1)}ms`
   return `${(ms * 1000).toFixed(0)}µs`
 }
+
+/** Shorthand formatter for histogram percentile rows. */
+function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99'): string {
+  if (!p) return '—'
+  return formatLatency(p[key])
+}
 </script>
 
 <template>
@@ -74,7 +80,7 @@ function formatLatency(ms: number): string {
       <!-- Secondary rows -->
       <div class="space-y-2 border-t border-[#1e2633] pt-3">
         <div class="flex items-center justify-between">
-          <span class="text-[#475569] text-xs">Latency</span>
+          <span class="text-[#475569] text-xs">Mean latency</span>
           <span class="mono text-xs" :style="{ color: decodeLatencyColor }">
             {{ formatLatency(metrics.decodeLatencyMs) }}
           </span>
@@ -88,6 +94,32 @@ function formatLatency(ms: number): string {
           <span class="mono text-xs"
                 :class="metrics.activeSessions > 0 ? 'text-[#2dd4bf]' : 'text-[#475569]'">
             {{ metrics.activeSessions }}
+          </span>
+        </div>
+      </div>
+
+      <!-- Percentile rows (real histogram data) -->
+      <div
+        v-if="metrics.histograms['Decode']"
+        class="space-y-1.5 border-t border-[#1e2633] pt-3"
+      >
+        <div class="text-[#2d3748] text-[10px] uppercase tracking-wider mb-1">Percentiles</div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-[11px]">p50</span>
+          <span class="mono text-[11px]" :style="{ color: decodeLatencyColor }">
+            {{ fmtPct(metrics.histograms['Decode'], 'p50') }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-[11px]">p95</span>
+          <span class="mono text-[11px]" :style="{ color: decodeLatencyColor }">
+            {{ fmtPct(metrics.histograms['Decode'], 'p95') }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-[11px]">p99</span>
+          <span class="mono text-[11px]" :style="{ color: decodeLatencyColor }">
+            {{ fmtPct(metrics.histograms['Decode'], 'p99') }}
           </span>
         </div>
       </div>
@@ -144,6 +176,32 @@ function formatLatency(ms: number): string {
         <div class="flex items-center justify-between">
           <span class="text-[#475569] text-xs">Scene cuts</span>
           <span class="mono text-[#f59e0b] text-xs">{{ fmtInt(metrics.sceneCuts) }}</span>
+        </div>
+      </div>
+
+      <!-- Percentile rows (real histogram data) -->
+      <div
+        v-if="metrics.histograms['Gate']"
+        class="space-y-1.5 border-t border-[#2a2010] pt-3"
+      >
+        <div class="text-[#2d3748] text-[10px] uppercase tracking-wider mb-1">Latency percentiles</div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-[11px]">p50</span>
+          <span class="mono text-[11px] text-[#f59e0b]">
+            {{ fmtPct(metrics.histograms['Gate'], 'p50') }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-[11px]">p95</span>
+          <span class="mono text-[11px] text-[#f59e0b]">
+            {{ fmtPct(metrics.histograms['Gate'], 'p95') }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-[11px]">p99</span>
+          <span class="mono text-[11px] text-[#f59e0b]">
+            {{ fmtPct(metrics.histograms['Gate'], 'p99') }}
+          </span>
         </div>
       </div>
 
@@ -205,6 +263,32 @@ function formatLatency(ms: number): string {
         </div>
       </div>
 
+      <!-- Percentile rows (real histogram data) -->
+      <div
+        v-if="metrics.histograms['VLM']"
+        class="space-y-1.5 border-t border-[#1e2633] pt-3"
+      >
+        <div class="text-[#2d3748] text-[10px] uppercase tracking-wider mb-1">Latency percentiles</div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-[11px]">p50</span>
+          <span class="mono text-[11px]" :style="{ color: vlmLatencyColor }">
+            {{ fmtPct(metrics.histograms['VLM'], 'p50') }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-[11px]">p95</span>
+          <span class="mono text-[11px]" :style="{ color: vlmLatencyColor }">
+            {{ fmtPct(metrics.histograms['VLM'], 'p95') }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-[11px]">p99</span>
+          <span class="mono text-[11px]" :style="{ color: vlmLatencyColor }">
+            {{ fmtPct(metrics.histograms['VLM'], 'p99') }}
+          </span>
+        </div>
+      </div>
+
       <!-- Queue depth bar -->
       <div>
         <div class="flex justify-between text-[10px] text-[#475569] mb-1">
@@ -258,6 +342,32 @@ function formatLatency(ms: number): string {
         <div class="flex items-center justify-between">
           <span class="text-[#475569] text-xs">Table</span>
           <span class="mono text-[#475569] text-xs">agent_events</span>
+        </div>
+      </div>
+
+      <!-- Percentile rows (real histogram data) -->
+      <div
+        v-if="metrics.histograms['SpacetimeDB']"
+        class="space-y-1.5 border-t border-[#1e2633] pt-3"
+      >
+        <div class="text-[#2d3748] text-[10px] uppercase tracking-wider mb-1">Emit latency</div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-[11px]">p50</span>
+          <span class="mono text-[11px] text-[#2dd4bf]">
+            {{ fmtPct(metrics.histograms['SpacetimeDB'], 'p50') }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-[11px]">p95</span>
+          <span class="mono text-[11px] text-[#2dd4bf]">
+            {{ fmtPct(metrics.histograms['SpacetimeDB'], 'p95') }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-[11px]">p99</span>
+          <span class="mono text-[11px] text-[#2dd4bf]">
+            {{ fmtPct(metrics.histograms['SpacetimeDB'], 'p99') }}
+          </span>
         </div>
       </div>
 

@@ -2,7 +2,7 @@
 import { computed, type Component } from 'vue'
 import { Radio, Cpu, SlidersHorizontal, Zap, Database } from 'lucide-vue-next'
 import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
-import type { PipelineStageMetrics } from '@/composables/useMetrics'
+import type { PipelineStageMetrics, HistogramPercentiles } from '@/composables/useMetrics'
 
 const props = defineProps<{
   stages: PipelineStageMetrics[]
@@ -60,6 +60,26 @@ function formatLatency(ms: number): string {
   if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`
   if (ms >= 1)    return `${ms.toFixed(0)}ms`
   return `${(ms * 1000).toFixed(0)}µs`
+}
+
+/**
+ * Return the best latency value to display for a stage card.
+ * Prefers p50 from real histogram data; falls back to the mean/estimate.
+ */
+function displayLatency(stage: PipelineStageMetrics): string {
+  if (stage.percentiles) {
+    return formatLatency(stage.percentiles.p50)
+  }
+  return formatLatency(stage.latencyMs)
+}
+
+/**
+ * Return a compact p95 label for the stage card subtitle when histogram
+ * data is present (e.g. "p95 2.1ms").
+ */
+function p95Label(percentiles: HistogramPercentiles | undefined): string | null {
+  if (!percentiles) return null
+  return `p95 ${formatLatency(percentiles.p95)}`
 }
 </script>
 
@@ -127,12 +147,21 @@ function formatLatency(ms: number): string {
               </div>
             </div>
 
-            <!-- Latency -->
+            <!-- Latency (p50 from histogram when available, else mean/estimate) -->
             <div class="text-center">
               <div class="mono text-[#f59e0b] text-xs font-medium">
-                {{ formatLatency(stage.latencyMs) }}
+                {{ displayLatency(stage) }}
               </div>
-              <div class="text-[#475569] text-[10px]">latency</div>
+              <div class="text-[#475569] text-[10px]">
+                {{ stage.percentiles ? 'p50' : 'latency' }}
+              </div>
+              <!-- p95 sub-label, only shown when real data present -->
+              <div
+                v-if="p95Label(stage.percentiles)"
+                class="mono text-[#2d3748] text-[9px] mt-0.5"
+              >
+                {{ p95Label(stage.percentiles) }}
+              </div>
             </div>
 
             <!-- Total frames (compact) -->
