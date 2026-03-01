@@ -519,6 +519,53 @@ fn normalize_unit(value: f32) -> f32 {
     }
 }
 
+/// Pre-compute which resampled-stream frame indices will be sent to VLM
+/// inference, given the total frame count, chunk layout, and per-chunk budget.
+/// Returns a sorted, deduplicated Vec<u64>.
+///
+/// This mirrors the selection logic in `select_semantic_images` (vidarax-api
+/// handlers.rs) but operates on frame index math only — no JPEG data needed.
+/// Call after `decode_mp4_to_frame_signals` to get the index set for
+/// `decode_selective_jpeg_frames`.
+pub fn compute_semantic_frame_indices(
+    total_frames: usize,
+    chunk_size: usize,
+    frames_per_chunk: usize,
+) -> Vec<u64> {
+    if total_frames == 0 || chunk_size == 0 || frames_per_chunk == 0 {
+        return Vec::new();
+    }
+
+    let n_chunks = (total_frames + chunk_size - 1) / chunk_size;
+    let mut indices = Vec::with_capacity(n_chunks * frames_per_chunk);
+
+    for chunk_idx in 0..n_chunks {
+        let start = chunk_idx * chunk_size;
+        let end = (start + chunk_size).min(total_frames);
+        let chunk_len = end - start;
+
+        if frames_per_chunk >= chunk_len {
+            for offset in 0..chunk_len {
+                indices.push((start + offset) as u64);
+            }
+        } else if frames_per_chunk == 1 {
+            indices.push((start + chunk_len / 2) as u64);
+        } else {
+            let mut last = usize::MAX;
+            for i in 0..frames_per_chunk {
+                let offset = i * (chunk_len - 1) / (frames_per_chunk - 1);
+                if offset != last {
+                    indices.push((start + offset) as u64);
+                    last = offset;
+                }
+            }
+        }
+    }
+
+    indices.dedup();
+    indices
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
