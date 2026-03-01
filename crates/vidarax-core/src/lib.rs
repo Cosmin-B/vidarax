@@ -7,6 +7,7 @@ pub mod memory;
 pub mod observability;
 pub mod pipeline;
 pub mod provider;
+pub mod tiered_vlm;
 pub mod timeline;
 
 #[cfg(test)]
