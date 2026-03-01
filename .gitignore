@@ -17,3 +17,4 @@
 .worktrees/
 crates/vendor/zvec/
 scripts/__pycache__/
+crates/zvec-sys-patched/target/
