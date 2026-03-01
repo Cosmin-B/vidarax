@@ -427,7 +427,9 @@ pub fn spawn_vlm_workers<I>(
                                 let first_conf =
                                     parse_confidence_from_output(&result.output_text);
                                 if config.needs_second_pass(first_conf) {
-                                    // Tier 3: accurate / teacher model
+                                    // Tier 3: accurate / teacher model — constrained decoding
+                                    // forces structured TeacherLabel output so downstream
+                                    // parse_teacher_label() never sees unstructured free text.
                                     let second_request = InferenceRequest {
                                         model: config.second_pass_model.clone(),
                                         prompt,
@@ -436,7 +438,9 @@ pub fn spawn_vlm_workers<I>(
                                         temperature: 0.0,
                                         timeout_ms: 10_000,
                                         allow_fallback: true,
-                                        guided_json: None,
+                                        guided_json: Some(
+                                            crate::provider::teacher_label_schema().to_string(),
+                                        ),
                                     };
                                     match provider.infer(&second_request) {
                                         Ok(second) => (second.output_text, true),

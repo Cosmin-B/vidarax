@@ -73,9 +73,16 @@ def _detect_device(requested: str) -> torch.device:
     return torch.device("cpu")
 
 
+MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
 def _load_image(req: EmbedRequest) -> Image.Image:
     if req.image_base64:
+        if len(req.image_base64) > MAX_IMAGE_BYTES * 4 // 3:
+            raise HTTPException(status_code=413, detail="Image too large (max 10MB)")
         raw = base64.b64decode(req.image_base64)
+        if len(raw) > MAX_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail="Decoded image exceeds 10MB")
         return Image.open(io.BytesIO(raw)).convert("RGB")
     if req.image_path:
         p = Path(req.image_path)

@@ -403,48 +403,111 @@ impl TrainingStore {
 
     /// Evict the oldest pairs so the tenant's total stays ≤ `max_pairs`.
     ///
-    /// Deletes from both SQLite and zvec, then removes the JPEG files.
+    /// Deletes from both SQLite and zvec, then removes the JPEG files on disk.
     /// Returns the number of rows removed.
+    ///
+    /// # Locking and re-entrancy
+    ///
+    /// This method is **not re-entrant**: it reads `pair_count`, decides how
+    /// many rows to evict, then issues the DELETE.  If two callers executed
+    /// this concurrently on the same `TrainingStore` value they could both
+    /// observe the same count and both evict, potentially removing more rows
+    /// than intended.
+    ///
+    /// The pair-count check and the DELETE are wrapped in a single SQLite
+    /// `IMMEDIATE` transaction so they are atomic with respect to other
+    /// writers on the same connection.  This prevents a TOCTOU race at the
+    /// database level (e.g. a concurrent `store_pair` inserting a row between
+    /// the `SELECT COUNT` and the `DELETE`).
+    ///
+    /// When `TrainingStore` is accessed through `Arc<Mutex<TrainingStore>>`
+    /// (the recommended pattern — see the module-level doc), the `Mutex`
+    /// serializes all calls, so the concern above does not apply.  Callers
+    /// that hold a bare `TrainingStore` without an enclosing mutex must ensure
+    /// they do not call `evict_oldest` from multiple threads simultaneously.
     pub fn evict_oldest(&self, tenant_id: &str, max_pairs: usize) -> Result<usize> {
-        let current = self.pair_count(tenant_id)?;
-        if current <= max_pairs {
+        // Phase 1: collect the candidate rows *and* perform the DELETE atomically
+        // inside an IMMEDIATE transaction.  Rows are captured before the DELETE
+        // so we still have their ids and frame paths for zvec + fs cleanup after
+        // the transaction commits.
+
+        // Quick pre-check outside a transaction to avoid opening one when there
+        // is nothing to do.  The real count check is repeated inside the
+        // transaction to guard against a concurrent insert.
+        let pre_count = self.pair_count(tenant_id)?;
+        if pre_count <= max_pairs {
             return Ok(0);
         }
-        let to_evict = current - max_pairs;
 
-        // Collect IDs + frame paths before deleting.
-        let mut stmt = self.conn.prepare(
-            "SELECT id, frame_path FROM training_pairs
-             WHERE tenant_id = ?1
-             ORDER BY id ASC
-             LIMIT ?2",
-        )?;
-        let rows: Vec<(i64, String)> = stmt
-            .query_map(params![tenant_id, to_evict as i64], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        drop(stmt);
+        // Phase 1 — collect candidates and DELETE inside a single transaction.
+        let rows: Vec<(i64, String)> = {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+
+            let inner_result = (|| -> Result<Vec<(i64, String)>> {
+                // Re-read count inside the transaction.
+                let current = self.pair_count(tenant_id)?;
+                if current <= max_pairs {
+                    return Ok(Vec::new());
+                }
+                let to_evict = current - max_pairs;
+
+                // Collect IDs + frame paths of the rows to be deleted.
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, frame_path FROM training_pairs
+                     WHERE tenant_id = ?1
+                     ORDER BY id ASC
+                     LIMIT ?2",
+                )?;
+                let candidates: Vec<(i64, String)> = stmt
+                    .query_map(params![tenant_id, to_evict as i64], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                drop(stmt);
+
+                if candidates.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                // Delete from SQLite while the transaction is still open.
+                self.conn.execute(
+                    "DELETE FROM training_pairs
+                     WHERE tenant_id = ?1
+                       AND id IN (
+                           SELECT id FROM training_pairs
+                           WHERE tenant_id = ?1
+                           ORDER BY id ASC
+                           LIMIT ?2
+                       )",
+                    params![tenant_id, to_evict as i64],
+                )?;
+
+                Ok(candidates)
+            })();
+
+            match &inner_result {
+                Ok(_) => {
+                    if let Err(e) = self.conn.execute_batch("COMMIT") {
+                        let _ = self.conn.execute_batch("ROLLBACK");
+                        return Err(TrainingError::Database(e));
+                    }
+                }
+                Err(_) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                }
+            }
+
+            inner_result?
+        };
 
         if rows.is_empty() {
             return Ok(0);
         }
 
-        // Delete from SQLite
-        self.conn.execute(
-            "DELETE FROM training_pairs
-             WHERE tenant_id = ?1
-               AND id IN (
-                   SELECT id FROM training_pairs
-                   WHERE tenant_id = ?1
-                   ORDER BY id ASC
-                   LIMIT ?2
-               )",
-            params![tenant_id, to_evict as i64],
-        )?;
-
-        // Delete from zvec
+        // Phase 2 — best-effort cleanup outside the transaction.
+        // SQLite records are already gone; zvec and fs failures are logged but
+        // not propagated so a transient error here does not interrupt the pipeline.
         let id_strings: Vec<String> = rows.iter().map(|(id, _)| id.to_string()).collect();
         let id_refs: Vec<&str> = id_strings.iter().map(|s| s.as_str()).collect();
         self.collection

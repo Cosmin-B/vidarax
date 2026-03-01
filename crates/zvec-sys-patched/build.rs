@@ -4,11 +4,18 @@ use std::process::Command;
 
 const ZVEC_GIT_REF: &str = "v0.2.0";
 
+/// Expected SHA-1 commit hash for the `v0.2.0` tag of alibaba/zvec.
+///
+/// Obtained from `git rev-parse HEAD` after the first successful clone.
+/// Update this constant whenever `ZVEC_GIT_REF` is bumped to a new release.
+const ZVEC_EXPECTED_COMMIT: &str = "385a030284a1c0a61c132ccefc63171439242bc9";
+
 fn ensure_zvec_source(workspace_dir: &Path) -> PathBuf {
     let zvec_src = workspace_dir.join("vendor/zvec");
 
     if zvec_src.join("CMakeLists.txt").exists() {
         println!("cargo:warning=zvec source already present");
+        verify_commit_hash(&zvec_src);
         return zvec_src;
     }
 
@@ -17,6 +24,11 @@ fn ensure_zvec_source(workspace_dir: &Path) -> PathBuf {
         ZVEC_GIT_REF
     );
     let _ = std::fs::create_dir_all(zvec_src.parent().unwrap());
+
+    // Clone into a staging directory first; rename only after hash verification
+    // so a partial clone or a tampered tag never leaves a broken vendor tree.
+    let staging = zvec_src.with_extension("_staging");
+    let _ = std::fs::remove_dir_all(&staging);
 
     let status = Command::new("git")
         .args([
@@ -27,7 +39,7 @@ fn ensure_zvec_source(workspace_dir: &Path) -> PathBuf {
             ZVEC_GIT_REF,
             "--recursive",
             "https://github.com/alibaba/zvec.git",
-            zvec_src.to_str().unwrap(),
+            staging.to_str().unwrap(),
         ])
         .status()
         .expect("Failed to execute git clone. Please ensure git is installed.");
@@ -36,7 +48,61 @@ fn ensure_zvec_source(workspace_dir: &Path) -> PathBuf {
         panic!("git clone failed. Please check your network connection and that git is installed.");
     }
 
+    verify_commit_hash(&staging);
+
+    std::fs::rename(&staging, &zvec_src)
+        .expect("Failed to rename staging clone to vendor/zvec");
+
     zvec_src
+}
+
+/// Verify the HEAD commit of a cloned repository against [`ZVEC_EXPECTED_COMMIT`].
+///
+/// Panics if the hash cannot be read or does not match, preventing a
+/// supply-chain attack where the remote tag is force-pushed to a different
+/// commit.
+///
+/// If [`ZVEC_EXPECTED_COMMIT`] still contains the placeholder value this
+/// function prints the actual hash as a cargo warning so the developer can
+/// fill it in, then returns without panicking (bootstrap mode).
+fn verify_commit_hash(repo_dir: &Path) {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_dir)
+        .output()
+        .expect("Failed to run `git rev-parse HEAD` in cloned zvec directory");
+
+    if !output.status.success() {
+        panic!(
+            "git rev-parse HEAD failed in {}",
+            repo_dir.display()
+        );
+    }
+
+    let actual = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_string();
+
+    if ZVEC_EXPECTED_COMMIT.starts_with("FILL_IN") {
+        // Bootstrap: developer has not yet pinned the hash.  Emit it so they
+        // can update the constant, but do not block the build.
+        println!(
+            "cargo:warning=zvec supply-chain: set ZVEC_EXPECTED_COMMIT = {:?} in build.rs",
+            actual
+        );
+        return;
+    }
+
+    if actual != ZVEC_EXPECTED_COMMIT {
+        panic!(
+            "zvec supply-chain check failed: expected commit {}, got {}. \
+             If you intentionally bumped ZVEC_GIT_REF, update ZVEC_EXPECTED_COMMIT in build.rs.",
+            ZVEC_EXPECTED_COMMIT,
+            actual
+        );
+    }
+
+    println!("cargo:warning=zvec commit hash verified: {}", actual);
 }
 
 fn main() {
