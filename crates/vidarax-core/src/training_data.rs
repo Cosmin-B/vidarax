@@ -35,6 +35,31 @@ use zvec_bindings::{
     VectorQuery, VectorSchema,
 };
 
+// ── Tenant ID validation ─────────────────────────────────────────────────────
+
+/// Validate that a tenant ID is safe for use as a filesystem path component.
+///
+/// Accepts 1–64 characters of ASCII alphanumeric, hyphen, or underscore.
+/// Rejects empty strings, path separators, `..`, and null bytes.
+fn validate_tenant_id(id: &str) -> Result<()> {
+    if id.is_empty() || id.len() > 64 {
+        return Err(TrainingError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tenant_id must be 1-64 characters",
+        )));
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(TrainingError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "tenant_id must contain only ASCII alphanumeric, hyphen, or underscore",
+        )));
+    }
+    Ok(())
+}
+
 // ── Error ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -210,6 +235,7 @@ impl TrainingStore {
         confidence: f32,
         embedding: &[f32; 768],
     ) -> Result<i64> {
+        validate_tenant_id(tenant_id)?;
         // Write JPEG thumbnail
         let frames_dir = self.data_dir.join("frames").join(tenant_id);
         std::fs::create_dir_all(&frames_dir)?;
@@ -273,6 +299,7 @@ impl TrainingStore {
         k: usize,
         distance_threshold: f32,
     ) -> Result<Option<KnnResult>> {
+        validate_tenant_id(tenant_id)?;
         if k == 0 {
             return Ok(None);
         }
@@ -352,6 +379,7 @@ impl TrainingStore {
     ///
     /// Returns the number of records written.
     pub fn export_training_jsonl(&self, tenant_id: &str, output_path: &Path) -> Result<usize> {
+        validate_tenant_id(tenant_id)?;
         let mut stmt = self.conn.prepare(
             "SELECT frame_path, label_json, teacher_model, confidence, created_at
              FROM training_pairs
@@ -393,6 +421,7 @@ impl TrainingStore {
 
     /// Number of stored pairs for a tenant.
     pub fn pair_count(&self, tenant_id: &str) -> Result<usize> {
+        validate_tenant_id(tenant_id)?;
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM training_pairs WHERE tenant_id = ?1",
             params![tenant_id],
@@ -426,6 +455,7 @@ impl TrainingStore {
     /// that hold a bare `TrainingStore` without an enclosing mutex must ensure
     /// they do not call `evict_oldest` from multiple threads simultaneously.
     pub fn evict_oldest(&self, tenant_id: &str, max_pairs: usize) -> Result<usize> {
+        validate_tenant_id(tenant_id)?;
         // Phase 1: collect the candidate rows *and* perform the DELETE atomically
         // inside an IMMEDIATE transaction.  Rows are captured before the DELETE
         // so we still have their ids and frame paths for zvec + fs cleanup after

@@ -306,11 +306,18 @@ fn build_payload(model: &str, request: &InferenceRequest) -> String {
     });
     if let Some(schema) = &request.guided_json {
         // vLLM ≥0.15 requires response_format (not extra_body.guided_json)
+        let parsed = match serde_json::from_str::<Value>(schema) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "guided_json schema is invalid JSON, sending unconstrained");
+                Value::Null
+            }
+        };
         body["response_format"] = serde_json::json!({
             "type": "json_schema",
             "json_schema": {
                 "name": "teacher_label",
-                "schema": serde_json::from_str::<Value>(schema).unwrap_or(Value::Null)
+                "schema": parsed
             }
         });
     }

@@ -85,9 +85,9 @@ def _load_image(req: EmbedRequest) -> Image.Image:
             raise HTTPException(status_code=413, detail="Decoded image exceeds 10MB")
         return Image.open(io.BytesIO(raw)).convert("RGB")
     if req.image_path:
-        p = Path(req.image_path)
+        p = Path(req.image_path).resolve()
         if not p.exists():
-            raise HTTPException(status_code=400, detail=f"Image not found: {p}")
+            raise HTTPException(status_code=400, detail="Image not found")
         return Image.open(p).convert("RGB")
     raise HTTPException(status_code=400, detail="Provide image_base64 or image_path")
 
@@ -182,7 +182,7 @@ def main():
     app.state.model_id = args.model_id
     app.state.device_pref = args.device
 
-    uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="info")
+    uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="info")
 
 
 if __name__ == "__main__":
