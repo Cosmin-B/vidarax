@@ -1627,6 +1627,134 @@ pub async fn health() -> impl IntoResponse {
     ok(json!({ "status": "ok" }))
 }
 
+/// `POST /v1/search`
+///
+/// Substring search over VLM descriptions stored in the WAL.
+///
+/// Scans all WAL events and returns those whose payload contains a
+/// `description` field matching the query string (case-insensitive).  When
+/// `run_id` is supplied only events belonging to that run are scanned.
+///
+/// This is an MVP implementation: no embedding model is required.  Exact
+/// substring matching is O(n) in the number of stored events but is fast
+/// enough for the typical WAL sizes encountered in development and staging.
+/// A vector-embedding upgrade path is available by storing description
+/// embeddings at write time and replacing this scan with a k-NN query.
+#[tracing::instrument(name = "api.search", skip_all)]
+pub async fn search(
+    State(state): State<AppState>,
+    Json(payload): Json<SearchRequest>,
+) -> impl IntoResponse {
+    // Validate query string.
+    let query = payload.query.trim();
+    if query.is_empty() {
+        return validation_error(
+            &state,
+            "invalid search request",
+            vec![field_error("query", "query must not be empty".to_string())],
+        );
+    }
+    if query.len() > 1024 {
+        return validation_error(
+            &state,
+            "invalid search request",
+            vec![field_error(
+                "query",
+                "query must be <= 1024 bytes".to_string(),
+            )],
+        );
+    }
+
+    let limit = payload.limit.unwrap_or(50);
+    if limit == 0 || limit > 500 {
+        return validation_error(
+            &state,
+            "invalid search request",
+            vec![field_error(
+                "limit",
+                "limit must be in [1, 500]".to_string(),
+            )],
+        );
+    }
+
+    // Load all events — either run-scoped or global.
+    let events = if let Some(ref run_id) = payload.run_id {
+        if let Some(error) = validate_run_id_or_error(&state, run_id, "invalid search request") {
+            return error;
+        }
+        match state.read_run_events_async(run_id).await {
+            Ok(events) => events,
+            Err(err) => return internal_error(&state, format!("failed to read events: {err}")),
+        }
+    } else {
+        match state.read_all_events_async().await {
+            Ok(events) => events,
+            Err(err) => return internal_error(&state, format!("failed to read events: {err}")),
+        }
+    };
+
+    let scanned = events.len();
+
+    // Case-insensitive substring search over the `description` field in every
+    // event payload.  The lowercase query is computed once.
+    let query_lower = query.to_lowercase();
+
+    let mut hits: Vec<SearchHit> = Vec::new();
+
+    for event in events {
+        let payload_val = parse_payload(&event.payload);
+
+        // Extract a description string from the event payload.  Different event
+        // kinds store it under different keys:
+        // - semantic_chunk_inferred: payload.description (from SemanticOverlay)
+        // - vlm / vlm_tiered: payload.description
+        // - analysis_generated: no per-frame description; skip
+        //
+        // We try the most common keys in priority order.
+        let description = payload_val
+            .get("description")
+            .and_then(|v| v.as_str())
+            .or_else(|| payload_val.get("summary").and_then(|v| v.as_str()))
+            .map(str::to_string);
+
+        let Some(description) = description else {
+            continue;
+        };
+
+        if !description.to_lowercase().contains(&query_lower) {
+            continue;
+        }
+
+        // Extract optional index_name for cross-index searches.
+        let index_name = payload_val
+            .get("index_name")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
+
+        hits.push(SearchHit {
+            seq: event.seq,
+            run_id: event.run_id,
+            pts_ms: event.pts_ms,
+            kind: event.kind,
+            description,
+            index_name,
+        });
+
+        if hits.len() >= limit {
+            break;
+        }
+    }
+
+    let total_hits = hits.len();
+
+    ok(json!(SearchResponse {
+        request_id: state.next_request_id(),
+        scanned,
+        total_hits,
+        hits,
+    }))
+}
+
 pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     let (runs, events) = state.metrics_snapshot();
     let mut metrics =

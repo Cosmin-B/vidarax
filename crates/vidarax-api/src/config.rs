@@ -246,6 +246,10 @@ const ROUTE_MANIFEST: &[RouteSpec] = &[
     },
     RouteSpec {
         method: "POST",
+        path: "/v1/search",
+    },
+    RouteSpec {
+        method: "POST",
         path: "/v1/infer",
     },
     RouteSpec {
