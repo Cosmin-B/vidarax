@@ -24,5 +24,6 @@ arc-swap = "1"
 base64 = "0.22"
 vidarax-contracts = { path = "../vidarax-contracts" }
 vidarax-core = { path = "../vidarax-core" }
+kanal = "0.1"
 
 [dev-dependencies]
