@@ -205,6 +205,11 @@ export function useEventStream() {
   }
 
   async function connect(runId: string): Promise<void> {
+    // C-1: Validate runId to prevent SQL injection in SpacetimeDB subscription queries.
+    if (!/^[a-zA-Z0-9_-]+$/.test(runId)) {
+      connectionError.value = 'Invalid run ID format'
+      return
+    }
     activeRunId = runId
     eventsStore.setActiveRunId(runId)
 
