@@ -28,7 +28,17 @@ pub struct TimelineEvent {
 
 impl TimelineEvent {
     fn encode_line(&self) -> String {
-        format!(
+        // Pre-allocate enough for the numeric fields plus the string fields
+        // (worst-case escape doubles every char, so reserve full field lengths).
+        let cap = 40
+            + self.run_id.len()
+            + self.stream_id.len()
+            + self.kind.len()
+            + self.payload.len();
+        let mut buf = String::with_capacity(cap);
+        use std::fmt::Write as _;
+        let _ = write!(
+            buf,
             "{}\t{}\t{}\t{}\t{}\t{}",
             self.seq,
             sanitize(&self.run_id),
@@ -36,7 +46,8 @@ impl TimelineEvent {
             self.pts_ms,
             sanitize(&self.kind),
             sanitize(&self.payload)
-        )
+        );
+        buf
     }
 
     fn decode_line(line: &str) -> Option<Self> {
