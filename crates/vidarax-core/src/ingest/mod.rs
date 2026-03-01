@@ -1,3 +1,5 @@
+pub mod pipeline;
+
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
