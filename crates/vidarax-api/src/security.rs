@@ -143,6 +143,23 @@ pub async fn enforce_security(
     let policy = state.security_policy();
     let origin = header_value(&request, header::ORIGIN.as_str()).map(ToString::to_string);
 
+    // M-10: Apply global rate limiting BEFORE the health/preflight bypass so
+    // that unauthenticated endpoints cannot be used to exhaust the rate budget.
+    // Only the API key check is skipped for these paths, not the rate limit.
+    if let Some(global) = &policy.global_limiter {
+        let now_sec = epoch_seconds();
+        if !global.allow(now_sec) {
+            let request_id = state.next_request_id();
+            let response = error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "global request rate exceeded",
+                request_id,
+            );
+            return finalize_response(policy, origin.as_deref(), response);
+        }
+    }
+
     if is_cors_preflight(&request) {
         let response = preflight_response(policy, origin.as_deref(), state.next_request_id());
         return finalize_response(policy, origin.as_deref(), response);
@@ -221,19 +238,10 @@ pub async fn enforce_security(
         return finalize_response(policy, origin.as_deref(), response);
     }
 
-    let now_sec = epoch_seconds();
-    if let Some(global) = &policy.global_limiter {
-        if !global.allow(now_sec) {
-            let response = error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limited",
-                "global request rate exceeded",
-                request_id,
-            );
-            return finalize_response(policy, origin.as_deref(), response);
-        }
-    }
+    // Note: global rate limiting is enforced at the top of this function
+    // (before the preflight/health bypass) so it is not duplicated here.
 
+    let now_sec = epoch_seconds();
     if let Some(tenant_limiter) = &policy.tenant_limiter {
         let Some(tenant_id) = tenant_id.as_deref() else {
             let response = error_response(
