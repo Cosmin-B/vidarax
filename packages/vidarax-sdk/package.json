@@ -2,7 +2,13 @@
   "name": "vidarax",
   "version": "0.1.0",
   "description": "TypeScript SDK for the Vidarax video analysis API",
-  "keywords": ["video", "analysis", "sdk", "webrtc", "whip"],
+  "keywords": [
+    "video",
+    "analysis",
+    "sdk",
+    "webrtc",
+    "whip"
+  ],
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
@@ -22,10 +28,13 @@
     "build": "tsc --project tsconfig.json",
     "build:watch": "tsc --project tsconfig.json --watch",
     "typecheck": "tsc --project tsconfig.json --noEmit",
-    "clean": "rm -rf dist tsconfig.tsbuildinfo"
+    "clean": "rm -rf dist tsconfig.tsbuildinfo",
+    "test": "vitest run",
+    "test:e2e": "vitest run tests/e2e.test.ts"
   },
   "devDependencies": {
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "vitest": "^4.0.18"
   },
   "engines": {
     "node": ">=18.0.0"
