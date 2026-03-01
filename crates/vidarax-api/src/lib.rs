@@ -293,11 +293,15 @@ mod tests {
     }
 
     fn create_test_mp4() -> Option<String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("vidarax-mp4-test-{nanos}.mp4"));
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tid = std::thread::current().id();
+        let path = std::env::temp_dir().join(format!("vidarax-mp4-test-{nanos}-{seq}-{tid:?}.mp4"));
         let status = Command::new(vidarax_core::ingest::ffmpeg_path())
             .args([
                 "-v",
