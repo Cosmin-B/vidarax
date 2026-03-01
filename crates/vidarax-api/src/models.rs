@@ -67,6 +67,9 @@ pub struct RealtimeReasonRequest {
     pub semantic_timeout_ms: Option<u64>,
     pub primary_provider: Option<String>,
     pub semantic_prompt: Option<String>,
+    pub first_pass_model: Option<String>,
+    pub second_pass_model: Option<String>,
+    pub second_pass_threshold: Option<f32>,
     pub trace_id: Option<String>,
 }
 

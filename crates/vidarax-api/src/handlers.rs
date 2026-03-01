@@ -1072,6 +1072,19 @@ pub async fn reason_realtime_run(
         ProviderKind::Vllm
     };
 
+    let tiered_config = {
+        use vidarax_core::tiered_vlm::TieredVlmConfig;
+        let first = payload.first_pass_model.as_deref().unwrap_or(&model);
+        let second = payload.second_pass_model.as_deref().unwrap_or(&model);
+        let threshold = payload.second_pass_threshold.unwrap_or(0.7);
+        TieredVlmConfig {
+            first_pass_model: first.to_string(),
+            second_pass_model: second.to_string(),
+            second_pass_threshold: threshold.clamp(0.0, 1.0),
+            second_pass_max_tokens: 256,
+        }
+    };
+
     let decode_source =
         match InputSource::parse_and_validate(&payload.source_uri, state.ingest_file_roots()) {
             Ok(source) => source,
@@ -1253,6 +1266,7 @@ pub async fn reason_realtime_run(
             let frame_offset = prep.frame_offset as u64;
             let pts_start_ms = prep.pts_start_ms;
             let pts_end_ms = prep.pts_end_ms;
+            let tiered_config_c = tiered_config.clone();
             join_set.spawn(async move {
                 let _permit = sem_c.acquire().await.unwrap();
                 let overlay = infer_chunk_semantics(
@@ -1267,6 +1281,7 @@ pub async fn reason_realtime_run(
                     frame_offset,
                     pts_start_ms,
                     pts_end_ms,
+                    tiered_config_c,
                 )
                 .await;
                 (chunk_idx, overlay, Instant::now())
@@ -1961,7 +1976,7 @@ async fn infer_chunk_semantics(
     providers: Option<&vidarax_core::provider::ProviderEndpoints>,
     semantic_available: bool,
     primary_provider: ProviderKind,
-    model: &str,
+    _model: &str,
     semantic_prompt: &str,
     timeout_ms: u64,
     semantic_frames_per_chunk: usize,
@@ -1969,6 +1984,7 @@ async fn infer_chunk_semantics(
     frame_start_index: u64,
     pts_start_ms: u64,
     pts_end_ms: u64,
+    tiered_config: vidarax_core::tiered_vlm::TieredVlmConfig,
 ) -> ChunkSemanticResult {
     if !semantic_available {
         return ChunkSemanticResult::default();
@@ -2003,18 +2019,19 @@ async fn infer_chunk_semantics(
             data_base64: BASE64_STANDARD.encode(&frame.jpeg_bytes),
         })
         .collect::<Vec<_>>();
-    let request = InferenceRequest {
-        model: model.to_string(),
-        prompt,
-        input_images: images,
+    let first_request = InferenceRequest {
+        model: tiered_config.first_pass_model.clone(),
+        prompt: prompt.clone(),
+        input_images: images.clone(),
         max_tokens: 160,
         temperature: 0.0,
         timeout_ms,
         allow_fallback: true,
     };
 
-    let provider_result = match tokio::task::spawn_blocking(move || {
-        infer_with_endpoints(&endpoints, primary_provider, &request)
+    let first_result = match tokio::task::spawn_blocking({
+        let endpoints = endpoints.clone();
+        move || infer_with_endpoints(&endpoints, primary_provider, &first_request)
     })
     .await
     {
@@ -2035,6 +2052,35 @@ async fn infer_chunk_semantics(
             return result;
         }
     };
+
+    // If tiered routing is active and first-pass confidence is low, run second pass.
+    let provider_result = if tiered_config.is_tiered() {
+        let first_conf = parse_confidence_from_output(&first_result.output_text);
+        if tiered_config.needs_second_pass(first_conf) {
+            let second_request = InferenceRequest {
+                model: tiered_config.second_pass_model.clone(),
+                prompt,
+                input_images: images,
+                max_tokens: tiered_config.second_pass_max_tokens,
+                temperature: 0.0,
+                timeout_ms,
+                allow_fallback: true,
+            };
+            match tokio::task::spawn_blocking(move || {
+                infer_with_endpoints(&endpoints, primary_provider, &second_request)
+            })
+            .await
+            {
+                Ok(Ok(output)) => output,
+                _ => first_result, // fallback to first pass on second-pass error
+            }
+        } else {
+            first_result
+        }
+    } else {
+        first_result
+    };
+
     result.provider = Some(provider_name(provider_result.provider).to_string());
     result.provider_fallback_used = provider_result.fallback_used;
 
@@ -2078,6 +2124,19 @@ fn select_semantic_images<'a>(
         }
     }
     out
+}
+
+/// Extract a confidence float from VLM JSON output for tiered routing decisions.
+///
+/// Looks for `"confidence": 0.XX` in the JSON. Falls back to `0.5` (triggers
+/// second pass at the default threshold of 0.7).
+fn parse_confidence_from_output(text: &str) -> f32 {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
+        if let Some(conf) = val.get("confidence").and_then(|v| v.as_f64()) {
+            return conf as f32;
+        }
+    }
+    0.5
 }
 
 fn parse_semantic_overlay(raw: &str) -> Option<SemanticOverlay> {
