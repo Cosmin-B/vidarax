@@ -72,8 +72,8 @@ pub struct KeyframeStore {
     /// VLM description of the keyframe content.
     pub description: String,
 
-    /// Base64-encoded JPEG of the keyframe.
-    pub jpeg_b64: String,
+    /// Raw JPEG bytes of the keyframe (no base64 encoding overhead).
+    pub jpeg_data: Vec<u8>,
 
     /// Wall-clock time at which the keyframe was stored.
     pub timestamp: Timestamp,
@@ -161,6 +161,7 @@ pub fn submit_feedback(
 }
 
 /// Store a keyframe for persistent visual memory.
+/// Accepts raw JPEG bytes — no base64 encoding needed.
 #[reducer]
 pub fn store_keyframe(
     ctx: &ReducerContext,
@@ -169,7 +170,7 @@ pub fn store_keyframe(
     pts_ms: u64,
     event_type: String,
     description: String,
-    jpeg_b64: String,
+    jpeg_data: Vec<u8>,
 ) {
     ctx.db.keyframe_store().insert(KeyframeStore {
         id: 0,
@@ -179,7 +180,7 @@ pub fn store_keyframe(
         pts_ms,
         event_type,
         description,
-        jpeg_b64,
+        jpeg_data,
         timestamp: ctx.timestamp,
     });
 }

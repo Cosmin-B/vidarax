@@ -123,7 +123,7 @@ pub struct ClipWork {
     pub run_id: String,
     pub session_id: String,
     /// Frames in this clip: `(signal, base64-encoded JPEG)`.
-    pub frames: Vec<(FrameSignal, String)>,
+    pub frames: Vec<(FrameSignal, Vec<u8>)>,
     /// PTS of the first frame in the batch (milliseconds).
     pub pts_start: u64,
     /// PTS of the last frame in the batch (milliseconds).
@@ -147,7 +147,7 @@ pub struct ClipAccumulator {
     session_id: String,
     prompt: String,
     /// Buffered frames for the current window.
-    buffer: Vec<(FrameSignal, String)>,
+    buffer: Vec<(FrameSignal, Vec<u8>)>,
     /// Minimum inter-sample distance in ms (1000 / target_fps).
     sample_interval_ms: u64,
     /// PTS of the last frame accepted into the buffer (for rate limiting).
@@ -195,18 +195,17 @@ impl ClipAccumulator {
         }
 
         // ── Encode JPEG ────────────────────────────────────────────────────
-        let jpeg_b64 = sf
+        let jpeg_bytes = sf
             .jpeg
-            .as_deref()
-            .map(|j| base64::engine::general_purpose::STANDARD.encode(j))
+            .clone()
             .unwrap_or_default();
 
-        if jpeg_b64.is_empty() {
+        if jpeg_bytes.is_empty() {
             return None; // no image data
         }
 
         self.last_accepted_pts = Some(sf.pts_ms);
-        self.buffer.push((sf.signal, jpeg_b64));
+        self.buffer.push((sf.signal, jpeg_bytes));
 
         // ── Check window duration ──────────────────────────────────────────
         let window_start_pts = match self.buffer.first() {
@@ -328,9 +327,9 @@ pub fn spawn_clip_vlm_workers<I>(
                     let input_images: Vec<InferenceImage> = work
                         .frames
                         .iter()
-                        .map(|(_, jpeg_b64)| InferenceImage {
+                        .map(|(_, jpeg_bytes)| InferenceImage {
                             media_type: "image/jpeg".to_string(),
-                            data_base64: jpeg_b64.clone(),
+                            data_base64: base64::engine::general_purpose::STANDARD.encode(&jpeg_bytes),
                         })
                         .collect();
 
@@ -389,7 +388,7 @@ pub fn spawn_clip_vlm_workers<I>(
                                 ghosting_score: 0.0,
                                 noise_variance_score: 0.0,
                             },
-                            String::new(),
+                            Vec::new(),
                         )
                     });
 

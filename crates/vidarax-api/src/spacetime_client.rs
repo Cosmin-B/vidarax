@@ -81,7 +81,7 @@ pub struct StoreKeyframeRequest {
     pub event_type: String,
     pub description: String,
     /// Base64-encoded JPEG bytes.
-    pub jpeg_b64: String,
+    pub jpeg_data: Vec<u8>,
 }
 
 // ─── Response types ───────────────────────────────────────────────────────────
@@ -126,7 +126,7 @@ pub struct StoredKeyframe {
     pub pts_ms: u64,
     pub event_type: String,
     pub description: String,
-    pub jpeg_b64: String,
+    pub jpeg_data: Vec<u8>,
     pub timestamp_micros: i64,
 }
 
@@ -251,7 +251,7 @@ impl SpacetimeClient {
             req.pts_ms,
             req.event_type,
             req.description,
-            req.jpeg_b64,
+            req.jpeg_data,
         ]);
         let mut rb = self
             .inner
@@ -417,7 +417,7 @@ impl SpacetimeClient {
             req.pts_ms,
             req.event_type,
             req.description,
-            req.jpeg_b64,
+            req.jpeg_data,
         ]);
         let mut rb = self
             .inner
@@ -544,6 +544,19 @@ fn col_str(row: &Value, idx: usize) -> Result<String, SpacetimeError> {
         .ok_or_else(|| SpacetimeError::Parse(format!("col {idx}: expected string")))
 }
 
+/// SpacetimeDB encodes `Vec<u8>` as a JSON array of numbers `[255, 216, ...]`.
+fn col_bytes(row: &Value, idx: usize) -> Result<Vec<u8>, SpacetimeError> {
+    row.get(idx)
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_u64)
+                .map(|v| v as u8)
+                .collect()
+        })
+        .ok_or_else(|| SpacetimeError::Parse(format!("col {idx}: expected byte array")))
+}
+
 fn col_u64(row: &Value, idx: usize) -> Result<u64, SpacetimeError> {
     row.get(idx)
         .and_then(Value::as_u64)
@@ -630,7 +643,7 @@ impl vidarax_core::webrtc::workers::EventSink for SpacetimeClient {
         pts_ms: u64,
         event_type: &str,
         description: &str,
-        jpeg_b64: &str,
+        jpeg_data: &[u8],
     ) -> Result<(), String> {
         self.store_keyframe(&StoreKeyframeRequest {
             run_id: run_id.to_string(),
@@ -638,7 +651,7 @@ impl vidarax_core::webrtc::workers::EventSink for SpacetimeClient {
             pts_ms,
             event_type: event_type.to_string(),
             description: description.to_string(),
-            jpeg_b64: jpeg_b64.to_string(),
+            jpeg_data: jpeg_data.to_vec(),
         })
         .map_err(|e| e.to_string())
     }
@@ -655,7 +668,7 @@ fn parse_keyframe(row: Value) -> Result<StoredKeyframe, SpacetimeError> {
         pts_ms: col_u64(&row, 4)?,
         event_type: col_str(&row, 5)?,
         description: col_str(&row, 6)?,
-        jpeg_b64: col_str(&row, 7)?,
+        jpeg_data: col_bytes(&row, 7)?,
         timestamp_micros: col_timestamp(&row, 8)?,
     })
 }

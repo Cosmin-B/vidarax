@@ -53,7 +53,7 @@ fn keyframe_work_has_prompt_field() {
         pts_ms: 0,
         event_type: "scene_cut".into(),
         confidence: 0.9,
-        jpeg_b64: String::new(),
+        jpeg_bytes: Vec::new(),
         prompt: "Describe this frame.".into(),
     };
     assert_eq!(kw.prompt, "Describe this frame.");

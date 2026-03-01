@@ -71,7 +71,7 @@ pub trait EventSink: Send + Sync {
         pts_ms: u64,
         event_type: &str,
         description: &str,
-        jpeg_b64: &str,
+        jpeg_data: &[u8],
     ) -> Result<(), String>;
 }
 
@@ -101,8 +101,8 @@ pub struct KeyframeWork {
     pub event_type: String,
     /// Gate confidence score in \[0.0, 1.0\].
     pub confidence: f32,
-    /// Base64-encoded JPEG thumbnail for VLM input.
-    pub jpeg_b64: String,
+    /// Raw JPEG bytes — base64-encoded on-demand for VLM, stored raw in SpacetimeDB.
+    pub jpeg_bytes: Vec<u8>,
     /// Semantic prompt to pass to the VLM.
     pub prompt: String,
 }
@@ -270,12 +270,9 @@ pub fn spawn_analysis_workers(
                         };
 
                         if meta.gate_event == GateEventType::KeepKeyframe {
-                            let jpeg_b64 = sf
+                            let jpeg_bytes = sf
                                 .jpeg
-                                .as_deref()
-                                .map(|j| {
-                                    base64::engine::general_purpose::STANDARD.encode(j)
-                                })
+                                .clone()
                                 .unwrap_or_default();
 
                             let event_type = if meta.scene_cut {
@@ -291,7 +288,7 @@ pub fn spawn_analysis_workers(
                                 pts_ms: sf.pts_ms,
                                 event_type: event_type.to_string(),
                                 confidence: meta.confidence,
-                                jpeg_b64,
+                                jpeg_bytes,
                                 prompt: String::new(),
                             };
 
@@ -389,7 +386,7 @@ pub fn spawn_vlm_workers<I>(
                         prompt: prompt.clone(),
                         input_images: vec![InferenceImage {
                             media_type: "image/jpeg".to_string(),
-                            data_base64: work.jpeg_b64.clone(),
+                            data_base64: base64::engine::general_purpose::STANDARD.encode(&work.jpeg_bytes),
                         }],
                         max_tokens: 128,
                         temperature: 0.0,
@@ -450,7 +447,7 @@ pub fn spawn_vlm_workers<I>(
                         work.pts_ms,
                         &work.event_type,
                         &description,
-                        &work.jpeg_b64,
+                        &&work.jpeg_bytes,
                     );
                 }
             })
@@ -516,7 +513,7 @@ mod tests {
             _pts_ms: u64,
             event_type: &str,
             _description: &str,
-            _jpeg_b64: &str,
+            _jpeg_data: &[u8],
         ) -> Result<(), String> {
             self.keyframes.lock().unwrap().push(event_type.to_string());
             Ok(())
@@ -553,7 +550,7 @@ mod tests {
             pts_ms: 0,
             event_type: "scene_cut".into(),
             confidence: 0.9,
-            jpeg_b64: "YWJj".into(),
+            jpeg_bytes: vec![0xFF, 0xD8, 0xFF, 0xD9],
             prompt: String::new(),
         };
         let _ = kw.clone();
@@ -564,7 +561,7 @@ mod tests {
     fn mock_sink_records_calls() {
         let sink = MockSink::new();
         sink.emit_event_sync("r", "s", 0, 0, "vlm", 0.9, "hello").unwrap();
-        sink.store_keyframe_sync("r", 0, 0, "scene_cut", "hello", "").unwrap();
+        sink.store_keyframe_sync("r", 0, 0, "scene_cut", "hello", b"").unwrap();
         assert_eq!(sink.events.lock().unwrap().as_slice(), ["vlm"]);
         assert_eq!(sink.keyframes.lock().unwrap().as_slice(), ["scene_cut"]);
     }
