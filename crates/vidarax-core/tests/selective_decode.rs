@@ -1,4 +1,4 @@
-use vidarax_core::ingest::compute_semantic_frame_indices;
+use vidarax_core::ingest::{build_select_expr, compute_semantic_frame_indices};
 
 #[test]
 fn indices_for_single_chunk() {
@@ -49,4 +49,22 @@ fn frames_per_chunk_exceeds_chunk_size() {
     // chunk 1: frames 5-9 → all 5 selected
     let indices = compute_semantic_frame_indices(10, 5, 8);
     assert_eq!(indices, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+}
+
+#[test]
+fn select_expr_single_index() {
+    assert_eq!(build_select_expr(&[42]), "select='eq(n\\,42)'");
+}
+
+#[test]
+fn select_expr_multiple_indices() {
+    assert_eq!(
+        build_select_expr(&[12, 37, 74]),
+        "select='eq(n\\,12)+eq(n\\,37)+eq(n\\,74)'"
+    );
+}
+
+#[test]
+fn select_expr_empty() {
+    assert_eq!(build_select_expr(&[]), "select='0'");
 }

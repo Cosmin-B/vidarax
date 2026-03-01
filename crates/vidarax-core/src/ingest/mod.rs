@@ -125,7 +125,7 @@ fn blocked_ip(ip: &IpAddr) -> bool {
     }
 }
 
-const FFMPEG_PROTOCOL_WHITELIST: &str = "file,http,https,tcp,tls,rtsp,rtp,udp";
+pub(crate) const FFMPEG_PROTOCOL_WHITELIST: &str = "file,http,https,tcp,tls,rtsp,rtp,udp";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FramePacket {
@@ -465,7 +465,7 @@ fn parse_hex_u64_prefix(source: &str, offset: usize, len: usize) -> Result<u64, 
         .map_err(|err| format!("invalid checksum hex: {err}"))
 }
 
-fn parse_jpeg_stream_to_frames(
+pub(crate) fn parse_jpeg_stream_to_frames(
     raw: &[u8],
     max_frames: usize,
 ) -> Result<Vec<DecodedJpegFrame>, String> {
@@ -564,6 +564,86 @@ pub fn compute_semantic_frame_indices(
 
     indices.dedup();
     indices
+}
+
+/// Build an ffmpeg `select` filter expression for the given frame indices.
+///
+/// For `[12, 37, 74]` produces: `"select='eq(n\\,12)+eq(n\\,37)+eq(n\\,74)'"`
+/// Commas are escaped for ffmpeg's filter parser.
+pub fn build_select_expr(indices: &[u64]) -> String {
+    use std::fmt::Write;
+    if indices.is_empty() {
+        return "select='0'".to_string();
+    }
+    let mut expr = String::with_capacity(indices.len() * 16 + 12);
+    expr.push_str("select='");
+    for (i, &idx) in indices.iter().enumerate() {
+        if i > 0 {
+            expr.push('+');
+        }
+        // Escape the comma inside eq(n,X) for ffmpeg filter graph parsing
+        write!(expr, "eq(n\\,{idx})").unwrap();
+    }
+    expr.push('\'');
+    expr
+}
+
+/// Decode only the specified frame indices from the source as JPEG, using a
+/// single ffmpeg pass with a `select` filter. Frames are sampled at
+/// `sample_fps` first (matching the framemd5 pass), then the select filter
+/// picks only the requested indices from that resampled stream.
+///
+/// `frame_indices` must be sorted ascending. Returns frames in the same order,
+/// each stamped with its original resampled-stream index.
+pub fn decode_selective_jpeg_frames(
+    source: &InputSource,
+    sample_fps: f32,
+    frame_indices: &[u64],
+    max_frames: usize,
+) -> Result<Vec<DecodedJpegFrame>, String> {
+    if frame_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !sample_fps.is_finite() || sample_fps <= 0.0 {
+        return Err("sample_fps must be > 0".to_string());
+    }
+
+    let select_expr = build_select_expr(frame_indices);
+    let vf_chain = format!("fps={sample_fps:.3},{select_expr}");
+    let frames_cap = frame_indices.len().min(max_frames).to_string();
+
+    let source_uri = source.as_ffmpeg_input();
+    let output = Command::new("ffmpeg")
+        .args([
+            "-v", "error",
+            "-protocol_whitelist", FFMPEG_PROTOCOL_WHITELIST,
+            "-i", source_uri,
+            "-an", "-sn", "-dn",
+            "-vf", &vf_chain,
+            "-vsync", "vfr",
+            "-frames:v", &frames_cap,
+            "-f", "image2pipe",
+            "-vcodec", "mjpeg",
+            "-",
+        ])
+        .output()
+        .map_err(|err| format!("failed to run ffmpeg: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffmpeg selective jpeg decode failed: {}", stderr.trim()));
+    }
+
+    let mut parsed = parse_jpeg_stream_to_frames(&output.stdout, frame_indices.len())?;
+
+    // Re-stamp frame_index with the original resampled-stream index.
+    let usable = parsed.len().min(frame_indices.len());
+    parsed.truncate(usable);
+    for (frame, &original_idx) in parsed.iter_mut().zip(frame_indices.iter()) {
+        frame.frame_index = original_idx;
+    }
+
+    Ok(parsed)
 }
 
 #[cfg(test)]
