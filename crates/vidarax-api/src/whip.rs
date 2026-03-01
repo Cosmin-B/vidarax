@@ -17,11 +17,13 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use vidarax_core::webrtc::session::{WebRtcConfig, WebRtcSession};
+use serde::{Deserialize, Serialize};
+use vidarax_core::webrtc::session::WebRtcSession;
 
 use crate::state::AppState;
 
@@ -122,7 +124,7 @@ pub async fn whip_offer(
 
     // Create the rustrtc PeerConnection and negotiate the SDP answer.
     let (session, answer_sdp) =
-        match WebRtcSession::new(offer_sdp, &WebRtcConfig::default()).await {
+        match WebRtcSession::new(offer_sdp, state.webrtc_config()).await {
             Ok(pair) => pair,
             Err(e) => {
                 tracing::warn!("WHIP offer negotiation failed: {e}");
@@ -297,6 +299,61 @@ pub async fn whip_terminate(
             StatusCode::NOT_FOUND
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Prompt update handler
+// ---------------------------------------------------------------------------
+
+/// Request body for `PATCH /v1/stream/whip/{sess_id}/prompt`.
+#[derive(Debug, Deserialize)]
+pub struct UpdatePromptRequest {
+    pub prompt: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdatePromptResponse {
+    session_id: String,
+    prompt: String,
+}
+
+/// `PATCH /v1/stream/whip/{sess_id}/prompt`
+///
+/// Replaces the VLM analysis prompt for a running WebRTC session.
+/// The new prompt is used by analysis workers on the next keyframe decision.
+///
+/// Body: `{ "prompt": "new prompt text" }`
+///
+/// Response:
+/// - `200 OK` with `{ "session_id": "...", "prompt": "..." }`
+/// - `404 Not Found` — unknown session
+/// - `403 Forbidden` — caller is not the session owner
+#[tracing::instrument(name = "whip.update_prompt", skip_all, fields(sess_id))]
+pub async fn whip_update_prompt(
+    State(state): State<AppState>,
+    Path(sess_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<UpdatePromptRequest>,
+) -> Response {
+    let Some((owner_principal, session)) = state.get_session(&sess_id).await else {
+        tracing::debug!("WHIP update_prompt: unknown session {sess_id}");
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let caller = principal_key_from_headers(&headers);
+    if caller != owner_principal {
+        tracing::warn!("WHIP update_prompt sess={sess_id} principal mismatch");
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    session.update_prompt(body.prompt.clone());
+    tracing::info!("WHIP prompt updated sess_id={sess_id}");
+
+    Json(UpdatePromptResponse {
+        session_id: sess_id,
+        prompt: body.prompt,
+    })
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------

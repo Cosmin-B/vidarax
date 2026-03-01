@@ -10,7 +10,7 @@ use crate::handlers::{
 };
 use crate::security::enforce_security;
 use crate::state::AppState;
-use crate::whip::{whip_ice, whip_offer, whip_terminate};
+use crate::whip::{whip_ice, whip_offer, whip_terminate, whip_update_prompt};
 
 pub fn app_router(state: AppState) -> Router {
     let middleware_state = state.clone();
@@ -38,6 +38,10 @@ pub fn app_router(state: AppState) -> Router {
         .route(
             "/v1/stream/whip/{sess_id}",
             patch(whip_ice).delete(whip_terminate),
+        )
+        .route(
+            "/v1/stream/whip/{sess_id}/prompt",
+            patch(whip_update_prompt),
         )
         .with_state(state)
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
