@@ -5,5 +5,14 @@ version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# Enable training-data commands (distill status, distill train).
+# Pulls in rusqlite + zvec-bindings via vidarax-core/training.
+training = ["vidarax-core/training"]
+
 [dependencies]
 vidarax-contracts = { path = "../vidarax-contracts" }
+vidarax-core = { path = "../vidarax-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

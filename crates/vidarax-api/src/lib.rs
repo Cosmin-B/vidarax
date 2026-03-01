@@ -52,6 +52,7 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
         config.stream_ttl_secs,
         config.active_stream_limit,
         webrtc_config,
+        config.distillation.clone(),
     )
     .map_err(invalid_input)?;
     let app = app_router(state);
@@ -149,6 +150,7 @@ mod tests {
         TransportMode,
     };
     use vidarax_core::ingest::pipeline::PipelineBackend;
+    use vidarax_core::tiered_vlm::DistillationConfig;
     use crate::security::SecurityPolicy;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -1445,6 +1447,7 @@ mod tests {
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
             webrtc_max_output_tokens_per_second: 128,
+            distillation: DistillationConfig::default(),
         })
         .unwrap();
         let app = app_router(test_state_with_endpoints_and_policy(None, policy));
@@ -1496,6 +1499,7 @@ mod tests {
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
             webrtc_max_output_tokens_per_second: 128,
+            distillation: DistillationConfig::default(),
         })
         .unwrap();
         let app = app_router(test_state_with_endpoints_and_policy(None, policy));
@@ -1544,6 +1548,7 @@ mod tests {
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
             webrtc_max_output_tokens_per_second: 128,
+            distillation: DistillationConfig::default(),
         })
         .unwrap();
         let app = app_router(test_state_with_endpoints_and_policy(None, policy));
@@ -1596,6 +1601,7 @@ mod tests {
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
             webrtc_max_output_tokens_per_second: 128,
+            distillation: DistillationConfig::default(),
         })
         .unwrap();
         let app = app_router(test_state_with_endpoints_and_policy(None, policy));
@@ -1732,6 +1738,7 @@ mod tests {
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
             webrtc_max_output_tokens_per_second: 128,
+            distillation: DistillationConfig::default(),
         };
         assert!(infer_provider_endpoints(&config).is_err());
 
@@ -1767,6 +1774,7 @@ mod tests {
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
             webrtc_max_output_tokens_per_second: 128,
+            distillation: DistillationConfig::default(),
         };
         assert!(infer_provider_endpoints(&config).unwrap().is_some());
 
@@ -1827,6 +1835,7 @@ mod tests {
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
             webrtc_max_output_tokens_per_second: 128,
+            distillation: DistillationConfig::default(),
         };
 
         let server_task =
@@ -1955,6 +1964,7 @@ mod tests {
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
             webrtc_max_output_tokens_per_second: 128,
+            distillation: DistillationConfig::default(),
         };
 
         let server_task =

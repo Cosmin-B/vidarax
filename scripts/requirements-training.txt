@@ -1,0 +1,24 @@
+# Training framework
+axolotl[flash-attn]>=0.7
+
+# Core dependencies (installed by axolotl, pinned for reproducibility)
+torch>=2.4
+transformers>=4.57
+peft>=0.14
+accelerate>=1.2
+datasets>=3.0
+pillow>=11.0
+
+# Embedding server
+fastapi>=0.115
+uvicorn>=0.32
+
+# Export tools
+# llama.cpp (install separately: git clone + cmake build)
+
+# Optional: Apple Silicon training (uncomment on Mac)
+# mlx>=0.22
+# mlx-vlm>=0.1
+
+# Post-install: required for LFM2-VL compatibility
+# pip uninstall -y causal-conv1d

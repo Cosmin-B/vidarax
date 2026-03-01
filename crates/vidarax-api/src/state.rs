@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use serde_json::Value;
 use vidarax_contracts::lifecycle::StreamState;
 use vidarax_core::provider::ProviderEndpoints;
+use vidarax_core::tiered_vlm::DistillationConfig;
 use vidarax_core::timeline::{append_event, read_all_events, TimelineEvent};
 use vidarax_core::webrtc::session::WebRtcSession;
 
@@ -38,6 +39,7 @@ pub struct AppState {
     security_policy: Arc<SecurityPolicy>,
     inference_metrics: Arc<InferenceMetrics>,
     pipeline_metrics: Arc<PipelineMetrics>,
+    distillation_config: Arc<DistillationConfig>,
     run_registry: Arc<ArcSwap<RunRegistry>>,
     tenant_label_maps: Arc<TenantLabelMaps>,
     stream_ttl_secs: u64,
@@ -58,6 +60,7 @@ impl AppState {
         stream_ttl_secs: u64,
         active_stream_limit: usize,
         webrtc_config: WebRtcConfig,
+        distillation: DistillationConfig,
     ) -> Result<Self, String> {
         let existing_events = read_all_events(&wal_path).map_err(|err| err.to_string())?;
         let run_registry = Arc::new(ArcSwap::from(build_run_registry(&existing_events)));
@@ -86,6 +89,7 @@ impl AppState {
             security_policy: Arc::new(security_policy),
             inference_metrics: Arc::new(InferenceMetrics::new()),
             pipeline_metrics: Arc::new(PipelineMetrics::new()),
+            distillation_config: Arc::new(distillation),
             run_registry,
             tenant_label_maps,
             stream_ttl_secs,
@@ -107,6 +111,7 @@ impl AppState {
             security_policy: Arc::new(SecurityPolicy::from_config_for_tests()),
             inference_metrics: Arc::new(InferenceMetrics::new()),
             pipeline_metrics: Arc::new(PipelineMetrics::new()),
+            distillation_config: Arc::new(DistillationConfig::default()),
             run_registry: Arc::new(ArcSwap::from_pointee(RunRegistry::default())),
             tenant_label_maps: Arc::new(TenantLabelMaps::default()),
             stream_ttl_secs: 3600,
@@ -143,6 +148,7 @@ impl AppState {
             security_policy: Arc::new(security_policy),
             inference_metrics: Arc::new(InferenceMetrics::new()),
             pipeline_metrics: Arc::new(PipelineMetrics::new()),
+            distillation_config: Arc::new(DistillationConfig::default()),
             run_registry: Arc::new(ArcSwap::from_pointee(RunRegistry::default())),
             tenant_label_maps: Arc::new(TenantLabelMaps::default()),
             stream_ttl_secs: 3600,
@@ -170,6 +176,7 @@ impl AppState {
             security_policy: Arc::new(security_policy),
             inference_metrics: Arc::new(InferenceMetrics::new()),
             pipeline_metrics: Arc::new(PipelineMetrics::new()),
+            distillation_config: Arc::new(DistillationConfig::default()),
             run_registry: Arc::new(ArcSwap::from_pointee(RunRegistry::default())),
             tenant_label_maps: Arc::new(TenantLabelMaps::default()),
             stream_ttl_secs: stream_ttl_secs.max(1),
@@ -367,6 +374,10 @@ impl AppState {
     /// Return the WebRTC configuration (STUN/TURN servers, token rate limit).
     pub fn webrtc_config(&self) -> &WebRtcConfig {
         &self.webrtc_config
+    }
+
+    pub fn distillation_config(&self) -> &DistillationConfig {
+        self.distillation_config.as_ref()
     }
 
     pub fn map_event_label(&self, tenant_id: Option<&str>, label: &str) -> LabelMapResult {

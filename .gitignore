@@ -15,3 +15,5 @@
 *.log
 *.sqlite
 .worktrees/
+crates/vendor/zvec/
+scripts/__pycache__/

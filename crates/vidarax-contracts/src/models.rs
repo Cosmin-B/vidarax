@@ -5,6 +5,8 @@ pub const REQUIRED_SMALL_MODELS: &[&str] = &[
     "OpenGVLab/InternVL3_5-4B",
     "Qwen/Qwen3-VL-2B-Instruct",
     "openbmb/MiniCPM-V-4_5",
+    "LiquidAI/LFM2-VL-450M",
+    "LiquidAI/LFM2.5-VL-1.6B",
 ];
 
 pub const REQUIRED_MODELS: &[&str] = &[
@@ -14,6 +16,8 @@ pub const REQUIRED_MODELS: &[&str] = &[
     "OpenGVLab/InternVL3_5-4B",
     "Qwen/Qwen3-VL-2B-Instruct",
     "openbmb/MiniCPM-V-4_5",
+    "LiquidAI/LFM2-VL-450M",
+    "LiquidAI/LFM2.5-VL-1.6B",
 ];
 
 pub fn normalize_model_id(input: &str) -> Option<&'static str> {
@@ -24,6 +28,8 @@ pub fn normalize_model_id(input: &str) -> Option<&'static str> {
         "opengvlab/internvl3_5-4b" | "opengvlab/internvl3.5-4b" => Some("OpenGVLab/InternVL3_5-4B"),
         "qwen/qwen3-vl-2b-instruct" => Some("Qwen/Qwen3-VL-2B-Instruct"),
         "openbmb/minicpm-v-4_5" | "openbmb/minicpm-v-4.5" => Some("openbmb/MiniCPM-V-4_5"),
+        "liquidai/lfm2-vl-450m" => Some("LiquidAI/LFM2-VL-450M"),
+        "liquidai/lfm2.5-vl-1.6b" => Some("LiquidAI/LFM2.5-VL-1.6B"),
         _ => None,
     }
 }

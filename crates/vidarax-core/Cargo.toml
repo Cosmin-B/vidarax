@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+libc = "0.2"
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 serde = { version = "1", features = ["derive"] }
+zvec-bindings = { version = "0.2", features = ["sync"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 serde_json = "1"
 vidarax-contracts = { path = "../vidarax-contracts" }
 openh264 = "0.9"
@@ -20,6 +23,7 @@ tokio = { version = "1", features = ["rt", "time"] }
 # initialisation). rustrtc itself is now a required dep.
 # Enable with: cargo run --example rustrtc_spike --features rustrtc-spike
 rustrtc-spike = ["dep:tracing-subscriber"]
+training = ["dep:zvec-bindings", "dep:rusqlite"]
 
 # rustrtc: pure-Rust WebRTC transport (session.rs).
 # rustls: TLS crypto provider — caller must call

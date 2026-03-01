@@ -39,7 +39,7 @@ fn base_request() -> InferenceRequest {
         temperature: 0.0,
         timeout_ms: 1_000,
         allow_fallback: false,
-        output_schema: None,
+        guided_json: None,
     }
 }
 
@@ -115,6 +115,10 @@ fn make_stream_frame(seq: u64, pts_ms: u64) -> StreamFrame {
 }
 
 // ── 1. Structured output schema in payload ────────────────────────────────────
+//
+// The field `guided_json: Option<String>` carries the schema as a JSON string.
+// The provider serializes it into `response_format.json_schema.schema` for
+// vLLM ≥0.15 constrained-decoding compatibility.
 
 #[test]
 fn output_schema_adds_guided_json_to_payload() {
@@ -130,14 +134,15 @@ fn output_schema_adds_guided_json_to_payload() {
     let (transport, captured) = MockTransport::capturing(&completion_json("ok"));
     let provider = VllmProvider::new(transport);
     let mut req = base_request();
-    req.output_schema = Some(schema);
+    req.guided_json = Some(schema.to_string());
 
     provider.infer(&req).unwrap();
 
     let raw = captured.lock().unwrap().clone().expect("body captured");
     let value: Value = serde_json::from_str(&raw).unwrap();
-    let guided = &value["extra_body"]["guided_json"];
-    assert_eq!(guided["type"].as_str(), Some("object"), "guided_json.type should be object");
+    // Provider writes the schema under response_format.json_schema.schema.
+    let guided = &value["response_format"]["json_schema"]["schema"];
+    assert_eq!(guided["type"].as_str(), Some("object"), "schema.type should be object");
     assert!(
         guided["properties"]["event_type"].is_object(),
         "event_type property should be present"
@@ -149,7 +154,7 @@ fn output_schema_adds_guided_json_to_payload() {
 }
 
 #[test]
-fn no_output_schema_omits_extra_body_from_payload() {
+fn no_output_schema_omits_response_format_from_payload() {
     let (transport, captured) = MockTransport::capturing(&completion_json("ok"));
     let provider = VllmProvider::new(transport);
 
@@ -158,8 +163,8 @@ fn no_output_schema_omits_extra_body_from_payload() {
     let raw = captured.lock().unwrap().clone().expect("body captured");
     let value: Value = serde_json::from_str(&raw).unwrap();
     assert!(
-        value.get("extra_body").is_none(),
-        "extra_body must be absent when output_schema is None"
+        value.get("response_format").is_none(),
+        "response_format must be absent when guided_json is None"
     );
 }
 
@@ -169,13 +174,13 @@ fn output_schema_is_forwarded_verbatim_to_payload() {
     let (transport, captured) = MockTransport::capturing(&completion_json("ok"));
     let provider = SglangProvider::new(transport);
     let mut req = base_request();
-    req.output_schema = Some(schema.clone());
+    req.guided_json = Some(schema.to_string());
 
     provider.infer(&req).unwrap();
 
     let raw = captured.lock().unwrap().clone().expect("body captured");
     let value: Value = serde_json::from_str(&raw).unwrap();
-    assert_eq!(value["extra_body"]["guided_json"], schema);
+    assert_eq!(value["response_format"]["json_schema"]["schema"], schema);
 }
 
 #[test]
@@ -196,13 +201,13 @@ fn output_schema_with_nested_properties_round_trips() {
     let (transport, captured) = MockTransport::capturing(&completion_json("ok"));
     let provider = VllmProvider::new(transport);
     let mut req = base_request();
-    req.output_schema = Some(schema.clone());
+    req.guided_json = Some(schema.to_string());
 
     provider.infer(&req).unwrap();
 
     let raw = captured.lock().unwrap().clone().expect("body captured");
     let value: Value = serde_json::from_str(&raw).unwrap();
-    let guided = &value["extra_body"]["guided_json"];
+    let guided = &value["response_format"]["json_schema"]["schema"];
     assert_eq!(guided["properties"]["scene"]["type"].as_str(), Some("object"));
 }
 

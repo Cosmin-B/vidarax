@@ -342,7 +342,7 @@ pub fn spawn_clip_vlm_workers<I>(
                         temperature: 0.0,
                         timeout_ms: 15_000,
                         allow_fallback: true,
-                        output_schema: None,
+                        guided_json: None,
                     };
 
                     let (description, used_second_pass) = match provider.infer(&first_request) {
@@ -357,7 +357,7 @@ pub fn spawn_clip_vlm_workers<I>(
                                     temperature: 0.0,
                                     timeout_ms: 20_000,
                                     allow_fallback: true,
-                                    output_schema: None,
+                                    guided_json: None,
                                 };
                                 match provider.infer(&second_request) {
                                     Ok(second) => (second.output_text, true),

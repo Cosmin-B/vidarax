@@ -4,6 +4,7 @@ use reqwest::StatusCode;
 use serde_json::Value;
 use vidarax_api::{run, ServerConfig, TransportMode};
 use vidarax_core::ingest::pipeline::PipelineBackend;
+use vidarax_core::tiered_vlm::DistillationConfig;
 
 #[tokio::test]
 async fn staging_live_provider_e2e_opt_in() {
@@ -46,6 +47,7 @@ async fn staging_live_provider_e2e_opt_in() {
         webrtc_turn_username: None,
         webrtc_turn_credential: None,
         webrtc_max_output_tokens_per_second: 128,
+        distillation: DistillationConfig::default(),
     };
 
     let server_task = tokio::spawn(async move { run(config).await.map_err(|e| e.to_string()) });

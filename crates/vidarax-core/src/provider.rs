@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
 use serde_json::Value;
 use vidarax_contracts::errors::classify_status_code;
 use vidarax_contracts::models::normalize_model_id;
@@ -21,7 +20,44 @@ pub struct InferenceRequest {
     pub temperature: f32,
     pub timeout_ms: u64,
     pub allow_fallback: bool,
-    pub output_schema: Option<Value>,
+    /// Optional JSON schema string for constrained decoding.
+    /// Sent as `response_format.json_schema` for vLLM ≥0.15 compatibility.
+    pub guided_json: Option<String>,
+}
+
+/// Structured label emitted by the teacher VLM.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct TeacherLabel {
+    pub event_type: String,
+    pub confidence: f32,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub reasoning: Option<String>,
+}
+
+/// JSON schema string for constrained teacher-label decoding.
+///
+/// Pass this as `guided_json` in an [`InferenceRequest`] to force vLLM/SGLang
+/// to emit a valid [`TeacherLabel`] object.
+pub fn teacher_label_schema() -> &'static str {
+    r#"{
+  "type": "object",
+  "properties": {
+    "event_type":   { "type": "string" },
+    "confidence":   { "type": "number", "minimum": 0, "maximum": 1 },
+    "description":  { "type": "string" },
+    "reasoning":    { "type": "string" }
+  },
+  "required": ["event_type", "confidence"]
+}"#
+}
+
+/// Parse a [`TeacherLabel`] from raw VLM output text.
+///
+/// Returns `None` if the text is not valid JSON or does not match the schema.
+pub fn parse_teacher_label(text: &str) -> Option<TeacherLabel> {
+    serde_json::from_str(text).ok()
 }
 
 #[derive(Debug, Clone)]
@@ -270,73 +306,49 @@ fn canonical_model(model: &str) -> Result<&'static str, ProviderError> {
     normalize_model_id(model).ok_or_else(|| ProviderError::UnsupportedModel(model.to_string()))
 }
 
-// ─── Payload serialization types ─────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct ChatPayload<'a> {
-    model: &'a str,
-    messages: [ChatMessage<'a>; 1],
-    max_tokens: u32,
-    temperature: f32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    extra_body: Option<ExtraBody<'a>>,
-}
-
-#[derive(Serialize)]
-struct ChatMessage<'a> {
-    role: &'static str,
-    content: UserContent<'a>,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum UserContent<'a> {
-    Text(&'a str),
-    Parts(Vec<ContentPart<'a>>),
-}
-
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ContentPart<'a> {
-    Text { text: &'a str },
-    ImageUrl { image_url: ImageUrlField },
-}
-
-#[derive(Serialize)]
-struct ImageUrlField {
-    url: String,
-}
-
-#[derive(Serialize)]
-struct ExtraBody<'a> {
-    guided_json: &'a Value,
-}
-
 fn build_payload(model: &str, request: &InferenceRequest) -> String {
-    let content = if request.input_images.is_empty() {
-        UserContent::Text(&request.prompt)
+    let user_content = if request.input_images.is_empty() {
+        Value::String(request.prompt.clone())
     } else {
-        let mut parts = Vec::with_capacity(request.input_images.len() + 1);
-        parts.push(ContentPart::Text { text: &request.prompt });
+        let mut content = Vec::with_capacity(request.input_images.len() + 1);
+        content.push(serde_json::json!({
+            "type": "text",
+            "text": request.prompt
+        }));
         for image in &request.input_images {
-            parts.push(ContentPart::ImageUrl {
-                image_url: ImageUrlField {
-                    url: format!("data:{};base64,{}", image.media_type, image.data_base64),
-                },
-            });
+            content.push(serde_json::json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{}", image.media_type, image.data_base64)
+                }
+            }));
         }
-        UserContent::Parts(parts)
+        Value::Array(content)
     };
-
-    let payload = ChatPayload {
-        model,
-        messages: [ChatMessage { role: "user", content }],
-        max_tokens: request.max_tokens,
-        temperature: request.temperature,
-        extra_body: request.output_schema.as_ref().map(|s| ExtraBody { guided_json: s }),
-    };
-
-    serde_json::to_string(&payload).expect("payload serialization is infallible")
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": user_content}],
+        "max_tokens": request.max_tokens,
+        "temperature": request.temperature
+    });
+    if let Some(schema) = &request.guided_json {
+        // vLLM ≥0.15 requires response_format (not extra_body.guided_json)
+        let parsed = match serde_json::from_str::<Value>(schema) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "guided_json schema is invalid JSON, sending unconstrained");
+                Value::Null
+            }
+        };
+        body["response_format"] = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "teacher_label",
+                "schema": parsed
+            }
+        });
+    }
+    body.to_string()
 }
 
 #[derive(serde::Deserialize)]
@@ -466,7 +478,7 @@ mod tests {
             temperature: 0.0,
             timeout_ms: 500,
             allow_fallback: true,
-            output_schema: None,
+            guided_json: None,
         }
     }
 
@@ -561,16 +573,13 @@ mod tests {
     }
 
     #[test]
-    fn payload_includes_guided_json_when_output_schema_set() {
+    fn payload_includes_guided_json_when_set() {
         let mut req = request();
-        req.output_schema = Some(serde_json::json!({
-            "type": "object",
-            "properties": {"event_type": {"type": "string"}}
-        }));
+        req.guided_json = Some(r#"{"type":"object","properties":{"event_type":{"type":"string"}}}"#.to_string());
         let body = build_payload("openbmb/MiniCPM-V-4_5", &req);
         let value: Value = serde_json::from_str(&body).unwrap();
-        let guided = &value["extra_body"]["guided_json"];
-        assert_eq!(guided["type"].as_str(), Some("object"));
+        let schema = &value["response_format"]["json_schema"]["schema"];
+        assert_eq!(schema["type"].as_str(), Some("object"));
     }
 
     #[test]

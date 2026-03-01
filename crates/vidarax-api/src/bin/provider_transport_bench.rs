@@ -41,7 +41,7 @@ async fn main() {
         temperature: 0.0,
         timeout_ms: 10_000,
         allow_fallback: true,
-        output_schema: None,
+        guided_json: None,
     };
 
     let requests = 200usize;
