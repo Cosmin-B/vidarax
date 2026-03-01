@@ -32,6 +32,7 @@ use crate::gate::{GateConfig, GateEventType};
 use crate::loop_detector::LoopDetector;
 use crate::pipeline::{TwoPassConfig, TwoPassPipeline};
 use crate::provider::{InferenceImage, InferenceProvider, InferenceRequest};
+use crate::tiered_vlm::TieredVlmConfig;
 use crate::webrtc::decode::{Decoder, DecoderConfig};
 use crate::webrtc::session::RtpFrame;
 use crate::webrtc::signals::{yuv_to_frame_signal, yuv_to_jpeg};
@@ -101,6 +102,8 @@ pub struct KeyframeWork {
     pub confidence: f32,
     /// Base64-encoded JPEG thumbnail for VLM input.
     pub jpeg_b64: String,
+    /// Semantic prompt to pass to the VLM.
+    pub prompt: String,
 }
 
 // ─── Decode workers ───────────────────────────────────────────────────────────
@@ -260,6 +263,7 @@ pub fn spawn_analysis_workers(
                             event_type: event_type.to_string(),
                             confidence: meta.confidence,
                             jpeg_b64,
+                            prompt: String::new(),
                         };
 
                         // Non-blocking: drop if VLM queue is full to avoid
@@ -274,13 +278,17 @@ pub fn spawn_analysis_workers(
 
 // ─── VLM workers ──────────────────────────────────────────────────────────────
 
-/// Spawn `n` VLM inference worker threads.
+/// Spawn `n` VLM inference worker threads with optional tiered routing.
+///
+/// When `config.is_tiered()`, workers call the first-pass model first, then
+/// re-infer with the second-pass model if confidence is below threshold.
 ///
 /// Each thread:
 /// 1. Pulls [`KeyframeWork`] from the shared `vlm_rx` channel.
-/// 2. Calls `provider.infer()` with the base64 JPEG as input.
-/// 3. Emits a `vlm` agent event to SpacetimeDB.
-/// 4. Stores the keyframe (JPEG + description) in SpacetimeDB.
+/// 2. Calls `provider.infer()` with the first-pass model.
+/// 3. If tiered and confidence is low, re-infers with the second-pass model.
+/// 4. Emits a `vlm` or `vlm_tiered` agent event to SpacetimeDB.
+/// 5. Stores the keyframe (JPEG + description) in SpacetimeDB.
 ///
 /// VLM inference errors are logged as the description text rather than
 /// crashing the worker, so a transient provider failure does not interrupt
@@ -290,6 +298,7 @@ pub fn spawn_vlm_workers<I>(
     vlm_rx: kanal::Receiver<KeyframeWork>,
     provider: Arc<I>,
     stdb: Arc<dyn EventSink>,
+    config: TieredVlmConfig,
 ) where
     I: InferenceProvider + 'static,
 {
@@ -297,15 +306,22 @@ pub fn spawn_vlm_workers<I>(
         let vlm_rx = vlm_rx.clone();
         let provider = Arc::clone(&provider);
         let stdb = Arc::clone(&stdb);
+        let config = config.clone();
 
         std::thread::Builder::new()
             .name(format!("vx-vlm-{i}"))
             .spawn(move || {
                 while let Ok(work) = vlm_rx.recv() {
-                    let request = InferenceRequest {
-                        model: "openbmb/MiniCPM-V-4.5".to_string(),
-                        prompt: "Briefly describe what is happening in this video frame."
-                            .to_string(),
+                    let prompt = if work.prompt.is_empty() {
+                        "Briefly describe what is happening in this video frame.".to_string()
+                    } else {
+                        work.prompt.clone()
+                    };
+
+                    // First pass (fast model)
+                    let first_request = InferenceRequest {
+                        model: config.first_pass_model.clone(),
+                        prompt: prompt.clone(),
                         input_images: vec![InferenceImage {
                             media_type: "image/jpeg".to_string(),
                             data_base64: work.jpeg_b64.clone(),
@@ -316,23 +332,42 @@ pub fn spawn_vlm_workers<I>(
                         allow_fallback: true,
                     };
 
-                    let description = match provider.infer(&request) {
-                        Ok(result) => result.output_text,
-                        Err(err) => format!("vlm_error: {err:?}"),
+                    let (description, used_second_pass) = match provider.infer(&first_request) {
+                        Ok(result) => {
+                            let first_conf = parse_confidence_from_output(&result.output_text);
+                            if config.needs_second_pass(first_conf) {
+                                // Second pass (accurate model)
+                                let second_request = InferenceRequest {
+                                    model: config.second_pass_model.clone(),
+                                    prompt,
+                                    input_images: first_request.input_images,
+                                    max_tokens: config.second_pass_max_tokens,
+                                    temperature: 0.0,
+                                    timeout_ms: 10_000,
+                                    allow_fallback: true,
+                                };
+                                match provider.infer(&second_request) {
+                                    Ok(second) => (second.output_text, true),
+                                    Err(_) => (result.output_text, false), // fallback to first
+                                }
+                            } else {
+                                (result.output_text, false)
+                            }
+                        }
+                        Err(err) => (format!("vlm_error: {err:?}"), false),
                     };
 
-                    // Emit the VLM-annotated agent event.
+                    let event_type = if used_second_pass { "vlm_tiered" } else { "vlm" };
+
                     let _ = stdb.emit_event_sync(
                         &work.run_id,
                         &work.session_id,
                         work.frame_index,
                         work.pts_ms,
-                        "vlm",
+                        event_type,
                         work.confidence,
                         &description,
                     );
-
-                    // Persist the keyframe with its thumbnail and description.
                     let _ = stdb.store_keyframe_sync(
                         &work.run_id,
                         work.frame_index,
@@ -345,6 +380,20 @@ pub fn spawn_vlm_workers<I>(
             })
             .expect("vlm thread spawn failed");
     }
+}
+
+/// Try to extract a confidence float from VLM JSON output.
+///
+/// Looks for `"confidence": 0.XX` in JSON output, or falls back to `0.5`
+/// (which triggers a second pass at the default threshold of 0.7).
+fn parse_confidence_from_output(text: &str) -> f32 {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
+        if let Some(conf) = val.get("confidence").and_then(|v| v.as_f64()) {
+            return conf as f32;
+        }
+    }
+    // Default: assume low confidence to trigger second pass when tiered.
+    0.5
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -429,6 +478,7 @@ mod tests {
             event_type: "scene_cut".into(),
             confidence: 0.9,
             jpeg_b64: "YWJj".into(),
+            prompt: String::new(),
         };
         let _ = kw.clone();
         let _ = format!("{:?}", kw);
