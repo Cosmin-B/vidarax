@@ -1,103 +1,131 @@
 # vidarax
 
-Vidarax is a low-latency video interpretation framework.
-The point is simple: deterministic outputs, strict validation, and enough observability to trust it in production.
+Real-time video intelligence engine -- any stream in, semantic events out.
 
-## What we are focused on right now
+## What it does
 
-- Ship a strong v1 that covers practical video interpretation workflows.
-- Keep model support explicit for the requested medium/small VLM set.
-- Hold a high reliability bar: validation, retries, idempotency, traceability, and frame-level metadata.
+- **Deterministic frame analysis**: Scene cuts, artifacts, motion markers at O(1) per frame via a lock-free gate engine. No ML needed for pass one.
+- **Tiered VLM reasoning**: First pass with Qwen 2B in ~200ms. If confidence is low, second pass with 8B. Intelligent routing between your streams and your models.
+- **Observable end to end**: WAL-backed run lifecycle, per-provider latency histograms, structured tracing with OpenTelemetry export. Every frame is traceable from ingest to event.
 
-## Main reference docs
+## Architecture
 
-- `docs/v1-world-class-support-spec.md`
-- `docs/lockfree-queue-topology.md`
-- `docs/memory-allocation-strategy.md`
-- `docs/deterministic-gate-engine.md`
-- `docs/provider-routing.md`
-- `docs/provider-transport-decision.md`
-- `docs/processing-modes.md`
-- `docs/api-surface.md`
-- `docs/api-architecture.md`
-- `docs/deployment.md`
-- `docs/ops-runbook.md`
-- `docs/inference-observability-slo.md`
-- `docs/wal-dual-write.md`
-- `docs/victoria-correlation.md`
-- `docs/release-gates.md`
-- `schemas/processing-config.schema.json`
-- `schemas/frame-metadata.schema.json`
+```
+                         vidarax
+  ┌─────────┐    ┌──────────────────────────┐    ┌──────────┐
+  │ Sources  │    │                          │    │ Clients  │
+  │          │───>│  WebRTC ─> Decode ─>     │    │          │
+  │ WebRTC   │    │              │           │    │ Vue 3 UI │
+  │ MP4      │    │         Gate Engine      │    │ REST API │
+  │ Upload   │    │          │       │       │───>│ SSE      │
+  │          │    │     Markers    VLM       │    │          │
+  │          │    │          │       │       │    │          │
+  │          │    │      SpacetimeDB         │    │          │
+  └─────────┘    └──────────────────────────┘    └──────────┘
+```
+
+## Performance
+
+Tested on Hetzner (Qwen3-VL-2B + 8B tiered):
+
+- **1.5s** wall time for a 10-second video (6.7x real-time)
+- **242 frames** decoded at 24fps
+- **20 markers** emitted (scene cuts, keyframes, artifacts)
+- Gate processing: **42ns p95** per frame, zero allocations
+- API workflow (create + ingest + analyze + query): **2.99ms p95**
+
+## Tech stack
+
+Rust | Vue 3 | SpacetimeDB | vLLM | WebRTC (WHIP)
+
+## Quick start
+
+```bash
+git clone https://github.com/vidarax/vidarax && cd vidarax
+cargo build --release -p vidarax-api
+VIDARAX_VLLM_BASE_URL=http://localhost:8000 cargo run --release -p vidarax-api
+```
+
+Frontend (separate terminal):
+
+```bash
+cd ui && npm install && npm run dev
+```
+
+## API endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/runs` | Create a new run |
+| `GET` | `/v1/runs` | List runs |
+| `GET` | `/v1/runs/:run_id` | Get run details |
+| `DELETE` | `/v1/runs/:run_id` | Delete a run |
+| `POST` | `/v1/runs/:run_id/ingest` | Ingest video (MP4 URI or raw frames) |
+| `POST` | `/v1/runs/:run_id/analyze` | Run deterministic frame analysis |
+| `POST` | `/v1/runs/:run_id/reason` | Realtime semantic reasoning (tiered VLM) |
+| `POST` | `/v1/runs/:run_id/stop` | Stop a run |
+| `POST` | `/v1/runs/:run_id/keepalive` | Refresh run TTL |
+| `GET` | `/v1/runs/:run_id/events` | Get run events |
+| `GET` | `/v1/runs/:run_id/markers` | Get markers (filterable by status/type/frame range) |
+| `GET` | `/v1/runs/:run_id/state` | Derive current run state |
+| `POST` | `/v1/runs/:run_id/feedback` | Submit feedback on a run |
+| `GET` | `/v1/feedback` | List all feedback |
+| `POST` | `/v1/upload` | Upload a file for processing |
+| `POST` | `/v1/query` | Query events across runs |
+| `POST` | `/v1/infer` | Single inference request |
+| `POST` | `/v1/infer/batch` | Batch inference (bounded parallelism) |
+| `GET` | `/v1/models` | Model catalog with availability status |
+| `GET` | `/v1/health` | Health check |
+| `GET` | `/v1/metrics` | Prometheus-compatible metrics |
+| `POST` | `/v1/stream/whip` | WHIP WebRTC offer (RFC 9725) |
+| `PATCH` | `/v1/stream/whip/:sess_id` | ICE trickle candidate |
+| `DELETE` | `/v1/stream/whip/:sess_id` | Terminate WebRTC session |
+| `PATCH` | `/v1/stream/whip/:sess_id/prompt` | Update live stream prompt |
+
+## Frontend pages
+
+| Page | Path | Description |
+|------|------|-------------|
+| Dashboard | `/` | Command center -- active runs, metrics overview |
+| Stream | `/stream` | Live WebRTC stream viewer and control |
+| Active Stream | `/stream/:sessionId` | Single stream session view |
+| Run Detail | `/runs/:runId` | Frame-by-frame markers, keyframes, VLM descriptions |
+| Upload | `/upload` | Upload video files for processing |
+| Tracing | `/tracing` | Pipeline flow visualization and observability |
+| Settings | `/settings` | Model selector, tiered routing config |
+
+## Configuration
+
+Key environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VIDARAX_VLLM_BASE_URL` | -- | vLLM inference endpoint |
+| `VIDARAX_SGLANG_BASE_URL` | -- | SGLang inference endpoint (fallback) |
+| `VIDARAX_BIND_ADDR` | `127.0.0.1:8080` | HTTP bind address |
+| `VIDARAX_REQUIRE_API_KEY` | `true` | Require `x-api-key` header |
+| `VIDARAX_TRANSPORT` | `h1h2` | Transport mode (`h1h2` or `h3`) |
+| `VIDARAX_DATA_DIR` | `.vidarax-data` | WAL and runtime data directory |
+| `VIDARAX_ACTIVE_STREAM_LIMIT` | `5` | Max concurrent runs per principal |
+| `VIDARAX_STREAM_TTL_SECS` | `3600` | Run idle TTL |
+
+See the full list in the [deployment docs](docs/deployment.md).
 
 ## Workspace layout
 
-- `crates/vidarax-core`
-  Lock-free primitives and memory foundations.
-- `crates/vidarax-contracts`
-  Shared contracts for models, lifecycle behavior, and error mapping.
-- `crates/vidarax-cli`
-  Small CLI entrypoint used for contract checks and tooling.
-- `crates/vidarax-api`
-  h1/h2 and h3 server, WAL-backed run lifecycle, and external provider inference.
+```
+crates/
+  vidarax-core/       Lock-free primitives, gate engine, ingest pipeline
+  vidarax-contracts/  Shared model contracts and error mapping
+  vidarax-api/        Axum HTTP server, handlers, WHIP, security middleware
+  vidarax-cli/        CLI tooling for contract checks
+ui/                   Vue 3 frontend
+spacetime-module/     SpacetimeDB server module
+docs/                 Architecture docs, runbooks, specs
+deploy/               Docker, compose, certificates
+scripts/              Benchmarks, smoke tests, release gates
+```
 
-## Validation and release gates
+## License
 
-- Replay + schema checks:
-  `./scripts/validate_replay_and_schema.sh`
-- Contention + allocation probe:
-  `./scripts/bench_regression.sh`
-- Provider transport benchmark + decision write-up:
-  `./scripts/bench_provider_transport.sh`
-- Full release gate run:
-  `./scripts/release_gates.sh`
-- CI definition:
-  `.github/workflows/ci.yml`
-- End-to-end smoke test:
-  `./scripts/smoke_v1.sh`
-- MP4 ingest/decode/analyze smoke test:
-  `./scripts/smoke_mp4_pipeline.sh`
-- Model artifact provisioning:
-  `./scripts/provision_models.sh`
-
-## Transport modes
-
-- Default h1/h2:
-  `VIDARAX_TRANSPORT=h1h2 cargo run -p vidarax-api --bin vidarax-api`
-- HTTP/3:
-  `VIDARAX_TRANSPORT=h3 cargo run -p vidarax-api --bin vidarax-api --features h3-experimental`
-- HTTP/3 TLS files:
-  - `VIDARAX_H3_TLS_CERT_PATH` (default `deploy/certs/dev.crt`)
-  - `VIDARAX_H3_TLS_KEY_PATH` (default `deploy/certs/dev.key`)
-  - Generate local dev files with: `make dev-cert`
-- External inference endpoints:
-  - `VIDARAX_VLLM_BASE_URL`
-  - `VIDARAX_SGLANG_BASE_URL`
-  - must be `https://` for non-loopback hosts; `http://127.0.0.1` / `http://localhost` allowed for local testing
-- Ingest file-root allowlist:
-  - `VIDARAX_INGEST_FILE_ROOTS` (comma-separated absolute roots; default `cwd` + system temp dir)
-- Optional security controls:
-  - `VIDARAX_REQUIRE_API_KEY` (default `true`)
-  - `VIDARAX_API_KEYS`
-  - `VIDARAX_REQUIRE_TENANT_ID`
-  - `VIDARAX_RATE_LIMIT_GLOBAL_RPS`
-  - `VIDARAX_RATE_LIMIT_TENANT_RPS`
-  - `VIDARAX_RATE_LIMIT_TENANT_SLOTS`
-  - `VIDARAX_STREAM_TTL_SECS`
-  - `VIDARAX_ACTIVE_STREAM_LIMIT`
-
-## Runtime data
-
-- Event WAL location:
-  `VIDARAX_DATA_DIR/timeline.wal`
-- Default data directory:
-  `.vidarax-data`
-
-## Local deployment
-
-- Build API image:
-  `docker build -f deploy/Dockerfile.api -t vidarax-api:local .`
-- Start local stack (API + Victoria services):
-  `docker compose -f deploy/docker-compose.local.yml up --build`
-- Local runtime defaults bind to loopback:
-  - `VIDARAX_BIND_ADDR=127.0.0.1:8080`
-  - `VIDARAX_H3_BIND_ADDR=127.0.0.1:8443`
+MIT
