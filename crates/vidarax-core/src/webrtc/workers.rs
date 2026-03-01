@@ -96,8 +96,10 @@ pub struct StreamFrame {
 /// Work item forwarded to VLM workers when a keyframe is decided upon.
 #[derive(Debug, Clone)]
 pub struct KeyframeWork {
-    pub run_id: String,
-    pub session_id: String,
+    /// Session run identifier — shared via `Arc<str>` so cloning is pointer-width.
+    pub run_id: Arc<str>,
+    /// Session identifier — shared via `Arc<str>` so cloning is pointer-width.
+    pub session_id: Arc<str>,
     pub frame_index: u64,
     pub pts_ms: u64,
     /// Gate reason code: `"scene_cut"` | `"periodic_keepalive"` | `"initial_frame"`.
@@ -210,8 +212,8 @@ pub fn spawn_analysis_workers(
     vlm_tx: kanal::Sender<KeyframeWork>,
     clip_tx: Option<kanal::Sender<StreamFrame>>,
     stdb: Arc<dyn EventSink>,
-    run_id: String,
-    session_id: String,
+    run_id: Arc<str>,
+    session_id: Arc<str>,
     metrics: Arc<PipelineMetrics>,
     session_span: tracing::Span,
 ) {
@@ -220,8 +222,8 @@ pub fn spawn_analysis_workers(
         let vlm_tx = vlm_tx.clone();
         let clip_tx = clip_tx.clone();
         let stdb = Arc::clone(&stdb);
-        let run_id = run_id.clone();
-        let session_id = session_id.clone();
+        let run_id = Arc::clone(&run_id);
+        let session_id = Arc::clone(&session_id);
         let metrics = Arc::clone(&metrics);
         let session_span = session_span.clone();
 
@@ -276,8 +278,8 @@ pub fn spawn_analysis_workers(
                             };
 
                             let work = KeyframeWork {
-                                run_id: run_id.clone(),
-                                session_id: session_id.clone(),
+                                run_id: Arc::clone(&run_id),
+                                session_id: Arc::clone(&session_id),
                                 frame_index: sf.signal.frame_index,
                                 pts_ms: sf.pts_ms,
                                 event_type: event_type.to_string(),
@@ -343,8 +345,9 @@ pub fn spawn_vlm_workers<I>(
             .name(format!("vx-vlm-{i}"))
             .spawn(move || {
                 // Per-session token budget: (window_start, tokens_emitted_in_window).
+                // Key is Arc<str>: clone is pointer-width; Hash/Eq compare string content.
                 let mut token_budget: std::collections::HashMap<
-                    String,
+                    Arc<str>,
                     (std::time::Instant, u32),
                 > = std::collections::HashMap::new();
 
@@ -419,7 +422,7 @@ pub fn spawn_vlm_workers<I>(
                     // Approximate: 4 bytes per token (UTF-8 average).
                     if max_output_tokens_per_second > 0 {
                         let token_count = (description.len() / 4).max(1) as u32;
-                        if let Some(entry) = token_budget.get_mut(&work.session_id) {
+                        if let Some(entry) = token_budget.get_mut(work.session_id.as_ref()) {
                             entry.1 = entry.1.saturating_add(token_count);
                         }
                     }
