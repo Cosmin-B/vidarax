@@ -84,24 +84,28 @@ pub fn yuv_to_frame_signal(
     let y = &yuv.y;
     let w = yuv.width;
     let h = yuv.height;
-    let pixel_count = y.len() as f64;
 
-    // Luma mean normalised to [0, 1].
-    let luma_sum: u64 = y.iter().map(|&b| b as u64).sum();
-    let luma_mean = (luma_sum as f64 / pixel_count / 255.0) as f32;
+    // Single-pass luma mean + variance via E[X²] - E[X]² with 4× subsampling.
+    // Subsampling every 4th pixel cuts work 4× while converging to the same
+    // statistics for typical video frames.
+    let stride = 4;
+    let mut sum = 0u64;
+    let mut sum_sq = 0u64;
+    let mut count = 0u64;
+    let mut i = 0;
+    while i < y.len() {
+        let v = y[i] as u64;
+        sum += v;
+        sum_sq += v * v;
+        count += 1;
+        i += stride;
+    }
 
-    // Luma variance normalised. Max u8 variance is bounded by (127.5)^2 ≈ 16256.
-    // We use 4096 as a practical normalisation cap to keep the score in [0, 1]
-    // for typical noisy frames without clipping signal content.
-    let mean_f64 = luma_sum as f64 / pixel_count;
-    let variance: f64 = y
-        .iter()
-        .map(|&b| {
-            let d = b as f64 - mean_f64;
-            d * d
-        })
-        .sum::<f64>()
-        / pixel_count;
+    let mean_raw = sum as f64 / count as f64;
+    let luma_mean = (mean_raw / 255.0) as f32;
+
+    // Variance via E[X²] - E[X]². Normalised with 4096 cap to keep [0, 1].
+    let variance = (sum_sq as f64 / count as f64) - (mean_raw * mean_raw);
     let noise_variance_score = (variance / 4096.0).min(1.0) as f32;
 
     // Perceptual hash from luma plane.
