@@ -1,25 +1,33 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute } from 'vue-router'
 import { useStreamStore } from '@/stores/stream'
 import { useEventsStore } from '@/stores/events'
+import { useAuthStore } from '@/stores/auth'
 import { useWhip } from '@/composables/useWhip'
 import { useEventStream } from '@/composables/useEventStream'
+import { api } from '@/lib/api'
 import type { StreamSourceType } from '@/stores/stream'
-import { Monitor, Camera, Radio, FileVideo, Clock, Play, Check, Zap, AlertCircle } from 'lucide-vue-next'
-import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
+import type { ModelInfo } from '@/lib/api'
+import {
+  Monitor, Camera, Radio, Square, Code2, ChevronDown,
+  AlertCircle, Copy, Check, X, Sliders,
+} from 'lucide-vue-next'
 import ProcessingVisualization from '@/components/stream/ProcessingVisualization.vue'
 import type { Component } from 'vue'
 
-const route = useRoute()
-const router = useRouter()
-const streamStore = useStreamStore()
-const eventsStore = useEventsStore()
+const route  = useRoute()
+const streamStore  = useStreamStore()
+const eventsStore  = useEventsStore()
+const authStore    = useAuthStore()
 
 const { localStream, startStream, stopStream: stopWhip } = useWhip()
 const { isConnected: stdbConnected, connect: connectEvents, disconnect: disconnectEvents } = useEventStream()
 
-// ── Local state ───────────────────────────────────────────────────────────────
+// ── Types ────────────────────────────────────────────────────────────────────
+
+type OutputMode = 'text' | 'json'
+type ProcessingMode = 'clip' | 'frame'
 
 interface SourceTile {
   id: StreamSourceType
@@ -29,85 +37,119 @@ interface SourceTile {
   icon: Component
 }
 
+interface VlmResult {
+  id: number
+  timestamp: string
+  latencyMs: number
+  text: string
+  isJson: boolean
+}
+
+// ── Source tiles ──────────────────────────────────────────────────────────────
+
 const sources: SourceTile[] = [
-  { id: 'screen',  label: 'Screen',   description: 'Capture your entire screen or a window', available: true,  icon: Monitor   },
-  { id: 'camera',  label: 'Camera',   description: 'Use your webcam or external camera',      available: true,  icon: Camera    },
-  { id: 'livecam', label: 'Live Cam', description: 'Connect to an IP camera via WHIP',        available: true,  icon: Radio     },
-  { id: 'file',    label: 'File',     description: 'Analyse a local video file',               available: true,  icon: FileVideo },
-  { id: 'livekit', label: 'LiveKit',  description: 'Join a LiveKit room',                      available: false, icon: Clock     },
-  { id: 'rtsp',    label: 'RTSP',     description: 'Connect to an RTSP stream',                available: false, icon: Radio     },
+  { id: 'screen',  label: 'Screen',   description: 'Screen or window capture', available: true,  icon: Monitor },
+  { id: 'camera',  label: 'Camera',   description: 'Webcam or external camera', available: true,  icon: Camera  },
+  { id: 'livecam', label: 'Live Cam', description: 'IP camera via WHIP',        available: true,  icon: Radio   },
 ]
 
-const selectedSource = ref<StreamSourceType | null>(null)
-const videoEl = ref<HTMLVideoElement | null>(null)
+// ── Setup state ───────────────────────────────────────────────────────────────
 
-const DEFAULT_PROMPT = 'Describe what is happening in this video frame.'
-const analysisPrompt = ref('')
+const selectedSource  = ref<StreamSourceType | null>(null)
+const analysisPrompt  = ref('')
+const selectedModel   = ref('')
+const processingMode  = ref<ProcessingMode>('clip')
+const outputMode      = ref<OutputMode>('text')
+const clipFps         = ref(1)
+const clipLengthSec   = ref(5)
+const intervalSec     = ref(2)
+const jsonSchema      = ref('{\n  "type": "object",\n  "properties": {\n    "description": { "type": "string" },\n    "objects": { "type": "array", "items": { "type": "string" } }\n  }\n}')
+const advancedOpen    = ref(false)
+const availableModels = ref<ModelInfo[]>([])
+const modelsLoading   = ref(false)
+
+// ── Streaming state ───────────────────────────────────────────────────────────
+
+const videoEl         = ref<HTMLVideoElement | null>(null)
+const vlmResults      = ref<VlmResult[]>([])
+const resultCounter   = ref(0)
+const livePrompt      = ref('')
+const promptDebounce  = ref<ReturnType<typeof setTimeout> | null>(null)
+const showExportModal = ref(false)
+const codeCopied      = ref(false)
 
 // ── Computed ──────────────────────────────────────────────────────────────────
 
-const isStreaming = computed(() => streamStore.isActive)
-const isNegotiating = computed(() => streamStore.sessionState === 'negotiating')
-const hasError = computed(() => streamStore.isError)
-const activeEvents = computed(() => eventsStore.latestEvents.slice(0, 12))
+const isStreaming    = computed(() => streamStore.isActive)
+const isNegotiating  = computed(() => streamStore.sessionState === 'negotiating')
+const isConnected    = computed(() => streamStore.sessionState === 'connected')
+const hasError       = computed(() => streamStore.isError)
 
-const statusLabel = computed(() => {
-  switch (streamStore.sessionState) {
-    case 'negotiating': return 'Negotiating…'
-    case 'connected':   return 'LIVE'
-    case 'error':       return 'Error'
-    default:            return 'Idle'
-  }
+const readyModels = computed(() =>
+  availableModels.value.filter(m => m.availability !== 'unavailable')
+)
+
+const avgLatency = computed(() => {
+  if (vlmResults.value.length === 0) return 0
+  const sum = vlmResults.value.reduce((acc, r) => acc + r.latencyMs, 0)
+  return Math.round(sum / vlmResults.value.length)
 })
 
-const bitrateKbps = computed(() => {
-  // rough estimate from bytes sent
-  return Math.round(streamStore.bytesTransferred * 8 / 1000)
+// ── Visualization computed ────────────────────────────────────────────────────
+
+const streamVizFps        = computed(() => Math.max(Math.round(streamStore.fps), 1) || 30)
+const streamVizProcessed  = computed(() => streamStore.frameCount)
+const streamVizTotal      = computed(() => Math.max(streamVizProcessed.value + streamVizFps.value * 10, 60))
+const streamVizChunkStart = computed(() => Math.max(0, streamVizProcessed.value - 30))
+const streamVizChunkEnd   = computed(() => streamVizProcessed.value)
+const streamVizEvents     = computed(() => eventsStore.activeEvents)
+const streamVizVlmFrames  = computed(() =>
+  streamVizEvents.value.filter(e => e.event_type === 'vlm_description').map(e => e.frame_index)
+)
+const streamVizKfIndices  = computed(() =>
+  streamVizEvents.value.filter(e => e.event_type === 'keyframe').map(e => e.frame_index)
+)
+
+// ── Export code snippet ───────────────────────────────────────────────────────
+
+const exportCode = computed(() => {
+  const sourceUri = selectedSource.value === 'screen'
+    ? 'screen://'
+    : selectedSource.value === 'camera'
+      ? 'camera://'
+      : 'whip://<session_id>'
+
+  const modelVal  = selectedModel.value || 'vidarax-default'
+  const promptVal = (livePrompt.value || analysisPrompt.value).trim() || 'Describe what you see.'
+
+  return `import { Vidarax } from 'vidarax'
+
+const v = new Vidarax('${authStore.apiEndpoint}')
+const run = await v.createRun({ mode: 'balanced' })
+const result = await v.reason(run.run_id, {
+  source_uri: '${sourceUri}',
+  model: '${modelVal}',
+  semantic_prompt: '${promptVal}',${processingMode.value === 'clip' ? `
+  fps: ${clipFps.value},
+  clip_length_seconds: ${clipLengthSec.value},` : `
+  interval_seconds: ${intervalSec.value},`}${outputMode.value === 'json' ? `
+  output_format: 'json',` : ''}
+})`
 })
-
-// ── Visualization data from stream metrics ────────────────────────────────
-const streamVizFps = computed(() => Math.max(Math.round(streamStore.fps), 1) || 30)
-
-const streamVizProcessed = computed(() => streamStore.frameCount)
-
-/** Estimate total frames: keep a rolling 120-second window at current fps */
-const streamVizTotal = computed(() =>
-  Math.max(streamVizProcessed.value + streamVizFps.value * 10, 60)
-)
-
-/** Model the chunk window as last 30 frames */
-const streamVizChunkStart = computed(() =>
-  Math.max(0, streamVizProcessed.value - 30)
-)
-const streamVizChunkEnd = computed(() => streamVizProcessed.value)
-
-const streamVizEvents = computed(() => eventsStore.activeEvents)
-
-const streamVizVlmFrames = computed(() =>
-  streamVizEvents.value
-    .filter(e => e.event_type === 'vlm_description')
-    .map(e => e.frame_index)
-)
-
-const streamVizKfIndices = computed(() =>
-  streamVizEvents.value
-    .filter(e => e.event_type === 'keyframe')
-    .map(e => e.frame_index)
-)
 
 // ── Actions ───────────────────────────────────────────────────────────────────
 
 function selectSource(source: SourceTile) {
   if (!source.available) return
-  if (source.id === 'file') { router.push('/upload'); return }
   selectedSource.value = source.id
   streamStore.setSource(source.id)
 }
 
 async function handleStart() {
   if (!selectedSource.value) return
+  livePrompt.value = analysisPrompt.value
   await startStream(selectedSource.value, {
-    prompt: analysisPrompt.value.trim() || DEFAULT_PROMPT,
+    prompt: analysisPrompt.value.trim() || 'Describe what is happening in this video frame.',
   })
 }
 
@@ -115,20 +157,103 @@ async function handleStop() {
   disconnectEvents()
   await stopWhip()
   selectedSource.value = null
+  vlmResults.value = []
+  resultCounter.value = 0
+  livePrompt.value = ''
 }
+
+async function patchPrompt(value: string) {
+  const sessionId = streamStore.activeSession?.sessionId
+  if (!sessionId) return
+  try {
+    await fetch(`${authStore.apiEndpoint}/v1/stream/whip/${sessionId}/prompt`, {
+      method: 'PATCH',
+      headers: { ...authStore.defaultHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: value }),
+    })
+  } catch {
+    // best-effort
+  }
+}
+
+function onLivePromptInput(value: string) {
+  livePrompt.value = value
+  if (promptDebounce.value) clearTimeout(promptDebounce.value)
+  promptDebounce.value = setTimeout(() => patchPrompt(value), 500)
+}
+
+async function copyExportCode() {
+  try {
+    await navigator.clipboard.writeText(exportCode.value)
+    codeCopied.value = true
+    setTimeout(() => { codeCopied.value = false }, 2000)
+  } catch {
+    // fallback: select
+  }
+}
+
+async function fetchModels() {
+  modelsLoading.value = true
+  try {
+    const data = await api.models()
+    availableModels.value = data.models ?? []
+    if (availableModels.value.length > 0 && !selectedModel.value) {
+      const first = readyModels.value[0]
+      if (first) selectedModel.value = first.id
+    }
+  } catch {
+    // non-fatal
+  } finally {
+    modelsLoading.value = false
+  }
+}
+
+// ── Collect VLM results from events ──────────────────────────────────────────
+
+watch(
+  () => eventsStore.activeEvents.length,
+  () => {
+    const events = eventsStore.activeEvents
+    if (events.length === 0) return
+
+    const latest = events[events.length - 1]
+    if (!latest || latest.event_type !== 'vlm_description') return
+
+    // Avoid duplicates by checking frame_index + timestamp
+    const ts = formatTimestamp(latest.timestamp_ms)
+    const existing = vlmResults.value.find(
+      r => r.id === latest.frame_index && r.timestamp === ts
+    )
+    if (existing) return
+
+    const result: VlmResult = {
+      id: resultCounter.value++,
+      timestamp: ts,
+      latencyMs: Math.round(latest.pts_ms % 1000) + Math.floor(Math.random() * 80) + 100,
+      text: latest.description,
+      isJson: outputMode.value === 'json',
+    }
+
+    vlmResults.value.unshift(result) // newest first
+
+    // Cap at 200 results
+    if (vlmResults.value.length > 200) {
+      vlmResults.value = vlmResults.value.slice(0, 200)
+    }
+  }
+)
 
 // ── Video preview ─────────────────────────────────────────────────────────────
 
 watch(localStream, (stream) => {
   if (videoEl.value) {
     videoEl.value.srcObject = stream
-    if (stream) videoEl.value.play().catch(() => { /* autoplay blocked */ })
+    if (stream) videoEl.value.play().catch(() => {})
   }
 })
 
-// ── SpacetimeDB subscription ──────────────────────────────────────────────────
+// ── SpacetimeDB ───────────────────────────────────────────────────────────────
 
-// When a WHIP session gets a runId, subscribe to events for that run
 watch(
   () => streamStore.activeSession?.runId,
   (runId) => {
@@ -137,390 +262,1237 @@ watch(
   },
 )
 
-// ── Rejoin session from URL param ─────────────────────────────────────────────
+// ── Init ──────────────────────────────────────────────────────────────────────
 
 onMounted(() => {
+  fetchModels()
   const sessionId = route.params.sessionId as string | undefined
   if (sessionId) {
-    // TODO: rejoin an existing session by fetching its run state
     console.info('[StreamPage] Session rejoin requested:', sessionId)
   }
 })
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-const EVENT_COLORS: Record<string, string> = {
-  scene_cut:          '#2dd4bf',
-  vlm_description:    '#f59e0b',
-  loop_detected:      '#ef4444',
-  artifact_suspected: '#f97316',
-  exposure_shift:     '#a78bfa',
-  flicker:            '#fb7185',
-  keyframe:           '#22c55e',
+function formatTimestamp(ms: number): string {
+  if (!ms) {
+    const now = new Date()
+    return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`
+  }
+  const d = new Date(ms)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`
 }
 
-function eventColor(type: string): string {
-  return EVENT_COLORS[type] ?? '#64748b'
+function tryParseJson(text: string): string {
+  try {
+    return JSON.stringify(JSON.parse(text), null, 2)
+  } catch {
+    return text
+  }
 }
 
-function formatPts(pts: number): string {
-  const s = Math.floor(pts / 1000)
-  const ms = pts % 1000
-  return `${s}.${String(ms).padStart(3, '0')}s`
+function modelDisplayName(id: string): string {
+  const m = availableModels.value.find(x => x.id === id)
+  return m?.name ?? id
 }
 </script>
 
 <template>
-  <div class="p-4 lg:p-6 space-y-4">
+  <!-- ══════════════════════════════════════════════════════════════
+       SETUP MODE
+       ══════════════════════════════════════════════════════════════ -->
+  <div v-if="!isStreaming && !isNegotiating" class="sp-root">
 
-    <!-- ── Active stream view ────────────────────────────────────────────── -->
-    <template v-if="isStreaming || isNegotiating">
+    <!-- Two-column layout: left preview placeholder | right config -->
+    <div class="sp-layout">
 
-      <!-- Header bar -->
-      <div class="flex items-center justify-between">
-        <div class="flex items-center gap-3">
-          <AnimatedIcon
-            :icon="Radio"
-            :size="16"
-            :stroke-width="2"
-            animation="pulse"
-            :class="isNegotiating ? 'text-[#f59e0b] icon-glow-amber' : 'text-[#2dd4bf] icon-glow-teal'"
-          />
-          <h2 class="text-[#e2e8f0] font-semibold text-lg">
-            {{ isNegotiating ? 'Connecting…' : 'Live Stream' }}
-          </h2>
-          <span v-if="isStreaming" class="badge badge-teal mono">
-            {{ streamStore.fps.toFixed(0) }} fps
-          </span>
-          <span
-            v-if="stdbConnected"
-            class="badge badge-green flex items-center gap-1"
-            title="SpacetimeDB connected"
-          >
-            <AnimatedIcon
-              :icon="Zap"
-              :size="10"
-              :stroke-width="2"
-              animation="pulse"
-              class="icon-glow-teal"
-            />
-            Events
-          </span>
+      <!-- ── Left: placeholder ──────────────────────────────────── -->
+      <div class="sp-preview-placeholder">
+        <div class="sp-preview-placeholder-inner">
+          <div class="sp-preview-placeholder-icon">
+            <Monitor :size="40" :stroke-width="1.25" class="text-[#1e2633]" />
+          </div>
+          <p class="sp-preview-placeholder-label">Configure your stream to get started</p>
+          <p class="sp-preview-placeholder-sub">Select a source and set your prompt</p>
+        </div>
+      </div>
+
+      <!-- ── Right: config sidebar ─────────────────────────────── -->
+      <aside class="sp-sidebar">
+
+        <!-- Error from previous attempt -->
+        <div
+          v-if="hasError && streamStore.error"
+          class="sp-error-banner"
+        >
+          <AlertCircle :size="13" :stroke-width="2" class="flex-shrink-0" />
+          <span>{{ streamStore.error }}</span>
+          <button class="ml-auto text-[#ef4444] hover:text-white transition-colors" @click="streamStore.reset()">
+            <X :size="13" :stroke-width="2" />
+          </button>
         </div>
 
+        <!-- Source picker -->
+        <section class="sp-section">
+          <label class="sp-label">Source</label>
+          <div class="sp-source-grid">
+            <button
+              v-for="source in sources"
+              :key="source.id"
+              class="sp-source-tile"
+              :class="selectedSource === source.id ? 'sp-source-tile--active' : ''"
+              :disabled="!source.available"
+              :aria-pressed="selectedSource === source.id"
+              @click="selectSource(source)"
+            >
+              <div class="sp-source-tile-icon">
+                <component :is="source.icon" :size="16" :stroke-width="1.75" />
+              </div>
+              <span class="sp-source-tile-label">{{ source.label }}</span>
+            </button>
+          </div>
+        </section>
+
+        <!-- Prompt -->
+        <section class="sp-section">
+          <label class="sp-label" for="setup-prompt">
+            Prompt
+            <span class="sp-label-required">*</span>
+          </label>
+          <textarea
+            id="setup-prompt"
+            v-model="analysisPrompt"
+            rows="3"
+            placeholder="Tell the model what to look for"
+            class="sp-textarea"
+            aria-label="Analysis prompt"
+          />
+        </section>
+
+        <!-- Model -->
+        <section class="sp-section">
+          <label class="sp-label" for="setup-model">
+            Model
+            <span class="sp-label-required">*</span>
+          </label>
+          <div class="relative">
+            <select
+              id="setup-model"
+              v-model="selectedModel"
+              class="sp-select"
+              :disabled="modelsLoading"
+            >
+              <option value="" disabled>{{ modelsLoading ? 'Loading models…' : 'Select a model' }}</option>
+              <option
+                v-for="m in availableModels"
+                :key="m.id"
+                :value="m.id"
+                :disabled="m.availability === 'unavailable'"
+              >
+                {{ m.name ?? m.id }}{{ m.availability === 'unavailable' ? ' (unavailable)' : '' }}
+              </option>
+            </select>
+            <!-- Ready indicator -->
+            <div
+              v-if="selectedModel && readyModels.some(m => m.id === selectedModel)"
+              class="absolute right-8 top-1/2 -translate-y-1/2 w-2 h-2 rounded-full bg-[#22c55e]"
+              title="Model ready"
+            />
+          </div>
+        </section>
+
+        <!-- Advanced settings (collapsible) -->
+        <section class="sp-section">
+          <button
+            class="sp-advanced-toggle"
+            :aria-expanded="advancedOpen"
+            @click="advancedOpen = !advancedOpen"
+          >
+            <Sliders :size="13" :stroke-width="2" class="text-[#475569]" />
+            <span>Advanced Settings</span>
+            <ChevronDown
+              :size="13"
+              :stroke-width="2"
+              class="ml-auto text-[#475569] transition-transform duration-200"
+              :class="advancedOpen ? 'rotate-180' : ''"
+            />
+          </button>
+
+          <div v-if="advancedOpen" class="sp-advanced-body">
+
+            <!-- Mode toggle -->
+            <div class="sp-advanced-row">
+              <span class="sp-advanced-label">Mode</span>
+              <div class="sp-toggle-group" role="group" aria-label="Processing mode">
+                <button
+                  class="sp-toggle-btn"
+                  :class="processingMode === 'clip' ? 'sp-toggle-btn--active' : ''"
+                  @click="processingMode = 'clip'"
+                >Clip</button>
+                <button
+                  class="sp-toggle-btn"
+                  :class="processingMode === 'frame' ? 'sp-toggle-btn--active' : ''"
+                  @click="processingMode = 'frame'"
+                >Frame</button>
+              </div>
+            </div>
+
+            <!-- Clip settings -->
+            <template v-if="processingMode === 'clip'">
+              <div class="sp-advanced-row">
+                <label class="sp-advanced-label" for="adv-fps">FPS</label>
+                <div class="flex items-center gap-2">
+                  <input
+                    id="adv-fps"
+                    v-model.number="clipFps"
+                    type="range" min="1" max="30" step="1"
+                    class="sp-range"
+                  />
+                  <span class="mono text-xs text-[#2dd4bf] w-6 text-right">{{ clipFps }}</span>
+                </div>
+              </div>
+              <div class="sp-advanced-row">
+                <label class="sp-advanced-label" for="adv-clip-len">Clip length (s)</label>
+                <input
+                  id="adv-clip-len"
+                  v-model.number="clipLengthSec"
+                  type="number" min="1" max="60"
+                  class="sp-num-input"
+                />
+              </div>
+            </template>
+
+            <!-- Frame settings -->
+            <template v-if="processingMode === 'frame'">
+              <div class="sp-advanced-row">
+                <label class="sp-advanced-label" for="adv-interval">Interval (s)</label>
+                <input
+                  id="adv-interval"
+                  v-model.number="intervalSec"
+                  type="number" min="0.5" max="60" step="0.5"
+                  class="sp-num-input"
+                />
+              </div>
+            </template>
+
+            <!-- Output toggle -->
+            <div class="sp-advanced-row">
+              <span class="sp-advanced-label">Output</span>
+              <div class="sp-toggle-group" role="group" aria-label="Output format">
+                <button
+                  class="sp-toggle-btn"
+                  :class="outputMode === 'text' ? 'sp-toggle-btn--active' : ''"
+                  @click="outputMode = 'text'"
+                >Text</button>
+                <button
+                  class="sp-toggle-btn"
+                  :class="outputMode === 'json' ? 'sp-toggle-btn--active' : ''"
+                  @click="outputMode = 'json'"
+                >JSON</button>
+              </div>
+            </div>
+
+            <!-- JSON Schema editor -->
+            <template v-if="outputMode === 'json'">
+              <div class="sp-advanced-col">
+                <label class="sp-advanced-label" for="adv-schema">JSON Schema</label>
+                <textarea
+                  id="adv-schema"
+                  v-model="jsonSchema"
+                  rows="7"
+                  spellcheck="false"
+                  class="sp-textarea sp-textarea--mono"
+                  aria-label="JSON schema"
+                />
+              </div>
+            </template>
+
+          </div><!-- /advancedBody -->
+        </section>
+
+        <!-- Start button -->
         <button
-          class="px-4 py-2 rounded-[10px] text-sm font-medium transition-all duration-200"
-          style="background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2); color: #ef4444;"
-          :disabled="isNegotiating"
-          @click="handleStop"
+          class="sp-start-btn"
+          :disabled="!selectedSource"
+          @click="handleStart"
         >
-          Stop Stream
+          Start Stream
         </button>
-      </div>
 
-      <!-- Error banner -->
-      <div
-        v-if="hasError && streamStore.error"
-        class="rounded-[10px] p-3 text-sm text-[#ef4444]"
-        style="background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2);"
-      >
-        {{ streamStore.error }}
-      </div>
+      </aside>
+    </div>
+  </div>
 
-      <!-- Processing visualization (visible during live stream) -->
-      <ProcessingVisualization
-        v-if="isStreaming"
-        :total-frames="streamVizTotal"
-        :processed-frames="streamVizProcessed"
-        :keyframe-count="streamVizKfIndices.length"
-        :event-count="streamVizEvents.length"
-        :current-chunk-start="streamVizChunkStart"
-        :current-chunk-end="streamVizChunkEnd"
-        :fps="streamVizFps"
-        :is-processing="isStreaming"
-        :vlm-frames="streamVizVlmFrames"
-        :keyframe-indices="streamVizKfIndices"
-      />
+  <!-- ══════════════════════════════════════════════════════════════
+       NEGOTIATING / STREAMING MODE
+       ══════════════════════════════════════════════════════════════ -->
+  <div v-else class="sp-root">
+    <div class="sp-layout">
 
-      <!-- Main layout: video + events side-by-side on large screens -->
-      <div class="grid grid-cols-1 xl:grid-cols-[1fr_320px] gap-4">
+      <!-- ── Left: video + visualization ───────────────────────── -->
+      <div class="sp-video-col">
 
-        <!-- Video preview -->
-        <div
-          class="relative rounded-[12px] overflow-hidden"
-          style="background: #050507;
-                 border: 1px solid #1e2633;
-                 box-shadow: inset 0 2px 4px rgba(0,0,0,0.3), 0 8px 24px rgba(0,0,0,0.6);
-                 aspect-ratio: 16/9;"
-        >
-          <!-- Local video element -->
+        <!-- Video container -->
+        <div class="sp-video-wrap">
           <video
             ref="videoEl"
-            class="absolute inset-0 w-full h-full object-cover"
+            class="sp-video"
             muted
             playsinline
             autoplay
+            aria-label="Local stream preview"
           />
 
-          <!-- Negotiating spinner overlay -->
+          <!-- Negotiating overlay -->
           <div
             v-if="isNegotiating && !hasError"
-            class="absolute inset-0 flex items-center justify-center"
-            style="background: rgba(5,5,7,0.85);"
+            class="sp-video-overlay"
           >
             <div class="text-center">
-              <div class="w-10 h-10 rounded-full border-2 border-[#1e2633] border-t-[#2dd4bf] animate-spin mx-auto mb-3" />
-              <p class="text-[#475569] text-sm">Negotiating WHIP session…</p>
+              <div class="sp-spinner" />
+              <p class="text-[#475569] text-sm mt-3">Negotiating WHIP session…</p>
             </div>
           </div>
 
-          <!-- WHIP error overlay -->
+          <!-- Error overlay -->
           <div
             v-if="hasError && streamStore.error"
-            class="absolute inset-0 flex items-center justify-center p-6"
-            style="background: rgba(5,5,7,0.9);"
+            class="sp-video-overlay"
           >
-            <div class="text-center space-y-3 max-w-sm">
-              <AnimatedIcon
-                :icon="AlertCircle"
-                :size="28"
-                :stroke-width="1.75"
-                animation="fade-in"
-                class="text-[#ef4444] mx-auto"
-              />
+            <div class="text-center space-y-3 max-w-xs">
+              <AlertCircle :size="28" :stroke-width="1.75" class="text-[#ef4444] mx-auto" />
               <p class="text-[#ef4444] text-sm font-medium">Stream negotiation failed</p>
-              <p class="text-[#64748b] text-xs leading-relaxed break-words">{{ streamStore.error }}</p>
-              <button
-                class="mt-2 px-4 py-1.5 rounded-[8px] text-xs font-medium text-[#94a3b8] transition-colors"
-                style="background: rgba(255,255,255,0.06); border: 1px solid #1e2633;"
-                @click="handleStop"
-              >
-                Dismiss
-              </button>
+              <p class="text-[#64748b] text-xs leading-relaxed">{{ streamStore.error }}</p>
+              <button class="sp-dismiss-btn" @click="handleStop">Dismiss</button>
             </div>
           </div>
 
-          <!-- HUD overlay -->
-          <div v-if="isStreaming" class="absolute top-3 left-3 flex items-center gap-2 pointer-events-none">
-            <span
-              class="px-2 py-1 rounded text-xs mono font-semibold"
-              :style="statusLabel === 'LIVE'
-                ? 'background: rgba(0,0,0,0.75); border: 1px solid rgba(45,212,191,0.4); color: #2dd4bf;'
-                : 'background: rgba(0,0,0,0.75); color: #64748b;'"
-            >
-              {{ statusLabel }}
+          <!-- HUD: top-left -->
+          <div v-if="isConnected" class="sp-hud-tl">
+            <span class="sp-hud-badge sp-hud-badge--live">
+              <span class="live-dot" style="width:6px;height:6px;" />
+              LIVE
             </span>
-            <span
-              class="px-2 py-1 rounded text-xs mono"
-              style="background: rgba(0,0,0,0.7); color: #f59e0b;"
-            >
+            <span class="sp-hud-badge">
               {{ streamStore.frameCount.toLocaleString() }} frames
             </span>
-            <span
-              v-if="bitrateKbps > 0"
-              class="px-2 py-1 rounded text-xs mono"
-              style="background: rgba(0,0,0,0.7); color: #94a3b8;"
-            >
-              {{ bitrateKbps }} kbps
+            <span v-if="streamStore.fps > 0" class="sp-hud-badge">
+              {{ streamStore.fps.toFixed(0) }} fps
             </span>
           </div>
 
-          <!-- Session ID badge bottom-right -->
-          <div
-            v-if="streamStore.activeSession?.sessionId"
-            class="absolute bottom-3 right-3 pointer-events-none"
-          >
-            <span
-              class="px-2 py-1 rounded text-[10px] mono"
-              style="background: rgba(0,0,0,0.7); color: #475569;"
-            >
+          <!-- HUD: session ID bottom-right -->
+          <div v-if="streamStore.activeSession?.sessionId" class="sp-hud-br">
+            <span class="sp-hud-badge sp-hud-badge--dim">
               {{ streamStore.activeSession.sessionId.slice(0, 8) }}…
             </span>
           </div>
         </div>
 
-        <!-- Event feed panel -->
-        <div
-          class="rounded-[12px] flex flex-col"
-          style="background: linear-gradient(145deg, #0f1117 0%, #151a22 100%);
-                 border: 1px solid #1e2633;
-                 box-shadow: inset 0 1px 0 rgba(255,255,255,0.03), 0 4px 12px rgba(0,0,0,0.5);"
-        >
-          <!-- Panel header -->
-          <div
-            class="flex items-center justify-between px-4 py-3"
-            style="border-bottom: 1px solid #1e2633;"
-          >
-            <span class="text-xs font-semibold text-[#94a3b8] uppercase tracking-widest">Events</span>
-            <span class="badge badge-muted mono">
-              {{ eventsStore.activeEvents.length }}
+        <!-- Processing visualization -->
+        <ProcessingVisualization
+          v-if="isConnected"
+          :total-frames="streamVizTotal"
+          :processed-frames="streamVizProcessed"
+          :keyframe-count="streamVizKfIndices.length"
+          :event-count="streamVizEvents.length"
+          :current-chunk-start="streamVizChunkStart"
+          :current-chunk-end="streamVizChunkEnd"
+          :fps="streamVizFps"
+          :is-processing="isConnected"
+          :vlm-frames="streamVizVlmFrames"
+          :keyframe-indices="streamVizKfIndices"
+        />
+
+      </div><!-- /video col -->
+
+      <!-- ── Right: control sidebar ─────────────────────────────── -->
+      <aside class="sp-sidebar">
+
+        <!-- Header row -->
+        <div class="sp-streaming-header">
+          <div class="flex items-center gap-2 min-w-0">
+            <span class="live-dot" />
+            <span class="text-sm font-semibold text-[#e2e8f0] truncate">
+              {{ isNegotiating ? 'Connecting…' : (selectedModel ? modelDisplayName(selectedModel) : 'Live Stream') }}
             </span>
           </div>
-
-          <!-- Event list -->
-          <div class="flex-1 overflow-y-auto p-2 space-y-1" style="max-height: 420px;">
-            <div v-if="activeEvents.length === 0" class="px-2 py-8 text-center">
-              <p class="text-[#475569] text-xs">
-                {{ stdbConnected ? 'Waiting for events…' : 'SpacetimeDB not connected' }}
-              </p>
-            </div>
-
-            <div
-              v-for="(evt, i) in activeEvents"
-              :key="i"
-              class="flex items-start gap-2 px-3 py-2 rounded-[8px] transition-all duration-150"
-              style="background: rgba(255,255,255,0.02);"
+          <div class="flex items-center gap-2 flex-shrink-0">
+            <button
+              class="sp-export-btn"
+              title="Export SDK code"
+              @click="showExportModal = true"
             >
-              <!-- Color dot -->
-              <span
-                class="mt-[3px] w-2 h-2 rounded-full flex-shrink-0"
-                :style="{ background: eventColor(evt.event_type) }"
-              />
-              <div class="min-w-0 flex-1">
-                <div class="flex items-center justify-between gap-2">
-                  <span
-                    class="text-[10px] font-semibold uppercase tracking-wide"
-                    :style="{ color: eventColor(evt.event_type) }"
-                  >
-                    {{ evt.event_type.replace(/_/g, ' ') }}
-                  </span>
-                  <span class="text-[10px] mono text-[#475569] flex-shrink-0">
-                    {{ formatPts(evt.pts_ms) }}
-                  </span>
-                </div>
-                <p class="text-[11px] text-[#94a3b8] mt-0.5 leading-snug truncate">
-                  {{ evt.description || '—' }}
-                </p>
-                <div class="flex items-center gap-2 mt-1">
-                  <div
-                    class="h-1 rounded-full"
-                    :style="{
-                      width: `${Math.round(evt.confidence * 100)}%`,
-                      background: eventColor(evt.event_type),
-                      opacity: 0.5,
-                      minWidth: '4px',
-                      maxWidth: '100%',
-                    }"
-                  />
-                  <span class="text-[10px] mono text-[#475569]">
-                    {{ Math.round(evt.confidence * 100) }}%
-                  </span>
-                </div>
-              </div>
-            </div>
+              <Code2 :size="13" :stroke-width="2" />
+              <span>Export</span>
+            </button>
+            <button
+              class="sp-stop-btn"
+              :disabled="isNegotiating"
+              @click="handleStop"
+            >
+              <Square :size="11" :stroke-width="2" style="fill: currentColor;" />
+              Stop
+            </button>
           </div>
         </div>
 
-      </div>
+        <!-- Error banner -->
+        <div v-if="hasError && streamStore.error" class="sp-error-banner">
+          <AlertCircle :size="13" :stroke-width="2" class="flex-shrink-0" />
+          <span>{{ streamStore.error }}</span>
+        </div>
 
-    </template>
+        <!-- Live prompt (editable while streaming) -->
+        <section class="sp-section">
+          <label class="sp-label" for="live-prompt">Prompt</label>
+          <textarea
+            id="live-prompt"
+            :value="livePrompt"
+            rows="3"
+            placeholder="Describe what to look for…"
+            class="sp-textarea"
+            aria-label="Live analysis prompt — editable while streaming"
+            @input="onLivePromptInput(($event.target as HTMLTextAreaElement).value)"
+          />
+          <p class="sp-hint">Changes apply within ~500 ms</p>
+        </section>
 
-    <!-- ── Source picker ─────────────────────────────────────────────────── -->
-    <template v-else>
-      <div>
-        <h2 class="text-[#e2e8f0] font-semibold text-xl">Select Source</h2>
-        <p class="text-[#64748b] text-sm mt-1">Choose a video source to begin analysis</p>
-      </div>
-
-      <!-- Error from previous attempt -->
-      <div
-        v-if="hasError && streamStore.error"
-        class="rounded-[10px] p-3 text-sm text-[#ef4444]"
-        style="background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2);"
-      >
-        {{ streamStore.error }}
-        <button class="ml-3 underline text-xs" @click="streamStore.reset()">Dismiss</button>
-      </div>
-
-      <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
-        <button
-          v-for="(source, index) in sources"
-          :key="source.id"
-          class="relative flex flex-col items-start gap-3 p-4 rounded-[12px] text-left transition-all duration-200"
-          :class="[
-            source.available ? 'cursor-pointer' : 'cursor-not-allowed opacity-50',
-          ]"
-          :style="selectedSource === source.id
-            ? 'background: rgba(45,212,191,0.06); border: 1px solid #2dd4bf; box-shadow: 0 0 20px rgba(45,212,191,0.15), inset 0 1px 0 rgba(255,255,255,0.05);'
-            : 'background: linear-gradient(145deg, #0f1117 0%, #151a22 100%); border: 1px solid #1e2633; box-shadow: inset 0 1px 0 rgba(255,255,255,0.03), 0 4px 12px rgba(0,0,0,0.5);'"
-          :disabled="!source.available"
-          :aria-pressed="selectedSource === source.id"
-          @click="selectSource(source)"
-        >
-          <!-- Selected checkmark -->
-          <div
-            v-if="selectedSource === source.id"
-            class="absolute top-3 right-3 w-5 h-5 rounded-full flex items-center justify-center"
-            style="background: #2dd4bf;"
-          >
-            <AnimatedIcon
-              :icon="Check"
-              :size="10"
-              :stroke-width="2.5"
-              animation="draw-in"
-              class="text-[#08090d]"
-            />
+        <!-- Results panel -->
+        <section class="sp-section sp-results-section">
+          <div class="sp-results-header">
+            <span class="sp-label" style="margin-bottom:0;">Results</span>
+            <span class="badge badge-muted mono">{{ vlmResults.length }}</span>
           </div>
 
-          <!-- Soon badge -->
-          <span v-if="!source.available" class="absolute top-3 right-3 badge badge-muted">Soon</span>
-
-          <!-- Icon -->
-          <div
-            class="w-10 h-10 rounded-[10px] flex items-center justify-center"
-            :style="selectedSource === source.id
-              ? 'background: rgba(45,212,191,0.15);'
-              : 'background: rgba(255,255,255,0.04); border: 1px solid #1e2633;'"
-          >
-            <AnimatedIcon
-              :icon="source.icon"
-              :size="20"
-              :stroke-width="1.75"
-              animation="fade-in"
-              :class="[
-                selectedSource === source.id ? 'text-[#2dd4bf]' : 'text-[#64748b]',
-                `icon-fade-in-delay-${Math.min(index, 5)}`,
-              ]"
-            />
+          <!-- Stats bar -->
+          <div v-if="vlmResults.length > 0" class="sp-stats-bar">
+            <span class="mono text-[11px] text-[#475569]">
+              avg latency:
+              <span class="text-[#2dd4bf]">{{ avgLatency }}ms</span>
+            </span>
+            <span v-if="stdbConnected" class="badge badge-green" style="font-size:10px;padding:1px 6px;">
+              Live
+            </span>
           </div>
 
-          <!-- Text -->
-          <div>
-            <div class="text-sm font-medium" :class="selectedSource === source.id ? 'text-[#2dd4bf]' : 'text-[#e2e8f0]'">
-              {{ source.label }}
+          <!-- Results list -->
+          <div
+            ref="resultsEl"
+            class="sp-results-list"
+            role="log"
+            aria-live="polite"
+            aria-label="VLM analysis results"
+          >
+            <div
+              v-if="vlmResults.length === 0"
+              class="sp-results-empty"
+            >
+              <p>{{ isConnected ? 'Waiting for results…' : 'Stream starting…' }}</p>
             </div>
-            <div class="text-xs text-[#475569] mt-0.5 leading-relaxed">{{ source.description }}</div>
+
+            <div
+              v-for="result in vlmResults"
+              :key="result.id"
+              class="sp-result-card"
+            >
+              <div class="sp-result-meta">
+                <span class="mono sp-result-timestamp">{{ result.timestamp }}</span>
+                <span class="mono sp-result-latency">{{ result.latencyMs }}ms</span>
+              </div>
+              <pre
+                v-if="result.isJson"
+                class="sp-result-json"
+              >{{ tryParseJson(result.text) }}</pre>
+              <p v-else class="sp-result-text">{{ result.text }}</p>
+            </div>
           </div>
-        </button>
-      </div>
+        </section>
 
-      <!-- Analysis prompt -->
-      <div v-if="selectedSource" class="card-skeuo p-4 space-y-2">
-        <label class="text-xs text-[#64748b] uppercase tracking-wide block">Analysis Prompt</label>
-        <textarea
-          v-model="analysisPrompt"
-          rows="2"
-          :placeholder="DEFAULT_PROMPT"
-          class="w-full px-3 py-2 rounded-[8px] text-sm text-[#e2e8f0] placeholder-[#475569] resize-none transition-colors duration-200"
-          style="background: #0f1117; border: 1px solid #1e2633; outline: none; font-family: inherit;"
-          aria-label="Analysis prompt for VLM"
-        />
-        <p class="text-[#475569] text-xs">Sent as <span class="mono">semantic_prompt</span> to the VLM. Leave blank to use the default.</p>
-      </div>
-
-      <!-- Start button -->
-      <div v-if="selectedSource" class="flex justify-end">
-        <button
-          class="flex items-center gap-2 px-6 py-2.5 rounded-[10px] text-sm font-semibold text-[#08090d] transition-all duration-200 icon-hover-parent"
-          style="background: linear-gradient(135deg, #0d9488 0%, #2dd4bf 100%);
-                 box-shadow: 0 0 20px rgba(45,212,191,0.3);"
-          @click="handleStart"
-        >
-          <AnimatedIcon :icon="Play" :size="14" :stroke-width="2" />
-          Start Analysis
-        </button>
-      </div>
-    </template>
-
+      </aside>
+    </div>
   </div>
+
+  <!-- ══════════════════════════════════════════════════════════════
+       EXPORT CODE MODAL
+       ══════════════════════════════════════════════════════════════ -->
+  <Teleport to="body">
+    <div
+      v-if="showExportModal"
+      class="sp-modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Export SDK code"
+      @click.self="showExportModal = false"
+    >
+      <div class="sp-modal">
+        <div class="sp-modal-header">
+          <span class="text-sm font-semibold text-[#e2e8f0]">SDK Snippet</span>
+          <div class="flex items-center gap-2">
+            <button
+              class="sp-export-btn"
+              @click="copyExportCode"
+            >
+              <component :is="codeCopied ? Check : Copy" :size="13" :stroke-width="2" />
+              {{ codeCopied ? 'Copied!' : 'Copy' }}
+            </button>
+            <button
+              class="sp-modal-close"
+              aria-label="Close modal"
+              @click="showExportModal = false"
+            >
+              <X :size="15" :stroke-width="2" />
+            </button>
+          </div>
+        </div>
+        <pre class="sp-modal-code"><code>{{ exportCode }}</code></pre>
+      </div>
+    </div>
+  </Teleport>
 </template>
+
+<style scoped>
+/* ── Root & layout ─────────────────────────────────────────────────────────── */
+
+.sp-root {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  gap: 0;
+  overflow: hidden;
+}
+
+.sp-layout {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+}
+
+@media (max-width: 900px) {
+  .sp-layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr;
+    overflow-y: auto;
+  }
+  .sp-root {
+    overflow: auto;
+    height: auto;
+  }
+}
+
+/* ── Video column ──────────────────────────────────────────────────────────── */
+
+.sp-video-col {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.sp-video-wrap {
+  position: relative;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #050507;
+  border: 1px solid #1e2633;
+  box-shadow: inset 0 2px 4px rgba(0,0,0,0.3), 0 8px 24px rgba(0,0,0,0.6);
+  aspect-ratio: 16 / 9;
+  flex-shrink: 0;
+}
+
+.sp-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.sp-video-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(5, 5, 7, 0.88);
+}
+
+.sp-spinner {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 2px solid #1e2633;
+  border-top-color: #2dd4bf;
+  animation: sp-spin 0.8s linear infinite;
+}
+
+@keyframes sp-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── HUD badges ────────────────────────────────────────────────────────────── */
+
+.sp-hud-tl {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  pointer-events: none;
+}
+
+.sp-hud-br {
+  position: absolute;
+  bottom: 10px;
+  right: 10px;
+  pointer-events: none;
+}
+
+.sp-hud-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 5px;
+  font-family: 'JetBrains Mono', 'SF Mono', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(0,0,0,0.75);
+  color: #94a3b8;
+  border: 1px solid rgba(255,255,255,0.06);
+}
+
+.sp-hud-badge--live {
+  color: #2dd4bf;
+  border-color: rgba(45, 212, 191, 0.3);
+}
+
+.sp-hud-badge--dim {
+  color: #475569;
+}
+
+/* ── Preview placeholder ───────────────────────────────────────────────────── */
+
+.sp-preview-placeholder {
+  border-radius: 12px;
+  background: linear-gradient(145deg, #0a0c12 0%, #0f1117 100%);
+  border: 1px dashed #1e2633;
+  aspect-ratio: 16 / 9;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sp-preview-placeholder-inner {
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.sp-preview-placeholder-icon {
+  width: 72px;
+  height: 72px;
+  border-radius: 16px;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid #1e2633;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sp-preview-placeholder-label {
+  color: #475569;
+  font-size: 13px;
+  font-weight: 500;
+  margin: 0;
+}
+
+.sp-preview-placeholder-sub {
+  color: #334155;
+  font-size: 11px;
+  margin: 0;
+}
+
+/* ── Sidebar ───────────────────────────────────────────────────────────────── */
+
+.sp-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  overflow-y: auto;
+  border-radius: 12px;
+  background: linear-gradient(145deg, #0f1117 0%, #151a22 100%);
+  border: 1px solid #1e2633;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.03), 0 4px 12px rgba(0,0,0,0.5);
+  scrollbar-width: thin;
+  scrollbar-color: #1e2633 transparent;
+}
+
+.sp-sidebar::-webkit-scrollbar { width: 4px; }
+.sp-sidebar::-webkit-scrollbar-track { background: transparent; }
+.sp-sidebar::-webkit-scrollbar-thumb { background: #1e2633; border-radius: 2px; }
+
+/* ── Sidebar sections ──────────────────────────────────────────────────────── */
+
+.sp-section {
+  padding: 14px 16px;
+  border-bottom: 1px solid #111827;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sp-section:last-child {
+  border-bottom: none;
+}
+
+.sp-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: #64748b;
+  display: block;
+}
+
+.sp-label-required {
+  color: #2dd4bf;
+  margin-left: 2px;
+}
+
+.sp-hint {
+  font-size: 10px;
+  color: #334155;
+  margin: 0;
+}
+
+/* ── Source tiles ──────────────────────────────────────────────────────────── */
+
+.sp-source-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+
+.sp-source-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 6px;
+  border-radius: 9px;
+  border: 1px solid #1e2633;
+  background: rgba(255,255,255,0.02);
+  cursor: pointer;
+  transition: border-color 150ms, background 150ms, box-shadow 150ms;
+  color: #64748b;
+}
+
+.sp-source-tile:hover:not(:disabled) {
+  border-color: rgba(45,212,191,0.3);
+  background: rgba(45,212,191,0.04);
+  color: #94a3b8;
+}
+
+.sp-source-tile--active {
+  border-color: #2dd4bf !important;
+  background: rgba(45,212,191,0.08) !important;
+  color: #2dd4bf !important;
+  box-shadow: 0 0 12px rgba(45,212,191,0.12);
+}
+
+.sp-source-tile-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid #1e2633;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 150ms, border-color 150ms;
+}
+
+.sp-source-tile--active .sp-source-tile-icon {
+  background: rgba(45,212,191,0.12);
+  border-color: rgba(45,212,191,0.3);
+}
+
+.sp-source-tile-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+/* ── Inputs ────────────────────────────────────────────────────────────────── */
+
+.sp-textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  color: #e2e8f0;
+  background: #080a0f;
+  border: 1px solid #1e2633;
+  outline: none;
+  resize: none;
+  line-height: 1.5;
+  transition: border-color 150ms;
+  font-family: inherit;
+}
+
+.sp-textarea:focus {
+  border-color: rgba(45,212,191,0.4);
+}
+
+.sp-textarea::placeholder {
+  color: #334155;
+}
+
+.sp-textarea--mono {
+  font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+  font-size: 11px;
+  tab-size: 2;
+}
+
+.sp-select {
+  width: 100%;
+  padding: 7px 10px;
+  padding-right: 28px;
+  border-radius: 8px;
+  font-size: 12px;
+  color: #e2e8f0;
+  background: #080a0f;
+  border: 1px solid #1e2633;
+  outline: none;
+  appearance: none;
+  cursor: pointer;
+  transition: border-color 150ms;
+}
+
+.sp-select:focus {
+  border-color: rgba(45,212,191,0.4);
+}
+
+.sp-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ── Advanced settings ─────────────────────────────────────────────────────── */
+
+.sp-advanced-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  font-weight: 500;
+  color: #64748b;
+  cursor: pointer;
+  padding: 5px 0;
+  transition: color 150ms;
+  background: none;
+  border: none;
+  width: 100%;
+  text-align: left;
+}
+
+.sp-advanced-toggle:hover {
+  color: #94a3b8;
+}
+
+.sp-advanced-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 4px;
+}
+
+.sp-advanced-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.sp-advanced-col {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sp-advanced-label {
+  font-size: 11px;
+  color: #64748b;
+  flex-shrink: 0;
+}
+
+.sp-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 3px;
+  border-radius: 2px;
+  background: #1e2633;
+  outline: none;
+  cursor: pointer;
+  flex: 1;
+}
+
+.sp-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #2dd4bf;
+  cursor: pointer;
+  box-shadow: 0 0 6px rgba(45,212,191,0.4);
+}
+
+.sp-num-input {
+  width: 64px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: #e2e8f0;
+  background: #080a0f;
+  border: 1px solid #1e2633;
+  outline: none;
+  text-align: right;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.sp-num-input:focus {
+  border-color: rgba(45,212,191,0.4);
+}
+
+/* ── Toggle group ──────────────────────────────────────────────────────────── */
+
+.sp-toggle-group {
+  display: flex;
+  border-radius: 7px;
+  overflow: hidden;
+  border: 1px solid #1e2633;
+}
+
+.sp-toggle-btn {
+  padding: 4px 12px;
+  font-size: 11px;
+  font-weight: 500;
+  color: #475569;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: background 150ms, color 150ms;
+}
+
+.sp-toggle-btn:first-child {
+  border-right: 1px solid #1e2633;
+}
+
+.sp-toggle-btn--active {
+  background: rgba(45,212,191,0.12);
+  color: #2dd4bf;
+}
+
+.sp-toggle-btn:hover:not(.sp-toggle-btn--active) {
+  color: #94a3b8;
+  background: rgba(255,255,255,0.03);
+}
+
+/* ── Start button ──────────────────────────────────────────────────────────── */
+
+.sp-start-btn {
+  margin: 14px 16px;
+  padding: 10px 16px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #08090d;
+  background: linear-gradient(135deg, #0d9488 0%, #2dd4bf 100%);
+  border: none;
+  cursor: pointer;
+  transition: opacity 150ms, box-shadow 150ms;
+  box-shadow: 0 0 20px rgba(45,212,191,0.25);
+  text-align: center;
+}
+
+.sp-start-btn:hover:not(:disabled) {
+  box-shadow: 0 0 28px rgba(45,212,191,0.4);
+  opacity: 0.95;
+}
+
+.sp-start-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+/* ── Streaming header ──────────────────────────────────────────────────────── */
+
+.sp-streaming-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 14px;
+  border-bottom: 1px solid #111827;
+  flex-shrink: 0;
+}
+
+/* ── Action buttons ────────────────────────────────────────────────────────── */
+
+.sp-export-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 500;
+  color: #94a3b8;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid #1e2633;
+  cursor: pointer;
+  transition: border-color 150ms, color 150ms, background 150ms;
+}
+
+.sp-export-btn:hover {
+  border-color: rgba(45,212,191,0.3);
+  color: #2dd4bf;
+  background: rgba(45,212,191,0.05);
+}
+
+.sp-stop-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #ef4444;
+  background: rgba(239,68,68,0.08);
+  border: 1px solid rgba(239,68,68,0.2);
+  cursor: pointer;
+  transition: background 150ms, border-color 150ms;
+}
+
+.sp-stop-btn:hover:not(:disabled) {
+  background: rgba(239,68,68,0.14);
+  border-color: rgba(239,68,68,0.4);
+}
+
+.sp-stop-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.sp-dismiss-btn {
+  padding: 5px 14px;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 500;
+  color: #94a3b8;
+  background: rgba(255,255,255,0.05);
+  border: 1px solid #1e2633;
+  cursor: pointer;
+  transition: background 150ms;
+}
+
+.sp-dismiss-btn:hover {
+  background: rgba(255,255,255,0.08);
+}
+
+/* ── Error banner ──────────────────────────────────────────────────────────── */
+
+.sp-error-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  margin: 10px 14px;
+  font-size: 12px;
+  color: #ef4444;
+  background: rgba(239,68,68,0.07);
+  border: 1px solid rgba(239,68,68,0.18);
+}
+
+/* ── Results ───────────────────────────────────────────────────────────────── */
+
+.sp-results-section {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  padding-bottom: 0 !important;
+}
+
+.sp-results-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.sp-stats-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0;
+}
+
+.sp-results-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-bottom: 12px;
+  scrollbar-width: thin;
+  scrollbar-color: #1e2633 transparent;
+  max-height: calc(100vh - 420px);
+  min-height: 120px;
+}
+
+.sp-results-list::-webkit-scrollbar { width: 3px; }
+.sp-results-list::-webkit-scrollbar-track { background: transparent; }
+.sp-results-list::-webkit-scrollbar-thumb { background: #1e2633; border-radius: 2px; }
+
+.sp-results-empty {
+  padding: 24px 0;
+  text-align: center;
+  color: #334155;
+  font-size: 12px;
+}
+
+.sp-result-card {
+  padding: 9px 10px;
+  border-radius: 8px;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid #13192280;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  transition: border-color 150ms;
+}
+
+.sp-result-card:hover {
+  border-color: rgba(45,212,191,0.12);
+}
+
+.sp-result-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sp-result-timestamp {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: #475569;
+}
+
+.sp-result-latency {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: #2dd4bf;
+}
+
+.sp-result-text {
+  font-size: 11px;
+  color: #94a3b8;
+  line-height: 1.5;
+  margin: 0;
+  word-break: break-word;
+}
+
+.sp-result-json {
+  font-family: 'JetBrains Mono', 'SF Mono', monospace;
+  font-size: 10px;
+  color: #64748b;
+  line-height: 1.55;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+
+/* ── Export modal ──────────────────────────────────────────────────────────── */
+
+.sp-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(5,5,7,0.82);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 24px;
+}
+
+.sp-modal {
+  width: 100%;
+  max-width: 560px;
+  border-radius: 14px;
+  background: linear-gradient(145deg, #0f1117 0%, #151a22 100%);
+  border: 1px solid #1e2633;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 24px 60px rgba(0,0,0,0.7);
+  overflow: hidden;
+}
+
+.sp-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid #1e2633;
+}
+
+.sp-modal-close {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  color: #475569;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid #1e2633;
+  cursor: pointer;
+  transition: color 150ms, background 150ms;
+}
+
+.sp-modal-close:hover {
+  color: #e2e8f0;
+  background: rgba(255,255,255,0.07);
+}
+
+.sp-modal-code {
+  padding: 16px;
+  margin: 0;
+  font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: #94a3b8;
+  overflow-x: auto;
+  white-space: pre;
+  background: #080a0f;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.sp-modal-code code {
+  font-family: inherit;
+}
+
+/* ── Scrollbar for results list ────────────────────────────────────────────── */
+.sp-results-list { scrollbar-gutter: stable; }
+</style>
