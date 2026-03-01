@@ -96,6 +96,33 @@ export interface ModelsResponse {
   models: ModelInfo[]
 }
 
+export interface FeedbackRequest {
+  rating: number
+  category: string
+  feedback?: string
+}
+
+export interface FeedbackResponse {
+  request_id: string
+  run_id: string
+  status: string
+}
+
+export interface FeedbackItem {
+  id: number
+  run_id: string
+  session_id: string
+  rating: number
+  category: string
+  feedback: string
+  timestamp_micros: number
+}
+
+export interface FeedbackListResponse {
+  request_id: string
+  feedback: FeedbackItem[]
+}
+
 export interface HealthResponse {
   status: string
   version: string
@@ -134,6 +161,15 @@ export const api = {
     },
     keepalive(runId: string): Promise<void> {
       return request<void>('POST', `/v1/runs/${validateId(runId)}/keepalive`)
+    },
+    feedback(runId: string, data: FeedbackRequest): Promise<FeedbackResponse> {
+      return request<FeedbackResponse>('POST', `/v1/runs/${validateId(runId)}/feedback`, data)
+    },
+  },
+
+  feedback: {
+    list(): Promise<FeedbackListResponse> {
+      return request<FeedbackListResponse>('GET', '/v1/feedback')
     },
   },
 

@@ -5,6 +5,7 @@ import { useRunsStore } from '@/stores/runs'
 import { useEventsStore } from '@/stores/events'
 import { useEventStream } from '@/composables/useEventStream'
 import { api, ApiError } from '@/lib/api'
+import type { FeedbackRequest } from '@/lib/api'
 import type { RunStatus } from '@/stores/runs'
 import { ChevronLeft, Image, StopCircle, Trash2, Radio, Zap } from 'lucide-vue-next'
 import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
@@ -110,6 +111,36 @@ async function deleteRun(): Promise<void> {
   } catch (err) {
     console.error('[RunDetail] delete failed:', err)
     actionLoading.value = null
+  }
+}
+
+// ── Feedback ──────────────────────────────────────────────────────────
+
+const showFeedback = ref(false)
+const feedbackRating = ref(5)
+const feedbackCategory = ref('quality')
+const feedbackText = ref('')
+const feedbackSubmitting = ref(false)
+const feedbackSubmitted = ref(false)
+
+const FEEDBACK_CATEGORIES = ['accuracy', 'latency', 'quality'] as const
+
+async function submitFeedback(): Promise<void> {
+  if (feedbackSubmitting.value) return
+  feedbackSubmitting.value = true
+  try {
+    const data: FeedbackRequest = {
+      rating: feedbackRating.value,
+      category: feedbackCategory.value,
+      feedback: feedbackText.value || undefined,
+    }
+    await api.runs.feedback(runId.value, data)
+    feedbackSubmitted.value = true
+    showFeedback.value = false
+  } catch (err) {
+    console.error('[RunDetail] feedback submit failed:', err)
+  } finally {
+    feedbackSubmitting.value = false
   }
 }
 
@@ -383,6 +414,80 @@ function formatDate(iso: string): string {
           class="mono text-xs text-[#94a3b8] rounded-[8px] p-4 overflow-x-auto"
           style="background: #050507; border: 1px solid #1e2633; line-height: 1.7;"
         >{{ JSON.stringify(run, null, 2) }}</pre>
+      </div>
+
+      <!-- Feedback ─────────────────────────────────────────────────────────── -->
+      <div v-if="!isProcessing && !feedbackSubmitted" class="flex justify-end">
+        <button
+          class="px-4 py-2 rounded-[8px] text-xs font-medium transition-all duration-200"
+          style="background: rgba(45,212,191,0.08); border: 1px solid rgba(45,212,191,0.2); color: #2dd4bf;"
+          @click="showFeedback = !showFeedback"
+        >
+          {{ showFeedback ? 'Cancel' : 'Rate this analysis' }}
+        </button>
+      </div>
+
+      <div v-if="feedbackSubmitted" class="flex justify-end">
+        <span class="text-xs text-[#2dd4bf]">Feedback submitted — thank you</span>
+      </div>
+
+      <div v-if="showFeedback" class="card-skeuo p-5 space-y-4">
+        <h3 class="text-[#e2e8f0] font-medium text-sm">Rate this analysis</h3>
+
+        <!-- Star rating 0-10 -->
+        <div>
+          <label class="text-xs text-[#64748b] block mb-2">Rating</label>
+          <div class="flex gap-1 items-center">
+            <button
+              v-for="n in 11"
+              :key="n - 1"
+              class="w-7 h-7 rounded-[6px] text-xs font-medium mono transition-all duration-150"
+              :style="feedbackRating === n - 1
+                ? 'background: rgba(45,212,191,0.15); border: 1px solid #2dd4bf; color: #2dd4bf; box-shadow: 0 0 8px rgba(45,212,191,0.2);'
+                : 'background: rgba(255,255,255,0.04); border: 1px solid #1e2633; color: #475569;'"
+              @click="feedbackRating = n - 1"
+            >
+              {{ n - 1 }}
+            </button>
+          </div>
+        </div>
+
+        <!-- Category dropdown -->
+        <div>
+          <label class="text-xs text-[#64748b] block mb-2">Category</label>
+          <select
+            v-model="feedbackCategory"
+            class="rounded-[8px] px-3 py-1.5 text-xs mono w-full max-w-[200px]"
+            style="background: #050507; border: 1px solid #1e2633; color: #e2e8f0; outline: none;"
+          >
+            <option v-for="cat in FEEDBACK_CATEGORIES" :key="cat" :value="cat">{{ cat }}</option>
+          </select>
+        </div>
+
+        <!-- Free text -->
+        <div>
+          <label class="text-xs text-[#64748b] block mb-2">Comments (optional)</label>
+          <textarea
+            v-model="feedbackText"
+            rows="3"
+            placeholder="Additional feedback…"
+            class="rounded-[8px] px-3 py-2 text-xs w-full resize-none"
+            style="background: #050507; border: 1px solid #1e2633; color: #e2e8f0; outline: none; font-family: 'JetBrains Mono', monospace;"
+          />
+        </div>
+
+        <!-- Submit -->
+        <div class="flex justify-end">
+          <button
+            class="px-4 py-2 rounded-[8px] text-xs font-medium transition-all duration-200"
+            style="background: rgba(45,212,191,0.12); border: 1px solid rgba(45,212,191,0.3); color: #2dd4bf;"
+            :disabled="feedbackSubmitting"
+            @click="submitFeedback"
+          >
+            <span v-if="feedbackSubmitting">Submitting…</span>
+            <span v-else>Submit feedback</span>
+          </button>
+        </div>
       </div>
 
     </template>
