@@ -192,6 +192,7 @@ pub fn spawn_decode_workers(
 
                     let dec = decoder.as_mut().expect("decoder initialised above");
 
+                    let decode_start = std::time::Instant::now();
                     let yuv = match dec.decode(&frame.nals) {
                         Ok(y) => y,
                         Err(_) => continue, // SPS/PPS, incomplete NAL, or VP8 header — skip
@@ -206,6 +207,10 @@ pub fn spawn_decode_workers(
                     // Allocate once; all downstream consumers share the Arc pointer.
                     let jpeg: Arc<[u8]> = Arc::from(yuv_to_jpeg(&yuv, 75));
                     prev_signal = Some(signal);
+
+                    // Record decode latency (decode + signal + JPEG encoding).
+                    let decode_us = decode_start.elapsed().as_micros() as u64;
+                    metrics.decode_latency_us.record(decode_us);
 
                     metrics.inc_frames_decoded();
                     let sf = StreamFrame {
@@ -306,7 +311,10 @@ pub fn spawn_analysis_workers(
                         let _ = clip_tx.try_send(sf);
                     } else {
                         // ── Normal mode: gate engine → VLM ───────────────
+                        let gate_start = std::time::Instant::now();
                         let metas = pipeline.analyze_batch(&[sf.signal]);
+                        let gate_us = gate_start.elapsed().as_micros() as u64;
+                        metrics.gate_latency_us.record(gate_us);
                         let meta = match metas.first() {
                             Some(m) => *m,
                             None => continue,
@@ -418,11 +426,16 @@ pub fn spawn_vlm_workers<I>(
     // FIFO channel between VLM workers and the SpacetimeDB writer.
     let (event_tx, event_rx) = kanal::bounded::<SinkEvent>(512);
 
+    // The writer thread needs its own Arc<PipelineMetrics> clone so it can
+    // record HTTP POST latency without contending with VLM worker threads.
+    let writer_metrics = Arc::clone(&metrics);
+
     // Dedicated writer thread: drains the FIFO and calls blocking sink methods.
     std::thread::Builder::new()
         .name("vx-stdb-writer".to_string())
         .spawn(move || {
             while let Ok(event) = event_rx.recv() {
+                let emit_start = std::time::Instant::now();
                 match event {
                     SinkEvent::Emit {
                         run_id, session_id, frame_index, pts_ms,
@@ -441,6 +454,8 @@ pub fn spawn_vlm_workers<I>(
                         );
                     }
                 }
+                let emit_ms = emit_start.elapsed().as_millis() as u64;
+                writer_metrics.stdb_emit_latency_ms.record(emit_ms);
             }
         })
         .expect("stdb writer thread spawn failed");
@@ -566,6 +581,7 @@ pub fn spawn_vlm_workers<I>(
                     let knn_hit: Option<(String, bool)> = None;
 
                     // ── Tiers 2+3: VLM inference (when KNN misses or disabled) ──────
+                    let vlm_start = std::time::Instant::now();
                     let (description, used_second_pass) = if let Some(hit) = knn_hit {
                         hit
                     } else {
@@ -614,6 +630,9 @@ pub fn spawn_vlm_workers<I>(
                             Err(err) => (format!("vlm_error: {err:?}"), false),
                         }
                     };
+                    // Record VLM latency (covers both tier-2 and tier-3 calls).
+                    let vlm_elapsed_ms = vlm_start.elapsed().as_millis() as u64;
+                    metrics.vlm_latency_ms.record(vlm_elapsed_ms);
 
                     // Charge output tokens against the session budget.
                     // Approximate: 4 bytes per token (UTF-8 average).
