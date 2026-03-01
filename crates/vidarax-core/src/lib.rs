@@ -1,6 +1,8 @@
 pub mod gate;
 pub mod ingest;
+pub mod webrtc;
 pub mod lockfree;
+pub mod loop_detector;
 pub mod memory;
 pub mod observability;
 pub mod pipeline;
