@@ -1,37 +1,49 @@
 #!/usr/bin/env python3
-"""Fine-tune LFM2-VL-450M specialist via TRL SFTTrainer (GPU path).
+"""Fine-tune LFM2-VL-450M specialist via Axolotl.
 
-Supports full fine-tuning, DoRA, and LoRA with checkpointing and replay-buffer
-mixing for catastrophic-forgetting prevention.
+Generates an Axolotl YAML config from the template and invokes
+`axolotl train`. Handles replay-buffer pre-mixing (since Axolotl lacks
+native weighted dataset sampling) and checkpoint resumption.
 """
 
 import argparse
 import json
 import logging
 import random
+import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 
-import torch
-
 logger = logging.getLogger("train_specialist")
+
+TEMPLATE_PATH = Path(__file__).parent / "axolotl_config.yaml"
+
+SYSTEM_PROMPT = (
+    "You are a video analytics classifier. "
+    "Respond with a JSON object containing event_type and confidence."
+)
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train LFM2-VL specialist (GPU)")
-    p.add_argument("--data-dir", type=Path, required=True, help="Dir with manifest.jsonl + frames")
-    p.add_argument("--output-dir", type=Path, required=True, help="Checkpoint output dir")
+    p = argparse.ArgumentParser(description="Train LFM2-VL specialist (Axolotl)")
+    p.add_argument("--data-dir", type=Path, required=True,
+                   help="Dir with training JSONL + frame images")
+    p.add_argument("--output-dir", type=Path, default=None,
+                   help="Checkpoint output dir (default: data-dir/checkpoints)")
     p.add_argument("--base-model", default="LiquidAI/LFM2-VL-450M")
-    p.add_argument("--method", choices=["full", "dora", "lora"], default="dora")
-    p.add_argument("--dora-rank", type=int, default=16)
     p.add_argument("--epochs", type=int, default=3)
-    p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--lr", type=float, default=2e-5)
+    p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--lora-r", type=int, default=32)
+    p.add_argument("--lora-alpha", type=int, default=16)
     p.add_argument("--save-steps", type=int, default=100)
-    p.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
+    p.add_argument("--sequence-len", type=int, default=8192)
+    p.add_argument("--resume", action="store_true",
+                   help="Resume from latest checkpoint in output-dir")
     p.add_argument("--replay-ratio", type=float, default=0.5,
-                   help="Fraction of each batch sampled from historical (replay) pairs")
-    p.add_argument("--max-steps", type=int, default=0, help="0 = unlimited")
+                   help="Fraction of dataset sampled from historical (replay) pairs")
     return p.parse_args()
 
 
@@ -45,164 +57,203 @@ def load_jsonl(path: Path) -> list[dict]:
     return rows
 
 
-def build_dataset(data_dir: Path, replay_ratio: float):
-    """Load manifest.jsonl and optionally split into new + replay portions."""
-    from datasets import Dataset
+def convert_to_axolotl_format(raw_rows: list[dict]) -> list[dict]:
+    """Convert vidarax JSONL (frame_path + label) to Axolotl chat_template format.
 
-    manifest = data_dir / "manifest.jsonl"
-    if not manifest.exists():
-        raise FileNotFoundError(f"No manifest.jsonl in {data_dir}")
+    Input format (from TrainingStore.export_training_jsonl):
+        {"frame_path": "/path/to/frame.jpg", "label": "{\"event_type\":\"person\",...}", ...}
 
-    rows = load_jsonl(manifest)
-    logger.info("Loaded %d training examples from %s", len(rows), manifest)
+    Output format (Axolotl multimodal chat_template):
+        {"messages": [
+            {"role": "system", "content": [{"type": "text", "text": "..."}]},
+            {"role": "user", "content": [
+                {"type": "image", "path": "/path/to/frame.jpg"},
+                {"type": "text", "text": "Classify the event in this frame."}
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "{...}"}]}
+        ]}
+    """
+    converted = []
+    for row in raw_rows:
+        frame_path = row.get("frame_path", "")
+        label = row.get("label", "")
 
-    if replay_ratio > 0 and len(rows) > 20:
-        # Treat the last 30% as "new", rest as "replay pool"
-        split = max(1, int(len(rows) * 0.7))
-        replay_pool = rows[:split]
-        new_examples = rows[split:]
+        messages = [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": SYSTEM_PROMPT}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "path": frame_path},
+                    {"type": "text", "text": "Classify the event in this frame."},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": label}],
+            },
+        ]
+        converted.append({"messages": messages})
+    return converted
 
-        # Mix: replay_ratio from pool, rest from new
-        n_replay = int(len(new_examples) * replay_ratio / (1 - replay_ratio))
-        n_replay = min(n_replay, len(replay_pool))
-        replay_sample = random.sample(replay_pool, n_replay) if n_replay > 0 else []
 
-        mixed = new_examples + replay_sample
-        random.shuffle(mixed)
-        logger.info("Replay mix: %d new + %d replay = %d total",
-                     len(new_examples), len(replay_sample), len(mixed))
-        rows = mixed
+def apply_replay_mixing(rows: list[dict], replay_ratio: float) -> list[dict]:
+    """Pre-mix new + replay examples since Axolotl lacks native weighted sampling."""
+    if replay_ratio <= 0 or len(rows) <= 20:
+        return rows
 
-    return Dataset.from_list(rows)
+    split = max(1, int(len(rows) * 0.7))
+    replay_pool = rows[:split]
+    new_examples = rows[split:]
+
+    n_replay = int(len(new_examples) * replay_ratio / max(1 - replay_ratio, 0.01))
+    n_replay = min(n_replay, len(replay_pool))
+    replay_sample = random.sample(replay_pool, n_replay) if n_replay > 0 else []
+
+    mixed = new_examples + replay_sample
+    random.shuffle(mixed)
+    logger.info("Replay mix: %d new + %d replay = %d total",
+                len(new_examples), len(replay_sample), len(mixed))
+    return mixed
+
+
+def write_dataset(rows: list[dict], output_path: Path):
+    """Write Axolotl-format JSONL to disk."""
+    with open(output_path, "w") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+    logger.info("Wrote %d training examples to %s", len(rows), output_path)
+
+
+def generate_config(args, dataset_path: Path, output_dir: Path) -> Path:
+    """Fill in the Axolotl YAML config template with runtime values."""
+    if not TEMPLATE_PATH.exists():
+        logger.error("Config template not found: %s", TEMPLATE_PATH)
+        sys.exit(1)
+
+    template = TEMPLATE_PATH.read_text()
+
+    replacements = {
+        "base_model: LiquidAI/LFM2-VL-450M": f"base_model: {args.base_model}",
+        "DATASET_PATH": str(dataset_path),
+        "OUTPUT_DIR": str(output_dir),
+        "NUM_EPOCHS": str(args.epochs),
+        "LEARNING_RATE": str(args.lr),
+        "MICRO_BATCH_SIZE": str(args.batch_size),
+        "LORA_R": str(args.lora_r),
+        "LORA_ALPHA": str(args.lora_alpha),
+        "SAVE_STEPS": str(args.save_steps),
+        "SEQUENCE_LEN": str(args.sequence_len),
+    }
+
+    config = template
+    for old, new in replacements.items():
+        config = config.replace(old, new)
+
+    config_path = output_dir / "axolotl_config.yaml"
+    config_path.write_text(config)
+    logger.info("Generated Axolotl config: %s", config_path)
+    return config_path
 
 
 def main():
     args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    # Verify axolotl is installed
+    if not shutil.which("axolotl"):
+        logger.error(
+            "axolotl CLI not found. Install with:\n"
+            "  pip install 'axolotl[flash-attn]'\n"
+            "  pip uninstall -y causal-conv1d  # required for LFM2-VL"
+        )
+        sys.exit(1)
+
+    output_dir = args.output_dir or (args.data_dir / "checkpoints")
+    output_dir.mkdir(parents=True, exist_ok=True)
     t_start = time.time()
 
-    # ------------------------------------------------------------------
-    # Load model + processor
-    # ------------------------------------------------------------------
-    from transformers import AutoModelForImageTextToText, AutoProcessor
+    # ── Load and convert dataset ──────────────────────────────────────
+    # Find the training JSONL (exported by vidarax-cli distill train)
+    jsonl_candidates = list(args.data_dir.glob("*-training.jsonl")) + \
+                       [args.data_dir / "manifest.jsonl"]
+    jsonl_path = next((p for p in jsonl_candidates if p.exists()), None)
 
-    logger.info("Loading base model: %s", args.base_model)
-    processor = AutoProcessor.from_pretrained(args.base_model)
-    model_kwargs = {"torch_dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32}
+    if jsonl_path is None:
+        logger.error("No training JSONL found in %s", args.data_dir)
+        sys.exit(1)
 
-    # Try flash attention on CUDA
-    if torch.cuda.is_available():
-        try:
-            model_kwargs["attn_implementation"] = "flash_attention_2"
-            logger.info("Flash Attention 2 enabled")
-        except Exception:
-            logger.info("Flash Attention 2 not available, using default")
+    raw_rows = load_jsonl(jsonl_path)
+    if not raw_rows:
+        logger.error("Training JSONL is empty: %s", jsonl_path)
+        sys.exit(1)
 
-    model = AutoModelForImageTextToText.from_pretrained(args.base_model, **model_kwargs)
+    logger.info("Loaded %d raw training pairs from %s", len(raw_rows), jsonl_path)
 
-    # ------------------------------------------------------------------
-    # Configure PEFT (if not full fine-tune)
-    # ------------------------------------------------------------------
-    if args.method in ("dora", "lora"):
-        from peft import LoraConfig, get_peft_model
+    # Convert to Axolotl chat_template format
+    converted = convert_to_axolotl_format(raw_rows)
 
-        peft_config = LoraConfig(
-            r=args.dora_rank,
-            lora_alpha=args.dora_rank * 2,
-            target_modules="all-linear",
-            use_dora=(args.method == "dora"),
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(model, peft_config)
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in model.parameters())
-        logger.info("PEFT %s: %d/%d trainable params (%.2f%%)",
-                     args.method.upper(), trainable, total, 100 * trainable / total)
-    else:
-        logger.info("Full fine-tune: all parameters trainable")
+    # Apply replay mixing
+    mixed = apply_replay_mixing(converted, args.replay_ratio)
 
-    # ------------------------------------------------------------------
-    # Build dataset
-    # ------------------------------------------------------------------
-    dataset = build_dataset(args.data_dir, args.replay_ratio)
+    # Write Axolotl-format dataset
+    dataset_path = output_dir / "training_data.jsonl"
+    write_dataset(mixed, dataset_path)
 
-    # ------------------------------------------------------------------
-    # SFT config + trainer
-    # ------------------------------------------------------------------
-    from trl import SFTConfig, SFTTrainer
+    # ── Generate Axolotl config ───────────────────────────────────────
+    config_path = generate_config(args, dataset_path, output_dir)
 
-    sft_config = SFTConfig(
-        output_dir=str(args.output_dir),
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        gradient_checkpointing=True,
-        bf16=torch.cuda.is_available(),
-        fp16=False,
-        learning_rate=args.lr,
-        warmup_ratio=0.1,
-        save_strategy="steps",
-        save_steps=args.save_steps,
-        save_total_limit=3,
-        logging_steps=10,
-        max_steps=args.max_steps if args.max_steps > 0 else -1,
-        remove_unused_columns=False,
-        dataset_kwargs={"skip_prepare_dataset": True},
+    # ── Run Axolotl training ──────────────────────────────────────────
+    cmd = ["axolotl", "train", str(config_path)]
+
+    if args.resume:
+        checkpoints = sorted(output_dir.glob("checkpoint-*"))
+        if checkpoints:
+            cmd.extend(["--resume-from-checkpoint", str(checkpoints[-1])])
+            logger.info("Resuming from %s", checkpoints[-1])
+        else:
+            logger.warning("--resume specified but no checkpoints found, starting fresh")
+
+    logger.info("Running: %s", " ".join(cmd))
+    result = subprocess.run(cmd)
+
+    if result.returncode != 0:
+        logger.error("Axolotl training failed with exit code %d", result.returncode)
+        sys.exit(result.returncode)
+
+    # ── Merge adapter ─────────────────────────────────────────────────
+    logger.info("Merging LoRA adapter into base model...")
+    merge_result = subprocess.run(
+        ["axolotl", "merge-lora", str(config_path)],
     )
+    if merge_result.returncode != 0:
+        logger.warning("Adapter merge failed (non-fatal) — adapter still saved separately")
 
-    # Collator for vision-language data
-    try:
-        from trl import DataCollatorForVisionLanguageModeling
-        collator = DataCollatorForVisionLanguageModeling(processor=processor)
-    except ImportError:
-        logger.warning("DataCollatorForVisionLanguageModeling not available, using default")
-        collator = None
-
-    trainer = SFTTrainer(
-        model=model,
-        args=sft_config,
-        train_dataset=dataset,
-        processing_class=processor,
-        data_collator=collator,
-    )
-
-    # ------------------------------------------------------------------
-    # Train (with optional resume)
-    # ------------------------------------------------------------------
-    resume_ckpt = args.resume and any(args.output_dir.glob("checkpoint-*"))
-    if resume_ckpt:
-        logger.info("Resuming from latest checkpoint in %s", args.output_dir)
-
-    result = trainer.train(resume_from_checkpoint=resume_ckpt if resume_ckpt else None)
-
-    # ------------------------------------------------------------------
-    # Save final + metrics
-    # ------------------------------------------------------------------
-    trainer.save_model(str(args.output_dir / "final"))
-    processor.save_pretrained(str(args.output_dir / "final"))
-
+    # ── Write metrics ─────────────────────────────────────────────────
     wall_time = time.time() - t_start
     metrics = {
         "base_model": args.base_model,
-        "method": args.method,
-        "rank": args.dora_rank if args.method != "full" else None,
+        "method": "lora",
+        "rank": args.lora_r,
+        "alpha": args.lora_alpha,
         "epochs": args.epochs,
-        "total_steps": result.global_step,
-        "final_loss": round(result.training_loss, 4),
         "wall_time_seconds": round(wall_time, 1),
-        "examples_per_sec": round(len(dataset) * args.epochs / wall_time, 1),
-        "training_pairs": len(dataset),
+        "training_pairs": len(mixed),
         "replay_ratio": args.replay_ratio,
+        "framework": "axolotl",
     }
 
-    metrics_path = args.output_dir / "training_metrics.json"
+    metrics_path = output_dir / "training_metrics.json"
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2)
 
-    logger.info("Training complete in %.1fs | loss=%.4f | %d steps | saved to %s",
-                 wall_time, result.training_loss, result.global_step, args.output_dir)
-    logger.info("Metrics: %s", metrics_path)
+    logger.info("Training complete in %.1fs | %d pairs | saved to %s",
+                wall_time, len(mixed), output_dir)
 
 
 if __name__ == "__main__":

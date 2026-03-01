@@ -183,10 +183,8 @@ async fn cmd_distill_train(opts: DistillOpts) {
 
     let mut cmd = tokio::process::Command::new("python3");
     cmd.arg(script)
-        .arg("--tenant-id")
-        .arg(tenant_id)
-        .arg("--data-path")
-        .arg(&jsonl_path)
+        .arg("--data-dir")
+        .arg(&opts.data_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

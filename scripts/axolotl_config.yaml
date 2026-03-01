@@ -1,0 +1,58 @@
+# Axolotl config for LFM2-VL-450M auto-distillation
+# Based on official axolotl/examples/LiquidAI/lfm2-vl-lora.yaml
+#
+# Template fields (replaced at runtime by train_specialist.py):
+#   DATASET_PATH, OUTPUT_DIR, NUM_EPOCHS, LEARNING_RATE,
+#   MICRO_BATCH_SIZE, LORA_R, LORA_ALPHA, SAVE_STEPS, SEQUENCE_LEN
+
+base_model: LiquidAI/LFM2-VL-450M
+trust_remote_code: true
+model_type: AutoModelForImageTextToText
+processor_type: AutoProcessor
+
+plugins:
+  - axolotl.integrations.cut_cross_entropy.CutCrossEntropyPlugin
+
+# Required for VLM multimodal in Axolotl
+skip_prepare_dataset: true
+remove_unused_columns: false
+sample_packing: false
+
+datasets:
+  - path: DATASET_PATH
+    type: chat_template
+    ds_type: json
+    split: train
+
+val_set_size: 0.05
+output_dir: OUTPUT_DIR
+
+adapter: lora
+sequence_len: SEQUENCE_LEN
+pad_to_sequence_len: false
+
+lora_r: LORA_R
+lora_alpha: LORA_ALPHA
+lora_dropout: 0.05
+# Language model layers only — vision encoder stays frozen
+lora_target_modules: 'model.language_model.layers.[\d]+.(mlp|cross_attn|self_attn).(up|down|gate|q|k|v|o)_proj'
+
+gradient_accumulation_steps: 4
+micro_batch_size: MICRO_BATCH_SIZE
+num_epochs: NUM_EPOCHS
+optimizer: adamw_bnb_8bit
+lr_scheduler: cosine
+learning_rate: LEARNING_RATE
+
+bf16: true
+tf32: true
+gradient_checkpointing: true
+flash_attention: true
+
+warmup_ratio: 0.1
+logging_steps: 10
+evals_per_epoch: 1
+saves_per_epoch: 1
+save_steps: SAVE_STEPS
+save_total_limit: 3
+weight_decay: 0.0
