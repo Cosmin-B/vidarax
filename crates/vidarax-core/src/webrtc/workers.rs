@@ -197,16 +197,19 @@ pub fn spawn_decode_workers(
 ///
 /// - **Loop detection** (perceptual-hash ring buffer): if a loop is detected,
 ///   `stdb.emit_event_sync("loop_detected", …)` is called immediately.
-/// - **Gate engine** ([`TwoPassPipeline`]): if the gate decides
-///   [`GateEventType::KeepKeyframe`], the JPEG is base64-encoded and a
-///   [`KeyframeWork`] is pushed to `vlm_tx` via a *non-blocking* try-send
-///   (dropped when the VLM queue is full to avoid stalling decode).
+/// - **Normal mode** (`clip_tx` is `None`): the gate engine ([`TwoPassPipeline`])
+///   decides which frames are keyframes; those are base64-encoded and forwarded
+///   to `vlm_tx` via a non-blocking try-send (dropped when VLM queue is full).
+/// - **Clip mode** (`clip_tx` is `Some`): the gate engine is bypassed; every
+///   accepted [`StreamFrame`] is forwarded (non-blocking) to the
+///   [`crate::webrtc::clip::ClipAccumulator`] channel.
 ///
 /// Threads exit when `frame_rx` is closed.
 pub fn spawn_analysis_workers(
     cores: usize,
     frame_rx: kanal::Receiver<StreamFrame>,
     vlm_tx: kanal::Sender<KeyframeWork>,
+    clip_tx: Option<kanal::Sender<StreamFrame>>,
     stdb: Arc<dyn EventSink>,
     run_id: String,
     session_id: String,
@@ -218,6 +221,7 @@ pub fn spawn_analysis_workers(
     for i in 0..cores.max(1) {
         let frame_rx = frame_rx.clone();
         let vlm_tx = vlm_tx.clone();
+        let clip_tx = clip_tx.clone();
         let stdb = Arc::clone(&stdb);
         let run_id = run_id.clone();
         let session_id = session_id.clone();
@@ -239,7 +243,7 @@ pub fn spawn_analysis_workers(
                 while let Ok(sf) = frame_rx.recv() {
                     let _guard = session_span.enter();
 
-                    // ── Loop detection ───────────────────────────────────
+                    // ── Loop detection (always active) ───────────────────
                     if loop_det.check(sf.signal.perceptual_hash) {
                         metrics.inc_loop_detected();
                         let _ = stdb.emit_event_sync(
@@ -253,45 +257,51 @@ pub fn spawn_analysis_workers(
                         );
                     }
 
-                    // ── Gate engine ──────────────────────────────────────
-                    let metas = pipeline.analyze_batch(&[sf.signal]);
-                    let meta = match metas.first() {
-                        Some(m) => *m,
-                        None => continue,
-                    };
-
-                    if meta.gate_event == GateEventType::KeepKeyframe {
-                        let jpeg_b64 = sf
-                            .jpeg
-                            .as_deref()
-                            .map(|j| {
-                                base64::engine::general_purpose::STANDARD.encode(j)
-                            })
-                            .unwrap_or_default();
-
-                        let event_type = if meta.scene_cut {
-                            "scene_cut"
-                        } else {
-                            "periodic_keepalive"
+                    if let Some(ref clip_tx) = clip_tx {
+                        // ── Clip mode: forward every frame to accumulator ─
+                        // Non-blocking: drop if accumulator queue is full.
+                        let _ = clip_tx.try_send(sf);
+                    } else {
+                        // ── Normal mode: gate engine → VLM ───────────────
+                        let metas = pipeline.analyze_batch(&[sf.signal]);
+                        let meta = match metas.first() {
+                            Some(m) => *m,
+                            None => continue,
                         };
 
-                        let work = KeyframeWork {
-                            run_id: run_id.clone(),
-                            session_id: session_id.clone(),
-                            frame_index: sf.signal.frame_index,
-                            pts_ms: sf.pts_ms,
-                            event_type: event_type.to_string(),
-                            confidence: meta.confidence,
-                            jpeg_b64,
-                            prompt: String::new(),
-                        };
+                        if meta.gate_event == GateEventType::KeepKeyframe {
+                            let jpeg_b64 = sf
+                                .jpeg
+                                .as_deref()
+                                .map(|j| {
+                                    base64::engine::general_purpose::STANDARD.encode(j)
+                                })
+                                .unwrap_or_default();
 
-                        // Non-blocking: drop if VLM queue is full to avoid
-                        // stalling the decode → analysis pipeline.
-                        if vlm_tx.try_send(work).is_ok() {
-                            metrics.inc_keyframes();
-                        } else {
-                            metrics.inc_keyframes_dropped();
+                            let event_type = if meta.scene_cut {
+                                "scene_cut"
+                            } else {
+                                "periodic_keepalive"
+                            };
+
+                            let work = KeyframeWork {
+                                run_id: run_id.clone(),
+                                session_id: session_id.clone(),
+                                frame_index: sf.signal.frame_index,
+                                pts_ms: sf.pts_ms,
+                                event_type: event_type.to_string(),
+                                confidence: meta.confidence,
+                                jpeg_b64,
+                                prompt: String::new(),
+                            };
+
+                            // Non-blocking: drop if VLM queue is full to avoid
+                            // stalling the decode → analysis pipeline.
+                            if vlm_tx.try_send(work).is_ok() {
+                                metrics.inc_keyframes();
+                            } else {
+                                metrics.inc_keyframes_dropped();
+                            }
                         }
                     }
                 }
@@ -309,10 +319,11 @@ pub fn spawn_analysis_workers(
 ///
 /// Each thread:
 /// 1. Pulls [`KeyframeWork`] from the shared `vlm_rx` channel.
-/// 2. Calls `provider.infer()` with the first-pass model.
-/// 3. If tiered and confidence is low, re-infers with the second-pass model.
-/// 4. Emits a `vlm` or `vlm_tiered` agent event to SpacetimeDB.
-/// 5. Stores the keyframe (JPEG + description) in SpacetimeDB.
+/// 2. Enforces `max_output_tokens_per_second` backpressure per session.
+/// 3. Calls `provider.infer()` with the first-pass model.
+/// 4. If tiered and confidence is low, re-infers with the second-pass model.
+/// 5. Emits a `vlm` or `vlm_tiered` agent event to SpacetimeDB.
+/// 6. Stores the keyframe (JPEG + description) in SpacetimeDB.
 ///
 /// VLM inference errors are logged as the description text rather than
 /// crashing the worker, so a transient provider failure does not interrupt
@@ -325,6 +336,7 @@ pub fn spawn_vlm_workers<I>(
     config: TieredVlmConfig,
     metrics: Arc<PipelineMetrics>,
     session_span: tracing::Span,
+    max_output_tokens_per_second: u32,
 ) where
     I: InferenceProvider + 'static,
 {
@@ -339,8 +351,31 @@ pub fn spawn_vlm_workers<I>(
         std::thread::Builder::new()
             .name(format!("vx-vlm-{i}"))
             .spawn(move || {
+                // Per-session token budget: (window_start, tokens_emitted_in_window).
+                let mut token_budget: std::collections::HashMap<
+                    String,
+                    (std::time::Instant, u32),
+                > = std::collections::HashMap::new();
+
                 while let Ok(work) = vlm_rx.recv() {
                     let _guard = session_span.enter();
+
+                    // Token rate limit: skip this frame if the session has
+                    // already exceeded the per-second output token budget.
+                    if max_output_tokens_per_second > 0 {
+                        let now = std::time::Instant::now();
+                        let entry = token_budget
+                            .entry(work.session_id.clone())
+                            .or_insert((now, 0));
+                        if now.duration_since(entry.0).as_secs() >= 1 {
+                            *entry = (now, 0); // reset 1-second window
+                        }
+                        if entry.1 >= max_output_tokens_per_second {
+                            metrics.inc_keyframes_dropped();
+                            continue; // backpressure: drop this inference
+                        }
+                    }
+
                     metrics.inc_vlm_inferences();
                     let prompt = if work.prompt.is_empty() {
                         "Briefly describe what is happening in this video frame.".to_string()
@@ -360,6 +395,7 @@ pub fn spawn_vlm_workers<I>(
                         temperature: 0.0,
                         timeout_ms: 5_000,
                         allow_fallback: true,
+                        output_schema: None,
                     };
 
                     let (description, used_second_pass) = match provider.infer(&first_request) {
@@ -375,6 +411,7 @@ pub fn spawn_vlm_workers<I>(
                                     temperature: 0.0,
                                     timeout_ms: 10_000,
                                     allow_fallback: true,
+                                    output_schema: None,
                                 };
                                 match provider.infer(&second_request) {
                                     Ok(second) => (second.output_text, true),
@@ -386,6 +423,15 @@ pub fn spawn_vlm_workers<I>(
                         }
                         Err(err) => (format!("vlm_error: {err:?}"), false),
                     };
+
+                    // Charge output tokens against the session budget.
+                    // Approximate: 4 bytes per token (UTF-8 average).
+                    if max_output_tokens_per_second > 0 {
+                        let token_count = (description.len() / 4).max(1) as u32;
+                        if let Some(entry) = token_budget.get_mut(&work.session_id) {
+                            entry.1 = entry.1.saturating_add(token_count);
+                        }
+                    }
 
                     let event_type = if used_second_pass { "vlm_tiered" } else { "vlm" };
 
@@ -535,6 +581,7 @@ mod tests {
             1,
             frame_rx,
             vlm_tx,
+            None, // no clip mode
             Arc::clone(&sink) as Arc<dyn EventSink>,
             "run-test".into(),
             "sess-test".into(),

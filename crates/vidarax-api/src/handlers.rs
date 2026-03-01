@@ -885,6 +885,7 @@ pub async fn analyze_run(
                 m,
                 None,
                 false,
+                None,
             );
             marker_inputs.push(marker_input);
             metadata
@@ -1338,6 +1339,7 @@ pub async fn reason_realtime_run(
                 frame,
                 semantic_overlay.overlay.as_ref(),
                 semantic_overlay.used_fallback,
+                semantic_overlay.finish_reason.clone(),
             );
             metadata.push(row);
             marker_inputs.push(marker_input);
@@ -1488,8 +1490,13 @@ pub async fn get_markers(
 pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
     let request_id = state.next_request_id();
     let endpoints = state.inference_endpoints().cloned();
+    let is_saturated = state.inference_metrics().is_high_latency();
     let availability =
-        match tokio::task::spawn_blocking(move || runtime_model_availability(endpoints)).await {
+        match tokio::task::spawn_blocking(move || {
+            runtime_model_availability(endpoints, is_saturated)
+        })
+        .await
+        {
             Ok(availability) => availability,
             Err(err) => {
                 return internal_error(&state, format!("model catalog worker join failure: {err}"));
@@ -1943,6 +1950,7 @@ struct ChunkSemanticResult {
     used_fallback: bool,
     error: Option<String>,
     attempted: bool,
+    finish_reason: Option<String>,
 }
 
 impl ChunkSemanticResult {
@@ -2174,6 +2182,7 @@ async fn infer_chunk_semantics(
 
     result.provider = Some(provider_name(provider_result.provider).to_string());
     result.provider_fallback_used = provider_result.fallback_used;
+    result.finish_reason = provider_result.finish_reason.clone();
 
     match parse_semantic_overlay(&provider_result.output_text) {
         Some(overlay) => {
@@ -2323,6 +2332,7 @@ fn compose_frame_metadata(
     m: FrameMetadata,
     semantic: Option<&SemanticOverlay>,
     semantic_fallback: bool,
+    finish_reason: Option<String>,
 ) -> (AnalyzeFrameMetadata, MarkerInput) {
     let (det_event_type, det_description) = match (m.scene_cut, m.suspect_artifact, m.gate_event) {
         (true, _, _) => ("scene_cut", "Hard transition detected from pass-1 gate"),
@@ -2401,6 +2411,7 @@ fn compose_frame_metadata(
                 span_id: format!("span-{:016x}", m.frame_index),
             },
             ordering_key: format!("{}:{}:{}", run_id, m.pts_ms, m.frame_index),
+            finish_reason,
         },
         MarkerInput {
             frame_index: m.frame_index,
@@ -2493,6 +2504,7 @@ struct RuntimeAvailability {
 
 fn runtime_model_availability(
     endpoints: Option<vidarax_core::provider::ProviderEndpoints>,
+    is_saturated: bool,
 ) -> RuntimeAvailability {
     let Some(endpoints) = endpoints else {
         return RuntimeAvailability {
@@ -2510,10 +2522,12 @@ fn runtime_model_availability(
         providers.push("sglang".to_string());
     }
 
+    // Status ordering: ready > saturated > degraded > unavailable.
+    // "saturated" means providers are reachable but overloaded (p95 > 5 s).
     let status = if vllm_up && sglang_up {
-        "ready"
+        if is_saturated { "saturated" } else { "ready" }
     } else if vllm_up || sglang_up {
-        "degraded"
+        if is_saturated { "saturated" } else { "degraded" }
     } else {
         "unavailable"
     };

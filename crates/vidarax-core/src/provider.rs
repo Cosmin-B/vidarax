@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use vidarax_contracts::errors::classify_status_code;
@@ -19,6 +19,7 @@ pub struct InferenceRequest {
     pub temperature: f32,
     pub timeout_ms: u64,
     pub allow_fallback: bool,
+    pub output_schema: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +34,8 @@ pub struct InferenceResult {
     pub model: String,
     pub output_text: String,
     pub fallback_used: bool,
+    pub finish_reason: Option<String>,
+    pub inference_latency_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,16 +146,20 @@ impl<T: Transport> InferenceProvider for VllmProvider<T> {
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
         let model = canonical_model(&request.model)?;
         let body = build_payload(model, request);
+        let t0 = Instant::now();
         let response = self
             .transport
             .call("/v1/chat/completions", &body, request.timeout_ms)?;
-        let output_text = parse_completion_text(&response)?;
+        let inference_latency_ms = t0.elapsed().as_millis() as u64;
+        let (output_text, finish_reason) = parse_completion(&response)?;
 
         Ok(InferenceResult {
             provider: ProviderKind::Vllm,
             model: model.to_string(),
             output_text,
             fallback_used: false,
+            finish_reason,
+            inference_latency_ms,
         })
     }
 }
@@ -165,16 +172,20 @@ impl<T: Transport> InferenceProvider for SglangProvider<T> {
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
         let model = canonical_model(&request.model)?;
         let body = build_payload(model, request);
+        let t0 = Instant::now();
         let response = self
             .transport
             .call("/v1/chat/completions", &body, request.timeout_ms)?;
-        let output_text = parse_completion_text(&response)?;
+        let inference_latency_ms = t0.elapsed().as_millis() as u64;
+        let (output_text, finish_reason) = parse_completion(&response)?;
 
         Ok(InferenceResult {
             provider: ProviderKind::Sglang,
             model: model.to_string(),
             output_text,
             fallback_used: false,
+            finish_reason,
+            inference_latency_ms,
         })
     }
 }
@@ -260,16 +271,20 @@ fn build_payload(model: &str, request: &InferenceRequest) -> String {
         }
         Value::Array(content)
     };
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": user_content}],
         "max_tokens": request.max_tokens,
         "temperature": request.temperature
-    })
-    .to_string()
+    });
+    if let Some(schema) = &request.output_schema {
+        payload["extra_body"] = serde_json::json!({"guided_json": schema});
+    }
+    payload.to_string()
 }
 
-fn parse_completion_text(raw: &str) -> Result<String, ProviderError> {
+/// Returns `(output_text, finish_reason)`.
+fn parse_completion(raw: &str) -> Result<(String, Option<String>), ProviderError> {
     let value: Value = serde_json::from_str(raw)
         .map_err(|err| ProviderError::InvalidResponse(format!("invalid json: {err}")))?;
 
@@ -281,12 +296,17 @@ fn parse_completion_text(raw: &str) -> Result<String, ProviderError> {
         .first()
         .ok_or_else(|| ProviderError::InvalidResponse("choices array is empty".to_string()))?;
 
+    let finish_reason = first
+        .get("finish_reason")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     if let Some(content) = first
         .get("message")
         .and_then(|v| v.get("content"))
         .or_else(|| first.get("text"))
     {
-        return parse_content_value(content);
+        return parse_content_value(content).map(|text| (text, finish_reason));
     }
 
     Err(ProviderError::InvalidResponse(
@@ -380,6 +400,7 @@ mod tests {
             temperature: 0.0,
             timeout_ms: 500,
             allow_fallback: true,
+            output_schema: None,
         }
     }
 
@@ -470,5 +491,42 @@ mod tests {
             content[1]["image_url"]["url"].as_str(),
             Some("data:image/jpeg;base64,YWJj")
         );
+    }
+
+    #[test]
+    fn payload_includes_guided_json_when_output_schema_set() {
+        let mut req = request();
+        req.output_schema = Some(serde_json::json!({
+            "type": "object",
+            "properties": {"event_type": {"type": "string"}}
+        }));
+        let body = build_payload("openbmb/MiniCPM-V-4_5", &req);
+        let value: Value = serde_json::from_str(&body).unwrap();
+        let guided = &value["extra_body"]["guided_json"];
+        assert_eq!(guided["type"].as_str(), Some("object"));
+    }
+
+    #[test]
+    fn parses_finish_reason_from_response() {
+        let json = r#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"done"}}]}"#;
+        let provider = VllmProvider::new(MockTransport::ok(json));
+        let result = provider.infer(&request()).unwrap();
+        assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(result.output_text, "done");
+    }
+
+    #[test]
+    fn finish_reason_is_none_when_absent() {
+        let provider = VllmProvider::new(MockTransport::ok(&completion_json("ok")));
+        let result = provider.infer(&request()).unwrap();
+        assert_eq!(result.finish_reason, None);
+    }
+
+    #[test]
+    fn inference_latency_ms_is_non_negative() {
+        let provider = VllmProvider::new(MockTransport::ok(&completion_json("ok")));
+        let result = provider.infer(&request()).unwrap();
+        // MockTransport returns instantly; just verify the field is present and >= 0.
+        let _ = result.inference_latency_ms; // u64, always >= 0
     }
 }

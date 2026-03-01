@@ -1,6 +1,47 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+// ─── Clip mode ────────────────────────────────────────────────────────────────
+
+/// Parameters for clip-mode multi-frame VLM inference.
+///
+/// When `clip_mode` is set on a streaming request, frames are accumulated
+/// into temporal windows and submitted as multi-image VLM calls instead of
+/// being processed one keyframe at a time.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClipConfig {
+    /// Frames per second to sample from the stream (1–30, default 6).
+    #[serde(default = "default_target_fps")]
+    pub target_fps: u32,
+    /// Duration of each clip window in seconds (0.1–60, default 0.5).
+    #[serde(default = "default_clip_length_seconds")]
+    pub clip_length_seconds: f32,
+    /// Minimum delay between clip emissions in seconds (0–60, default 0.5).
+    #[serde(default = "default_delay_seconds")]
+    pub delay_seconds: f32,
+}
+
+fn default_target_fps() -> u32 {
+    6
+}
+fn default_clip_length_seconds() -> f32 {
+    0.5
+}
+fn default_delay_seconds() -> f32 {
+    0.5
+}
+
+impl ClipConfig {
+    /// Convert to the core ClipConfig type used by the worker pipeline.
+    pub fn into_core(self) -> vidarax_core::webrtc::clip::ClipConfig {
+        vidarax_core::webrtc::clip::ClipConfig {
+            target_fps: self.target_fps,
+            clip_length_seconds: self.clip_length_seconds,
+            delay_seconds: self.delay_seconds,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateRunRequest {
     pub mode: Option<String>,
@@ -76,6 +117,9 @@ pub struct RealtimeReasonRequest {
     pub trace_id: Option<String>,
     #[serde(default)]
     pub output_schema: Option<Value>,
+    /// Optional clip-mode config. When set, frames are accumulated into
+    /// temporal windows for multi-image VLM inference.
+    pub clip_mode: Option<ClipConfig>,
 }
 
 #[derive(Debug, Serialize)]
