@@ -22,20 +22,28 @@ fn perceptual_hash_y(y: &[u8], width: u32, height: u32) -> u64 {
         return 0;
     }
 
+    // Stride by 4 in both dx/dy — reduces iterations ~16× while preserving
+    // hash quality (block averages converge quickly for perceptual hashing).
+    let stride = 4;
     let mut grid = [0u32; 64];
     for by in 0..8usize {
         for bx in 0..8usize {
             let mut sum = 0u64;
             let mut count = 0u32;
-            for dy in 0..block_h {
-                for dx in 0..block_w {
-                    let px = bx * block_w + dx;
-                    let py = by * block_h + dy;
-                    if px < w && py < h {
-                        sum += y[py * w + px] as u64;
-                        count += 1;
-                    }
+            let base_x = bx * block_w;
+            let base_y = by * block_h;
+            // By construction: base_x + dx < 8*(w/8) <= w, same for y.
+            // Bounds check is always true, so we skip it.
+            let mut dy = 0;
+            while dy < block_h {
+                let row = (base_y + dy) * w;
+                let mut dx = 0;
+                while dx < block_w {
+                    sum += y[row + base_x + dx] as u64;
+                    count += 1;
+                    dx += stride;
                 }
+                dy += stride;
             }
             grid[by * 8 + bx] = if count > 0 {
                 (sum / count as u64) as u32
