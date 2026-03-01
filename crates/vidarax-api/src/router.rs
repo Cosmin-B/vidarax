@@ -2,6 +2,7 @@ use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing::{get, patch, post};
 use axum::Router;
+use tower_http::compression::CompressionLayer;
 
 use crate::handlers::{
     analyze_run, create_run, delete_run, get_events, get_markers, get_run, get_state, health,
@@ -46,6 +47,7 @@ pub fn app_router(state: AppState) -> Router {
             patch(whip_update_prompt),
         )
         .with_state(state)
+        .layer(CompressionLayer::new())
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(
             middleware_state,
