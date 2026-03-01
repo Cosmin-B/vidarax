@@ -424,11 +424,21 @@ impl SpacetimeClient {
 
 /// Build a SELECT statement with an optional `run_id` filter.
 ///
-/// `run_id` is a server-controlled identifier — callers must not pass
-/// untrusted user input here without additional validation.
+/// Both `table` and `run_id` are validated to contain only safe characters
+/// (`[a-zA-Z0-9_-]`) to prevent SQL injection (C-2).
 fn build_select(table: &str, run_id: Option<&str>) -> String {
+    fn is_safe_identifier(s: &str) -> bool {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    }
+
+    // Table names are compile-time constants, but validate defensively.
+    assert!(is_safe_identifier(table), "invalid table name: {table}");
+
     match run_id {
-        Some(id) => format!("SELECT * FROM {table} WHERE run_id = '{id}'"),
+        Some(id) => {
+            assert!(is_safe_identifier(id), "invalid run_id format");
+            format!("SELECT * FROM {table} WHERE run_id = '{id}'")
+        }
         None => format!("SELECT * FROM {table}"),
     }
 }
