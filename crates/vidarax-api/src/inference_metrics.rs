@@ -32,6 +32,14 @@ impl InferenceMetrics {
         metrics.record_latency(latency_ms);
     }
 
+    /// Returns `true` when either provider shows p95 latency > 5 000 ms.
+    ///
+    /// Used by `GET /v1/models` to report `"saturated"` availability status
+    /// when inference providers are reachable but overloaded.
+    pub fn is_high_latency(&self) -> bool {
+        self.vllm.is_high_latency() || self.sglang.is_high_latency()
+    }
+
     pub fn render_prometheus(&self) -> String {
         let mut out = String::new();
         self.render_provider("vllm", &self.vllm, &mut out);
@@ -123,6 +131,24 @@ impl ProviderMetrics {
             latency_count: AtomicU64::new(0),
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
         }
+    }
+
+    /// p95 > 5 000 ms: fewer than 95% of requests fit within the 5 000 ms bucket.
+    fn is_high_latency(&self) -> bool {
+        let total = self.latency_count.load(Ordering::Relaxed);
+        if total < 10 {
+            return false; // too few samples
+        }
+        // LATENCY_BUCKETS_MS = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]
+        // Index 8 (inclusive) gives cumulative count ≤ 5 000 ms.
+        let within_5s: u64 = self
+            .latency_buckets
+            .iter()
+            .take(9)
+            .map(|b| b.load(Ordering::Relaxed))
+            .sum();
+        // saturated when fewer than 95% of requests complete within 5 s
+        within_5s.saturating_mul(100) < total.saturating_mul(95)
     }
 
     fn record_latency(&self, latency_ms: u64) {
