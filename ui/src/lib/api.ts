@@ -205,6 +205,18 @@ export const api = {
     },
   },
 
+  /**
+   * Build a browser-accessible URL for a file uploaded to the server.
+   * The backend serves files from the ingest roots under GET /v1/files/{filename}.
+   * This is needed because uploaded files land on the server's filesystem at a
+   * file:// path that the browser cannot access directly.
+   */
+  files: {
+    url(apiEndpoint: string, filename: string): string {
+      return `${apiEndpoint}/v1/files/${encodeURIComponent(filename)}`
+    },
+  },
+
   stream: {
     async whipOffer(offerSdp: string): Promise<{ answer_sdp: string; session_id: string; location: string }> {
       // WHIP (RFC 9725): POST raw SDP text, response is 201 + SDP body + Location header.
