@@ -379,7 +379,7 @@ pub fn spawn_vlm_workers<I>(
                         model: config.first_pass_model.clone(),
                         prompt: prompt.clone(),
                         input_images: vec![InferenceImage {
-                            media_type: "image/jpeg".to_string(),
+                            media_type: "image/jpeg",
                             data_base64: base64::engine::general_purpose::STANDARD.encode(&work.jpeg_bytes),
                         }],
                         max_tokens: 128,

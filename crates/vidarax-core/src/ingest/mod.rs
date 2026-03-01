@@ -610,33 +610,46 @@ pub(crate) fn parse_jpeg_stream_to_frames(
     raw: &[u8],
     max_frames: usize,
 ) -> Result<Vec<DecodedJpegFrame>, String> {
+    use memchr::memchr;
+
     let mut frames = Vec::with_capacity(max_frames.min(1024));
     let mut cursor = 0usize;
+
     while cursor + 1 < raw.len() && frames.len() < max_frames {
-        let mut start = None;
-        while cursor + 1 < raw.len() {
-            if raw[cursor] == 0xff && raw[cursor + 1] == 0xd8 {
-                start = Some(cursor);
-                cursor += 2;
-                break;
+        // SIMD scan for 0xFF, then check next byte for SOI marker (0xD8).
+        let start = loop {
+            match memchr(0xFF, &raw[cursor..]) {
+                Some(offset) => {
+                    let pos = cursor + offset;
+                    if pos + 1 < raw.len() && raw[pos + 1] == 0xD8 {
+                        break pos;
+                    }
+                    cursor = pos + 1;
+                }
+                None => return if frames.is_empty() {
+                    Err("no jpeg frames decoded from source".to_string())
+                } else {
+                    Ok(frames)
+                },
             }
-            cursor += 1;
-        }
-        let Some(start) = start else { break };
-
-        let mut end = None;
-        while cursor + 1 < raw.len() {
-            if raw[cursor] == 0xff && raw[cursor + 1] == 0xd9 {
-                end = Some(cursor + 2);
-                cursor += 2;
-                break;
-            }
-            cursor += 1;
-        }
-
-        let Some(end) = end else {
-            return Err("mjpeg stream ended with an incomplete frame".to_string());
         };
+        cursor = start + 2;
+
+        // SIMD scan for EOI marker (0xFF 0xD9).
+        let end = loop {
+            match memchr(0xFF, &raw[cursor..]) {
+                Some(offset) => {
+                    let pos = cursor + offset;
+                    if pos + 1 < raw.len() && raw[pos + 1] == 0xD9 {
+                        break pos + 2;
+                    }
+                    cursor = pos + 1;
+                }
+                None => return Err("mjpeg stream ended with an incomplete frame".to_string()),
+            }
+        };
+        cursor = end;
+
         frames.push(DecodedJpegFrame {
             frame_index: frames.len() as u64,
             jpeg_bytes: raw[start..end].to_vec(),

@@ -24,7 +24,7 @@ pub struct InferenceRequest {
 
 #[derive(Debug, Clone)]
 pub struct InferenceImage {
-    pub media_type: String,
+    pub media_type: &'static str,
     pub data_base64: String,
 }
 
@@ -234,18 +234,20 @@ impl<P: InferenceProvider, F: InferenceProvider> InferenceProvider for ProviderR
     }
 }
 
-pub fn infer_with_endpoints(
-    endpoints: &ProviderEndpoints,
-    primary: ProviderKind,
+/// Forward `request` to `router`, which holds pre-built transports.
+///
+/// The router (and its underlying [`reqwest::blocking::Client`] instances)
+/// must be created once at startup and reused across calls so that TCP
+/// connection pools are shared rather than rebuilt on every inference.
+pub fn infer_with_endpoints<P, F>(
+    router: &ProviderRouter<P, F>,
     request: &InferenceRequest,
-) -> Result<InferenceResult, ProviderError> {
-    let vllm = VllmProvider::new(HttpTransport::new(&endpoints.vllm_base_url)?);
-    let sglang = SglangProvider::new(HttpTransport::new(&endpoints.sglang_base_url)?);
-
-    match primary {
-        ProviderKind::Vllm => ProviderRouter::new(vllm, sglang).infer(request),
-        ProviderKind::Sglang => ProviderRouter::new(sglang, vllm).infer(request),
-    }
+) -> Result<InferenceResult, ProviderError>
+where
+    P: InferenceProvider,
+    F: InferenceProvider,
+{
+    router.infer(request)
 }
 
 fn canonical_model(model: &str) -> Result<&'static str, ProviderError> {
@@ -283,35 +285,45 @@ fn build_payload(model: &str, request: &InferenceRequest) -> String {
     payload.to_string()
 }
 
+#[derive(Deserialize)]
+struct CompletionResponse {
+    choices: Vec<CompletionChoice>,
+}
+
+#[derive(Deserialize)]
+struct CompletionChoice {
+    finish_reason: Option<String>,
+    message: Option<CompletionMessage>,
+    text: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct CompletionMessage {
+    content: Value,
+}
+
 /// Returns `(output_text, finish_reason)`.
 fn parse_completion(raw: &str) -> Result<(String, Option<String>), ProviderError> {
-    let value: Value = serde_json::from_str(raw)
+    let resp: CompletionResponse = serde_json::from_str(raw)
         .map_err(|err| ProviderError::InvalidResponse(format!("invalid json: {err}")))?;
 
-    let choices = value
-        .get("choices")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| ProviderError::InvalidResponse("missing choices array".to_string()))?;
-    let first = choices
-        .first()
+    let first = resp
+        .choices
+        .into_iter()
+        .next()
         .ok_or_else(|| ProviderError::InvalidResponse("choices array is empty".to_string()))?;
 
-    let finish_reason = first
-        .get("finish_reason")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let finish_reason = first.finish_reason;
 
-    if let Some(content) = first
-        .get("message")
-        .and_then(|v| v.get("content"))
-        .or_else(|| first.get("text"))
-    {
-        return parse_content_value(content).map(|text| (text, finish_reason));
-    }
+    let content = first
+        .message
+        .map(|m| m.content)
+        .or(first.text)
+        .ok_or_else(|| {
+            ProviderError::InvalidResponse("missing choices[0].message.content".to_string())
+        })?;
 
-    Err(ProviderError::InvalidResponse(
-        "missing choices[0].message.content".to_string(),
-    ))
+    parse_content_value(&content).map(|text| (text, finish_reason))
 }
 
 fn parse_content_value(value: &Value) -> Result<String, ProviderError> {
@@ -348,9 +360,9 @@ fn parse_content_value(value: &Value) -> Result<String, ProviderError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_payload, infer_with_endpoints, InferenceImage, InferenceProvider, InferenceRequest,
-        ProviderEndpoints, ProviderError, ProviderKind, ProviderRouter, SglangProvider, Transport,
-        VllmProvider,
+        build_payload, infer_with_endpoints, HttpTransport, InferenceImage, InferenceProvider,
+        InferenceRequest, ProviderEndpoints, ProviderError, ProviderKind, ProviderRouter,
+        SglangProvider, Transport, VllmProvider,
     };
     use serde_json::Value;
     use std::io::{Read, Write};
@@ -465,11 +477,12 @@ mod tests {
             stream.flush().unwrap();
         });
 
-        let endpoints = ProviderEndpoints {
-            vllm_base_url: format!("http://{addr}"),
-            sglang_base_url: format!("http://{addr}"),
-        };
-        let result = infer_with_endpoints(&endpoints, ProviderKind::Vllm, &request()).unwrap();
+        let base = format!("http://{addr}");
+        let router = ProviderRouter::new(
+            VllmProvider::new(HttpTransport::new(&base).unwrap()),
+            SglangProvider::new(HttpTransport::new(&base).unwrap()),
+        );
+        let result = infer_with_endpoints(&router, &request()).unwrap();
         assert_eq!(result.output_text, "from-server");
         assert_eq!(result.provider, ProviderKind::Vllm);
         server.join().unwrap();
@@ -479,7 +492,7 @@ mod tests {
     fn payload_includes_multimodal_content_when_images_exist() {
         let mut req = request();
         req.input_images = vec![InferenceImage {
-            media_type: "image/jpeg".to_string(),
+            media_type: "image/jpeg",
             data_base64: "YWJj".to_string(),
         }];
         let body = build_payload("openbmb/MiniCPM-V-4_5", &req);
