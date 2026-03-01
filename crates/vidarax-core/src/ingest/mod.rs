@@ -47,10 +47,27 @@ impl InputSource {
             let url =
                 reqwest::Url::parse(trimmed).map_err(|err| format!("invalid source_uri: {err}"))?;
             return match url.scheme() {
-                "http" | "https" | "rtsp" => validate_remote_url(url),
+                "http" | "https" => validate_remote_url(url),
+                "rtsps" => validate_remote_url(url),
+                "rtsp" => {
+                    // M-12: Reject unencrypted RTSP by default. Operators can
+                    // opt in via VIDARAX_ALLOW_UNENCRYPTED_RTSP=true for legacy
+                    // cameras on trusted networks.
+                    let allow_plain = std::env::var("VIDARAX_ALLOW_UNENCRYPTED_RTSP")
+                        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+                        .unwrap_or(false);
+                    if !allow_plain {
+                        return Err(
+                            "unencrypted rtsp:// is not allowed; use rtsps:// or set \
+                             VIDARAX_ALLOW_UNENCRYPTED_RTSP=true"
+                                .to_string(),
+                        );
+                    }
+                    validate_remote_url(url)
+                }
                 "file" => validate_file_url(url, allowed_file_roots),
                 other => Err(format!(
-                    "unsupported source_uri scheme '{other}', expected one of: file, http, https, rtsp"
+                    "unsupported source_uri scheme '{other}', expected one of: file, http, https, rtsps"
                 )),
             };
         }
