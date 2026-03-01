@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, type Component } from 'vue'
 import { useRoute } from 'vue-router'
 import { useStreamStore } from '@/stores/stream'
 import { useEventsStore } from '@/stores/events'
+import { LayoutDashboard, Radio, Upload, Settings, Wifi, WifiOff } from 'lucide-vue-next'
+import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
 
 const route = useRoute()
 const streamStore = useStreamStore()
@@ -11,7 +13,7 @@ const eventsStore = useEventsStore()
 interface NavItem {
   name: string
   path: string
-  icon: string
+  icon: Component
   label: string
   badge?: string | null
 }
@@ -20,25 +22,25 @@ const navItems: NavItem[] = [
   {
     name: 'dashboard',
     path: '/',
-    icon: 'grid',
+    icon: LayoutDashboard,
     label: 'Dashboard',
   },
   {
     name: 'stream',
     path: '/stream',
-    icon: 'broadcast',
+    icon: Radio,
     label: 'Stream',
   },
   {
     name: 'upload',
     path: '/upload',
-    icon: 'upload',
+    icon: Upload,
     label: 'Upload',
   },
   {
     name: 'settings',
     path: '/settings',
-    icon: 'settings',
+    icon: Settings,
     label: 'Settings',
   },
 ]
@@ -98,31 +100,13 @@ const spacetimeConnected = computed(() => eventsStore.isConnected)
 
         <!-- Icon -->
         <div class="w-5 h-5 shrink-0 flex items-center justify-center">
-          <!-- Grid icon (Dashboard) -->
-          <svg v-if="item.icon === 'grid'" width="18" height="18" viewBox="0 0 18 18" fill="none">
-            <rect x="2" y="2" width="6" height="6" rx="1.5" fill="currentColor"/>
-            <rect x="10" y="2" width="6" height="6" rx="1.5" fill="currentColor"/>
-            <rect x="2" y="10" width="6" height="6" rx="1.5" fill="currentColor"/>
-            <rect x="10" y="10" width="6" height="6" rx="1.5" fill="currentColor"/>
-          </svg>
-          <!-- Broadcast icon (Stream) -->
-          <svg v-else-if="item.icon === 'broadcast'" width="18" height="18" viewBox="0 0 18 18" fill="none">
-            <circle cx="9" cy="9" r="2.5" fill="currentColor"/>
-            <path d="M5.5 5.5C4.3 6.7 4.3 11.3 5.5 12.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-            <path d="M12.5 5.5C13.7 6.7 13.7 11.3 12.5 12.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-            <path d="M3 3C1 5 1 13 3 15" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" opacity="0.5"/>
-            <path d="M15 3C17 5 17 13 15 15" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" opacity="0.5"/>
-          </svg>
-          <!-- Upload icon -->
-          <svg v-else-if="item.icon === 'upload'" width="18" height="18" viewBox="0 0 18 18" fill="none">
-            <path d="M9 2L9 11M9 2L6 5M9 2L12 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M3 13V14C3 15.1 3.9 16 5 16H13C14.1 16 15 15.1 15 14V13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-          </svg>
-          <!-- Settings icon -->
-          <svg v-else-if="item.icon === 'settings'" width="18" height="18" viewBox="0 0 18 18" fill="none">
-            <circle cx="9" cy="9" r="2.5" stroke="currentColor" stroke-width="1.5"/>
-            <path d="M9 2V3.5M9 14.5V16M3.5 6.1L4.75 6.85M13.25 11.15L14.5 11.9M2 9H3.5M14.5 9H16M3.5 11.9L4.75 11.15M13.25 6.85L14.5 6.1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-          </svg>
+          <AnimatedIcon
+            :icon="item.icon"
+            :size="18"
+            :stroke-width="1.75"
+            :animation="item.name === 'stream' && streamActive ? 'glow-teal' : undefined"
+            :active="isActive(item)"
+          />
         </div>
 
         <!-- Label (only on xl) -->
@@ -133,7 +117,13 @@ const spacetimeConnected = computed(() => eventsStore.isConnected)
           v-if="item.name === 'stream' && streamActive"
           class="hidden xl:flex ml-auto"
         >
-          <span class="live-dot" style="width:6px;height:6px;" />
+          <AnimatedIcon
+            :icon="Radio"
+            :size="10"
+            :stroke-width="2"
+            animation="pulse"
+            class="text-[#2dd4bf] icon-glow-teal"
+          />
         </span>
       </RouterLink>
     </nav>
@@ -141,10 +131,12 @@ const spacetimeConnected = computed(() => eventsStore.isConnected)
     <!-- Connection status footer -->
     <div class="p-3 border-t border-[#1e2633]">
       <div class="flex items-center gap-2 px-2 py-2">
-        <div
-          class="w-2 h-2 rounded-full shrink-0 transition-colors duration-200"
-          :class="spacetimeConnected ? 'bg-[#2dd4bf]' : 'bg-[#475569]'"
-          :style="spacetimeConnected ? 'box-shadow: 0 0 6px rgba(45,212,191,0.5)' : ''"
+        <AnimatedIcon
+          :icon="spacetimeConnected ? Wifi : WifiOff"
+          :size="14"
+          :stroke-width="1.75"
+          :animation="spacetimeConnected ? 'glow-teal' : undefined"
+          :class="spacetimeConnected ? 'text-[#2dd4bf]' : 'text-[#475569]'"
         />
         <span class="hidden xl:block text-xs text-[#475569] truncate">
           {{ spacetimeConnected ? 'Connected' : 'Disconnected' }}
@@ -171,25 +163,13 @@ const spacetimeConnected = computed(() => eventsStore.isConnected)
       :aria-current="isActive(item) ? 'page' : undefined"
     >
       <div class="w-5 h-5 flex items-center justify-center">
-        <svg v-if="item.icon === 'grid'" width="18" height="18" viewBox="0 0 18 18" fill="none">
-          <rect x="2" y="2" width="6" height="6" rx="1.5" fill="currentColor"/>
-          <rect x="10" y="2" width="6" height="6" rx="1.5" fill="currentColor"/>
-          <rect x="2" y="10" width="6" height="6" rx="1.5" fill="currentColor"/>
-          <rect x="10" y="10" width="6" height="6" rx="1.5" fill="currentColor"/>
-        </svg>
-        <svg v-else-if="item.icon === 'broadcast'" width="18" height="18" viewBox="0 0 18 18" fill="none">
-          <circle cx="9" cy="9" r="2.5" fill="currentColor"/>
-          <path d="M5.5 5.5C4.3 6.7 4.3 11.3 5.5 12.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-          <path d="M12.5 5.5C13.7 6.7 13.7 11.3 12.5 12.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-        </svg>
-        <svg v-else-if="item.icon === 'upload'" width="18" height="18" viewBox="0 0 18 18" fill="none">
-          <path d="M9 2L9 11M9 2L6 5M9 2L12 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-          <path d="M3 13V14C3 15.1 3.9 16 5 16H13C14.1 16 15 15.1 15 14V13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-        </svg>
-        <svg v-else-if="item.icon === 'settings'" width="18" height="18" viewBox="0 0 18 18" fill="none">
-          <circle cx="9" cy="9" r="2.5" stroke="currentColor" stroke-width="1.5"/>
-          <path d="M9 2V3.5M9 14.5V16M3.5 6.1L4.75 6.85M13.25 11.15L14.5 11.9M2 9H3.5M14.5 9H16M3.5 11.9L4.75 11.15M13.25 6.85L14.5 6.1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-        </svg>
+        <AnimatedIcon
+          :icon="item.icon"
+          :size="18"
+          :stroke-width="1.75"
+          :animation="item.name === 'stream' && streamActive ? 'glow-teal' : undefined"
+          :active="isActive(item)"
+        />
       </div>
       <span class="text-[10px] font-medium">{{ item.label }}</span>
       <!-- Active indicator -->

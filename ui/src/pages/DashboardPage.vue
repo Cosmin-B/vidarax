@@ -5,6 +5,8 @@ import { useRunsStore } from '@/stores/runs'
 import { useEventsStore } from '@/stores/events'
 import { api, ApiError } from '@/lib/api'
 import type { RunSummary, RunStatus } from '@/stores/runs'
+import { RefreshCw, Radio, Upload, AlertCircle, ChevronRight, Zap } from 'lucide-vue-next'
+import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
 
 const router = useRouter()
 const runsStore = useRunsStore()
@@ -100,7 +102,7 @@ function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
       <div class="flex gap-3">
         <!-- Refresh -->
         <button
-          class="w-9 h-9 flex items-center justify-center rounded-[8px] text-[#64748b] transition-colors duration-200 hover:text-[#94a3b8]"
+          class="w-9 h-9 flex items-center justify-center rounded-[8px] text-[#64748b] transition-colors duration-200 hover:text-[#94a3b8] icon-hover-parent"
           style="background: rgba(255,255,255,0.04); border: 1px solid #1e2633;"
           :disabled="loading"
           :class="loading ? 'opacity-50' : ''"
@@ -108,37 +110,28 @@ function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
           aria-label="Refresh runs"
           @click="fetchRuns"
         >
-          <svg
-            width="14" height="14" viewBox="0 0 14 14" fill="none"
-            :class="loading ? 'animate-spin' : ''"
-            stroke="currentColor" stroke-width="1.5" stroke-linecap="round"
-          >
-            <path d="M1 7A6 6 0 1 0 7 1a6 6 0 0 0-4.5 2"/>
-            <path d="M1 1v3h3"/>
-          </svg>
+          <AnimatedIcon
+            :icon="RefreshCw"
+            :size="14"
+            :stroke-width="2"
+            :animation="loading ? 'spin' : undefined"
+          />
         </button>
         <RouterLink
           to="/stream"
-          class="flex items-center gap-2 px-4 py-2 rounded-[10px] text-sm font-medium text-[#08090d] transition-all duration-200"
+          class="flex items-center gap-2 px-4 py-2 rounded-[10px] text-sm font-medium text-[#08090d] transition-all duration-200 icon-hover-parent"
           style="background: linear-gradient(135deg, #0d9488 0%, #2dd4bf 100%);
                  box-shadow: 0 0 20px rgba(45,212,191,0.2);"
         >
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-            <circle cx="7" cy="7" r="2" fill="currentColor"/>
-            <path d="M3.5 3.5C2.3 4.7 2.3 9.3 3.5 10.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-            <path d="M10.5 3.5C11.7 4.7 11.7 9.3 10.5 10.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-          </svg>
+          <AnimatedIcon :icon="Radio" :size="14" :stroke-width="2" />
           New Stream
         </RouterLink>
         <RouterLink
           to="/upload"
-          class="flex items-center gap-2 px-4 py-2 rounded-[10px] text-sm font-medium text-[#94a3b8] transition-all duration-200"
+          class="flex items-center gap-2 px-4 py-2 rounded-[10px] text-sm font-medium text-[#94a3b8] transition-all duration-200 icon-hover-parent"
           style="background: rgba(255,255,255,0.04); border: 1px solid #1e2633;"
         >
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-            <path d="M7 1L7 9M7 1L4 4M7 1L10 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M2 11V12C2 12.6 2.4 13 3 13H11C11.6 13 12 12.6 12 12V11" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-          </svg>
+          <AnimatedIcon :icon="Upload" :size="14" :stroke-width="2" />
           Upload Video
         </RouterLink>
       </div>
@@ -150,9 +143,13 @@ function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
       class="flex items-center gap-3 p-3 rounded-[10px] text-sm"
       style="background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2);"
     >
-      <svg width="14" height="14" viewBox="0 0 14 14" fill="#ef4444" class="shrink-0">
-        <path d="M7 1C3.7 1 1 3.7 1 7s2.7 6 6 6 6-2.7 6-6-2.7-6-6-6zm-.5 3h1v4H6.5V4zm0 5h1v1h-1V9z"/>
-      </svg>
+      <AnimatedIcon
+        :icon="AlertCircle"
+        :size="14"
+        :stroke-width="2"
+        animation="fade-in"
+        class="text-[#ef4444] shrink-0"
+      />
       <span class="text-[#ef4444] flex-1">{{ fetchError }}</span>
       <button class="text-[#ef4444] text-xs underline" @click="fetchRuns">Retry</button>
     </div>
@@ -239,10 +236,12 @@ function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
             {{ statusConfig(run.status).label }}
           </span>
           <!-- Chevron -->
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"
-               class="text-[#475569] shrink-0 group-hover:text-[#64748b] transition-colors">
-            <path d="M5 3L9 7L5 11" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
+          <AnimatedIcon
+            :icon="ChevronRight"
+            :size="14"
+            :stroke-width="2"
+            class="text-[#475569] shrink-0 group-hover:text-[#64748b] transition-colors"
+          />
         </button>
       </div>
     </div>
@@ -250,7 +249,13 @@ function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
     <!-- Recent SpacetimeDB events -->
     <div v-if="recentEvents.length > 0" class="card-skeuo overflow-hidden">
       <div class="px-5 py-4 border-b border-[#1e2633] flex items-center gap-2">
-        <span class="live-dot" style="width:6px; height:6px;" />
+        <AnimatedIcon
+          :icon="Zap"
+          :size="12"
+          :stroke-width="2"
+          animation="pulse"
+          class="text-[#2dd4bf] icon-glow-teal shrink-0"
+        />
         <h3 class="text-[#e2e8f0] font-medium text-sm">Live Events</h3>
         <span class="badge badge-teal mono ml-auto">{{ recentEvents.length }}</span>
       </div>

@@ -2,6 +2,8 @@
 import { ref, reactive, onMounted } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { api } from '@/lib/api'
+import { Check, ChevronDown, RefreshCw } from 'lucide-vue-next'
+import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
 
 const authStore = useAuthStore()
 
@@ -229,9 +231,14 @@ function toggle(section: SectionKey): void {
             : 'background: linear-gradient(135deg, #0d9488 0%, #2dd4bf 100%); box-shadow: 0 0 20px rgba(45,212,191,0.2);'"
           @click="saveSettings"
         >
-          <svg v-if="saved" width="14" height="14" viewBox="0 0 14 14" fill="none">
-            <path d="M2 7L5.5 10.5L12 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
+          <AnimatedIcon
+            v-if="saved"
+            :icon="Check"
+            :size="14"
+            :stroke-width="2"
+            animation="draw-in"
+            class="icon-glow-teal"
+          />
           {{ saved ? 'Saved!' : 'Save' }}
         </button>
       </div>
@@ -261,11 +268,14 @@ function toggle(section: SectionKey): void {
             STDB {{ stdbTestState === 'ok' ? '✓' : stdbTestState === 'error' ? '✗' : '…' }}
           </span>
         </div>
-        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"
-             class="text-[#475569] transition-transform duration-200"
-             :class="openSection === 'connection' ? 'rotate-180' : ''">
-          <path d="M3 5L7 9L11 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-        </svg>
+        <AnimatedIcon
+          :icon="ChevronDown"
+          :size="14"
+          :stroke-width="2"
+          animation="draw-in"
+          class="text-[#475569] transition-transform duration-200"
+          :class="openSection === 'connection' ? 'rotate-180' : ''"
+        />
       </button>
 
       <div v-if="openSection === 'connection'"
@@ -346,11 +356,14 @@ function toggle(section: SectionKey): void {
           <span class="text-[#e2e8f0] font-medium text-sm">Models</span>
           <span v-if="modelsLoading" class="badge badge-muted">Fetching…</span>
         </div>
-        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"
-             class="text-[#475569] transition-transform duration-200"
-             :class="openSection === 'models' ? 'rotate-180' : ''">
-          <path d="M3 5L7 9L11 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-        </svg>
+        <AnimatedIcon
+          :icon="ChevronDown"
+          :size="14"
+          :stroke-width="2"
+          animation="draw-in"
+          class="text-[#475569] transition-transform duration-200"
+          :class="openSection === 'models' ? 'rotate-180' : ''"
+        />
       </button>
 
       <div v-if="openSection === 'models'"
@@ -414,11 +427,17 @@ function toggle(section: SectionKey): void {
         </div>
 
         <button
-          class="text-xs text-[#2dd4bf] hover:text-[#5eead4] transition-colors"
+          class="flex items-center gap-1.5 text-xs text-[#2dd4bf] hover:text-[#5eead4] transition-colors icon-scale-hover"
           :disabled="modelsLoading"
           @click="fetchModels"
         >
-          {{ modelsLoading ? 'Fetching models…' : '↺ Refresh from API' }}
+          <AnimatedIcon
+            :icon="RefreshCw"
+            :size="12"
+            :stroke-width="2"
+            :animation="modelsLoading ? 'spin' : undefined"
+          />
+          {{ modelsLoading ? 'Fetching models…' : 'Refresh from API' }}
         </button>
       </div>
     </div>
@@ -430,11 +449,14 @@ function toggle(section: SectionKey): void {
         @click="toggle('stream')"
       >
         <span class="text-[#e2e8f0] font-medium text-sm">Stream</span>
-        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"
-             class="text-[#475569] transition-transform duration-200"
-             :class="openSection === 'stream' ? 'rotate-180' : ''">
-          <path d="M3 5L7 9L11 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-        </svg>
+        <AnimatedIcon
+          :icon="ChevronDown"
+          :size="14"
+          :stroke-width="2"
+          animation="draw-in"
+          class="text-[#475569] transition-transform duration-200"
+          :class="openSection === 'stream' ? 'rotate-180' : ''"
+        />
       </button>
 
       <div v-if="openSection === 'stream'"
@@ -525,11 +547,14 @@ function toggle(section: SectionKey): void {
         @click="toggle('gate')"
       >
         <span class="text-[#e2e8f0] font-medium text-sm">Gate Engine</span>
-        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"
-             class="text-[#475569] transition-transform duration-200"
-             :class="openSection === 'gate' ? 'rotate-180' : ''">
-          <path d="M3 5L7 9L11 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-        </svg>
+        <AnimatedIcon
+          :icon="ChevronDown"
+          :size="14"
+          :stroke-width="2"
+          animation="draw-in"
+          class="text-[#475569] transition-transform duration-200"
+          :class="openSection === 'gate' ? 'rotate-180' : ''"
+        />
       </button>
 
       <div v-if="openSection === 'gate'"
@@ -624,11 +649,14 @@ function toggle(section: SectionKey): void {
         @click="toggle('advanced')"
       >
         <span class="text-[#e2e8f0] font-medium text-sm">Advanced</span>
-        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"
-             class="text-[#475569] transition-transform duration-200"
-             :class="openSection === 'advanced' ? 'rotate-180' : ''">
-          <path d="M3 5L7 9L11 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-        </svg>
+        <AnimatedIcon
+          :icon="ChevronDown"
+          :size="14"
+          :stroke-width="2"
+          animation="draw-in"
+          class="text-[#475569] transition-transform duration-200"
+          :class="openSection === 'advanced' ? 'rotate-180' : ''"
+        />
       </button>
 
       <div v-if="openSection === 'advanced'"

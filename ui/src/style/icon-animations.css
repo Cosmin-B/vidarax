@@ -1,0 +1,218 @@
+/* ============================================================
+ * icon-animations.css
+ * CSS @keyframes and utility classes for lucide-vue-next icons
+ * Used via AnimatedIcon.vue wrapper
+ * ============================================================ */
+
+/* ── Keyframes ──────────────────────────────────────────────── */
+
+/* Draw-in: SVG stroke-dasharray reveal, mimicking the
+   lucide-animated library's stroke draw-in effect.
+   Works on any lucide icon because all paths use stroke. */
+@keyframes icon-draw-in {
+  0% {
+    stroke-dashoffset: 100;
+    opacity: 0;
+  }
+  40% {
+    opacity: 1;
+  }
+  100% {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+}
+
+/* Gentle scale pulse for live/active indicators */
+@keyframes icon-pulse {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.15);
+    opacity: 0.85;
+  }
+}
+
+/* Smooth rotation for loading/refresh states */
+@keyframes icon-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Subtle vertical bounce on hover/trigger */
+@keyframes icon-bounce {
+  0%, 100% {
+    transform: translateY(0);
+    animation-timing-function: cubic-bezier(0.8, 0, 1, 1);
+  }
+  50% {
+    transform: translateY(-4px);
+    animation-timing-function: cubic-bezier(0, 0, 0.2, 1);
+  }
+}
+
+/* Opacity entrance fade */
+@keyframes icon-fade-in {
+  from {
+    opacity: 0;
+    transform: scale(0.85);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Teal glow pulse for active connection / live states */
+@keyframes icon-glow-teal {
+  0%, 100% {
+    filter: drop-shadow(0 0 0px rgba(45, 212, 191, 0));
+    opacity: 1;
+  }
+  50% {
+    filter: drop-shadow(0 0 6px rgba(45, 212, 191, 0.7));
+    opacity: 0.9;
+  }
+}
+
+/* Amber glow pulse for warning / processing states */
+@keyframes icon-glow-amber {
+  0%, 100% {
+    filter: drop-shadow(0 0 0px rgba(245, 158, 11, 0));
+    opacity: 1;
+  }
+  50% {
+    filter: drop-shadow(0 0 6px rgba(245, 158, 11, 0.65));
+    opacity: 0.9;
+  }
+}
+
+/* ── Utility classes ────────────────────────────────────────── */
+
+.animated-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  /* Keep icons crisp at small sizes */
+  shape-rendering: geometricPrecision;
+}
+
+/* Draw-in entrance — apply once on mount */
+.icon-draw-in {
+  stroke-dasharray: 100;
+  stroke-dashoffset: 100;
+  animation: icon-draw-in 0.55s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* Continuous pulse */
+.icon-pulse {
+  animation: icon-pulse 2s ease-in-out infinite;
+}
+
+/* Continuous spin — use for loading/refresh */
+.icon-spin {
+  animation: icon-spin 1s linear infinite;
+}
+
+/* Bounce — one-shot or can be toggled via .is-active */
+.icon-bounce {
+  animation: icon-bounce 0.6s ease-in-out;
+}
+
+/* Fade-in entrance */
+.icon-fade-in {
+  animation: icon-fade-in 0.3s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* Teal glow pulse */
+.icon-glow-teal {
+  animation: icon-glow-teal 2.2s ease-in-out infinite;
+  color: #2dd4bf;
+}
+
+/* Amber glow pulse */
+.icon-glow-amber {
+  animation: icon-glow-amber 2.2s ease-in-out infinite;
+  color: #f59e0b;
+}
+
+/* ── Active state modifiers ─────────────────────────────────── */
+
+/* .is-active amplifies the animation of any glow class */
+.icon-glow-teal.is-active {
+  animation-duration: 1.4s;
+}
+
+.icon-glow-amber.is-active {
+  animation-duration: 1.4s;
+}
+
+/* .is-active on spin slows to a gentle idle rotation */
+.icon-spin.is-active {
+  animation-duration: 2s;
+}
+
+/* ── Hover utilities (opt-in) ───────────────────────────────── */
+
+/* Wrap the icon's parent in .icon-hover-bounce to trigger on hover */
+.icon-hover-bounce:hover .animated-icon {
+  animation: icon-bounce 0.5s ease-in-out;
+}
+
+.icon-hover-spin:hover .animated-icon {
+  animation: icon-spin 0.6s linear;
+}
+
+/* ── Stagger delay helpers for source-picker fade-ins ─────── */
+.icon-fade-in-delay-0 { animation-delay: 0ms; }
+.icon-fade-in-delay-1 { animation-delay: 60ms; }
+.icon-fade-in-delay-2 { animation-delay: 120ms; }
+.icon-fade-in-delay-3 { animation-delay: 180ms; }
+.icon-fade-in-delay-4 { animation-delay: 240ms; }
+.icon-fade-in-delay-5 { animation-delay: 300ms; }
+
+/* ── Scale-on-hover for individual icons ─────────────────── */
+/* Add .icon-scale-hover to any element wrapping or being an animated-icon.
+   Scale applies when the element itself is hovered (for standalone icon links/buttons)
+   or when a parent with .icon-hover-parent is hovered. */
+.icon-scale-hover {
+  transition: transform 200ms cubic-bezier(0.4, 0, 0.2, 1);
+  transform-origin: center;
+}
+
+.icon-scale-hover:hover {
+  transform: scale(1.1);
+}
+
+/* Apply scale to animated-icon when a parent button/link is hovered:
+   add class="icon-hover-parent" to the wrapper button/link element */
+.icon-hover-parent:hover .animated-icon {
+  transform: scale(1.1);
+  transition: transform 200ms cubic-bezier(0.4, 0, 0.2, 1);
+  transform-origin: center;
+}
+
+/* ── Reduce motion: respect user preference ───────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .icon-draw-in,
+  .icon-pulse,
+  .icon-spin,
+  .icon-bounce,
+  .icon-glow-teal,
+  .icon-glow-amber,
+  .icon-fade-in {
+    animation: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+    filter: none !important;
+    stroke-dasharray: unset !important;
+    stroke-dashoffset: 0 !important;
+  }
+}

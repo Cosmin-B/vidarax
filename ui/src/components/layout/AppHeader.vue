@@ -4,6 +4,8 @@ import { useRoute } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useEventsStore } from '@/stores/events'
 import { useStreamStore } from '@/stores/stream'
+import { Radio, Wifi, WifiOff, Server } from 'lucide-vue-next'
+import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
 
 const route = useRoute()
 const authStore = useAuthStore()
@@ -48,7 +50,13 @@ const streamState = computed(() => streamStore.sessionState)
       class="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-lg"
       style="background: rgba(45,212,191,0.08); border: 1px solid rgba(45,212,191,0.2);"
     >
-      <span class="live-dot" style="width:6px;height:6px;" />
+      <AnimatedIcon
+        :icon="Radio"
+        :size="12"
+        :stroke-width="2"
+        animation="pulse"
+        class="text-[#2dd4bf] icon-glow-teal"
+      />
       <span class="text-[#2dd4bf] text-xs font-medium font-mono">
         LIVE &middot; {{ streamStore.fps.toFixed(0) }}fps
       </span>
@@ -59,13 +67,22 @@ const streamState = computed(() => streamStore.sessionState)
       class="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-lg cursor-default"
       style="background: rgba(255,255,255,0.03); border: 1px solid #1e2633;"
     >
-      <div
-        class="w-1.5 h-1.5 rounded-full transition-colors duration-300"
+      <AnimatedIcon
+        :icon="connectionState === 'disconnected' ? WifiOff : connectionState === 'error' ? WifiOff : Wifi"
+        :size="12"
+        :stroke-width="2"
+        :animation="connectionState === 'connected' ? 'glow-teal' : undefined"
         :class="{
-          'bg-[#2dd4bf]': connectionState === 'connected',
-          'bg-[#ef4444]': connectionState === 'error',
-          'bg-[#475569]': connectionState === 'disconnected',
+          'text-[#2dd4bf]': connectionState === 'connected',
+          'text-[#ef4444]': connectionState === 'error',
+          'text-[#475569]': connectionState === 'disconnected',
         }"
+      />
+      <AnimatedIcon
+        :icon="Server"
+        :size="12"
+        :stroke-width="2"
+        class="text-[#475569]"
       />
       <span class="text-[#64748b] text-xs font-mono truncate max-w-[140px]">
         {{ endpointHost }}

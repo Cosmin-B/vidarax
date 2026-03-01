@@ -1,0 +1,140 @@
+/* ── Icon Animation Utilities ─────────────────────────────────────────────────
+   All animations use GPU-composited properties only (transform, opacity).
+   ──────────────────────────────────────────────────────────────────────────── */
+
+/* ── Draw-in: SVG stroke-dashoffset reveal ──────────────────────────────────── */
+@keyframes icon-draw-in {
+  from {
+    stroke-dashoffset: 40;
+    opacity: 0;
+  }
+  to {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+}
+
+.icon-draw-in {
+  stroke-dasharray: 40;
+  stroke-dashoffset: 40;
+  animation: icon-draw-in 0.45s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* ── Pulse: scale + opacity throb (teal glow) ──────────────────────────────── */
+@keyframes icon-pulse-keyframes {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 1;
+    filter: drop-shadow(0 0 0px rgba(45, 212, 191, 0));
+  }
+  50% {
+    transform: scale(1.12);
+    opacity: 0.85;
+    filter: drop-shadow(0 0 6px rgba(45, 212, 191, 0.7));
+  }
+}
+
+.icon-pulse {
+  animation: icon-pulse-keyframes 2s ease-in-out infinite;
+  transform-origin: center;
+}
+
+/* ── Spin: continuous 360° rotation ─────────────────────────────────────────── */
+@keyframes icon-spin-keyframes {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+.icon-spin {
+  animation: icon-spin-keyframes 0.9s linear infinite;
+  transform-origin: center;
+}
+
+/* ── Bounce: vertical spring on hover ───────────────────────────────────────── */
+@keyframes icon-bounce-keyframes {
+  0%   { transform: translateY(0); }
+  30%  { transform: translateY(-5px); }
+  50%  { transform: translateY(-2px); }
+  70%  { transform: translateY(-4px); }
+  100% { transform: translateY(0); }
+}
+
+.icon-bounce {
+  animation: icon-bounce-keyframes 0.6s cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
+  transform-origin: center;
+}
+
+/* ── Glow – teal: static glow for success states ───────────────────────────── */
+@keyframes icon-glow-teal-keyframes {
+  0%, 100% { filter: drop-shadow(0 0 3px rgba(45, 212, 191, 0.5)); }
+  50%       { filter: drop-shadow(0 0 8px rgba(45, 212, 191, 0.9)); }
+}
+
+.icon-glow-teal {
+  animation: icon-glow-teal-keyframes 2.5s ease-in-out infinite;
+}
+
+/* ── Glow – amber: pulsing glow for processing states ──────────────────────── */
+@keyframes icon-glow-amber-keyframes {
+  0%, 100% { filter: drop-shadow(0 0 3px rgba(245, 158, 11, 0.5)); }
+  50%       { filter: drop-shadow(0 0 8px rgba(245, 158, 11, 0.9)); }
+}
+
+.icon-glow-amber {
+  animation: icon-glow-amber-keyframes 2s ease-in-out infinite;
+}
+
+/* ── Fade-in: opacity + slight upward slide ─────────────────────────────────── */
+@keyframes icon-fade-in-keyframes {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.9);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.icon-fade-in {
+  opacity: 0;
+  animation: icon-fade-in-keyframes 0.35s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  transform-origin: center;
+}
+
+/* ── Stagger helpers (used on source tiles by index) ────────────────────────── */
+.icon-fade-in-delay-0 { animation-delay: 0ms; }
+.icon-fade-in-delay-1 { animation-delay: 60ms; }
+.icon-fade-in-delay-2 { animation-delay: 120ms; }
+.icon-fade-in-delay-3 { animation-delay: 180ms; }
+.icon-fade-in-delay-4 { animation-delay: 240ms; }
+.icon-fade-in-delay-5 { animation-delay: 300ms; }
+
+/* ── Hover scale: composited 1.1× scale on hover ────────────────────────────── */
+.icon-hover {
+  transition: transform 200ms cubic-bezier(0.4, 0, 0.2, 1),
+              color 200ms cubic-bezier(0.4, 0, 0.2, 1);
+  transform-origin: center;
+}
+
+.icon-hover:hover {
+  transform: scale(1.1);
+}
+
+/* ── Reduce motion: respect user preference ─────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .icon-draw-in,
+  .icon-pulse,
+  .icon-spin,
+  .icon-bounce,
+  .icon-glow-teal,
+  .icon-glow-amber,
+  .icon-fade-in {
+    animation: none;
+    opacity: 1;
+    transform: none;
+    filter: none;
+    stroke-dasharray: none;
+    stroke-dashoffset: 0;
+  }
+}

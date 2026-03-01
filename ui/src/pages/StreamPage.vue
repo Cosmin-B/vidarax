@@ -6,6 +6,9 @@ import { useEventsStore } from '@/stores/events'
 import { useWhip } from '@/composables/useWhip'
 import { useEventStream } from '@/composables/useEventStream'
 import type { StreamSourceType } from '@/stores/stream'
+import { Monitor, Camera, Radio, FileVideo, Clock, Play, Check, Zap } from 'lucide-vue-next'
+import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
+import type { Component } from 'vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -22,16 +25,16 @@ interface SourceTile {
   label: string
   description: string
   available: boolean
-  icon: string
+  icon: Component
 }
 
 const sources: SourceTile[] = [
-  { id: 'screen',  label: 'Screen',   description: 'Capture your entire screen or a window', available: true,  icon: 'monitor'   },
-  { id: 'camera',  label: 'Camera',   description: 'Use your webcam or external camera',      available: true,  icon: 'camera'    },
-  { id: 'livecam', label: 'Live Cam', description: 'Connect to an IP camera via WHIP',        available: true,  icon: 'broadcast' },
-  { id: 'file',    label: 'File',     description: 'Analyse a local video file',               available: true,  icon: 'file'      },
-  { id: 'livekit', label: 'LiveKit',  description: 'Join a LiveKit room',                      available: false, icon: 'generic'   },
-  { id: 'rtsp',    label: 'RTSP',     description: 'Connect to an RTSP stream',                available: false, icon: 'generic'   },
+  { id: 'screen',  label: 'Screen',   description: 'Capture your entire screen or a window', available: true,  icon: Monitor   },
+  { id: 'camera',  label: 'Camera',   description: 'Use your webcam or external camera',      available: true,  icon: Camera    },
+  { id: 'livecam', label: 'Live Cam', description: 'Connect to an IP camera via WHIP',        available: true,  icon: Radio     },
+  { id: 'file',    label: 'File',     description: 'Analyse a local video file',               available: true,  icon: FileVideo },
+  { id: 'livekit', label: 'LiveKit',  description: 'Join a LiveKit room',                      available: false, icon: Clock     },
+  { id: 'rtsp',    label: 'RTSP',     description: 'Connect to an RTSP stream',                available: false, icon: Radio     },
 ]
 
 const selectedSource = ref<StreamSourceType | null>(null)
@@ -140,9 +143,12 @@ function formatPts(pts: number): string {
       <!-- Header bar -->
       <div class="flex items-center justify-between">
         <div class="flex items-center gap-3">
-          <span
-            class="live-dot"
-            :style="isNegotiating ? 'background: #f59e0b;' : ''"
+          <AnimatedIcon
+            :icon="Radio"
+            :size="16"
+            :stroke-width="2"
+            animation="pulse"
+            :class="isNegotiating ? 'text-[#f59e0b] icon-glow-amber' : 'text-[#2dd4bf] icon-glow-teal'"
           />
           <h2 class="text-[#e2e8f0] font-semibold text-lg">
             {{ isNegotiating ? 'Connecting…' : 'Live Stream' }}
@@ -152,10 +158,17 @@ function formatPts(pts: number): string {
           </span>
           <span
             v-if="stdbConnected"
-            class="badge badge-green mono"
+            class="badge badge-green flex items-center gap-1"
             title="SpacetimeDB connected"
           >
-            ●&nbsp;Events
+            <AnimatedIcon
+              :icon="Zap"
+              :size="10"
+              :stroke-width="2"
+              animation="pulse"
+              class="icon-glow-teal"
+            />
+            Events
           </span>
         </div>
 
@@ -344,7 +357,7 @@ function formatPts(pts: number): string {
 
       <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
         <button
-          v-for="source in sources"
+          v-for="(source, index) in sources"
           :key="source.id"
           class="relative flex flex-col items-start gap-3 p-4 rounded-[12px] text-left transition-all duration-200"
           :class="[
@@ -363,9 +376,13 @@ function formatPts(pts: number): string {
             class="absolute top-3 right-3 w-5 h-5 rounded-full flex items-center justify-center"
             style="background: #2dd4bf;"
           >
-            <svg width="10" height="8" viewBox="0 0 10 8" fill="none">
-              <path d="M1 4L3.5 6.5L9 1" stroke="#08090d" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
+            <AnimatedIcon
+              :icon="Check"
+              :size="10"
+              :stroke-width="2.5"
+              animation="draw-in"
+              class="text-[#08090d]"
+            />
           </div>
 
           <!-- Soon badge -->
@@ -378,39 +395,16 @@ function formatPts(pts: number): string {
               ? 'background: rgba(45,212,191,0.15);'
               : 'background: rgba(255,255,255,0.04); border: 1px solid #1e2633;'"
           >
-            <svg v-if="source.icon === 'monitor'" width="20" height="20" viewBox="0 0 20 20" fill="none"
-                 :stroke="selectedSource === source.id ? '#2dd4bf' : '#64748b'"
-                 stroke-width="1.5" stroke-linecap="round">
-              <rect x="2" y="3" width="16" height="11" rx="2"/>
-              <path d="M7 17H13M10 14V17"/>
-            </svg>
-            <svg v-else-if="source.icon === 'camera'" width="20" height="20" viewBox="0 0 20 20" fill="none"
-                 :stroke="selectedSource === source.id ? '#2dd4bf' : '#64748b'"
-                 stroke-width="1.5" stroke-linecap="round">
-              <path d="M2 7C2 5.9 2.9 5 4 5H6L7.5 3H12.5L14 5H16C17.1 5 18 5.9 18 7V15C18 16.1 17.1 17 16 17H4C2.9 17 2 16.1 2 15V7Z"/>
-              <circle cx="10" cy="11" r="3"/>
-            </svg>
-            <svg v-else-if="source.icon === 'broadcast'" width="20" height="20" viewBox="0 0 20 20" fill="none"
-                 :stroke="selectedSource === source.id ? '#2dd4bf' : '#64748b'"
-                 stroke-width="1.5" stroke-linecap="round">
-              <circle cx="10" cy="10" r="2.5" stroke="none"
-                      :fill="selectedSource === source.id ? '#2dd4bf' : '#64748b'"/>
-              <path d="M6 6C4.3 7.7 4.3 12.3 6 14M14 6C15.7 7.7 15.7 12.3 14 14"/>
-              <path d="M3.5 3.5C1 6 1 14 3.5 16.5M16.5 3.5C19 6 19 14 16.5 16.5" opacity="0.5"/>
-            </svg>
-            <svg v-else-if="source.icon === 'file'" width="20" height="20" viewBox="0 0 20 20" fill="none"
-                 :stroke="selectedSource === source.id ? '#2dd4bf' : '#64748b'"
-                 stroke-width="1.5" stroke-linecap="round">
-              <path d="M4 3H12L16 7V17C16 17.6 15.6 18 15 18H5C4.4 18 4 17.6 4 17V3Z"/>
-              <path d="M12 3V7H16"/>
-              <path d="M7 11H13M7 14H11"/>
-            </svg>
-            <svg v-else width="20" height="20" viewBox="0 0 20 20" fill="none"
-                 :stroke="selectedSource === source.id ? '#2dd4bf' : '#64748b'"
-                 stroke-width="1.5" stroke-linecap="round">
-              <circle cx="10" cy="10" r="7"/>
-              <path d="M10 7V10L12 12"/>
-            </svg>
+            <AnimatedIcon
+              :icon="source.icon"
+              :size="20"
+              :stroke-width="1.75"
+              animation="fade-in"
+              :class="[
+                selectedSource === source.id ? 'text-[#2dd4bf]' : 'text-[#64748b]',
+                `icon-fade-in-delay-${Math.min(index, 5)}`,
+              ]"
+            />
           </div>
 
           <!-- Text -->
@@ -426,14 +420,12 @@ function formatPts(pts: number): string {
       <!-- Start button -->
       <div v-if="selectedSource" class="flex justify-end">
         <button
-          class="flex items-center gap-2 px-6 py-2.5 rounded-[10px] text-sm font-semibold text-[#08090d] transition-all duration-200"
+          class="flex items-center gap-2 px-6 py-2.5 rounded-[10px] text-sm font-semibold text-[#08090d] transition-all duration-200 icon-hover-parent"
           style="background: linear-gradient(135deg, #0d9488 0%, #2dd4bf 100%);
                  box-shadow: 0 0 20px rgba(45,212,191,0.3);"
           @click="handleStart"
         >
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-            <path d="M3 2L11 7L3 12V2Z" fill="currentColor"/>
-          </svg>
+          <AnimatedIcon :icon="Play" :size="14" :stroke-width="2" />
           Start Analysis
         </button>
       </div>

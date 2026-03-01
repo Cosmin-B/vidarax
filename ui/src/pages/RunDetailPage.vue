@@ -6,6 +6,8 @@ import { useEventsStore } from '@/stores/events'
 import { useEventStream } from '@/composables/useEventStream'
 import { api, ApiError } from '@/lib/api'
 import type { RunStatus } from '@/stores/runs'
+import { ChevronLeft, Image, StopCircle, Trash2, Radio, Zap } from 'lucide-vue-next'
+import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -170,17 +172,22 @@ function formatDate(iso: string): string {
           <div class="flex items-center gap-2 mb-1">
             <RouterLink
               to="/"
-              class="text-[#475569] hover:text-[#64748b] transition-colors"
+              class="text-[#475569] hover:text-[#64748b] transition-colors icon-hover-parent"
               aria-label="Back to Dashboard"
             >
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                <path d="M10 3L6 8L10 13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
+              <AnimatedIcon :icon="ChevronLeft" :size="16" :stroke-width="2" />
             </RouterLink>
             <span :class="['badge', statusConfig(run.status as RunStatus).cls]">
               {{ statusConfig(run.status as RunStatus).label }}
             </span>
-            <span v-if="isProcessing" class="live-dot" style="width:6px; height:6px;" />
+            <AnimatedIcon
+              v-if="isProcessing"
+              :icon="Radio"
+              :size="14"
+              :stroke-width="2"
+              animation="pulse"
+              class="text-[#f59e0b] icon-glow-amber"
+            />
           </div>
           <h2 class="mono text-[#e2e8f0] font-semibold text-lg">{{ run.run_id }}</h2>
           <div class="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 text-xs text-[#64748b]">
@@ -267,7 +274,13 @@ function formatDate(iso: string): string {
         <div class="px-5 py-4 border-b border-[#1e2633] flex items-center justify-between">
           <h3 class="text-[#e2e8f0] font-medium text-sm">Event Timeline</h3>
           <span v-if="isProcessing" class="flex items-center gap-1.5 text-xs text-[#f59e0b]">
-            <span class="live-dot" style="background: #f59e0b; width:6px; height:6px;" />
+            <AnimatedIcon
+              :icon="Zap"
+              :size="12"
+              :stroke-width="2"
+              animation="pulse"
+              class="icon-glow-amber"
+            />
             Live
           </span>
         </div>
@@ -338,10 +351,7 @@ function formatDate(iso: string): string {
               v-else
               class="absolute inset-0 flex items-center justify-center text-[#1e2633]"
             >
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
-                <rect x="3" y="3" width="18" height="18" rx="2"/>
-                <path d="M3 9l4-4 4 4 4-4 4 4"/>
-              </svg>
+              <AnimatedIcon :icon="Image" :size="24" :stroke-width="1" />
             </div>
             <!-- Overlay -->
             <div

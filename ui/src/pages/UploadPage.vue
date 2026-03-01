@@ -7,6 +7,8 @@ import { useEventStream } from '@/composables/useEventStream'
 import { useAuthStore } from '@/stores/auth'
 import { api, ApiError } from '@/lib/api'
 import type { RunStatus } from '@/stores/runs'
+import { ChevronLeft, UploadCloud, CheckCircle, AlertCircle, Upload, Zap } from 'lucide-vue-next'
+import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
 
 const router = useRouter()
 const runsStore = useRunsStore()
@@ -245,10 +247,8 @@ function formatPts(ms: number) {
 
     <!-- Header -->
     <div class="flex items-center gap-3">
-      <RouterLink to="/" class="text-[#475569] hover:text-[#64748b] transition-colors" aria-label="Back">
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-          <path d="M10 3L6 8L10 13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
+      <RouterLink to="/" class="text-[#475569] hover:text-[#64748b] transition-colors icon-hover-parent" aria-label="Back">
+        <AnimatedIcon :icon="ChevronLeft" :size="16" :stroke-width="2" />
       </RouterLink>
       <div>
         <h2 class="text-[#e2e8f0] font-semibold text-xl">Upload Video</h2>
@@ -263,9 +263,13 @@ function formatPts(ms: number) {
           class="w-12 h-12 rounded-full flex items-center justify-center mx-auto"
           style="background: rgba(34,197,94,0.12); border: 1px solid rgba(34,197,94,0.2);"
         >
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-            <path d="M5 12L9 16L19 6" stroke="#22c55e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
+          <AnimatedIcon
+            :icon="CheckCircle"
+            :size="24"
+            :stroke-width="2"
+            animation="draw-in"
+            class="text-[#22c55e]"
+          />
         </div>
         <div>
           <div class="text-[#e2e8f0] font-semibold">Analysis Complete</div>
@@ -398,13 +402,13 @@ function formatPts(ms: number) {
               ? 'background: rgba(45,212,191,0.15);'
               : 'background: rgba(255,255,255,0.04); border: 1px solid #1e2633;'"
           >
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none"
-                 :stroke="isDragging ? '#2dd4bf' : '#64748b'"
-                 stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 15V19C21 20.1 20.1 21 19 21H5C3.9 21 3 20.1 3 19V15"/>
-              <polyline points="17 8 12 3 7 8"/>
-              <line x1="12" y1="3" x2="12" y2="15"/>
-            </svg>
+            <AnimatedIcon
+              :icon="UploadCloud"
+              :size="24"
+              :stroke-width="1.75"
+              :animation="isDragging ? 'bounce' : undefined"
+              :class="isDragging ? 'text-[#2dd4bf]' : 'text-[#64748b]'"
+            />
           </div>
 
           <template v-if="!selectedFile">
@@ -432,9 +436,13 @@ function formatPts(ms: number) {
         class="flex items-center gap-2 p-3 rounded-[10px] text-sm"
         style="background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.2);"
       >
-        <svg width="14" height="14" viewBox="0 0 14 14" fill="#ef4444" class="shrink-0">
-          <path d="M7 1C3.7 1 1 3.7 1 7s2.7 6 6 6 6-2.7 6-6-2.7-6-6-6zm-.5 3h1v4H6.5V4zm0 5h1v1h-1V9z"/>
-        </svg>
+        <AnimatedIcon
+          :icon="AlertCircle"
+          :size="14"
+          :stroke-width="2"
+          animation="fade-in"
+          class="text-[#ef4444] shrink-0"
+        />
         <span class="text-[#ef4444] flex-1">{{ uploadError }}</span>
         <button class="text-xs text-[#ef4444] underline ml-2" @click="reset">Reset</button>
       </div>
@@ -534,7 +542,13 @@ function formatPts(ms: number) {
             style="border: 1px solid #1e2633;"
           >
             <div class="px-4 py-2.5 flex items-center gap-2" style="border-bottom: 1px solid #1e2633;">
-              <span class="live-dot" style="width:6px; height:6px;" />
+              <AnimatedIcon
+                :icon="Zap"
+                :size="12"
+                :stroke-width="2"
+                animation="pulse"
+                class="text-[#2dd4bf] icon-glow-teal shrink-0"
+              />
               <span class="text-xs text-[#94a3b8] uppercase tracking-wide">Live Events</span>
             </div>
             <div class="divide-y divide-[#1e2633] max-h-48 overflow-y-auto">
@@ -564,14 +578,12 @@ function formatPts(ms: number) {
       <!-- Submit button -->
       <div v-if="selectedFile && !isProcessing && uploadState !== 'error'" class="flex justify-end">
         <button
-          class="flex items-center gap-2 px-6 py-2.5 rounded-[10px] text-sm font-semibold text-[#08090d] transition-all duration-200"
+          class="flex items-center gap-2 px-6 py-2.5 rounded-[10px] text-sm font-semibold text-[#08090d] transition-all duration-200 icon-hover-parent"
           style="background: linear-gradient(135deg, #0d9488 0%, #2dd4bf 100%);
                  box-shadow: 0 0 20px rgba(45,212,191,0.2);"
           @click="startUpload"
         >
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
-            <path d="M7 1L7 9M7 1L4 4M7 1L10 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
+          <AnimatedIcon :icon="Upload" :size="14" :stroke-width="2" />
           Start Analysis
         </button>
       </div>
