@@ -126,7 +126,7 @@ def export_gguf(model_dir: Path, output_dir: Path, quantization: str):
     logger.info("Quantizing to %s: %s", quantization, quant_path)
     result = subprocess.run(
         [str(quantize_tool), str(f16_path), str(quant_path), quantization],
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     if result.returncode != 0:
         logger.error("Quantization failed:\n%s", result.stderr)
