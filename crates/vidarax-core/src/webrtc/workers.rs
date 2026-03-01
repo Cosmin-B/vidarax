@@ -121,14 +121,21 @@ pub struct KeyframeWork {
 
 // ─── Decode workers ───────────────────────────────────────────────────────────
 
-/// Spawn `cores` H.264 decode worker threads.
+/// Spawn `cores` video decode worker threads.
 ///
 /// Each thread:
-/// 1. Constructs a [`Decoder`] using the selected backend (`gpu` flag).
+/// 1. Waits for the first [`RtpFrame`] to determine the stream codec, then
+///    constructs a [`Decoder`] for that codec.  All subsequent frames on the
+///    same worker are decoded with the same [`Decoder`] instance.
 /// 2. Decodes every [`RtpFrame`] to planar YUV 4:2:0.
 /// 3. Computes a [`crate::gate::FrameSignal`] from the luma plane.
 /// 4. Encodes a JPEG thumbnail at quality 75.
 /// 5. Sends the [`StreamFrame`] to `frame_tx`.
+///
+/// Codec detection is lazy (first frame) so the workers do not need to be
+/// restarted when the codec changes across sessions — they simply re-initialise
+/// the decoder the first time they see a frame whose codec differs from the
+/// previous one.
 ///
 /// Threads exit when `rtp_rx` is closed (all senders dropped).
 /// `rtp_rx` is cloned so all `cores` workers share the same channel (MPMC).
@@ -153,18 +160,35 @@ pub fn spawn_decode_workers(
         std::thread::Builder::new()
             .name(format!("vx-decode-{i}"))
             .spawn(move || {
+                use crate::webrtc::decode::VideoCodec;
 
-                let config = DecoderConfig { gpu_available: gpu, width: 1920, height: 1080 };
-                let mut decoder = Decoder::new(&config);
+                // Lazy decoder: created on the first frame so we know the codec.
+                let mut decoder: Option<Decoder> = None;
+                let mut active_codec: Option<VideoCodec> = None;
                 let mut prev_signal: Option<crate::gate::FrameSignal> = None;
 
                 while let Ok(frame) = rtp_rx.recv() {
                     let _guard = session_span.enter();
                     metrics.inc_rtp_received();
 
-                    let yuv = match decoder.decode(&frame.nals) {
+                    // Re-initialise the decoder when the codec changes (e.g. a
+                    // new session with a different codec arrives on the same worker).
+                    if active_codec != Some(frame.codec) {
+                        let config = DecoderConfig {
+                            gpu_available: gpu,
+                            codec: frame.codec,
+                            width: 1920,
+                            height: 1080,
+                        };
+                        decoder = Some(Decoder::new(&config));
+                        active_codec = Some(frame.codec);
+                    }
+
+                    let dec = decoder.as_mut().expect("decoder initialised above");
+
+                    let yuv = match dec.decode(&frame.nals) {
                         Ok(y) => y,
-                        Err(_) => continue, // SPS/PPS or incomplete NAL — skip
+                        Err(_) => continue, // SPS/PPS, incomplete NAL, or VP8 header — skip
                     };
 
                     let signal = yuv_to_frame_signal(

@@ -1,10 +1,27 @@
-use vidarax_core::webrtc::decode::{Decoder, DecoderConfig, YuvFrame};
+use vidarax_core::webrtc::decode::{Decoder, DecoderConfig, VideoCodec, YuvFrame};
 
 #[test]
 fn software_decoder_creates_without_panic() {
-    let config = DecoderConfig { gpu_available: false, width: 1280, height: 720 };
+    let config = DecoderConfig {
+        gpu_available: false,
+        codec: VideoCodec::H264,
+        width: 1280,
+        height: 720,
+    };
     let decoder = Decoder::new(&config);
     assert!(matches!(decoder, Decoder::Software { .. }));
+}
+
+#[test]
+fn ffmpeg_sw_decoder_selects_for_vp8_no_gpu() {
+    let config = DecoderConfig {
+        gpu_available: false,
+        codec: VideoCodec::Vp8,
+        width: 1280,
+        height: 720,
+    };
+    let decoder = Decoder::new(&config);
+    assert!(matches!(decoder, Decoder::FfmpegSw { .. }));
 }
 
 #[test]

@@ -131,6 +131,8 @@ pub struct WebRtcSession {
     pub prompt: Arc<RwLock<String>>,
     /// Token output rate cap (tokens/s) for backpressure in VLM workers.
     pub max_output_tokens_per_second: u32,
+    /// Video codec negotiated from the SDP offer (H.264 or VP8).
+    pub codec: VideoCodec,
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +167,10 @@ impl WebRtcSession {
         offer_sdp: &str,
         config: &WebRtcConfig,
     ) -> Result<(Self, String), String> {
+        // Detect codec before handing the SDP to rustrtc so that even if the
+        // peer connection transforms the SDP we still know what was offered.
+        let codec = VideoCodec::from_sdp(offer_sdp);
+
         let mut rtc_config = RtcConfiguration::default();
         for url in &config.stun_servers {
             rtc_config
@@ -213,6 +219,7 @@ impl WebRtcSession {
                 pc,
                 prompt: Arc::new(RwLock::new(String::new())),
                 max_output_tokens_per_second: config.max_output_tokens_per_second,
+                codec,
             },
             answer_sdp,
         ))
@@ -271,6 +278,7 @@ impl WebRtcSession {
         // needs and has no lifetime dependency on `self`.
         let pc = self.pc.clone();
         let seq_counter = Arc::new(AtomicU64::new(0));
+        let codec = self.codec;
 
         async move {
             while let Some(event) = pc.recv().await {
@@ -298,12 +306,24 @@ impl WebRtcSession {
                                     Ok(MediaSample::Video(frame)) => {
                                         let nal_seq = seq.fetch_add(1, Ordering::Relaxed);
 
-                                        // rustrtc delivers NAL payload WITHOUT Annex B
-                                        // start codes.  Prepend 0x00 0x00 0x00 0x01.
                                         nals_buf.clear();
-                                        nals_buf.reserve(4 + frame.data.len());
-                                        nals_buf.extend_from_slice(&ANNEX_B_START);
-                                        nals_buf.extend_from_slice(&frame.data);
+
+                                        match codec {
+                                            VideoCodec::H264 => {
+                                                // rustrtc delivers H.264 NAL payload WITHOUT
+                                                // Annex B start codes.  Prepend 0x00 0x00 0x00 0x01
+                                                // so both openh264 and ffmpeg accept the bytes.
+                                                nals_buf.reserve(4 + frame.data.len());
+                                                nals_buf.extend_from_slice(&ANNEX_B_START);
+                                                nals_buf.extend_from_slice(&frame.data);
+                                            }
+                                            VideoCodec::Vp8 => {
+                                                // VP8 payloads are passed through as-is.
+                                                // No start code framing is needed or expected.
+                                                nals_buf.reserve(frame.data.len());
+                                                nals_buf.extend_from_slice(&frame.data);
+                                            }
+                                        }
 
                                         // RTP timestamp is on a 90 kHz clock → ms.
                                         let pts_ms = frame.rtp_timestamp as u64 / 90;
@@ -312,6 +332,7 @@ impl WebRtcSession {
                                             nals: nals_buf.clone(),
                                             pts_ms,
                                             seq: nal_seq,
+                                            codec,
                                         };
 
                                         if tx.send(rtp_frame).is_err() {
@@ -376,10 +397,11 @@ impl WebRtcSession {
 #[cfg(test)]
 mod tests {
     use super::{RtpFrame, WebRtcConfig};
+    use crate::webrtc::decode::VideoCodec;
 
     #[test]
-    fn rtp_frame_annex_b_layout() {
-        // Simulate what run() produces: start code + payload.
+    fn rtp_frame_annex_b_layout_h264() {
+        // Simulate what run() produces for H.264: start code + payload.
         let payload = vec![0x65, 0xB8, 0x00]; // IDR NAL header byte
         let mut nals = Vec::with_capacity(4 + payload.len());
         nals.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
@@ -387,6 +409,21 @@ mod tests {
 
         assert_eq!(&nals[..4], &[0x00, 0x00, 0x00, 0x01]);
         assert_eq!(&nals[4..], &payload[..]);
+    }
+
+    #[test]
+    fn rtp_frame_vp8_no_annex_b() {
+        // VP8 payloads should be forwarded without Annex B start codes.
+        let payload = vec![0x30, 0x01, 0x02, 0x03]; // synthetic VP8 bytes
+        let frame = RtpFrame {
+            nals: payload.clone(),
+            pts_ms: 0,
+            seq: 0,
+            codec: VideoCodec::Vp8,
+        };
+        // No Annex B prefix — first byte should be the raw VP8 payload byte.
+        assert_eq!(frame.nals[0], 0x30);
+        assert_eq!(frame.nals, payload);
     }
 
     #[test]
@@ -431,9 +468,24 @@ mod tests {
             nals: vec![0x00, 0x00, 0x00, 0x01, 0x65],
             pts_ms: 33,
             seq: 0,
+            codec: VideoCodec::H264,
         };
         let cloned = frame.clone();
         assert_eq!(frame.seq, cloned.seq);
+        assert_eq!(frame.codec, cloned.codec);
+        let _ = format!("{:?}", cloned);
+    }
+
+    #[test]
+    fn rtp_frame_vp8_is_clone_and_debug() {
+        let frame = RtpFrame {
+            nals: vec![0x30, 0x01],
+            pts_ms: 100,
+            seq: 5,
+            codec: VideoCodec::Vp8,
+        };
+        let cloned = frame.clone();
+        assert_eq!(cloned.codec, VideoCodec::Vp8);
         let _ = format!("{:?}", cloned);
     }
 }
