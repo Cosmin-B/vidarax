@@ -1,4 +1,4 @@
-use axum::extract::{Path, Query, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -1871,6 +1871,247 @@ pub async fn list_feedback(State(state): State<AppState>) -> impl IntoResponse {
         }
         Err(err) => internal_error(&state, format!("spacetimedb query feedback failed: {err}")),
     }
+}
+
+// ─── New resource endpoints ────────────────────────────────────────────────
+
+#[tracing::instrument(name = "api.list_runs", skip_all)]
+pub async fn list_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let principal = principal_key_from_headers(&headers);
+    let all_events = match state.read_all_events_async().await {
+        Ok(events) => events,
+        Err(err) => return internal_error(&state, format!("failed to read events: {err}")),
+    };
+
+    let mut by_run: std::collections::HashMap<String, Vec<TimelineEvent>> =
+        std::collections::HashMap::new();
+    for event in all_events {
+        by_run.entry(event.run_id.clone()).or_default().push(event);
+    }
+
+    let now_ms = now_epoch_ms();
+    let mut runs: Vec<Value> = by_run
+        .into_iter()
+        .filter_map(|(run_id, events)| {
+            // Skip runs that have been deleted.
+            if events.iter().any(|e| e.kind == "run_deleted") {
+                return None;
+            }
+            let created_event = events.iter().find(|e| e.kind == "run_created")?;
+            let created_payload = parse_payload(&created_event.payload);
+            let event_principal = created_payload
+                .get("principal_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("public");
+            if event_principal != principal {
+                return None;
+            }
+            let (mode, model, source_uri, created_at_ms, updated_at_ms) =
+                extract_run_metadata(&events);
+            let snapshot = state.run_runtime_snapshot(&run_id, now_ms)?;
+            let status = format!("{:?}", snapshot.state).to_ascii_lowercase();
+            Some(json!({
+                "run_id": run_id,
+                "status": status,
+                "mode": mode,
+                "model": model,
+                "source_uri": source_uri,
+                "created_at": ms_to_iso(created_at_ms),
+                "updated_at": ms_to_iso(updated_at_ms),
+            }))
+        })
+        .collect();
+
+    // Stable ordering by creation time.
+    runs.sort_by(|a, b| {
+        let ca = a.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let cb = b.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        ca.cmp(cb)
+    });
+
+    ok(json!(runs))
+}
+
+#[tracing::instrument(name = "api.get_run", skip_all, fields(run_id))]
+pub async fn get_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(error) = validate_run_id_or_error(&state, &run_id, "invalid run request") {
+        return error;
+    }
+    let snapshot = match load_run_snapshot(&state, &headers, &run_id) {
+        Ok(s) => s,
+        Err(error) => return error,
+    };
+    let events = match load_existing_events(&state, &run_id).await {
+        Ok(events) => events,
+        Err(error) => return error,
+    };
+    if events.iter().any(|e| e.kind == "run_deleted") {
+        return not_found_error(
+            &state,
+            "run_id was not found",
+            vec![field_error("run_id", run_id.to_string())],
+        );
+    }
+    let (mode, model, source_uri, created_at_ms, updated_at_ms) = extract_run_metadata(&events);
+    let status = format!("{:?}", snapshot.state).to_ascii_lowercase();
+    ok(json!({
+        "run_id": run_id,
+        "status": status,
+        "mode": mode,
+        "model": model,
+        "source_uri": source_uri,
+        "created_at": ms_to_iso(created_at_ms),
+        "updated_at": ms_to_iso(updated_at_ms),
+    }))
+}
+
+#[tracing::instrument(name = "api.delete_run", skip_all, fields(run_id))]
+pub async fn delete_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(error) = validate_run_id_or_error(&state, &run_id, "invalid delete request") {
+        return error;
+    }
+    if let Err(error) = load_run_snapshot(&state, &headers, &run_id) {
+        return error;
+    }
+    let request_id = state.next_request_id();
+    if let Err(err) = state
+        .append_run_event_async(
+            &run_id,
+            "run_deleted",
+            json!({ "request_id": request_id }),
+        )
+        .await
+    {
+        return internal_error(&state, format!("failed to append run_deleted event: {err}"));
+    }
+    ok(json!({
+        "request_id": request_id,
+        "run_id": run_id,
+    }))
+}
+
+pub async fn upload_file(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(err) => {
+                return internal_error(&state, format!("multipart error: {err}"));
+            }
+        };
+        if field.name() != Some("file") {
+            continue;
+        }
+        let raw_name = field.file_name().unwrap_or("upload").to_string();
+        // Sanitize: keep only safe characters.
+        let safe_name: String = raw_name
+            .chars()
+            .filter(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_'))
+            .collect();
+        let safe_name = if safe_name.is_empty() {
+            "upload".to_string()
+        } else {
+            safe_name
+        };
+        let dest = std::env::temp_dir().join(&safe_name);
+        let data = match field.bytes().await {
+            Ok(data) => data,
+            Err(err) => {
+                return internal_error(&state, format!("failed to read upload field: {err}"));
+            }
+        };
+        if let Err(err) = tokio::fs::write(&dest, &data).await {
+            return internal_error(&state, format!("failed to write upload: {err}"));
+        }
+        return ok(json!({ "file_path": dest.display().to_string() }));
+    }
+    validation_error(
+        &state,
+        "upload request missing file field",
+        vec![field_error(
+            "file",
+            "no file field found in multipart form".to_string(),
+        )],
+    )
+}
+
+// ─── Run metadata helpers ──────────────────────────────────────────────────
+
+fn extract_run_metadata(events: &[TimelineEvent]) -> (String, String, String, u64, u64) {
+    let created = events.iter().find(|e| e.kind == "run_created");
+    let created_payload = created
+        .map(|e| parse_payload(&e.payload))
+        .unwrap_or_default();
+    let mode = created_payload
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let model = created_payload
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let source_uri = events
+        .iter()
+        .find(|e| e.kind == "ingest_received")
+        .and_then(|e| {
+            let p = parse_payload(&e.payload);
+            p.get("source_uri")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_default();
+    let created_at_ms = created.map(|e| e.pts_ms).unwrap_or(0);
+    let updated_at_ms = events
+        .iter()
+        .map(|e| e.pts_ms)
+        .max()
+        .unwrap_or(created_at_ms);
+    (mode, model, source_uri, created_at_ms, updated_at_ms)
+}
+
+/// Convert a Unix epoch millisecond timestamp to an ISO 8601 string.
+/// Uses Howard Hinnant's civil_from_days algorithm; no external dependencies.
+fn ms_to_iso(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    let millis = ms % 1000;
+    let time_of_day = total_secs % 86400;
+    let days = total_secs / 86400;
+
+    let hh = time_of_day / 3600;
+    let mm = (time_of_day % 3600) / 60;
+    let ss = time_of_day % 60;
+
+    // civil_from_days: https://howardhinnant.github.io/date_algorithms.html
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    format!(
+        "{year:04}-{month:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{millis:03}Z"
+    )
 }
 
 fn validate_run_id_or_error(

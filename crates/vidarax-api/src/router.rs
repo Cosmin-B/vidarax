@@ -4,9 +4,9 @@ use axum::routing::{get, patch, post};
 use axum::Router;
 
 use crate::handlers::{
-    analyze_run, create_run, get_events, get_markers, get_state, health, infer, infer_batch,
-    ingest_run, keepalive_run, list_feedback, list_models, metrics, query, reason_realtime_run,
-    stop_run, submit_feedback,
+    analyze_run, create_run, delete_run, get_events, get_markers, get_run, get_state, health,
+    infer, infer_batch, ingest_run, keepalive_run, list_feedback, list_models, list_runs, metrics,
+    query, reason_realtime_run, stop_run, submit_feedback, upload_file,
 };
 use crate::security::enforce_security;
 use crate::state::AppState;
@@ -16,7 +16,9 @@ pub fn app_router(state: AppState) -> Router {
     let middleware_state = state.clone();
     Router::new()
         // Existing run/analysis routes
-        .route("/v1/runs", post(create_run))
+        .route("/v1/runs", get(list_runs).post(create_run))
+        .route("/v1/runs/{run_id}", get(get_run).delete(delete_run))
+        .route("/v1/upload", post(upload_file))
         .route("/v1/runs/{run_id}/ingest", post(ingest_run))
         .route("/v1/runs/{run_id}/analyze", post(analyze_run))
         .route("/v1/runs/{run_id}/reason", post(reason_realtime_run))

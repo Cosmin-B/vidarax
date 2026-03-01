@@ -185,8 +185,24 @@ pub struct RouteSpec {
 
 const ROUTE_MANIFEST: &[RouteSpec] = &[
     RouteSpec {
+        method: "GET",
+        path: "/v1/runs",
+    },
+    RouteSpec {
         method: "POST",
         path: "/v1/runs",
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/runs/{run_id}",
+    },
+    RouteSpec {
+        method: "DELETE",
+        path: "/v1/runs/{run_id}",
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/upload",
     },
     RouteSpec {
         method: "POST",
