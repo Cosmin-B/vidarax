@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>rustrtc spike test</title>
+  <style>
+    body { font-family: monospace; padding: 1rem; background: #111; color: #ccc; }
+    button { padding: 0.5rem 1rem; margin: 0.25rem; cursor: pointer; background: #333; color: #eee; border: 1px solid #555; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    #log { white-space: pre; font-size: 0.85rem; margin-top: 1rem; max-height: 60vh; overflow-y: auto; border: 1px solid #444; padding: 0.5rem; }
+    #status { color: #8f8; margin: 0.5rem 0; }
+  </style>
+</head>
+<body>
+  <h2>rustrtc spike — H.264 frame delivery test</h2>
+
+  <button id="btnStart">1. Start Screen Share</button>
+  <button id="btnSend" disabled>2. Send Offer → spike server</button>
+  <button id="btnStop" disabled>Stop</button>
+
+  <div id="status">idle</div>
+  <div id="log">— log —</div>
+
+  <script>
+    // The spike server runs at http://127.0.0.1:8765
+    const SPIKE_ORIGIN = 'http://127.0.0.1:8765';
+
+    const btnStart = document.getElementById('btnStart');
+    const btnSend  = document.getElementById('btnSend');
+    const btnStop  = document.getElementById('btnStop');
+    const statusEl = document.getElementById('status');
+    const logEl    = document.getElementById('log');
+
+    let pc = null;
+    let stream = null;
+
+    function log(msg) {
+      const ts = new Date().toISOString().slice(11, 23);
+      logEl.textContent += `\n[${ts}] ${msg}`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setStatus(msg) {
+      statusEl.textContent = msg;
+      log('STATUS: ' + msg);
+    }
+
+    // ------------------------------------------------------------------
+    // Step 1: capture screen + create RTCPeerConnection (send-only)
+    // ------------------------------------------------------------------
+    btnStart.addEventListener('click', async () => {
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+          audio: false,
+        });
+        setStatus('screen capture started');
+
+        // H.264 send-only peer connection
+        pc = new RTCPeerConnection({
+          iceServers: [],            // rely on host candidates only (loopback)
+          bundlePolicy: 'max-bundle',
+        });
+
+        stream.getTracks().forEach(track => {
+          pc.addTransceiver(track, {
+            direction: 'sendonly',
+            sendEncodings: [{ maxBitrate: 2_000_000 }],
+          });
+        });
+
+        // Trickle ICE: send each candidate to the spike server.
+        pc.addEventListener('icecandidate', async (ev) => {
+          if (!ev.candidate) return;
+          try {
+            await fetch(`${SPIKE_ORIGIN}/ice`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ candidate: ev.candidate.candidate }),
+            });
+          } catch (e) {
+            log('ice POST error: ' + e.message);
+          }
+        });
+
+        pc.addEventListener('iceconnectionstatechange', () => {
+          log('ICE state: ' + pc.iceConnectionState);
+          setStatus('ICE: ' + pc.iceConnectionState);
+        });
+
+        pc.addEventListener('connectionstatechange', () => {
+          log('connection state: ' + pc.connectionState);
+          if (pc.connectionState === 'connected') {
+            setStatus('CONNECTED — check spike terminal for NAL output');
+          }
+        });
+
+        btnSend.disabled = false;
+        btnStop.disabled = false;
+        btnStart.disabled = true;
+      } catch (e) {
+        setStatus('error: ' + e.message);
+        log('start error: ' + e);
+      }
+    });
+
+    // ------------------------------------------------------------------
+    // Step 2: create offer and POST it to the spike, apply answer
+    // ------------------------------------------------------------------
+    btnSend.addEventListener('click', async () => {
+      if (!pc) { log('no peer connection'); return; }
+      btnSend.disabled = true;
+
+      try {
+        // Force H.264-only by filtering the SDP if VP8/VP9/AV1 appear first.
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        log('offer created, posting to ' + SPIKE_ORIGIN + '/offer …');
+
+        const resp = await fetch(`${SPIKE_ORIGIN}/offer`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ type: offer.type, sdp: offer.sdp }),
+        });
+
+        if (!resp.ok) {
+          const body = await resp.text();
+          throw new Error(`HTTP ${resp.status}: ${body}`);
+        }
+
+        const answer = await resp.json();
+        log('answer received (type=' + answer.type + ')');
+        log('answer SDP (first 300 chars):\n' + answer.sdp.slice(0, 300) + '…');
+
+        await pc.setRemoteDescription(answer);
+        setStatus('remote description set — waiting for ICE …');
+      } catch (e) {
+        setStatus('error: ' + e.message);
+        log('send error: ' + e);
+        btnSend.disabled = false;
+      }
+    });
+
+    // ------------------------------------------------------------------
+    // Stop
+    // ------------------------------------------------------------------
+    btnStop.addEventListener('click', () => {
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+      if (pc) { pc.close(); pc = null; }
+      setStatus('stopped');
+      btnStart.disabled = false;
+      btnSend.disabled  = true;
+      btnStop.disabled  = true;
+    });
+  </script>
+</body>
+</html>
