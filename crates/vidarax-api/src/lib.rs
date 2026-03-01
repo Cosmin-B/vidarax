@@ -11,9 +11,11 @@ mod router;
 mod security;
 mod semantic;
 mod server;
+pub mod spacetime_client;
 mod state;
 mod tenant_labels;
 mod validation;
+mod whip;
 
 pub use config::{assert_route_parity, resolve_wal_path, ServerConfig, TransportMode};
 pub use router::app_router;
@@ -21,6 +23,15 @@ pub use state::AppState;
 use vidarax_core::provider::ProviderEndpoints;
 
 pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    // Install the TLS crypto provider once, before any WebRTC sessions are
+    // created.  rustrtc uses rustls for DTLS; it requires an installed
+    // CryptoProvider.  `ok()` silences the error when a provider is already
+    // installed (e.g. in tests).
+    rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::ring::default_provider(),
+    )
+    .ok();
+
     assert_route_parity().map_err(invalid_input)?;
     let wal_path = resolve_wal_path(&config).map_err(invalid_input)?;
     let inference_endpoints = infer_provider_endpoints(&config).map_err(invalid_input)?;

@@ -4,16 +4,22 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
 
 use serde_json::Value;
 use vidarax_contracts::lifecycle::StreamState;
 use vidarax_core::provider::ProviderEndpoints;
 use vidarax_core::timeline::{append_event, read_all_events, TimelineEvent};
+use vidarax_core::webrtc::session::WebRtcSession;
 
 use crate::ids::{parse_run_sequence, random_run_id};
 use crate::inference_metrics::InferenceMetrics;
 use crate::security::SecurityPolicy;
+use crate::spacetime_client::SpacetimeClient;
 use crate::tenant_labels::{LabelMapResult, TenantLabelMaps};
+
+/// In-memory store for active WebRTC sessions, keyed by session ID.
+type SessionMap = Arc<RwLock<HashMap<String, Arc<WebRtcSession>>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -29,6 +35,9 @@ pub struct AppState {
     tenant_label_maps: Arc<TenantLabelMaps>,
     stream_ttl_secs: u64,
     active_stream_limit: usize,
+    spacetime_client: Option<SpacetimeClient>,
+    /// Active WebRTC peer connections indexed by session ID.
+    sessions: SessionMap,
 }
 
 impl AppState {
@@ -70,6 +79,8 @@ impl AppState {
             tenant_label_maps,
             stream_ttl_secs,
             active_stream_limit: active_stream_limit.max(1),
+            spacetime_client: None,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -87,6 +98,8 @@ impl AppState {
             tenant_label_maps: Arc::new(TenantLabelMaps::default()),
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            spacetime_client: None,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -119,6 +132,8 @@ impl AppState {
             tenant_label_maps: Arc::new(TenantLabelMaps::default()),
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            spacetime_client: None,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -142,7 +157,59 @@ impl AppState {
             tenant_label_maps: Arc::new(TenantLabelMaps::default()),
             stream_ttl_secs: stream_ttl_secs.max(1),
             active_stream_limit: active_stream_limit.max(1),
+            spacetime_client: None,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Attach a `SpacetimeClient` to this state (builder pattern).
+    ///
+    /// ```no_run
+    /// use vidarax_api::spacetime_client::SpacetimeClient;
+    /// # let state: vidarax_api::AppState = todo!();
+    /// let state = state.with_spacetime_client(
+    ///     SpacetimeClient::new("http://127.0.0.1:3000", "vidarax")
+    /// );
+    /// ```
+    pub fn with_spacetime_client(mut self, client: SpacetimeClient) -> Self {
+        self.spacetime_client = Some(client);
+        self
+    }
+
+    /// Return the attached `SpacetimeClient`, if any.
+    pub fn spacetime_client(&self) -> Option<&SpacetimeClient> {
+        self.spacetime_client.as_ref()
+    }
+
+    // -----------------------------------------------------------------------
+    // WebRTC session management
+    // -----------------------------------------------------------------------
+
+    /// Insert a new WebRTC session.  Returns `false` if the session ID is
+    /// already present (collision — caller should retry with a new ID).
+    pub async fn insert_session(&self, sess_id: String, session: Arc<WebRtcSession>) -> bool {
+        let mut map = self.sessions.write().await;
+        if map.contains_key(&sess_id) {
+            return false;
+        }
+        map.insert(sess_id, session);
+        true
+    }
+
+    /// Look up a WebRTC session by ID.  Returns `None` if not found.
+    pub async fn get_session(&self, sess_id: &str) -> Option<Arc<WebRtcSession>> {
+        self.sessions.read().await.get(sess_id).cloned()
+    }
+
+    /// Remove and return a WebRTC session.  Dropping the returned `Arc`
+    /// (or ignoring the return value) triggers peer connection cleanup.
+    pub async fn remove_session(&self, sess_id: &str) -> Option<Arc<WebRtcSession>> {
+        self.sessions.write().await.remove(sess_id)
+    }
+
+    /// Number of active WebRTC sessions.
+    pub async fn session_count(&self) -> usize {
+        self.sessions.read().await.len()
     }
 
     pub fn next_run_id(&self) -> String {

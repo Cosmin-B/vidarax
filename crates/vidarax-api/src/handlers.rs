@@ -6,6 +6,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use serde_json::{json, Value};
 use std::cmp::min;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
 use vidarax_contracts::models::{
@@ -1179,6 +1180,18 @@ pub async fn reason_realtime_run(
         }
     }
 
+    // --- Phase 1: serial pipeline analysis + chunk preparation ---
+    // TwoPassPipeline carries mutable state, so analysis must remain sequential.
+    struct ChunkPrep {
+        analyzed: Vec<FrameMetadata>,
+        frame_offset: usize,
+        chunk_jpegs: Vec<DecodedJpegFrame>,
+        pts_start_ms: u64,
+        pts_end_ms: u64,
+        chunk_len: usize,
+        started: Instant,
+    }
+    let mut chunk_preps: Vec<ChunkPrep> = Vec::new();
     for (chunk_idx, chunk) in decoded.frame_signals.chunks(chunk_size).enumerate() {
         let started = Instant::now();
         let analyzed = pipeline.analyze_batch(chunk);
@@ -1188,23 +1201,70 @@ pub async fn reason_realtime_run(
             .map(|frames| {
                 let start = frame_offset.min(frames.len());
                 let end = (frame_offset + chunk.len()).min(frames.len());
-                &frames[start..end]
+                frames[start..end].to_vec()
             })
-            .unwrap_or(&[]);
-        let semantic_overlay = infer_chunk_semantics(
-            providers.as_ref(),
-            semantic_available,
-            semantic_primary_provider,
-            &model,
-            &semantic_prompt,
-            semantic_timeout_ms,
-            semantic_frames_per_chunk,
+            .unwrap_or_default();
+        chunk_preps.push(ChunkPrep {
+            started,
+            analyzed,
+            frame_offset,
             chunk_jpegs,
-            frame_offset as u64,
-            chunk.first().map(|f| f.pts_ms).unwrap_or(0),
-            chunk.last().map(|f| f.pts_ms).unwrap_or(0),
-        )
-        .await;
+            pts_start_ms: chunk.first().map(|f| f.pts_ms).unwrap_or(0),
+            pts_end_ms: chunk.last().map(|f| f.pts_ms).unwrap_or(0),
+            chunk_len: chunk.len(),
+        });
+    }
+
+    // --- Phase 2: parallel VLM inference (≤4 concurrent, saturates vLLM batching) ---
+    let num_chunks = chunk_preps.len();
+    let mut semantic_results: Vec<Option<ChunkSemanticResult>> = (0..num_chunks).map(|_| None).collect();
+    let mut task_end_times: Vec<Instant> = vec![Instant::now(); num_chunks];
+
+    if semantic_available {
+        let sem = Arc::new(tokio::sync::Semaphore::new(4));
+        let mut join_set: JoinSet<(usize, ChunkSemanticResult, Instant)> = JoinSet::new();
+
+        for (chunk_idx, prep) in chunk_preps.iter().enumerate() {
+            let providers_c = providers.clone();
+            let model_c = model.clone();
+            let prompt_c = semantic_prompt.clone();
+            let chunk_jpegs_c = prep.chunk_jpegs.clone();
+            let sem_c = Arc::clone(&sem);
+            let frame_offset = prep.frame_offset as u64;
+            let pts_start_ms = prep.pts_start_ms;
+            let pts_end_ms = prep.pts_end_ms;
+            join_set.spawn(async move {
+                let _permit = sem_c.acquire().await.unwrap();
+                let overlay = infer_chunk_semantics(
+                    providers_c.as_ref(),
+                    true,
+                    semantic_primary_provider,
+                    &model_c,
+                    &prompt_c,
+                    semantic_timeout_ms,
+                    semantic_frames_per_chunk,
+                    &chunk_jpegs_c,
+                    frame_offset,
+                    pts_start_ms,
+                    pts_end_ms,
+                )
+                .await;
+                (chunk_idx, overlay, Instant::now())
+            });
+        }
+
+        while let Some(Ok((idx, result, finished))) = join_set.join_next().await {
+            semantic_results[idx] = Some(result);
+            task_end_times[idx] = finished;
+        }
+    }
+
+    // --- Phase 3: sequential post-processing (WAL events, metadata, lag tracking) ---
+    for (chunk_idx, prep) in chunk_preps.into_iter().enumerate() {
+        let semantic_overlay = semantic_results[chunk_idx]
+            .take()
+            .unwrap_or_default();
+        let finished = task_end_times[chunk_idx];
 
         if let Some(details) =
             semantic_overlay.event_payload(chunk_idx, request_id.as_str(), stream_id.as_str())
@@ -1220,7 +1280,7 @@ pub async fn reason_realtime_run(
             }
         }
 
-        for frame in analyzed {
+        for frame in prep.analyzed {
             let (row, marker_input) = compose_frame_metadata(
                 &state,
                 tenant_id,
@@ -1241,12 +1301,8 @@ pub async fn reason_realtime_run(
             marker_inputs.push(marker_input);
         }
 
-        let process_ms = started.elapsed().as_millis() as u64;
-        let source_span_ms = chunk
-            .last()
-            .zip(chunk.first())
-            .map(|(last, first)| last.pts_ms.saturating_sub(first.pts_ms))
-            .unwrap_or(0);
+        let process_ms = finished.duration_since(prep.started).as_millis() as u64;
+        let source_span_ms = prep.pts_end_ms.saturating_sub(prep.pts_start_ms);
         let lag_ms = process_ms.saturating_sub(source_span_ms);
         chunk_lags.push(lag_ms);
 
@@ -1258,7 +1314,7 @@ pub async fn reason_realtime_run(
                     "request_id": request_id,
                     "stream_id": stream_id,
                     "chunk_index": chunk_idx,
-                    "chunk_frames": chunk.len(),
+                    "chunk_frames": prep.chunk_len,
                     "process_ms": process_ms,
                     "source_span_ms": source_span_ms,
                     "lag_ms": lag_ms

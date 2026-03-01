@@ -3104,6 +3104,7 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -4191,11 +4192,13 @@ dependencies = [
  "http-body-util",
  "kanal",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
  "tokio-quiche",
  "tower",
+ "tracing",
  "vidarax-contracts",
  "vidarax-core",
 ]
@@ -4216,6 +4219,7 @@ name = "vidarax-core"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "core_affinity",
  "crossbeam",
  "jpeg-encoder",
