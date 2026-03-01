@@ -202,6 +202,27 @@ impl<P: InferenceProvider, F: InferenceProvider> ProviderRouter<P, F> {
     }
 }
 
+/// Allow `ProviderRouter` to be passed as `Arc<dyn InferenceProvider>` to worker pools.
+impl<P: InferenceProvider, F: InferenceProvider> InferenceProvider for ProviderRouter<P, F> {
+    fn kind(&self) -> ProviderKind {
+        self.primary.kind()
+    }
+
+    fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+        // Mirror inherent method logic — cannot call `self.infer()` here as that
+        // would recurse into this trait impl.
+        match self.primary.infer(request) {
+            Ok(result) => Ok(result),
+            Err(err) if request.allow_fallback && err.is_retryable() => {
+                let mut r = self.fallback.infer(request)?;
+                r.fallback_used = true;
+                Ok(r)
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
 pub fn infer_with_endpoints(
     endpoints: &ProviderEndpoints,
     primary: ProviderKind,

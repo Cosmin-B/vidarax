@@ -8,6 +8,9 @@ use crate::gate::FrameSignal;
 pub enum InputSource {
     FilePath(String),
     Url(String),
+    /// Live WebRTC stream identified by session ID (processed via worker pools,
+    /// not through ffmpeg).
+    WebRtcStream(String),
 }
 
 impl InputSource {
@@ -35,6 +38,10 @@ impl InputSource {
     pub fn as_ffmpeg_input(&self) -> &str {
         match self {
             InputSource::FilePath(path) | InputSource::Url(path) => path,
+            // WebRTC streams are fed through the worker pool directly; the
+            // session ID is returned as a placeholder but should never be
+            // passed to ffmpeg.
+            InputSource::WebRtcStream(session_id) => session_id.as_str(),
         }
     }
 }
