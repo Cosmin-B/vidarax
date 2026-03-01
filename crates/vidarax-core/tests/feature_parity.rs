@@ -77,8 +77,8 @@ impl MockTransport {
 }
 
 impl Transport for MockTransport {
-    fn call(&self, _endpoint: &str, body: &str, _timeout_ms: u64) -> Result<String, ProviderError> {
-        *self.captured_body.lock().unwrap() = Some(body.to_string());
+    fn call(&self, _endpoint: &str, body: String, _timeout_ms: u64) -> Result<String, ProviderError> {
+        *self.captured_body.lock().unwrap() = Some(body);
         self.response.clone()
     }
 }
@@ -90,7 +90,7 @@ struct DelayTransport {
 }
 
 impl Transport for DelayTransport {
-    fn call(&self, _endpoint: &str, _body: &str, _timeout_ms: u64) -> Result<String, ProviderError> {
+    fn call(&self, _endpoint: &str, _body: String, _timeout_ms: u64) -> Result<String, ProviderError> {
         thread::sleep(Duration::from_millis(self.delay_ms));
         Ok(self.response.clone())
     }
@@ -108,7 +108,7 @@ fn make_stream_frame(seq: u64, pts_ms: u64) -> StreamFrame {
             ghosting_score: 0.0,
             noise_variance_score: 0.0,
         },
-        jpeg: Some(vec![0xff, 0xd8, 0xaa, 0xbb, 0xff, 0xd9]),
+        jpeg: Some(Arc::from([0xff_u8, 0xd8, 0xaa, 0xbb, 0xff, 0xd9] as [u8; 6])),
         pts_ms,
         seq,
     }

@@ -1,5 +1,7 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use serde_json::Value;
 use vidarax_contracts::errors::classify_status_code;
 use vidarax_contracts::models::normalize_model_id;
@@ -57,7 +59,7 @@ impl ProviderError {
 }
 
 pub trait Transport: Send + Sync {
-    fn call(&self, endpoint: &str, body: &str, timeout_ms: u64) -> Result<String, ProviderError>;
+    fn call(&self, endpoint: &str, body: String, timeout_ms: u64) -> Result<String, ProviderError>;
 }
 
 pub trait InferenceProvider: Send + Sync {
@@ -96,14 +98,14 @@ impl HttpTransport {
 }
 
 impl Transport for HttpTransport {
-    fn call(&self, endpoint: &str, body: &str, timeout_ms: u64) -> Result<String, ProviderError> {
+    fn call(&self, endpoint: &str, body: String, timeout_ms: u64) -> Result<String, ProviderError> {
         let url = self.endpoint_url(endpoint);
         let response = self
             .client
             .post(url)
             .header("content-type", "application/json")
             .timeout(Duration::from_millis(timeout_ms.max(1)))
-            .body(body.to_string())
+            .body(body)
             .send()
             .map_err(|err| ProviderError::Transport(err.to_string()))?;
 
@@ -149,7 +151,7 @@ impl<T: Transport> InferenceProvider for VllmProvider<T> {
         let t0 = Instant::now();
         let response = self
             .transport
-            .call("/v1/chat/completions", &body, request.timeout_ms)?;
+            .call("/v1/chat/completions", body, request.timeout_ms)?;
         let inference_latency_ms = t0.elapsed().as_millis() as u64;
         let (output_text, finish_reason) = parse_completion(&response)?;
 
@@ -175,7 +177,7 @@ impl<T: Transport> InferenceProvider for SglangProvider<T> {
         let t0 = Instant::now();
         let response = self
             .transport
-            .call("/v1/chat/completions", &body, request.timeout_ms)?;
+            .call("/v1/chat/completions", body, request.timeout_ms)?;
         let inference_latency_ms = t0.elapsed().as_millis() as u64;
         let (output_text, finish_reason) = parse_completion(&response)?;
 
@@ -234,70 +236,122 @@ impl<P: InferenceProvider, F: InferenceProvider> InferenceProvider for ProviderR
     }
 }
 
-/// Forward `request` to `router`, which holds pre-built transports.
+/// Build an HTTP-backed [`ProviderRouter`] with `primary` as the first choice.
 ///
-/// The router (and its underlying [`reqwest::blocking::Client`] instances)
-/// must be created once at startup and reused across calls so that TCP
-/// connection pools are shared rather than rebuilt on every inference.
-pub fn infer_with_endpoints<P, F>(
-    router: &ProviderRouter<P, F>,
+/// Creates both [`HttpTransport`] instances — and their underlying
+/// `reqwest::blocking::Client` connection pools — once.  The returned
+/// `Arc` should be kept alive for the lifetime of the service and cloned
+/// cheaply into worker tasks or `spawn_blocking` closures.
+pub fn build_http_router(
+    endpoints: &ProviderEndpoints,
+    primary: ProviderKind,
+) -> Result<Arc<dyn InferenceProvider + Send + Sync>, ProviderError> {
+    let vllm = VllmProvider::new(HttpTransport::new(&endpoints.vllm_base_url)?);
+    let sglang = SglangProvider::new(HttpTransport::new(&endpoints.sglang_base_url)?);
+    Ok(match primary {
+        ProviderKind::Vllm => Arc::new(ProviderRouter::new(vllm, sglang)),
+        ProviderKind::Sglang => Arc::new(ProviderRouter::new(sglang, vllm)),
+    })
+}
+
+/// Forward `request` to `provider`, which holds pre-built transports.
+///
+/// The provider must be created once (via [`build_http_router`] or directly)
+/// and reused across calls so that TCP connection pools are shared rather
+/// than rebuilt on every inference.
+pub fn infer_with_endpoints(
+    provider: &dyn InferenceProvider,
     request: &InferenceRequest,
-) -> Result<InferenceResult, ProviderError>
-where
-    P: InferenceProvider,
-    F: InferenceProvider,
-{
-    router.infer(request)
+) -> Result<InferenceResult, ProviderError> {
+    provider.infer(request)
 }
 
 fn canonical_model(model: &str) -> Result<&'static str, ProviderError> {
     normalize_model_id(model).ok_or_else(|| ProviderError::UnsupportedModel(model.to_string()))
 }
 
-fn build_payload(model: &str, request: &InferenceRequest) -> String {
-    let user_content = if request.input_images.is_empty() {
-        Value::String(request.prompt.clone())
-    } else {
-        let mut content = Vec::with_capacity(request.input_images.len() + 1);
-        content.push(serde_json::json!({
-            "type": "text",
-            "text": request.prompt
-        }));
-        for image in &request.input_images {
-            content.push(serde_json::json!({
-                "type": "image_url",
-                "image_url": {
-                    "url": format!("data:{};base64,{}", image.media_type, image.data_base64)
-                }
-            }));
-        }
-        Value::Array(content)
-    };
-    let mut payload = serde_json::json!({
-        "model": model,
-        "messages": [{"role": "user", "content": user_content}],
-        "max_tokens": request.max_tokens,
-        "temperature": request.temperature
-    });
-    if let Some(schema) = &request.output_schema {
-        payload["extra_body"] = serde_json::json!({"guided_json": schema});
-    }
-    payload.to_string()
+// ─── Payload serialization types ─────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct ChatPayload<'a> {
+    model: &'a str,
+    messages: [ChatMessage<'a>; 1],
+    max_tokens: u32,
+    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra_body: Option<ExtraBody<'a>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize)]
+struct ChatMessage<'a> {
+    role: &'static str,
+    content: UserContent<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum UserContent<'a> {
+    Text(&'a str),
+    Parts(Vec<ContentPart<'a>>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentPart<'a> {
+    Text { text: &'a str },
+    ImageUrl { image_url: ImageUrlField },
+}
+
+#[derive(Serialize)]
+struct ImageUrlField {
+    url: String,
+}
+
+#[derive(Serialize)]
+struct ExtraBody<'a> {
+    guided_json: &'a Value,
+}
+
+fn build_payload(model: &str, request: &InferenceRequest) -> String {
+    let content = if request.input_images.is_empty() {
+        UserContent::Text(&request.prompt)
+    } else {
+        let mut parts = Vec::with_capacity(request.input_images.len() + 1);
+        parts.push(ContentPart::Text { text: &request.prompt });
+        for image in &request.input_images {
+            parts.push(ContentPart::ImageUrl {
+                image_url: ImageUrlField {
+                    url: format!("data:{};base64,{}", image.media_type, image.data_base64),
+                },
+            });
+        }
+        UserContent::Parts(parts)
+    };
+
+    let payload = ChatPayload {
+        model,
+        messages: [ChatMessage { role: "user", content }],
+        max_tokens: request.max_tokens,
+        temperature: request.temperature,
+        extra_body: request.output_schema.as_ref().map(|s| ExtraBody { guided_json: s }),
+    };
+
+    serde_json::to_string(&payload).expect("payload serialization is infallible")
+}
+
+#[derive(serde::Deserialize)]
 struct CompletionResponse {
     choices: Vec<CompletionChoice>,
 }
 
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 struct CompletionChoice {
     finish_reason: Option<String>,
     message: Option<CompletionMessage>,
     text: Option<Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 struct CompletionMessage {
     content: Value,
 }
@@ -361,8 +415,8 @@ fn parse_content_value(value: &Value) -> Result<String, ProviderError> {
 mod tests {
     use super::{
         build_payload, infer_with_endpoints, HttpTransport, InferenceImage, InferenceProvider,
-        InferenceRequest, ProviderEndpoints, ProviderError, ProviderKind, ProviderRouter,
-        SglangProvider, Transport, VllmProvider,
+        InferenceRequest, ProviderError, ProviderKind, ProviderRouter, SglangProvider, Transport,
+        VllmProvider,
     };
     use serde_json::Value;
     use std::io::{Read, Write};
@@ -395,7 +449,7 @@ mod tests {
         fn call(
             &self,
             _endpoint: &str,
-            _body: &str,
+            _body: String,
             _timeout_ms: u64,
         ) -> Result<String, ProviderError> {
             self.calls.fetch_add(1, Ordering::Relaxed);

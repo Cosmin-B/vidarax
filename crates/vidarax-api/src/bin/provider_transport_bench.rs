@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::Semaphore;
 use vidarax_core::provider::{
-    infer_with_endpoints, InferenceRequest, ProviderEndpoints, ProviderKind,
+    build_http_router, InferenceRequest, ProviderEndpoints, ProviderKind,
 };
 
 #[derive(Debug, Serialize)]
@@ -77,23 +77,23 @@ async fn bench_blocking_spawn(
     endpoints: ProviderEndpoints,
     request: InferenceRequest,
 ) -> BenchStats {
+    // Build the router once so all tasks share the same connection pool.
+    let router = build_http_router(&endpoints, ProviderKind::Vllm).unwrap();
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut tasks = Vec::with_capacity(requests);
     let start = Instant::now();
 
     for _ in 0..requests {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
-        let endpoints = endpoints.clone();
+        let router = Arc::clone(&router);
         let request = request.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
             let started = Instant::now();
-            let _ = tokio::task::spawn_blocking(move || {
-                infer_with_endpoints(&endpoints, ProviderKind::Vllm, &request)
-            })
-            .await
-            .unwrap()
-            .unwrap();
+            let _ = tokio::task::spawn_blocking(move || router.infer(&request))
+                .await
+                .unwrap()
+                .unwrap();
             started.elapsed().as_secs_f64() * 1000.0
         }));
     }

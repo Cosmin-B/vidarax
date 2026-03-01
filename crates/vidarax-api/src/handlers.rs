@@ -19,7 +19,8 @@ use vidarax_core::ingest::{
 };
 use vidarax_core::pipeline::{FrameMetadata, TwoPassConfig, TwoPassPipeline};
 use vidarax_core::provider::{
-    infer_with_endpoints, InferenceImage, InferenceRequest, ProviderError, ProviderKind,
+    build_http_router, InferenceImage, InferenceRequest, InferenceResult, ProviderEndpoints,
+    ProviderError, ProviderKind,
 };
 use vidarax_core::timeline::TimelineEvent;
 
@@ -1679,6 +1680,19 @@ async fn validate_infer_request(
     })
 }
 
+/// Build a provider router from raw endpoints and run a single inference call.
+///
+/// Constructs [`HttpTransport`] instances (and their connection pools) each
+/// call.  For high-frequency paths, build the router once with
+/// [`build_http_router`] and reuse the [`Arc`].
+fn infer_from_endpoints(
+    endpoints: &ProviderEndpoints,
+    primary: ProviderKind,
+    request: &InferenceRequest,
+) -> Result<InferenceResult, ProviderError> {
+    build_http_router(endpoints, primary)?.infer(request)
+}
+
 async fn execute_infer_request(
     state: AppState,
     prepared: PreparedInferRequest,
@@ -1696,7 +1710,7 @@ async fn execute_infer_request(
     let primary_provider_for_metrics = prepared.primary_provider;
     let request_for_provider = prepared.request.clone();
     let result = match tokio::task::spawn_blocking(move || {
-        infer_with_endpoints(
+        infer_from_endpoints(
             &endpoints,
             primary_provider_for_metrics,
             &request_for_provider,
@@ -2353,7 +2367,7 @@ async fn infer_chunk_semantics(
     let images = selected
         .iter()
         .map(|frame| InferenceImage {
-            media_type: "image/jpeg".to_string(),
+            media_type: "image/jpeg",
             data_base64: BASE64_STANDARD.encode(&frame.jpeg_bytes),
         })
         .collect::<Vec<_>>();
@@ -2370,7 +2384,7 @@ async fn infer_chunk_semantics(
 
     let first_result = match tokio::task::spawn_blocking({
         let endpoints = endpoints.clone();
-        move || infer_with_endpoints(&endpoints, primary_provider, &first_request)
+        move || infer_from_endpoints(&endpoints, primary_provider, &first_request)
     })
     .await
     {
@@ -2407,7 +2421,7 @@ async fn infer_chunk_semantics(
                 output_schema: None,
             };
             match tokio::task::spawn_blocking(move || {
-                infer_with_endpoints(&endpoints, primary_provider, &second_request)
+                infer_from_endpoints(&endpoints, primary_provider, &second_request)
             })
             .await
             {

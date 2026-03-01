@@ -4384,6 +4384,7 @@ dependencies = [
  "jpeg-encoder",
  "jsonschema",
  "kanal",
+ "memchr",
  "openh264",
  "reqwest 0.13.2",
  "rustls",
