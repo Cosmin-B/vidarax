@@ -30,6 +30,7 @@ use base64::Engine as _;
 
 use crate::gate::{GateConfig, GateEventType};
 use crate::loop_detector::LoopDetector;
+use crate::metrics::PipelineMetrics;
 use crate::pipeline::{TwoPassConfig, TwoPassPipeline};
 use crate::provider::{InferenceImage, InferenceProvider, InferenceRequest};
 use crate::tiered_vlm::TieredVlmConfig;
@@ -120,17 +121,25 @@ pub struct KeyframeWork {
 ///
 /// Threads exit when `rtp_rx` is closed (all senders dropped).
 /// `rtp_rx` is cloned so all `cores` workers share the same channel (MPMC).
+///
+/// `metrics` counters are incremented for each received / decoded frame.
+/// `session_span` is entered inside each thread so all log events are
+/// attributed to the owning session.
 pub fn spawn_decode_workers(
     cores: usize,
     rtp_rx: kanal::Receiver<RtpFrame>,
     frame_tx: kanal::Sender<StreamFrame>,
     gpu: bool,
+    metrics: Arc<PipelineMetrics>,
+    session_span: tracing::Span,
 ) {
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
 
     for i in 0..cores.max(1) {
         let rtp_rx = rtp_rx.clone();
         let frame_tx = frame_tx.clone();
+        let metrics = Arc::clone(&metrics);
+        let session_span = session_span.clone();
         let core_id = core_ids.get(i).copied();
 
         std::thread::Builder::new()
@@ -145,6 +154,9 @@ pub fn spawn_decode_workers(
                 let mut prev_signal: Option<crate::gate::FrameSignal> = None;
 
                 while let Ok(frame) = rtp_rx.recv() {
+                    let _guard = session_span.enter();
+                    metrics.inc_rtp_received();
+
                     let yuv = match decoder.decode(&frame.nals) {
                         Ok(y) => y,
                         Err(_) => continue, // SPS/PPS or incomplete NAL — skip
@@ -159,6 +171,7 @@ pub fn spawn_decode_workers(
                     let jpeg = yuv_to_jpeg(&yuv, 75);
                     prev_signal = Some(signal);
 
+                    metrics.inc_frames_decoded();
                     let sf = StreamFrame {
                         signal,
                         jpeg: Some(jpeg),
@@ -197,6 +210,8 @@ pub fn spawn_analysis_workers(
     stdb: Arc<dyn EventSink>,
     run_id: String,
     session_id: String,
+    metrics: Arc<PipelineMetrics>,
+    session_span: tracing::Span,
 ) {
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
 
@@ -206,6 +221,8 @@ pub fn spawn_analysis_workers(
         let stdb = Arc::clone(&stdb);
         let run_id = run_id.clone();
         let session_id = session_id.clone();
+        let metrics = Arc::clone(&metrics);
+        let session_span = session_span.clone();
         let core_id = core_ids.get(i).copied();
 
         std::thread::Builder::new()
@@ -220,8 +237,11 @@ pub fn spawn_analysis_workers(
                 let mut loop_det = LoopDetector::new(6, 3);
 
                 while let Ok(sf) = frame_rx.recv() {
+                    let _guard = session_span.enter();
+
                     // ── Loop detection ───────────────────────────────────
                     if loop_det.check(sf.signal.perceptual_hash) {
+                        metrics.inc_loop_detected();
                         let _ = stdb.emit_event_sync(
                             &run_id,
                             &session_id,
@@ -268,7 +288,11 @@ pub fn spawn_analysis_workers(
 
                         // Non-blocking: drop if VLM queue is full to avoid
                         // stalling the decode → analysis pipeline.
-                        let _ = vlm_tx.try_send(work);
+                        if vlm_tx.try_send(work).is_ok() {
+                            metrics.inc_keyframes();
+                        } else {
+                            metrics.inc_keyframes_dropped();
+                        }
                     }
                 }
             })
@@ -299,6 +323,8 @@ pub fn spawn_vlm_workers<I>(
     provider: Arc<I>,
     stdb: Arc<dyn EventSink>,
     config: TieredVlmConfig,
+    metrics: Arc<PipelineMetrics>,
+    session_span: tracing::Span,
 ) where
     I: InferenceProvider + 'static,
 {
@@ -307,11 +333,15 @@ pub fn spawn_vlm_workers<I>(
         let provider = Arc::clone(&provider);
         let stdb = Arc::clone(&stdb);
         let config = config.clone();
+        let metrics = Arc::clone(&metrics);
+        let session_span = session_span.clone();
 
         std::thread::Builder::new()
             .name(format!("vx-vlm-{i}"))
             .spawn(move || {
                 while let Ok(work) = vlm_rx.recv() {
+                    let _guard = session_span.enter();
+                    metrics.inc_vlm_inferences();
                     let prompt = if work.prompt.is_empty() {
                         "Briefly describe what is happening in this video frame.".to_string()
                     } else {
@@ -508,6 +538,8 @@ mod tests {
             Arc::clone(&sink) as Arc<dyn EventSink>,
             "run-test".into(),
             "sess-test".into(),
+            Arc::new(crate::metrics::PipelineMetrics::new()),
+            tracing::Span::none(),
         );
 
         // Send 8 frames with the same hash to trigger loop detection.

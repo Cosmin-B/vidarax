@@ -4,6 +4,7 @@ pub mod webrtc;
 pub mod lockfree;
 pub mod loop_detector;
 pub mod memory;
+pub mod metrics;
 pub mod observability;
 pub mod pipeline;
 pub mod provider;

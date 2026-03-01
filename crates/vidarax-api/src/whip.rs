@@ -96,6 +96,7 @@ fn hex_char(v: u8) -> char {
 /// Errors:
 /// - `400` — empty or unparseable SDP offer
 /// - `500` — internal rustrtc or ICE failure
+#[tracing::instrument(name = "whip.offer", skip_all)]
 pub async fn whip_offer(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -137,6 +138,10 @@ pub async fn whip_offer(
     let sess_id = new_session_id();
     let principal = principal_key_from_headers(&headers);
 
+    // Create a session-scoped span so all worker-thread log events are
+    // attributed to this WebRTC session.
+    let session_span = tracing::info_span!("whip_session", sess_id = %sess_id);
+
     // Store the session bound to the requesting principal.
     if !state
         .insert_session(sess_id.clone(), principal, Arc::clone(&session))
@@ -151,6 +156,9 @@ pub async fn whip_offer(
             .into_response();
     }
 
+    // Record the new session in pipeline metrics.
+    state.pipeline_metrics().inc_sessions_created();
+
     // Spawn the media ingestion task.
     // Bounded channel (128 frames): provides backpressure without excessive
     // buffering.  Frames are drained and discarded until the decode pipeline
@@ -159,18 +167,23 @@ pub async fn whip_offer(
     let run_future = session.run(frame_tx);
     tokio::spawn(run_future);
 
-    // Drain task: counts received NAL units.  Replace with decode workers
-    // once the full pipeline (x02.3) is ready.
+    // Drain task: counts received NAL units and increments pipeline metrics.
+    // Replace with full decode workers (spawn_decode_workers) once the
+    // pipeline (x02.3) is wired in.
     let sess_id_drain = sess_id.clone();
+    let drain_metrics = std::sync::Arc::clone(state.pipeline_metrics_arc());
+    let drain_span = session_span.clone();
     tokio::task::spawn_blocking(move || {
         let mut total: u64 = 0;
         while let Ok(_frame) = frame_rx.recv() {
+            let _guard = drain_span.enter();
+            drain_metrics.inc_rtp_received();
             total += 1;
             if total % 300 == 0 {
-                tracing::debug!("WHIP sess={sess_id_drain} nals_received={total}");
+                tracing::debug!(sess_id = %sess_id_drain, nals_received = total, "WHIP drain");
             }
         }
-        tracing::info!("WHIP sess={sess_id_drain} drain_task_ended total_nals={total}");
+        tracing::info!(sess_id = %sess_id_drain, total_nals = total, "WHIP drain task ended");
     });
 
     // Build the 201 Created response with SDP answer.
@@ -201,6 +214,7 @@ pub async fn whip_offer(
 /// Response:
 /// - `204 No Content` — candidate accepted (or no-op for end-of-candidates)
 /// - `404 Not Found` — unknown session
+#[tracing::instrument(name = "whip.ice", skip_all, fields(sess_id))]
 pub async fn whip_ice(
     State(state): State<AppState>,
     Path(sess_id): Path<String>,
@@ -250,6 +264,7 @@ pub async fn whip_ice(
 /// Response:
 /// - `200 OK` — session terminated
 /// - `404 Not Found` — unknown session
+#[tracing::instrument(name = "whip.terminate", skip_all, fields(sess_id))]
 pub async fn whip_terminate(
     State(state): State<AppState>,
     Path(sess_id): Path<String>,
@@ -269,6 +284,7 @@ pub async fn whip_terminate(
 
     match state.remove_session(&sess_id).await {
         Some((_principal, session)) => {
+            state.pipeline_metrics().inc_sessions_removed();
             tracing::info!("WHIP session terminated sess_id={sess_id}");
             match Arc::try_unwrap(session) {
                 Ok(s) => s.terminate(),

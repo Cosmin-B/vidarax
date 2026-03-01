@@ -49,6 +49,7 @@ pub struct MarkerQueryParams {
     pub to_frame: Option<u64>,
 }
 
+#[tracing::instrument(name = "api.create_run", skip_all)]
 pub async fn create_run(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -119,6 +120,7 @@ pub async fn create_run(
     }))
 }
 
+#[tracing::instrument(name = "api.ingest_run", skip_all, fields(run_id))]
 pub async fn ingest_run(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
@@ -349,6 +351,7 @@ pub async fn ingest_run(
     }))
 }
 
+#[tracing::instrument(name = "api.stop_run", skip_all, fields(run_id))]
 pub async fn stop_run(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
@@ -540,6 +543,7 @@ pub async fn query(
     }))
 }
 
+#[tracing::instrument(name = "api.infer", skip_all)]
 pub async fn infer(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -562,6 +566,7 @@ pub async fn infer(
     }
 }
 
+#[tracing::instrument(name = "api.infer_batch", skip_all)]
 pub async fn infer_batch(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -684,6 +689,7 @@ pub async fn infer_batch(
     }))
 }
 
+#[tracing::instrument(name = "api.analyze_run", skip_all, fields(run_id))]
 pub async fn analyze_run(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
@@ -941,6 +947,7 @@ pub async fn analyze_run(
     }))
 }
 
+#[tracing::instrument(name = "api.reason_realtime_run", skip_all, fields(run_id))]
 pub async fn reason_realtime_run(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
@@ -1529,6 +1536,7 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     let mut metrics =
         format!("vidarax_runs_created_total {runs}\nvidarax_timeline_events_total {events}\n");
     metrics.push_str(&state.inference_metrics().render_prometheus());
+    metrics.push_str(&state.pipeline_metrics().render_prometheus());
     (axum::http::StatusCode::OK, metrics)
 }
 

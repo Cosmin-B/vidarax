@@ -17,6 +17,7 @@ use crate::inference_metrics::InferenceMetrics;
 use crate::security::SecurityPolicy;
 use crate::spacetime_client::SpacetimeClient;
 use crate::tenant_labels::{LabelMapResult, TenantLabelMaps};
+use vidarax_core::metrics::PipelineMetrics;
 
 /// Maximum number of concurrent WebRTC sessions to prevent memory exhaustion.
 const MAX_WEBRTC_SESSIONS: usize = 100;
@@ -35,6 +36,7 @@ pub struct AppState {
     inference_endpoints: Option<ProviderEndpoints>,
     security_policy: Arc<SecurityPolicy>,
     inference_metrics: Arc<InferenceMetrics>,
+    pipeline_metrics: Arc<PipelineMetrics>,
     run_registry: Arc<ArcSwap<RunRegistry>>,
     tenant_label_maps: Arc<TenantLabelMaps>,
     stream_ttl_secs: u64,
@@ -79,6 +81,7 @@ impl AppState {
             inference_endpoints,
             security_policy: Arc::new(security_policy),
             inference_metrics: Arc::new(InferenceMetrics::new()),
+            pipeline_metrics: Arc::new(PipelineMetrics::new()),
             run_registry,
             tenant_label_maps,
             stream_ttl_secs,
@@ -98,6 +101,7 @@ impl AppState {
             inference_endpoints: None,
             security_policy: Arc::new(SecurityPolicy::from_config_for_tests()),
             inference_metrics: Arc::new(InferenceMetrics::new()),
+            pipeline_metrics: Arc::new(PipelineMetrics::new()),
             run_registry: Arc::new(ArcSwap::from_pointee(RunRegistry::default())),
             tenant_label_maps: Arc::new(TenantLabelMaps::default()),
             stream_ttl_secs: 3600,
@@ -132,6 +136,7 @@ impl AppState {
             inference_endpoints,
             security_policy: Arc::new(security_policy),
             inference_metrics: Arc::new(InferenceMetrics::new()),
+            pipeline_metrics: Arc::new(PipelineMetrics::new()),
             run_registry: Arc::new(ArcSwap::from_pointee(RunRegistry::default())),
             tenant_label_maps: Arc::new(TenantLabelMaps::default()),
             stream_ttl_secs: 3600,
@@ -157,6 +162,7 @@ impl AppState {
             inference_endpoints,
             security_policy: Arc::new(security_policy),
             inference_metrics: Arc::new(InferenceMetrics::new()),
+            pipeline_metrics: Arc::new(PipelineMetrics::new()),
             run_registry: Arc::new(ArcSwap::from_pointee(RunRegistry::default())),
             tenant_label_maps: Arc::new(TenantLabelMaps::default()),
             stream_ttl_secs: stream_ttl_secs.max(1),
@@ -338,6 +344,16 @@ impl AppState {
 
     pub fn inference_metrics(&self) -> &InferenceMetrics {
         self.inference_metrics.as_ref()
+    }
+
+    pub fn pipeline_metrics(&self) -> &PipelineMetrics {
+        self.pipeline_metrics.as_ref()
+    }
+
+    /// Return the raw `Arc` for cases that need to move the metrics into
+    /// a background thread (e.g. WHIP drain task).
+    pub fn pipeline_metrics_arc(&self) -> &std::sync::Arc<PipelineMetrics> {
+        &self.pipeline_metrics
     }
 
     pub fn map_event_label(&self, tenant_id: Option<&str>, label: &str) -> LabelMapResult {
