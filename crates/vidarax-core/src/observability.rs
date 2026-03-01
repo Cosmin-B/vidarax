@@ -1,3 +1,17 @@
+//! Pre-tracing telemetry multiplexer — superseded by the tracing/OTel stack.
+//!
+//! # Deprecated
+//!
+//! This module predates the structured observability framework added in Phase 1–3.
+//! New code should use:
+//!
+//! - **Logging / spans** — [`tracing`] macros and [`vidarax_api::telemetry::init_telemetry`]
+//! - **Metrics** — [`vidarax_core::metrics::PipelineMetrics`] (Prometheus counters at `/v1/metrics`)
+//! - **Traces** — OTLP export via `VIDARAX_TRACES_ENDPOINT` → VictoriaTraces
+//!
+//! This module is retained for backwards compatibility and will be removed in a
+//! future release.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CorrelationIds {
     pub trace_id: String,
@@ -42,12 +56,17 @@ pub trait TraceSink {
     fn emit_trace(&mut self, record: TraceRecord) -> Result<(), String>;
 }
 
+#[deprecated(
+    since = "0.2.0",
+    note = "Use vidarax_api::telemetry (tracing/OTel) and vidarax_core::metrics::PipelineMetrics instead."
+)]
 pub struct TelemetryMux<L: LogSink, M: MetricSink, T: TraceSink> {
     pub logs: L,
     pub metrics: M,
     pub traces: T,
 }
 
+#[allow(deprecated)]
 impl<L: LogSink, M: MetricSink, T: TraceSink> TelemetryMux<L, M, T> {
     pub fn new(logs: L, metrics: M, traces: T) -> Self {
         Self {
@@ -134,6 +153,7 @@ fn sanitize(value: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::{
         victoria_log_line, CorrelationIds, LogRecord, LogSink, MetricRecord, MetricSink,

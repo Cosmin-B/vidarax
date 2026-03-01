@@ -9,6 +9,7 @@ services:
       VIDARAX_BIND_ADDR: 0.0.0.0:8080
       VIDARAX_DATA_DIR: /var/lib/vidarax
       VIDARAX_TRANSPORT: h1h2
+      VIDARAX_TRACES_ENDPOINT: http://victoriatraces:4317
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
@@ -23,10 +24,12 @@ services:
     command:
       - --storageDataPath=/storage
       - --httpListenAddr=:8428
+      - --promscrape.config=/etc/vm/scrape.yml
     ports:
       - "127.0.0.1:8428:8428"
     volumes:
       - vm-data:/storage
+      - ./vm-scrape.yml:/etc/vm/scrape.yml:ro
 
   victorialogs:
     image: victoriametrics/victoria-logs:v1.24.0-victorialogs
@@ -43,8 +46,10 @@ services:
     command:
       - --storageDataPath=/storage
       - --httpListenAddr=:10428
+      - --grpcListenAddr=:4317
     ports:
       - "127.0.0.1:10428:10428"
+      - "127.0.0.1:4317:4317"
     volumes:
       - vtrace-data:/storage
 
