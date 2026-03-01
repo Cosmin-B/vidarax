@@ -109,6 +109,57 @@ pub fn emit_event(
     });
 }
 
+/// User feedback on analysis quality.
+#[table(accessor = feedback, public)]
+pub struct Feedback {
+    #[primary_key]
+    #[auto_inc]
+    pub id: u64,
+
+    /// Identity of the agent that submitted feedback.
+    pub agent_id: Identity,
+
+    /// Run ID the feedback applies to.
+    pub run_id: String,
+
+    /// Session ID for the WebRTC stream.
+    pub session_id: String,
+
+    /// Rating from 0 to 10.
+    pub rating: u32,
+
+    /// Category: "accuracy" | "latency" | "quality"
+    pub category: String,
+
+    /// Free-text feedback.
+    pub feedback: String,
+
+    /// Wall-clock time at which the reducer was invoked.
+    pub timestamp: Timestamp,
+}
+
+/// Submit feedback for a run.
+#[reducer]
+pub fn submit_feedback(
+    ctx: &ReducerContext,
+    run_id: String,
+    session_id: String,
+    rating: u32,
+    category: String,
+    feedback: String,
+) {
+    ctx.db.feedback().insert(Feedback {
+        id: 0,
+        agent_id: ctx.sender(),
+        run_id,
+        session_id,
+        rating,
+        category,
+        feedback,
+        timestamp: ctx.timestamp,
+    });
+}
+
 /// Store a keyframe for persistent visual memory.
 #[reducer]
 pub fn store_keyframe(
