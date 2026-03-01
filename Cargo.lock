@@ -3175,7 +3175,7 @@ dependencies = [
 [[package]]
 name = "rustrtc"
 version = "0.3.25"
-source = "git+https://github.com/restsend/rustrtc#ef11fe717c9206382cb149c9bf11f02f54de9f69"
+source = "git+https://github.com/restsend/rustrtc?rev=ef11fe717c9206382cb149c9bf11f02f54de9f69#ef11fe717c9206382cb149c9bf11f02f54de9f69"
 dependencies = [
  "aes",
  "aes-gcm",

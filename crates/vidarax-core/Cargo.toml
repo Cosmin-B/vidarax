@@ -27,6 +27,7 @@ rustrtc-spike = ["dep:tracing", "dep:tracing-subscriber"]
 #   rustls::crypto::CryptoProvider::install_default(…) before creating sessions.
 [dependencies.rustrtc]
 git = "https://github.com/restsend/rustrtc"
+rev = "ef11fe717c9206382cb149c9bf11f02f54de9f69"
 
 [dependencies.rustls]
 version = "0.23.37"
