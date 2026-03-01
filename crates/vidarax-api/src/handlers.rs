@@ -2231,6 +2231,79 @@ pub async fn delete_run(
     }))
 }
 
+/// GET /v1/files/{filename}
+///
+/// Serve a file by bare filename from any directory listed in `VIDARAX_INGEST_FILE_ROOTS`.
+/// This allows the browser to load videos that were uploaded to the server's temp directory
+/// via the `/v1/upload` endpoint, which returns an absolute file path.
+///
+/// Security: only files whose canonical path starts with one of the allowed ingest roots
+/// are served.  Path traversal (`../`) is rejected by the canonicalization check.
+pub async fn serve_file(
+    State(state): State<AppState>,
+    Path(filename): Path<String>,
+) -> impl IntoResponse {
+    use axum::http::{header, StatusCode};
+    use axum::response::Response;
+    use axum::body::Body;
+
+    // Reject filenames with path separators or obvious traversal attempts.
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("invalid filename"))
+            .unwrap();
+    }
+
+    // Search each allowed root for a file with this name.
+    let roots = state.ingest_file_roots().to_vec();
+    for root in &roots {
+        let candidate = root.join(&filename);
+        // Canonicalize to resolve any symlinks and check containment.
+        let canonical = match candidate.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Security: ensure the resolved path is still inside the allowed root.
+        let root_canonical = match root.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if !canonical.starts_with(&root_canonical) {
+            continue;
+        }
+        // Read the file and stream it back.
+        let data = match tokio::fs::read(&canonical).await {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let mime = if filename.ends_with(".mp4") {
+            "video/mp4"
+        } else if filename.ends_with(".webm") {
+            "video/webm"
+        } else if filename.ends_with(".mov") {
+            "video/quicktime"
+        } else if filename.ends_with(".avi") {
+            "video/x-msvideo"
+        } else {
+            "application/octet-stream"
+        };
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, mime)
+            .header(header::CONTENT_LENGTH, data.len())
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(Body::from(data))
+            .unwrap();
+    }
+
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(Body::from("file not found"))
+        .unwrap()
+}
+
 pub async fn upload_file(
     State(state): State<AppState>,
     mut multipart: Multipart,
