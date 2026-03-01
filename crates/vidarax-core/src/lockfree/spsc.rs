@@ -39,6 +39,7 @@ struct Inner<T, const N: usize> {
 impl<T, const N: usize> Inner<T, N> {
     fn new() -> Self {
         assert!(N > 0, "SPSC channel capacity must be > 0");
+        assert!(N.is_power_of_two(), "SPSC channel capacity must be a power of two");
         Self {
             head: AtomicUsize::new(0),
             _pad0: [0u8; 56],
