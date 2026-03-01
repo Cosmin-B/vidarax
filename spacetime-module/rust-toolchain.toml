@@ -1,0 +1,7 @@
+# The SpacetimeDB WASM module must be compiled with a toolchain that has
+# the wasm32-unknown-unknown target installed.  The parent workspace pins
+# 1.85.0 which lacks that target, so this file overrides the toolchain
+# for this sub-directory only.
+[toolchain]
+channel = "1.93.0"
+targets = ["wasm32-unknown-unknown"]
