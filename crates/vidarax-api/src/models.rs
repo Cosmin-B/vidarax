@@ -317,3 +317,20 @@ pub struct ModelCatalogResponse {
     pub request_id: String,
     pub models: Vec<ModelCatalogItem>,
 }
+
+// ─── Stream attach ────────────────────────────────────────────────────────────
+
+/// Optional per-stream configuration sent when attaching a session.
+///
+/// Used to set the initial VLM prompt, token rate cap, and clip mode.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AttachStreamRequest {
+    /// Initial VLM analysis prompt for this session.
+    pub prompt: Option<String>,
+    /// Maximum VLM output tokens per second (backpressure).
+    /// Overrides the server default (`VIDARAX_WEBRTC_MAX_OUTPUT_TOKENS_PER_SECOND`).
+    pub max_output_tokens_per_second: Option<u32>,
+    /// Optional clip-mode config. When set, frames are accumulated into
+    /// temporal windows for multi-image VLM inference instead of per-keyframe.
+    pub clip_mode: Option<ClipConfig>,
+}
