@@ -99,6 +99,19 @@ export interface ModelsResponse {
   models: ModelInfo[]
 }
 
+export interface RawRunEvent {
+  seq: number
+  pts_ms: number
+  kind: string
+  payload: Record<string, unknown>
+}
+
+export interface RunEventsResponse {
+  request_id: string
+  run_id: string
+  events: RawRunEvent[]
+}
+
 export interface FeedbackRequest {
   rating: number
   category: string
@@ -180,6 +193,9 @@ export const api = {
     },
     feedback(runId: string, data: FeedbackRequest): Promise<FeedbackResponse> {
       return request<FeedbackResponse>('POST', `/v1/runs/${validateId(runId)}/feedback`, data)
+    },
+    events(runId: string): Promise<RunEventsResponse> {
+      return request<RunEventsResponse>('GET', `/v1/runs/${validateId(runId)}/events`)
     },
   },
 

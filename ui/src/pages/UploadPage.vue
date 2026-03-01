@@ -24,6 +24,8 @@ const uploadProgress = ref(0)
 const uploadState = ref<'idle' | 'uploading' | 'creating' | 'analyzing' | 'done' | 'error'>('idle')
 const uploadError = ref<string | null>(null)
 
+const DEFAULT_ANALYSIS_PROMPT = 'Describe what is happening in this video frame.'
+
 // Config for the run
 const selectedModel = ref(localStorage.getItem('vidarax_default_model') ?? 'Qwen/Qwen3-VL-4B-Instruct')
 const prompt = ref('')
@@ -125,10 +127,12 @@ async function startUpload(): Promise<void> {
     const fps = Number(localStorage.getItem('vidarax_fps') ?? '5')
     const chunkSize = Number(localStorage.getItem('vidarax_chunk_size') ?? '30')
 
+    const effectivePrompt = prompt.value.trim() || DEFAULT_ANALYSIS_PROMPT
+
     const run = await api.runs.create({
       source_uri: filePath,
       model: selectedModel.value,
-      prompt: prompt.value || undefined,
+      prompt: effectivePrompt,
       semantic_inference: semanticInference.value,
       fps,
       chunk_size: chunkSize,
@@ -155,7 +159,7 @@ async function startUpload(): Promise<void> {
     await api.runs.reason(run.run_id, {
       source_uri: filePath,
       model: selectedModel.value,
-      prompt: prompt.value || undefined,
+      prompt: effectivePrompt,
       semantic_inference: semanticInference.value,
       fps,
       chunk_size: chunkSize,
@@ -476,15 +480,17 @@ function formatPts(ms: number) {
           </div>
 
           <!-- Prompt -->
-          <div class="space-y-1.5">
-            <label class="text-xs text-[#64748b] uppercase tracking-wide">Custom Prompt (optional)</label>
-            <input
+          <div class="space-y-1.5 sm:col-span-2">
+            <label class="text-xs text-[#64748b] uppercase tracking-wide">Analysis Prompt</label>
+            <textarea
               v-model="prompt"
-              type="text"
-              placeholder="e.g. Focus on motion artefacts"
-              class="w-full px-3 py-2 rounded-[8px] text-sm text-[#e2e8f0] placeholder-[#475569] transition-colors duration-200"
-              style="background: #0f1117; border: 1px solid #1e2633; outline: none;"
+              rows="2"
+              :placeholder="DEFAULT_ANALYSIS_PROMPT"
+              class="w-full px-3 py-2 rounded-[8px] text-sm text-[#e2e8f0] placeholder-[#475569] resize-none transition-colors duration-200"
+              style="background: #0f1117; border: 1px solid #1e2633; outline: none; font-family: inherit;"
+              aria-label="Analysis prompt for VLM"
             />
+            <p class="text-[#475569] text-xs">Sent as <span class="mono">semantic_prompt</span>. Leave blank to use the default.</p>
           </div>
         </div>
 

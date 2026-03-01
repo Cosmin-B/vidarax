@@ -5,16 +5,17 @@ import { useRunsStore } from '@/stores/runs'
 import { useEventsStore } from '@/stores/events'
 import { useEventStream } from '@/composables/useEventStream'
 import { api, ApiError } from '@/lib/api'
-import type { FeedbackRequest } from '@/lib/api'
+import type { FeedbackRequest, RawRunEvent } from '@/lib/api'
 import type { RunStatus } from '@/stores/runs'
-import { ChevronLeft, Image, StopCircle, Trash2, Radio, Zap } from 'lucide-vue-next'
+import type { AgentEvent } from '@/stores/events'
+import { ChevronLeft, Image, Radio, Zap } from 'lucide-vue-next'
 import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
 
 const route = useRoute()
 const router = useRouter()
 const runsStore = useRunsStore()
 const eventsStore = useEventsStore()
-const { connect: connectEvents, disconnect: disconnectEvents } = useEventStream()
+const { connect: connectEvents, disconnect: disconnectEvents, isConnected: stdbConnected } = useEventStream()
 
 const runId = computed(() => route.params.runId as string)
 const activeTab = ref<'timeline' | 'keyframes' | 'metadata'>('timeline')
@@ -23,6 +24,7 @@ const fetchError = ref<string | null>(null)
 const actionLoading = ref<'stop' | 'delete' | 'keepalive' | null>(null)
 const confirmDelete = ref(false)
 let keepaliveTimer: ReturnType<typeof setInterval> | null = null
+const eventsPollingTimer = ref<ReturnType<typeof setInterval> | null>(null)
 
 // ── Run data ──────────────────────────────────────────────────────────────────
 
@@ -66,6 +68,15 @@ onMounted(async () => {
   // Subscribe to SpacetimeDB events for this run
   connectEvents(runId.value)
 
+  // HTTP polling fallback: fetch events from the REST API when SpacetimeDB
+  // is not connected (either not configured or unavailable).
+  // We check on the next tick so connectEvents has a chance to set the status.
+  setTimeout(() => {
+    if (!stdbConnected.value) {
+      startEventsPolling(runId.value)
+    }
+  }, 200)
+
   // Keepalive for processing runs (every 20s)
   if (isProcessing.value) {
     keepaliveTimer = setInterval(async () => {
@@ -84,6 +95,7 @@ onUnmounted(() => {
   runsStore.setActiveRun(null)
   eventsStore.setActiveRunId(null)
   if (keepaliveTimer) clearInterval(keepaliveTimer)
+  if (eventsPollingTimer.value) clearInterval(eventsPollingTimer.value)
 })
 
 // ── Actions ───────────────────────────────────────────────────────────────────
@@ -112,6 +124,71 @@ async function deleteRun(): Promise<void> {
     console.error('[RunDetail] delete failed:', err)
     actionLoading.value = null
   }
+}
+
+// ── HTTP events fallback ─────────────────────────────────────────────────────
+
+/**
+ * Map a raw run event from the HTTP API to the AgentEvent shape used by the store.
+ * Only `marker_emitted` events carry meaningful agent data; other event kinds are skipped.
+ */
+function mapRawEvent(raw: RawRunEvent, runIdVal: string): AgentEvent | null {
+  if (raw.kind !== 'marker_emitted') return null
+  const p = raw.payload
+  const eventType = (p.event_type as string | undefined)
+    ?? (p.kind as string | undefined)
+    ?? 'vlm_description'
+  return {
+    run_id: runIdVal,
+    session_id: (p.stream_id as string | undefined) ?? '',
+    frame_index: Number((p.start_frame as number | undefined) ?? 0),
+    pts_ms: Number(raw.pts_ms ?? 0),
+    event_type: eventType as AgentEvent['event_type'],
+    confidence: Number((p.confidence as number | undefined) ?? 0),
+    description: (p.description as string | undefined) ?? (p.summary as string | undefined) ?? '',
+    timestamp_ms: 0,
+  }
+}
+
+/**
+ * Poll GET /v1/runs/{id}/events every 3 s when SpacetimeDB is not connected.
+ * Stops automatically once the run reaches a terminal status.
+ */
+function startEventsPolling(id: string): void {
+  const TERMINAL = new Set<string>(['completed', 'failed', 'stopped'])
+
+  async function poll(): Promise<void> {
+    try {
+      const res = await api.runs.events(id)
+      const mapped = res.events
+        .map(e => mapRawEvent(e, id))
+        .filter((e): e is AgentEvent => e !== null)
+      // Add only events not already in the store (avoid duplicates)
+      const existing = new Set(
+        eventsStore.eventsForRun(id).map(e => `${e.frame_index}:${e.event_type}`)
+      )
+      for (const evt of mapped) {
+        const key = `${evt.frame_index}:${evt.event_type}`
+        if (!existing.has(key)) {
+          eventsStore.addEvent(evt)
+          existing.add(key)
+        }
+      }
+      // Also refresh run status
+      const runData = await api.runs.get(id)
+      runsStore.updateRunStatus(id, runData.status as RunStatus)
+      if (TERMINAL.has(runData.status) && eventsPollingTimer.value !== null) {
+        clearInterval(eventsPollingTimer.value)
+        eventsPollingTimer.value = null
+      }
+    } catch {
+      // transient — keep polling
+    }
+  }
+
+  // Immediate first fetch, then interval
+  poll()
+  eventsPollingTimer.value = setInterval(poll, 3000)
 }
 
 // ── Feedback ──────────────────────────────────────────────────────────
@@ -304,16 +381,25 @@ function formatDate(iso: string): string {
       <div v-if="activeTab === 'timeline'" class="card-skeuo overflow-hidden">
         <div class="px-5 py-4 border-b border-[#1e2633] flex items-center justify-between">
           <h3 class="text-[#e2e8f0] font-medium text-sm">Event Timeline</h3>
-          <span v-if="isProcessing" class="flex items-center gap-1.5 text-xs text-[#f59e0b]">
-            <AnimatedIcon
-              :icon="Zap"
-              :size="12"
-              :stroke-width="2"
-              animation="pulse"
-              class="icon-glow-amber"
-            />
-            Live
-          </span>
+          <div class="flex items-center gap-2">
+            <span
+              v-if="!stdbConnected && eventsPollingTimer !== null"
+              class="text-xs text-[#475569]"
+              title="SpacetimeDB not connected — polling REST API every 3s"
+            >
+              polling API
+            </span>
+            <span v-if="isProcessing" class="flex items-center gap-1.5 text-xs text-[#f59e0b]">
+              <AnimatedIcon
+                :icon="Zap"
+                :size="12"
+                :stroke-width="2"
+                animation="pulse"
+                class="icon-glow-amber"
+              />
+              {{ stdbConnected ? 'Live' : 'Live (HTTP)' }}
+            </span>
+          </div>
         </div>
 
         <div v-if="events.length === 0" class="py-12 text-center text-[#475569] text-sm">

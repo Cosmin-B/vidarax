@@ -67,6 +67,16 @@ function buildWsUrl(baseUrl: string, moduleName: string): string {
   return url.toString()
 }
 
+/** Returns true when the endpoint is the default localhost value (not user-configured). */
+function isDefaultLocalhostEndpoint(endpoint: string): boolean {
+  try {
+    const url = new URL(endpoint)
+    return (url.hostname === 'localhost' || url.hostname === '127.0.0.1') && url.port === '3000'
+  } catch {
+    return false
+  }
+}
+
 /** Extract database_update from TransactionUpdate (handles both shapes). */
 function extractDbUpdate(msg: ServerMessage & { TransactionUpdate: unknown }): StdbDatabaseUpdate | null {
   const tu = (msg as { TransactionUpdate: { status: unknown; database_update?: StdbDatabaseUpdate } })
@@ -116,6 +126,10 @@ function parseKeyframeEntry(row: unknown): KeyframeEntry | null {
 // ── Module name used in the SpacetimeDB module ────────────────────────────────
 const MODULE_NAME = 'vidarax'
 
+// ── Reconnect config ──────────────────────────────────────────────────────────
+const MAX_RECONNECT_ATTEMPTS = 3
+const RECONNECT_BASE_DELAY_MS = 3000
+
 // ── Composable ────────────────────────────────────────────────────────────────
 
 export function useEventStream() {
@@ -129,6 +143,7 @@ export function useEventStream() {
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
   let activeRunId: string | null = null
   let reqId = 1
+  let reconnectAttempts = 0
 
   function applyTableInserts(dbUpdate: StdbDatabaseUpdate, runIdFilter?: string): void {
     for (const table of dbUpdate.tables) {
@@ -179,13 +194,13 @@ export function useEventStream() {
     }
 
     if ('SubscribeError' in msg) {
-      console.error('[SpacetimeDB] SubscribeError:', msg.SubscribeError.message)
+      logger.warn('[SpacetimeDB] SubscribeError:', msg.SubscribeError.message)
       connectionError.value = msg.SubscribeError.message
       return
     }
 
     if ('ErrorMessage' in msg) {
-      console.error('[SpacetimeDB] ErrorMessage:', msg.ErrorMessage.message)
+      logger.warn('[SpacetimeDB] ErrorMessage:', msg.ErrorMessage.message)
       connectionError.value = msg.ErrorMessage.message
     }
   }
@@ -211,8 +226,19 @@ export function useEventStream() {
       connectionError.value = 'Invalid run ID format'
       return
     }
+
+    // Do not auto-connect when SpacetimeDB endpoint is the unconfigured default localhost:3000.
+    // The user must explicitly configure a reachable endpoint in Settings.
+    if (isDefaultLocalhostEndpoint(authStore.spacetimeEndpoint)) {
+      connectionError.value = 'SpacetimeDB not connected'
+      eventsStore.setConnectionStatus(false, 'SpacetimeDB not connected')
+      logger.info('[SpacetimeDB] Skipping connection — endpoint is default localhost:3000 (not configured)')
+      return
+    }
+
     activeRunId = runId
     eventsStore.setActiveRunId(runId)
+    reconnectAttempts = 0
 
     if (ws && ws.readyState === WebSocket.OPEN) {
       // Already connected — re-subscribe for the new runId
@@ -246,6 +272,7 @@ export function useEventStream() {
     ws.onopen = () => {
       isConnected.value = true
       connectionError.value = null
+      reconnectAttempts = 0
       eventsStore.setConnectionStatus(true)
       logger.info('[SpacetimeDB] Connected to', wsUrl)
 
@@ -263,21 +290,30 @@ export function useEventStream() {
       // Binary BSATN frames are ignored (should not arrive with json protocol)
     }
 
-    ws.onerror = (ev) => {
-      console.error('[SpacetimeDB] WebSocket error', ev)
+    ws.onerror = () => {
+      // Suppress the noisy browser WebSocket error event — the close event
+      // fires immediately after with the reason, which we handle below.
     }
 
     ws.onclose = (ev) => {
       isConnected.value = false
       eventsStore.setConnectionStatus(false)
-      logger.info(`[SpacetimeDB] Disconnected (code=${ev.code})`)
 
-      // Auto-reconnect after 3 s if we still have an active run
-      if (activeRunId) {
+      // Only attempt reconnect if we have an active run and haven't exceeded the limit
+      if (activeRunId && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+        reconnectAttempts++
+        const delay = RECONNECT_BASE_DELAY_MS * Math.pow(2, reconnectAttempts - 1)
+        logger.info(`[SpacetimeDB] Disconnected (code=${ev.code}). Reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delay}ms…`)
         reconnectTimer = setTimeout(() => {
-          logger.info('[SpacetimeDB] Attempting reconnect…')
           _openWebSocket()
-        }, 3000)
+        }, delay)
+      } else if (activeRunId && reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        logger.info(`[SpacetimeDB] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Giving up.`)
+        connectionError.value = 'SpacetimeDB not connected'
+        eventsStore.setConnectionStatus(false, 'SpacetimeDB not connected')
+        activeRunId = null
+      } else {
+        logger.info(`[SpacetimeDB] Disconnected (code=${ev.code})`)
       }
     }
   }
@@ -288,6 +324,7 @@ export function useEventStream() {
       reconnectTimer = null
     }
     activeRunId = null
+    reconnectAttempts = 0
     eventsStore.setActiveRunId(null)
 
     if (ws) {

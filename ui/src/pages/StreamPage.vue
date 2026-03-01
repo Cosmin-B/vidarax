@@ -6,7 +6,7 @@ import { useEventsStore } from '@/stores/events'
 import { useWhip } from '@/composables/useWhip'
 import { useEventStream } from '@/composables/useEventStream'
 import type { StreamSourceType } from '@/stores/stream'
-import { Monitor, Camera, Radio, FileVideo, Clock, Play, Check, Zap } from 'lucide-vue-next'
+import { Monitor, Camera, Radio, FileVideo, Clock, Play, Check, Zap, AlertCircle } from 'lucide-vue-next'
 import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
 import type { Component } from 'vue'
 
@@ -40,6 +40,9 @@ const sources: SourceTile[] = [
 const selectedSource = ref<StreamSourceType | null>(null)
 const videoEl = ref<HTMLVideoElement | null>(null)
 
+const DEFAULT_PROMPT = 'Describe what is happening in this video frame.'
+const analysisPrompt = ref('')
+
 // ── Computed ──────────────────────────────────────────────────────────────────
 
 const isStreaming = computed(() => streamStore.isActive)
@@ -72,7 +75,9 @@ function selectSource(source: SourceTile) {
 
 async function handleStart() {
   if (!selectedSource.value) return
-  await startStream(selectedSource.value)
+  await startStream(selectedSource.value, {
+    prompt: analysisPrompt.value.trim() || DEFAULT_PROMPT,
+  })
 }
 
 async function handleStop() {
@@ -213,13 +218,39 @@ function formatPts(pts: number): string {
 
           <!-- Negotiating spinner overlay -->
           <div
-            v-if="isNegotiating"
+            v-if="isNegotiating && !hasError"
             class="absolute inset-0 flex items-center justify-center"
             style="background: rgba(5,5,7,0.85);"
           >
             <div class="text-center">
               <div class="w-10 h-10 rounded-full border-2 border-[#1e2633] border-t-[#2dd4bf] animate-spin mx-auto mb-3" />
               <p class="text-[#475569] text-sm">Negotiating WHIP session…</p>
+            </div>
+          </div>
+
+          <!-- WHIP error overlay -->
+          <div
+            v-if="hasError && streamStore.error"
+            class="absolute inset-0 flex items-center justify-center p-6"
+            style="background: rgba(5,5,7,0.9);"
+          >
+            <div class="text-center space-y-3 max-w-sm">
+              <AnimatedIcon
+                :icon="AlertCircle"
+                :size="28"
+                :stroke-width="1.75"
+                animation="fade-in"
+                class="text-[#ef4444] mx-auto"
+              />
+              <p class="text-[#ef4444] text-sm font-medium">Stream negotiation failed</p>
+              <p class="text-[#64748b] text-xs leading-relaxed break-words">{{ streamStore.error }}</p>
+              <button
+                class="mt-2 px-4 py-1.5 rounded-[8px] text-xs font-medium text-[#94a3b8] transition-colors"
+                style="background: rgba(255,255,255,0.06); border: 1px solid #1e2633;"
+                @click="handleStop"
+              >
+                Dismiss
+              </button>
             </div>
           </div>
 
@@ -415,6 +446,20 @@ function formatPts(pts: number): string {
             <div class="text-xs text-[#475569] mt-0.5 leading-relaxed">{{ source.description }}</div>
           </div>
         </button>
+      </div>
+
+      <!-- Analysis prompt -->
+      <div v-if="selectedSource" class="card-skeuo p-4 space-y-2">
+        <label class="text-xs text-[#64748b] uppercase tracking-wide block">Analysis Prompt</label>
+        <textarea
+          v-model="analysisPrompt"
+          rows="2"
+          :placeholder="DEFAULT_PROMPT"
+          class="w-full px-3 py-2 rounded-[8px] text-sm text-[#e2e8f0] placeholder-[#475569] resize-none transition-colors duration-200"
+          style="background: #0f1117; border: 1px solid #1e2633; outline: none; font-family: inherit;"
+          aria-label="Analysis prompt for VLM"
+        />
+        <p class="text-[#475569] text-xs">Sent as <span class="mono">semantic_prompt</span> to the VLM. Leave blank to use the default.</p>
       </div>
 
       <!-- Start button -->
