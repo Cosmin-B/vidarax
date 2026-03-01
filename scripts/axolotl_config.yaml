@@ -44,7 +44,8 @@ learning_rate: LEARNING_RATE
 bf16: true
 tf32: true
 gradient_checkpointing: true
-flash_attention: true
+# flash_attention disabled: varlen cu_seqlens shape error with LFM2-VL multimodal batches
+flash_attention: false
 
 warmup_ratio: 0.1
 logging_steps: 10
