@@ -79,6 +79,12 @@ impl ServerConfig {
         let security_metrics_require_api_key =
             parse_bool_env("VIDARAX_METRICS_REQUIRE_API_KEY", true)?;
         let cors_allowed_origins = parse_csv_env("VIDARAX_CORS_ALLOWED_ORIGINS");
+        if security_require_api_key && cors_allowed_origins.iter().any(|o| o.trim() == "*") {
+            return Err(
+                "VIDARAX_CORS_ALLOWED_ORIGINS must not contain '*' when VIDARAX_REQUIRE_API_KEY is enabled"
+                    .to_string(),
+            );
+        }
         let stream_ttl_secs = parse_u64_env_with_default("VIDARAX_STREAM_TTL_SECS", 3600)?;
         if !(60..=86_400).contains(&stream_ttl_secs) {
             return Err("VIDARAX_STREAM_TTL_SECS must be in [60, 86400]".to_string());

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::io;
 use std::net::IpAddr;
 
@@ -252,7 +254,7 @@ mod tests {
     }
 
     fn ffmpeg_available() -> bool {
-        Command::new("ffmpeg")
+        Command::new(vidarax_core::ingest::ffmpeg_path())
             .arg("-version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -267,7 +269,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!("vidarax-mp4-test-{nanos}.mp4"));
-        let status = Command::new("ffmpeg")
+        let status = Command::new(vidarax_core::ingest::ffmpeg_path())
             .args([
                 "-v",
                 "error",

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use vidarax_contracts::lifecycle::StreamState;
 use vidarax_contracts::models::REQUIRED_MODELS;
 

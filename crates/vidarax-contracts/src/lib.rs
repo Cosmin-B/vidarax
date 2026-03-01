@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod errors;
 pub mod lifecycle;
 pub mod models;

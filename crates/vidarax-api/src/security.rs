@@ -301,7 +301,7 @@ fn add_preflight_headers(policy: &SecurityPolicy, response: &mut Response, origi
     add_cors_origin_header(policy, response.headers_mut(), origin);
     response.headers_mut().insert(
         header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET,POST,OPTIONS"),
+        HeaderValue::from_static("GET,POST,PATCH,DELETE,OPTIONS"),
     );
     response.headers_mut().insert(
         header::ACCESS_CONTROL_ALLOW_HEADERS,
@@ -347,6 +347,18 @@ fn apply_security_headers(headers: &mut HeaderMap) {
         HeaderValue::from_static("no-referrer"),
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+    );
+    headers.insert(
+        HeaderName::from_static("strict-transport-security"),
+        HeaderValue::from_static("max-age=63072000; includeSubDomains"),
+    );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+    );
 }
 
 fn normalize_cors_origins(origins: &[String]) -> Vec<String> {
