@@ -65,8 +65,7 @@ impl TwoPassPipeline {
         // Pass 2: derive contextual metadata from a bounded sliding window.
         let mut out = Vec::with_capacity(frames.len());
         for (frame, gate_event) in frames.iter().zip(pass1.iter()) {
-            let novelty = self.novelty_against_window(frame.perceptual_hash);
-            let stability = self.temporal_stability(frame.luma_mean);
+            let (novelty, stability) = self.window_metrics(frame.perceptual_hash, frame.luma_mean);
             let motion = self.motion_score(frame.perceptual_hash);
             let confidence = normalize(0.45 * novelty + 0.35 * (1.0 - stability) + 0.20 * motion);
 
@@ -93,26 +92,20 @@ impl TwoPassPipeline {
         out
     }
 
-    fn novelty_against_window(&self, hash: u64) -> f32 {
+    /// Fused single-pass over the sliding window: computes both novelty
+    /// (hamming similarity) and temporal stability (luma drift) in one loop.
+    fn window_metrics(&self, hash: u64, luma_mean: f32) -> (f32, f32) {
         if self.window_len == 0 {
-            return 1.0;
+            return (1.0, 0.0);
         }
-        let mut total = 0.0f32;
-        for sample in self.window.iter().take(self.window_len) {
-            total += hamming_similarity(hash, sample.perceptual_hash);
-        }
-        normalize(total / self.window_len as f32)
-    }
-
-    fn temporal_stability(&self, luma_mean: f32) -> f32 {
-        if self.window_len == 0 {
-            return 0.0;
-        }
+        let mut similarity = 0.0f32;
         let mut drift = 0.0f32;
         for sample in self.window.iter().take(self.window_len) {
+            similarity += hamming_similarity(hash, sample.perceptual_hash);
             drift += (sample.luma_mean - luma_mean).abs();
         }
-        normalize(drift / self.window_len as f32)
+        let inv = 1.0 / self.window_len as f32;
+        (normalize(similarity * inv), normalize(drift * inv))
     }
 
     fn motion_score(&self, hash: u64) -> f32 {
