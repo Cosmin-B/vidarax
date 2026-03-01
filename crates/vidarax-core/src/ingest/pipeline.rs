@@ -36,7 +36,7 @@ impl PipelineBackend {
     /// Auto-detect best available backend.
     pub fn auto_detect() -> Self {
         // Check for NVIDIA GPU
-        if std::process::Command::new("nvidia-smi")
+        if std::process::Command::new(super::nvidia_smi_path())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -234,7 +234,7 @@ fn decode_selective_jpeg_frames_nvdec(
     );
     let frames_cap = frame_indices.len().min(max_frames).to_string();
 
-    let output = Command::new("ffmpeg")
+    let output = Command::new(super::ffmpeg_path())
         .args([
             "-hwaccel", "nvdec",
             "-hwaccel_output_format", "cuda",
@@ -250,11 +250,14 @@ fn decode_selective_jpeg_frames_nvdec(
             "-",
         ])
         .output()
-        .map_err(|err| format!("failed to run ffmpeg with NVDEC: {err}"))?;
+        .map_err(|_| "failed to run ffmpeg with NVDEC".to_string())?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffmpeg nvdec selective decode failed: {}", stderr.trim()));
+        eprintln!(
+            "ffmpeg nvdec decode stderr: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return Err("GPU video decode failed".to_string());
     }
 
     let mut parsed = crate::ingest::parse_jpeg_stream_to_frames(&output.stdout, frame_indices.len())?;

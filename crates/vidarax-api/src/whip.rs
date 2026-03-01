@@ -25,6 +25,26 @@ use vidarax_core::webrtc::session::{WebRtcConfig, WebRtcSession};
 
 use crate::state::AppState;
 
+const HEADER_API_KEY: &str = "x-api-key";
+const HEADER_TENANT_ID: &str = "x-tenant-id";
+
+/// Derive a principal key from the request headers, matching the scheme used
+/// by the main API handlers.
+fn principal_key_from_headers(headers: &HeaderMap) -> String {
+    if let Some(tid) = headers.get(HEADER_TENANT_ID).and_then(|v| v.to_str().ok()) {
+        return format!("tenant:{tid}");
+    }
+    if let Some(key) = headers.get(HEADER_API_KEY).and_then(|v| v.to_str().ok()) {
+        let mut hash = 1469598103934665603u64;
+        for b in key.bytes() {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(1099511628211);
+        }
+        return format!("api-key:{hash:016x}");
+    }
+    "public".to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Session ID generation
 // ---------------------------------------------------------------------------
@@ -107,7 +127,7 @@ pub async fn whip_offer(
                 tracing::warn!("WHIP offer negotiation failed: {e}");
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("WebRTC negotiation error: {e}"),
+                    "WebRTC negotiation failed",
                 )
                     .into_response();
             }
@@ -115,12 +135,20 @@ pub async fn whip_offer(
 
     let session = Arc::new(session);
     let sess_id = new_session_id();
+    let principal = principal_key_from_headers(&headers);
 
-    // Store the session.
-    if !state.insert_session(sess_id.clone(), Arc::clone(&session)).await {
-        // Collision — extremely unlikely but handle gracefully.
-        tracing::error!("WHIP session ID collision for {sess_id}");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    // Store the session bound to the requesting principal.
+    if !state
+        .insert_session(sess_id.clone(), principal, Arc::clone(&session))
+        .await
+    {
+        // Collision or global session limit reached.
+        tracing::error!("WHIP session insert failed for {sess_id} (collision or limit)");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session limit reached or ID collision",
+        )
+            .into_response();
     }
 
     // Spawn the media ingestion task.
@@ -176,12 +204,20 @@ pub async fn whip_offer(
 pub async fn whip_ice(
     State(state): State<AppState>,
     Path(sess_id): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
-    let Some(session) = state.get_session(&sess_id).await else {
+    let Some((owner_principal, session)) = state.get_session(&sess_id).await else {
         tracing::debug!("WHIP ICE unknown session {sess_id}");
         return StatusCode::NOT_FOUND;
     };
+
+    // Verify the caller owns this session.
+    let caller = principal_key_from_headers(&headers);
+    if caller != owner_principal {
+        tracing::warn!("WHIP ICE sess={sess_id} principal mismatch");
+        return StatusCode::FORBIDDEN;
+    }
 
     let candidate_str = match std::str::from_utf8(&body) {
         Ok(s) => s.trim(),
@@ -217,16 +253,26 @@ pub async fn whip_ice(
 pub async fn whip_terminate(
     State(state): State<AppState>,
     Path(sess_id): Path<String>,
+    headers: HeaderMap,
 ) -> StatusCode {
+    // Verify ownership before removing — peek first.
+    let Some((owner_principal, _)) = state.get_session(&sess_id).await else {
+        tracing::debug!("WHIP terminate: unknown session {sess_id}");
+        return StatusCode::NOT_FOUND;
+    };
+
+    let caller = principal_key_from_headers(&headers);
+    if caller != owner_principal {
+        tracing::warn!("WHIP terminate sess={sess_id} principal mismatch");
+        return StatusCode::FORBIDDEN;
+    }
+
     match state.remove_session(&sess_id).await {
-        Some(session) => {
+        Some((_principal, session)) => {
             tracing::info!("WHIP session terminated sess_id={sess_id}");
-            // Unwrap the Arc and call terminate() if this is the last handle;
-            // otherwise just drop our reference — rustrtc cleans up when all
-            // handles are released.
             match Arc::try_unwrap(session) {
                 Ok(s) => s.terminate(),
-                Err(_arc) => {} // other references exist; they will clean up on drop
+                Err(_arc) => {}
             }
             StatusCode::OK
         }

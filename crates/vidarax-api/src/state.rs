@@ -18,8 +18,12 @@ use crate::security::SecurityPolicy;
 use crate::spacetime_client::SpacetimeClient;
 use crate::tenant_labels::{LabelMapResult, TenantLabelMaps};
 
+/// Maximum number of concurrent WebRTC sessions to prevent memory exhaustion.
+const MAX_WEBRTC_SESSIONS: usize = 100;
+
 /// In-memory store for active WebRTC sessions, keyed by session ID.
-type SessionMap = Arc<RwLock<HashMap<String, Arc<WebRtcSession>>>>;
+/// Each entry stores the owning principal alongside the session.
+type SessionMap = Arc<RwLock<HashMap<String, (String, Arc<WebRtcSession>)>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -185,25 +189,35 @@ impl AppState {
     // WebRTC session management
     // -----------------------------------------------------------------------
 
-    /// Insert a new WebRTC session.  Returns `false` if the session ID is
-    /// already present (collision — caller should retry with a new ID).
-    pub async fn insert_session(&self, sess_id: String, session: Arc<WebRtcSession>) -> bool {
+    /// Insert a new WebRTC session bound to the given principal.
+    ///
+    /// Returns `false` if the session ID already exists (collision) or the
+    /// global session limit has been reached.
+    pub async fn insert_session(
+        &self,
+        sess_id: String,
+        principal: String,
+        session: Arc<WebRtcSession>,
+    ) -> bool {
         let mut map = self.sessions.write().await;
+        if map.len() >= MAX_WEBRTC_SESSIONS {
+            return false;
+        }
         if map.contains_key(&sess_id) {
             return false;
         }
-        map.insert(sess_id, session);
+        map.insert(sess_id, (principal, session));
         true
     }
 
     /// Look up a WebRTC session by ID.  Returns `None` if not found.
-    pub async fn get_session(&self, sess_id: &str) -> Option<Arc<WebRtcSession>> {
+    pub async fn get_session(&self, sess_id: &str) -> Option<(String, Arc<WebRtcSession>)> {
         self.sessions.read().await.get(sess_id).cloned()
     }
 
     /// Remove and return a WebRTC session.  Dropping the returned `Arc`
     /// (or ignoring the return value) triggers peer connection cleanup.
-    pub async fn remove_session(&self, sess_id: &str) -> Option<Arc<WebRtcSession>> {
+    pub async fn remove_session(&self, sess_id: &str) -> Option<(String, Arc<WebRtcSession>)> {
         self.sessions.write().await.remove(sess_id)
     }
 

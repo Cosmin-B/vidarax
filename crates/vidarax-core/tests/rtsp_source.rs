@@ -4,9 +4,10 @@ use vidarax_core::ingest::InputSource;
 #[test]
 fn rtsp_url_is_accepted() {
     let roots: Vec<PathBuf> = vec![];
-    let result = InputSource::parse_and_validate("rtsp://cameras.example.com/stream1", &roots);
+    // Use example.com which resolves to a public IP (93.184.216.34).
+    let result = InputSource::parse_and_validate("rtsp://example.com/stream1", &roots);
     assert!(result.is_ok(), "rtsp URL should be accepted: {result:?}");
-    assert_eq!(result.unwrap(), InputSource::Url("rtsp://cameras.example.com/stream1".to_string()));
+    assert_eq!(result.unwrap(), InputSource::Url("rtsp://example.com/stream1".to_string()));
 }
 
 #[test]

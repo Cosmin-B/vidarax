@@ -1,10 +1,31 @@
 pub mod pipeline;
 
-use std::net::IpAddr;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::gate::FrameSignal;
+
+/// Return the configured ffmpeg binary path.
+///
+/// Checks `VIDARAX_FFMPEG_PATH` env var first, falls back to `"ffmpeg"`.
+pub fn ffmpeg_path() -> String {
+    std::env::var("VIDARAX_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string())
+}
+
+/// Return the configured ffprobe binary path.
+///
+/// Checks `VIDARAX_FFPROBE_PATH` env var first, falls back to `"ffprobe"`.
+pub fn ffprobe_path() -> String {
+    std::env::var("VIDARAX_FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string())
+}
+
+/// Return the configured nvidia-smi binary path.
+///
+/// Checks `VIDARAX_NVIDIA_SMI_PATH` env var first, falls back to `"nvidia-smi"`.
+pub fn nvidia_smi_path() -> String {
+    std::env::var("VIDARAX_NVIDIA_SMI_PATH").unwrap_or_else(|_| "nvidia-smi".to_string())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputSource {
@@ -64,6 +85,31 @@ fn validate_remote_url(url: reqwest::Url) -> Result<InputSource, String> {
             return Err("source_uri host must not be private, loopback, or link-local".to_string());
         }
     }
+
+    // H-1: Resolve DNS and validate ALL resolved IPs to prevent DNS rebinding.
+    let port = url.port_or_known_default().unwrap_or(80);
+    let resolve_target = format!("{host}:{port}");
+    match resolve_target.to_socket_addrs() {
+        Ok(addrs) => {
+            let addrs: Vec<_> = addrs.collect();
+            if addrs.is_empty() {
+                return Err("source_uri host did not resolve to any address".to_string());
+            }
+            for addr in &addrs {
+                if blocked_ip(&addr.ip()) {
+                    return Err(
+                        "source_uri host must not be private, loopback, or link-local".to_string(),
+                    );
+                }
+            }
+        }
+        Err(_) => {
+            // DNS resolution failed — reject rather than allow a potentially
+            // unvalidated host through.
+            return Err("source_uri host could not be resolved".to_string());
+        }
+    }
+
     Ok(InputSource::Url(url.to_string()))
 }
 
@@ -83,15 +129,12 @@ fn validate_file_url(
 fn validate_file_path(path: &str, allowed_file_roots: &[PathBuf]) -> Result<InputSource, String> {
     let canonical = Path::new(path)
         .canonicalize()
-        .map_err(|err| format!("source_uri file path is invalid: {err}"))?;
+        .map_err(|_| "source_uri file path is invalid or does not exist".to_string())?;
     if !allowed_file_roots
         .iter()
         .any(|root| canonical.starts_with(root))
     {
-        return Err(format!(
-            "source_uri file path is outside configured ingest roots: {}",
-            canonical.to_string_lossy()
-        ));
+        return Err("source_uri file path is outside configured ingest roots".to_string());
     }
     Ok(InputSource::FilePath(
         canonical.to_string_lossy().to_string(),
@@ -232,7 +275,7 @@ pub struct DecodedJpegFrame {
 
 pub fn probe_source_fps(source: &InputSource) -> Option<f32> {
     let source_uri = source.as_ffmpeg_input();
-    let output = Command::new("ffprobe")
+    let output = Command::new(ffprobe_path())
         .args([
             "-v",
             "error",
@@ -268,7 +311,7 @@ pub fn decode_mp4_to_frame_signals(
 
     let source_uri = source.as_ffmpeg_input();
     let fps_expr = format!("fps={:.3}", config.sample_fps);
-    let output = Command::new("ffmpeg")
+    let output = Command::new(ffmpeg_path())
         .args([
             "-v",
             "error",
@@ -286,13 +329,16 @@ pub fn decode_mp4_to_frame_signals(
             "-",
         ])
         .output()
-        .map_err(|err| format!("failed to run ffmpeg: {err}"))?;
+        .map_err(|_| "failed to run ffmpeg".to_string())?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffmpeg decode failed: {}", stderr.trim()));
+        eprintln!(
+            "ffmpeg decode stderr: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return Err("video decode failed".to_string());
     }
     let text = String::from_utf8(output.stdout)
-        .map_err(|err| format!("invalid utf8 from ffmpeg output: {err}"))?;
+        .map_err(|_| "invalid output from video decoder".to_string())?;
     parse_framemd5_to_signals(&text, source_uri, config.max_frames)
 }
 
@@ -309,7 +355,7 @@ pub fn decode_mp4_to_jpeg_frames(
 
     let source_uri = source.as_ffmpeg_input();
     let fps_expr = format!("fps={:.3}", config.sample_fps);
-    let output = Command::new("ffmpeg")
+    let output = Command::new(ffmpeg_path())
         .args([
             "-v",
             "error",
@@ -331,10 +377,13 @@ pub fn decode_mp4_to_jpeg_frames(
             "-",
         ])
         .output()
-        .map_err(|err| format!("failed to run ffmpeg: {err}"))?;
+        .map_err(|_| "failed to run ffmpeg".to_string())?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffmpeg jpeg decode failed: {}", stderr.trim()));
+        eprintln!(
+            "ffmpeg jpeg decode stderr: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return Err("video jpeg decode failed".to_string());
     }
     parse_jpeg_stream_to_frames(&output.stdout, config.max_frames)
 }
@@ -615,7 +664,7 @@ pub fn decode_selective_jpeg_frames(
     let frames_cap = frame_indices.len().min(max_frames).to_string();
 
     let source_uri = source.as_ffmpeg_input();
-    let output = Command::new("ffmpeg")
+    let output = Command::new(ffmpeg_path())
         .args([
             "-v", "error",
             "-protocol_whitelist", FFMPEG_PROTOCOL_WHITELIST,
@@ -629,11 +678,14 @@ pub fn decode_selective_jpeg_frames(
             "-",
         ])
         .output()
-        .map_err(|err| format!("failed to run ffmpeg: {err}"))?;
+        .map_err(|_| "failed to run ffmpeg".to_string())?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffmpeg selective jpeg decode failed: {}", stderr.trim()));
+        eprintln!(
+            "ffmpeg selective decode stderr: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return Err("selective video decode failed".to_string());
     }
 
     let mut parsed = parse_jpeg_stream_to_frames(&output.stdout, frame_indices.len())?;

@@ -47,7 +47,7 @@ impl DecoderConfig {
     /// Falls back to CPU (`gpu_available: false`) if the binary is not found
     /// or returns a non-zero exit status.
     pub fn auto_detect() -> Self {
-        let gpu_available = Command::new("nvidia-smi")
+        let gpu_available = Command::new(crate::ingest::nvidia_smi_path())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -98,7 +98,7 @@ impl Decoder {
     }
 
     fn new_nvdec(width: u32, height: u32) -> Self {
-        let mut child = Command::new("ffmpeg")
+        let mut child = Command::new(crate::ingest::ffmpeg_path())
             .args([
                 "-hwaccel",
                 "cuda",
