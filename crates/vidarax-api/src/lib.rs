@@ -117,6 +117,7 @@ mod tests {
         app_router, assert_route_parity, infer_provider_endpoints, AppState, ServerConfig,
         TransportMode,
     };
+    use vidarax_core::ingest::pipeline::PipelineBackend;
     use crate::security::SecurityPolicy;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -1403,6 +1404,7 @@ mod tests {
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
+            decode_backend: PipelineBackend::CpuFfmpeg,
         })
         .unwrap();
         let app = app_router(test_state_with_endpoints_and_policy(None, policy));
@@ -1448,6 +1450,7 @@ mod tests {
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
+            decode_backend: PipelineBackend::CpuFfmpeg,
         })
         .unwrap();
         let app = app_router(test_state_with_endpoints_and_policy(None, policy));
@@ -1490,6 +1493,7 @@ mod tests {
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
+            decode_backend: PipelineBackend::CpuFfmpeg,
         })
         .unwrap();
         let app = app_router(test_state_with_endpoints_and_policy(None, policy));
@@ -1536,6 +1540,7 @@ mod tests {
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
+            decode_backend: PipelineBackend::CpuFfmpeg,
         })
         .unwrap();
         let app = app_router(test_state_with_endpoints_and_policy(None, policy));
@@ -1666,6 +1671,7 @@ mod tests {
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
+            decode_backend: PipelineBackend::CpuFfmpeg,
         };
         assert!(infer_provider_endpoints(&config).is_err());
 
@@ -1695,6 +1701,7 @@ mod tests {
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
+            decode_backend: PipelineBackend::CpuFfmpeg,
         };
         assert!(infer_provider_endpoints(&config).unwrap().is_some());
 
@@ -1749,6 +1756,7 @@ mod tests {
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
             transport: TransportMode::H3Experimental,
+            decode_backend: PipelineBackend::CpuFfmpeg,
         };
 
         let server_task =
@@ -1871,6 +1879,7 @@ mod tests {
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
             transport: TransportMode::H3Experimental,
+            decode_backend: PipelineBackend::CpuFfmpeg,
         };
 
         let server_task =

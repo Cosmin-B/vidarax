@@ -3,6 +3,7 @@ use std::time::Duration;
 use reqwest::StatusCode;
 use serde_json::Value;
 use vidarax_api::{run, ServerConfig, TransportMode};
+use vidarax_core::ingest::pipeline::PipelineBackend;
 
 #[tokio::test]
 async fn staging_live_provider_e2e_opt_in() {
@@ -39,6 +40,7 @@ async fn staging_live_provider_e2e_opt_in() {
         stream_ttl_secs: 3600,
         active_stream_limit: 5,
         transport: TransportMode::H1H2,
+        decode_backend: PipelineBackend::CpuFfmpeg,
     };
 
     let server_task = tokio::spawn(async move { run(config).await.map_err(|e| e.to_string()) });

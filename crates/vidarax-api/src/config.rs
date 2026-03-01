@@ -1,6 +1,8 @@
 use std::env;
 use std::path::PathBuf;
 
+use vidarax_core::ingest::pipeline::PipelineBackend;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportMode {
     H1H2,
@@ -47,11 +49,16 @@ pub struct ServerConfig {
     pub stream_ttl_secs: u64,
     pub active_stream_limit: usize,
     pub transport: TransportMode,
+    pub decode_backend: PipelineBackend,
 }
 
 impl ServerConfig {
     pub fn from_env() -> Result<Self, String> {
         let transport = TransportMode::parse(env::var("VIDARAX_TRANSPORT").ok().as_deref())?;
+        let decode_backend = match env::var("VIDARAX_DECODE_BACKEND").ok().as_deref() {
+            Some("auto") | None => PipelineBackend::auto_detect(),
+            Some(val) => PipelineBackend::parse(val)?,
+        };
         let bind_addr = env::var("VIDARAX_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
         let h3_bind_addr =
             env::var("VIDARAX_H3_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8443".into());
@@ -97,6 +104,7 @@ impl ServerConfig {
             stream_ttl_secs,
             active_stream_limit,
             transport,
+            decode_backend,
         })
     }
 }
