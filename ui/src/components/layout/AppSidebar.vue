@@ -3,7 +3,7 @@ import { computed, type Component } from 'vue'
 import { useRoute } from 'vue-router'
 import { useStreamStore } from '@/stores/stream'
 import { useEventsStore } from '@/stores/events'
-import { LayoutDashboard, Radio, Upload, Settings, Wifi, WifiOff } from 'lucide-vue-next'
+import { LayoutDashboard, Radio, Upload, Settings, Activity, Wifi, WifiOff } from 'lucide-vue-next'
 import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
 
 const route = useRoute()
@@ -36,6 +36,12 @@ const navItems: NavItem[] = [
     path: '/upload',
     icon: Upload,
     label: 'Upload',
+  },
+  {
+    name: 'tracing',
+    path: '/tracing',
+    icon: Activity,
+    label: 'Tracing',
   },
   {
     name: 'settings',

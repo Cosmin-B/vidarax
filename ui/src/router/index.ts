@@ -33,6 +33,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: 'Upload' },
   },
   {
+    path: '/tracing',
+    name: 'tracing',
+    component: () => import('@/pages/TracingPage.vue'),
+    meta: { title: 'Tracing' },
+  },
+  {
     path: '/settings',
     name: 'settings',
     component: () => import('@/pages/SettingsPage.vue'),
