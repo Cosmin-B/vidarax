@@ -106,7 +106,7 @@ export interface HealthResponse {
 
 export const api = {
   health(): Promise<HealthResponse> {
-    return request<HealthResponse>('GET', '/health')
+    return request<HealthResponse>('GET', '/v1/health')
   },
 
   models(): Promise<ModelsResponse> {
