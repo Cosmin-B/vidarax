@@ -50,6 +50,14 @@ pub struct MarkerQueryParams {
     pub to_frame: Option<u64>,
 }
 
+/// Query parameters accepted by `GET /v1/runs/{run_id}/events`.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct EventsQueryParams {
+    /// When set, only events whose payload contains `"index_name": "<value>"`
+    /// are returned.  Supports multiple analysis passes on the same run.
+    pub index: Option<String>,
+}
+
 #[tracing::instrument(name = "api.create_run", skip_all)]
 pub async fn create_run(
     State(state): State<AppState>,
@@ -446,6 +454,7 @@ pub async fn get_events(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
     headers: HeaderMap,
+    Query(query): Query<EventsQueryParams>,
 ) -> impl IntoResponse {
     if let Some(error) = validate_run_id_or_error(&state, &run_id, "invalid events request") {
         return error;
@@ -459,8 +468,28 @@ pub async fn get_events(
         Err(error) => return error,
     };
 
+    // Filter by index_name when ?index=<name> is supplied.
+    // The index is stored as `"index_name": "<name>"` inside the event payload
+    // JSON.  Events without an `index_name` field are only returned when no
+    // filter is specified (i.e. when `query.index` is `None`).
     let events = events
         .into_iter()
+        .filter(|event| {
+            match &query.index {
+                None => true,
+                Some(wanted) => {
+                    // Parse the payload to check for a matching index_name.
+                    serde_json::from_str::<serde_json::Value>(&event.payload)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("index_name")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s == wanted.as_str())
+                        })
+                        .unwrap_or(false)
+                }
+            }
+        })
         .map(|event| {
             json!({
                 "seq": event.seq,
@@ -1183,6 +1212,9 @@ pub async fn reason_realtime_run(
         .unwrap_or_else(|| format!("trace-{}", &request_id[4..]));
     let stream_id = payload.stream_id.unwrap_or_else(|| "stream-0".to_string());
     let tenant_id = header_value(&headers, HEADER_TENANT_ID);
+    // Optional index tag — carried through all WAL events for this pass so
+    // callers can filter with GET /v1/runs/{id}/events?index=<name>.
+    let index_name: Option<String> = payload.index_name;
 
     if let Err(err) = state
         .append_run_event_async(
@@ -1191,6 +1223,7 @@ pub async fn reason_realtime_run(
             json!({
                 "request_id": request_id,
                 "source_uri": payload.source_uri.as_str(),
+                "index_name": index_name,
             }),
         )
         .await
@@ -1329,9 +1362,15 @@ pub async fn reason_realtime_run(
             .unwrap_or_default();
         let finished = task_end_times[chunk_idx];
 
-        if let Some(details) =
+        if let Some(mut details) =
             semantic_overlay.event_payload(chunk_idx, request_id.as_str(), stream_id.as_str())
         {
+            // Attach the index tag so the event can be filtered later.
+            if let Some(ref idx) = index_name {
+                if let Some(obj) = details.as_object_mut() {
+                    obj.insert("index_name".to_string(), serde_json::json!(idx));
+                }
+            }
             if let Err(err) = state
                 .append_run_event_async(&run_id, "semantic_chunk_inferred", details)
                 .await
@@ -1381,7 +1420,8 @@ pub async fn reason_realtime_run(
                     "chunk_frames": prep.chunk_len,
                     "process_ms": process_ms,
                     "source_span_ms": source_span_ms,
-                    "lag_ms": lag_ms
+                    "lag_ms": lag_ms,
+                    "index_name": index_name,
                 }),
             )
             .await
@@ -1398,8 +1438,15 @@ pub async fn reason_realtime_run(
         .map(semantic_marker_to_api_marker)
         .collect::<Vec<_>>();
     for marker in &markers {
+        // Embed index_name so marker events can be filtered by index.
+        let mut marker_payload = json!(marker);
+        if let Some(ref idx) = index_name {
+            if let Some(obj) = marker_payload.as_object_mut() {
+                obj.insert("index_name".to_string(), serde_json::json!(idx));
+            }
+        }
         if let Err(err) = state
-            .append_run_event_async(&run_id, "marker_emitted", json!(marker))
+            .append_run_event_async(&run_id, "marker_emitted", marker_payload)
             .await
         {
             return internal_error(
@@ -1426,7 +1473,8 @@ pub async fn reason_realtime_run(
                 "lag_p95_ms": lag_p95_ms,
                 "lag_p99_ms": lag_p99_ms,
                 "mode": mode,
-                "model": model
+                "model": model,
+                "index_name": index_name,
             }),
         )
         .await
@@ -1446,6 +1494,7 @@ pub async fn reason_realtime_run(
                 "stream_id": stream_id,
                 "frames": metadata.len(),
                 "markers": markers.len(),
+                "index_name": index_name,
             }),
         )
         .await

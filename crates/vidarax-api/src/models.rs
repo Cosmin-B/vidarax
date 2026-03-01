@@ -120,6 +120,18 @@ pub struct RealtimeReasonRequest {
     /// Optional clip-mode config. When set, frames are accumulated into
     /// temporal windows for multi-image VLM inference.
     pub clip_mode: Option<ClipConfig>,
+    /// Optional index name for this analysis pass.
+    ///
+    /// Tagging a run with an `index_name` allows multiple analysis passes over
+    /// the same video with different prompts to be stored and queried
+    /// independently.  For example:
+    ///
+    /// - Pass 1: `semantic_prompt = "detect safety violations"`, `index_name = "safety"`
+    /// - Pass 2: `semantic_prompt = "count people"`, `index_name = "crowd"`
+    ///
+    /// Then `GET /v1/runs/{id}/events?index=safety` returns only events from
+    /// the first pass.  When absent all events are returned regardless of index.
+    pub index_name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -333,6 +345,12 @@ pub struct AttachStreamRequest {
     /// Optional clip-mode config. When set, frames are accumulated into
     /// temporal windows for multi-image VLM inference instead of per-keyframe.
     pub clip_mode: Option<ClipConfig>,
+    /// Optional index name for this streaming session.
+    ///
+    /// When set, all VLM events emitted during this session are tagged with the
+    /// given index name so they can be filtered independently from other
+    /// analysis passes on the same run via `GET /v1/runs/{id}/events?index=…`.
+    pub index_name: Option<String>,
 }
 
 #[cfg(test)]
@@ -436,5 +454,42 @@ mod tests {
     fn sampling_policy_rejects_unknown_value() {
         let result = SamplingPolicy::parse(Some("random"));
         assert!(result.is_err());
+    }
+
+    // ─── index_name deserialization ───────────────────────────────────────────
+
+    #[test]
+    fn realtime_reason_request_parses_index_name() {
+        let raw = r#"{
+            "source_uri": "file:///tmp/test.mp4",
+            "model": "Qwen/Qwen3-VL-2B",
+            "index_name": "safety"
+        }"#;
+        let parsed: RealtimeReasonRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.index_name.as_deref(), Some("safety"));
+    }
+
+    #[test]
+    fn realtime_reason_request_index_name_absent_is_none() {
+        let raw = r#"{
+            "source_uri": "file:///tmp/test.mp4",
+            "model": "Qwen/Qwen3-VL-2B"
+        }"#;
+        let parsed: RealtimeReasonRequest = serde_json::from_str(raw).unwrap();
+        assert!(parsed.index_name.is_none());
+    }
+
+    #[test]
+    fn attach_stream_request_parses_index_name() {
+        let raw = r#"{"index_name": "crowd"}"#;
+        let parsed: AttachStreamRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.index_name.as_deref(), Some("crowd"));
+    }
+
+    #[test]
+    fn attach_stream_request_index_name_absent_is_none() {
+        let raw = r#"{}"#;
+        let parsed: AttachStreamRequest = serde_json::from_str(raw).unwrap();
+        assert!(parsed.index_name.is_none());
     }
 }
