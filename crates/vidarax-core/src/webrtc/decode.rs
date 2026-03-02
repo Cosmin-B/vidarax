@@ -30,6 +30,7 @@
 
 use std::io::{BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
 
 use openh264::formats::YUVSource;
 
@@ -97,7 +98,7 @@ impl VideoCodec {
     fn ffmpeg_input_format(self) -> &'static str {
         match self {
             VideoCodec::H264 => "h264",
-            VideoCodec::Vp8 => "ivf",
+            VideoCodec::Vp8 => "vp8",
         }
     }
 }
@@ -153,35 +154,68 @@ impl DecoderConfig {
 
 /// Multi-codec video decoder backed by either NVDEC, openh264, or a software
 /// ffmpeg sidecar.
+///
+/// The ffmpeg pipe paths (`NvDec`, `FfmpegSw`) use a dedicated reader thread
+/// to avoid deadlocks: H.264 commonly requires multiple NAL units (SPS, PPS,
+/// IDR) before ffmpeg can produce a frame, so writing and reading must happen
+/// concurrently.  The reader thread continuously reads complete YUV frames from
+/// ffmpeg stdout and sends them through an `mpsc` channel.
 pub enum Decoder {
     /// GPU: long-lived ffmpeg sidecar using `-hwaccel auto` (~0.5 ms/frame).
-    ///
-    /// Handles both H.264 (NVDEC) and VP8 (GPU VP8 decode) transparently.
-    /// Requires a CUDA-capable GPU and `ffmpeg` built with NVDEC support.
     NvDec {
         child: Child,
         stdin: ChildStdin,
-        stdout: BufReader<ChildStdout>,
+        frame_rx: mpsc::Receiver<Result<YuvFrame, String>>,
         width: u32,
         height: u32,
     },
     /// CPU: openh264 in-process decoder (~2–5 ms/frame on ARM).
-    ///
-    /// Only valid for H.264 streams.
     Software {
         decoder: openh264::decoder::Decoder,
     },
     /// CPU: long-lived ffmpeg sidecar without hardware acceleration.
-    ///
-    /// Used for VP8 streams on machines without a CUDA GPU.  ffmpeg's bundled
-    /// `libvpx` decoder handles the bitstream; output is planar YUV420.
     FfmpegSw {
         child: Child,
         stdin: ChildStdin,
-        stdout: BufReader<ChildStdout>,
+        frame_rx: mpsc::Receiver<Result<YuvFrame, String>>,
         width: u32,
         height: u32,
     },
+}
+
+/// Spawn a background thread that continuously reads YUV420 frames from
+/// ffmpeg stdout and sends them to the returned receiver.
+fn spawn_frame_reader(
+    mut stdout: BufReader<ChildStdout>,
+    width: u32,
+    height: u32,
+) -> mpsc::Receiver<Result<YuvFrame, String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let w = width as usize;
+        let h = height as usize;
+        let y_size = w * h;
+        let uv_size = (w / 2) * (h / 2);
+        loop {
+            let mut y = vec![0u8; y_size];
+            let mut u = vec![0u8; uv_size];
+            let mut v = vec![0u8; uv_size];
+            if stdout.read_exact(&mut y).is_err() {
+                break; // ffmpeg closed stdout (process exited)
+            }
+            if stdout.read_exact(&mut u).is_err() {
+                break;
+            }
+            if stdout.read_exact(&mut v).is_err() {
+                break;
+            }
+            let frame = YuvFrame { y, u, v, width, height };
+            if tx.send(Ok(frame)).is_err() {
+                break; // receiver dropped
+            }
+        }
+    });
+    rx
 }
 
 impl Decoder {
@@ -245,11 +279,12 @@ impl Decoder {
 
         let stdin = child.stdin.take().expect("ffmpeg stdin missing");
         let stdout = BufReader::new(child.stdout.take().expect("ffmpeg stdout missing"));
+        let frame_rx = spawn_frame_reader(stdout, width, height);
 
         Decoder::NvDec {
             child,
             stdin,
-            stdout,
+            frame_rx,
             width,
             height,
         }
@@ -282,11 +317,12 @@ impl Decoder {
 
         let stdin = child.stdin.take().expect("ffmpeg stdin missing");
         let stdout = BufReader::new(child.stdout.take().expect("ffmpeg stdout missing"));
+        let frame_rx = spawn_frame_reader(stdout, width, height);
 
         Decoder::FfmpegSw {
             child,
             stdin,
-            stdout,
+            frame_rx,
             width,
             height,
         }
@@ -294,71 +330,46 @@ impl Decoder {
 
     /// Decode raw video payload bytes into a packed YUV420 frame.
     ///
-    /// - For `NvDec` and `FfmpegSw`: writes `payload` to the ffmpeg stdin pipe,
-    ///   then reads back one full YUV frame from stdout.  The caller must ensure
-    ///   `payload` contains exactly one complete access unit (H.264) or VP8
-    ///   partition.
+    /// - For `NvDec` and `FfmpegSw`: writes `payload` to the ffmpeg stdin pipe
+    ///   and then checks the reader thread's channel for a decoded frame.
+    ///   H.264 streams commonly need several NAL units (SPS, PPS, IDR) before
+    ///   ffmpeg produces a frame, so this returns `Err` (with a "buffered" msg)
+    ///   for NALs that don't yet produce output — callers should keep feeding
+    ///   NALs and ignore those errors (same contract as the openh264 path).
     /// - For `Software` (H.264 only): passes `payload` directly to openh264.
     ///   Returns `Err` if openh264 reports no frame (e.g. SPS/PPS only).
     pub fn decode(&mut self, payload: &[u8]) -> Result<YuvFrame, String> {
         match self {
             Decoder::NvDec {
-                stdin,
-                stdout,
-                width,
-                height,
-                ..
-            } => Self::decode_ffmpeg_pipe(stdin, stdout, *width, *height, payload),
+                stdin, frame_rx, ..
+            }
+            | Decoder::FfmpegSw {
+                stdin, frame_rx, ..
+            } => {
+                // Write the NAL/payload to ffmpeg.  The reader thread
+                // independently reads decoded frames from stdout.
+                stdin
+                    .write_all(payload)
+                    .map_err(|e| format!("ffmpeg write: {e}"))?;
+                stdin
+                    .flush()
+                    .map_err(|e| format!("ffmpeg flush: {e}"))?;
+
+                // Try to receive a frame without blocking.  If ffmpeg hasn't
+                // produced one yet (e.g. still buffering SPS/PPS) we return a
+                // "no frame" error — the caller feeds the next NAL and retries.
+                match frame_rx.try_recv() {
+                    Ok(result) => result,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        Err("ffmpeg: no frame yet (NAL buffered)".to_string())
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Err("ffmpeg reader thread exited".to_string())
+                    }
+                }
+            }
             Decoder::Software { decoder } => Self::decode_software(decoder, payload),
-            Decoder::FfmpegSw {
-                stdin,
-                stdout,
-                width,
-                height,
-                ..
-            } => Self::decode_ffmpeg_pipe(stdin, stdout, *width, *height, payload),
         }
-    }
-
-    /// Shared implementation for both `NvDec` and `FfmpegSw` paths.
-    fn decode_ffmpeg_pipe(
-        stdin: &mut ChildStdin,
-        stdout: &mut BufReader<ChildStdout>,
-        width: u32,
-        height: u32,
-        payload: &[u8],
-    ) -> Result<YuvFrame, String> {
-        let w = width as usize;
-        let h = height as usize;
-
-        stdin
-            .write_all(payload)
-            .map_err(|e| format!("ffmpeg write: {e}"))?;
-        stdin.flush().map_err(|e| format!("ffmpeg flush: {e}"))?;
-
-        let y_size = w * h;
-        let uv_size = (w / 2) * (h / 2);
-        let mut y = vec![0u8; y_size];
-        let mut u = vec![0u8; uv_size];
-        let mut v = vec![0u8; uv_size];
-
-        stdout
-            .read_exact(&mut y)
-            .map_err(|e| format!("ffmpeg read Y plane: {e}"))?;
-        stdout
-            .read_exact(&mut u)
-            .map_err(|e| format!("ffmpeg read U plane: {e}"))?;
-        stdout
-            .read_exact(&mut v)
-            .map_err(|e| format!("ffmpeg read V plane: {e}"))?;
-
-        Ok(YuvFrame {
-            y,
-            u,
-            v,
-            width,
-            height,
-        })
     }
 
     fn decode_software(
@@ -476,7 +487,7 @@ mod tests {
     #[test]
     fn ffmpeg_input_format_strings_are_correct() {
         assert_eq!(VideoCodec::H264.ffmpeg_input_format(), "h264");
-        assert_eq!(VideoCodec::Vp8.ffmpeg_input_format(), "ivf");
+        assert_eq!(VideoCodec::Vp8.ffmpeg_input_format(), "vp8");
     }
 
     #[test]

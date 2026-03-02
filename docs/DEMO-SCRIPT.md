@@ -1,104 +1,61 @@
 # Demo Script (3 minutes)
 
-Target audience: hackathon judges, engineers, investors.
-Tone: direct, no fluff, show the product working.
+Audience: engineers, investors. Tone: direct, technical, no fluff.
 
----
+## 0:00 -- 0:15 | The Problem
 
-## 0:00 -- 0:20 | The problem
+> "Video agents are blind. They scrape screenshots and miss context. Vidarax is a real-time video intelligence engine -- any video in, semantic events out."
 
-> "Video agents are blind. They parse DOM, scrape screenshots, miss what they actually see. We built vidarax -- a real-time video intelligence engine that gives any agent eyes. Any stream in, semantic events out."
+Screen: Dashboard page at `/`.
 
-Screen: vidarax landing page or logo. Keep it brief.
+## 0:15 -- 0:40 | Dashboard
 
----
+Point out the Command Center:
+- Recent runs list with status indicators
+- Stats row: total runs, processing, events, completed
+- Live events feed streaming from SpacetimeDB
 
-## 0:20 -- 0:50 | Dashboard
+## 0:40 -- 1:30 | Upload and Analyze
 
-Open the Dashboard (`/`).
+Navigate to Upload (`/upload`). Drag in a 10-second screen recording.
+Select model (Qwen3-VL 4B), leave semantic inference on. Click Start Analysis.
+Show the processing visualization: frame strip, chunk progress, live event feed.
 
-> "This is the command center. Every video stream gets deterministic frame analysis -- scene cuts, artifacts, motion -- at O(1) per frame. No ML needed for pass one. Just math."
+> "Done. Scene cuts detected at exactly the right transitions."
 
-Point out:
-- Active runs list
-- Metrics counters (frames processed, markers emitted)
-- Dark UI with real-time updates
+Click View Results to open Run Detail (`/runs/:runId`). Show:
+- Video player with timeline scrubbing
+- Color-coded event timeline (scene cuts, keyframes, VLM descriptions)
+- Keyframe gallery with JPEG thumbnails and semantic descriptions
 
----
-
-## 0:50 -- 1:30 | Upload and analyze
-
-Navigate to Upload (`/upload`). Upload a 10-second screen recording.
-
-> "Watch this. Ten-second video going in."
-
-Wait for processing. Navigate to Run Detail (`/runs/:runId`).
-
-> "1.5 seconds. 242 frames decoded, 20 markers extracted. Scene cuts detected at exactly the right transitions."
-
-Click a scene cut marker. Show the keyframe JPEG and the VLM description.
-
-> "Every marker has a keyframe and a semantic description from the VLM. Click any marker, see exactly what the model saw."
-
-Emphasize:
-- Wall time: 1.5s for 10s video (6.7x real-time)
-- Marker types: scene cuts, keyframe keeps, artifact suspected
-- VLM descriptions are generated per-chunk, not per-frame
-
----
-
-## 1:30 -- 2:10 | Pipeline tracing
+## 1:30 -- 2:10 | Pipeline Tracing
 
 Navigate to Tracing (`/tracing`).
 
-> "Every frame flows through a pipeline: WebRTC or file ingest, decode, gate engine, VLM, SpacetimeDB. All observable. All measurable."
+> "Every frame is observable. Ingest, decode, gate engine, VLM, SpacetimeDB."
 
-Point out:
-- Pipeline flow diagram
-- Per-stage latency
-- Gate engine: 42 nanoseconds p95, zero allocations
+Point out: pipeline flow diagram, live metrics grid (2s refresh), trace timeline waterfall.
 
-> "The gate engine is lock-free. Zero-copy. We run a two-pass sliding window: first pass builds deterministic metadata, second pass refines markers. No frames dropped, no backpressure."
+> "Gate engine is lock-free Rust. Two-pass sliding window -- deterministic metadata first, refined markers second."
 
----
+## 2:10 -- 2:45 | Settings and Model Routing
 
-## 2:10 -- 2:40 | Tiered model routing
+Navigate to Settings (`/settings`). Show:
+- Connection panel with test-connection button
+- Tiered model routing: first pass (2B), second pass (4B/8B)
+- Stream controls: FPS, chunk size, semantic frames per chunk
+- Gate engine tuning: Hamming threshold, luma shift, loop detection
 
-Navigate to Settings (`/settings`).
+> "All models run on your GPU. Self-hosted. No data leaves your infrastructure."
 
-> "Model selector. We run Qwen 2B for the first pass -- 200 millisecond response times. If confidence drops below threshold, we route to 8B for a second opinion. Intelligent tiered routing."
+## 2:45 -- 3:00 | Close
 
-Show:
-- Model dropdown (Qwen3-VL-2B, Qwen3-VL-8B)
-- Confidence threshold slider
-- Primary/fallback provider config (vLLM / SGLang)
+> "Open VLMs. Deterministic gate engine. Tiered inference. Vidarax -- the intelligent routing layer between your video and your models."
 
-> "Both models run on your own GPU. Self-hosted. Open-source VLMs. No data leaves your infrastructure."
-
----
-
-## 2:40 -- 3:00 | Closing
-
-Switch back to Dashboard.
-
-> "Self-hosted. Open-source models. Runs on your own hardware. 27 performance optimizations from gate engine to transport layer. Vidarax -- the Kafka of video. Smart routing between your streams and your models."
-
----
-
-## Pre-demo checklist
+## Pre-demo Checklist
 
 - [ ] API server running (`cargo run --release -p vidarax-api`)
-- [ ] vLLM running with Qwen3-VL-2B + 8B loaded
+- [ ] vLLM running with target models loaded
 - [ ] Frontend running (`cd ui && npm run dev`)
-- [ ] 10-second test video ready (3-scene color transitions)
-- [ ] Browser open to Dashboard, tabs for each page pre-loaded
-- [ ] Screen recording off (no UI lag)
-- [ ] Terminal visible for server logs (shows tracing spans in real time)
-
-## Backup talking points
-
-If something breaks during demo:
-
-- **VLM timeout**: "The deterministic pipeline still works without the VLM. Markers are gate-engine generated. VLM adds semantic descriptions on top."
-- **Upload fails**: Switch to curl: `curl -X POST http://localhost:8080/v1/runs` then `curl -X POST http://localhost:8080/v1/runs/{id}/ingest -d '{"source_uri": "test.mp4"}'`
-- **WebRTC not working**: "WebRTC is for live streams. The upload path uses the same pipeline, just file-based ingest instead of real-time."
+- [ ] 10-second test video ready
+- [ ] Browser tabs pre-loaded: Dashboard, Upload, Tracing, Settings

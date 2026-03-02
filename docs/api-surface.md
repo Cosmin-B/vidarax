@@ -1,127 +1,161 @@
-# API Surface (v1 Foundation)
+# API Surface
 
-Implemented endpoints in `vidarax-api`:
+Complete endpoint reference for `vidarax-api`. All routes are defined in
+`crates/vidarax-api/src/router.rs`. Transport: Axum/Hyper over HTTP/1.1 + HTTP/2
+(optional HTTP/3 via `--features h3-experimental`).
 
-- `POST /v1/runs`
-- `POST /v1/runs/:run_id/ingest`
-- `POST /v1/runs/:run_id/analyze`
-- `POST /v1/runs/:run_id/reason`
-- `POST /v1/runs/:run_id/stop`
-- `POST /v1/runs/:run_id/keepalive`
-- `GET /v1/runs/:run_id/events`
-- `GET /v1/runs/:run_id/markers`
-- `GET /v1/runs/:run_id/state`
-- `POST /v1/query`
-- `POST /v1/infer`
-- `POST /v1/infer/batch`
-- `GET /v1/models`
-- `GET /v1/health`
-- `GET /v1/metrics`
+---
 
-## Current behavior
+## Run Lifecycle
 
-- Deterministic JSON response shapes.
-- Run IDs use random 128-bit hex identifiers.
-- Request IDs from a monotonic atomic counter.
-- WAL-backed lifecycle:
-  - `POST /v1/runs` appends `run_created`
-  - `POST /v1/runs/:run_id/ingest` appends `ingest_received`
-  - `POST /v1/runs/:run_id/ingest` with `source_uri` + `max_frames` decodes MP4 via ffmpeg and appends `frames_decoded`
-  - ingest fixed fps supports `fixed_fps` up to `120.0`
-  - ingest `max_frames` supports up to `500000` for whole-video processing
-  - ingest sampling supports `sampling_policy=source_fps_adaptive` (default) and `sampling_policy=fixed` (`fixed_fps` required)
-  - `POST /v1/runs/:run_id/analyze` runs two-pass sliding-window metadata generation, emits marker lifecycle events, and appends `analysis_generated`
-  - `POST /v1/runs/:run_id/analyze` can omit `frames` and reuse the latest `frames_decoded` payload from ingest
-  - analyze supports `sampling_policy` (`source_fps_adaptive` default, `fixed` with `fixed_fps`)
-  - `POST /v1/runs/:run_id/reason` executes whole-video semantic reasoning in chunked realtime mode and emits:
-    - `semantic_chunk_generated`
-    - `semantic_chunk_inferred`
-    - `marker_emitted`
-    - `analysis_generated` (with lag and marker summary)
-  - realtime reason can enrich deterministic gate metadata with provider semantics using sampled raw JPEG frames from each chunk
-  - realtime reason semantic controls:
-    - `semantic_inference` (default `true`)
-    - `semantic_frames_per_chunk` (range `[1, 4]`, default `2`)
-    - `semantic_timeout_ms` (range `[100, 120000]`, default `1500`)
-    - `primary_provider` (`vllm` or `sglang`)
-    - `semantic_prompt` (optional override, max 4096 bytes)
-  - marker lifecycle statuses support `exact`, `provisional`, and `finalized`
-  - `GET /v1/runs/:run_id/markers` returns marker timeline and supports filtering by `status`, `event_type`, `from_frame`, `to_frame`
-  - `POST /v1/runs/:run_id/stop` appends `stop_requested`
-  - `POST /v1/runs/:run_id/keepalive` appends `keepalive_refreshed`
-  - `GET /v1/runs/:run_id/state` derives state from persisted events
-  - state derivation applies idle TTL expiry and can return `expired`
-  - `GET /v1/runs/:run_id/events` returns decoded event list
-  - `POST /v1/query` filters by `run_id`, optional `kind`, and `from_seq`
-- WAL lives at `VIDARAX_DATA_DIR/timeline.wal` (default `.vidarax-data/timeline.wal`).
-- Active-run cap is enforced per principal (`x-tenant-id` when present, otherwise API key hash, otherwise `public`).
+| Method   | Path                              | Description                                    |
+|----------|-----------------------------------|------------------------------------------------|
+| `GET`    | `/v1/runs`                        | List runs for the current principal.           |
+| `POST`   | `/v1/runs`                        | Create a new run.                              |
+| `GET`    | `/v1/runs/{run_id}`               | Get a single run by ID.                        |
+| `DELETE` | `/v1/runs/{run_id}`               | Soft-delete a run (appends `run_deleted`).     |
+| `POST`   | `/v1/runs/{run_id}/ingest`        | Ingest frames from a video source URI.         |
+| `POST`   | `/v1/runs/{run_id}/analyze`       | Two-pass sliding-window deterministic analysis.|
+| `POST`   | `/v1/runs/{run_id}/reason`        | Chunked real-time semantic reasoning pipeline. |
+| `POST`   | `/v1/runs/{run_id}/stop`          | Request graceful stop (appends `stop_requested`).|
+| `POST`   | `/v1/runs/{run_id}/keepalive`     | Refresh idle TTL for an active run.            |
+| `GET`    | `/v1/runs/{run_id}/events`        | List timeline events. Supports `?index=<name>`.|
+| `GET`    | `/v1/runs/{run_id}/markers`       | List markers. Filters: `?status`, `?event_type`, `?from_frame`, `?to_frame`.|
+| `GET`    | `/v1/runs/{run_id}/state`         | Derive current run state from persisted events.|
+| `POST`   | `/v1/runs/{run_id}/feedback`      | Submit feedback (rating, category, text).      |
 
-## Validation and error envelopes
+## File Upload and Serving
 
-- Validation failures are stable and structured:
-  - HTTP `422`
-  - `error.code = validation_error`
-  - deterministic `request_id`
-  - field-level `details[]`
-- Additional failure classes:
-  - HTTP `404` with `error.code = not_found` for unknown `run_id`
-  - HTTP `409` with `error.code = conflict` for terminal-run ingest/stop conflicts
+| Method   | Path                              | Description                                    |
+|----------|-----------------------------------|------------------------------------------------|
+| `POST`   | `/v1/upload`                      | Multipart file upload (200 MB limit). Returns `{ file_path }`. |
+| `GET`    | `/v1/files/{filename}`            | Serve an uploaded file by filename from allowed ingest roots. |
 
-## External inference behavior
+## Inference
 
-- `POST /v1/infer` validates model/prompt/provider contract.
-- `POST /v1/infer` and realtime reason semantic inference both support multimodal payloads (text + image_url parts) when images are provided.
-- Calls configured vLLM/SGLang endpoints.
-- Uses retryable fallback routing (`vllm` <-> `sglang`) when allowed.
-- Appends `inference_completed` when a `run_id` is provided.
-- `POST /v1/infer/batch` runs validated infer requests with bounded in-flight parallelism (`max_parallel`, default `8`, range `[1, 64]`) and returns per-item success/error entries in request order.
-- `GET /v1/models` returns required-model catalog with runtime availability (`ready`, `degraded`, `unavailable`) and fallback candidates.
+| Method   | Path                              | Description                                    |
+|----------|-----------------------------------|------------------------------------------------|
+| `POST`   | `/v1/infer`                       | Single VLM inference request. Supports multimodal payloads (text + image_url). |
+| `POST`   | `/v1/infer/batch`                 | Batch inference with bounded parallelism (`max_parallel`, default 8, range [1, 64]). |
+| `GET`    | `/v1/models`                      | Model catalog with runtime availability (`ready`, `degraded`, `unavailable`). |
 
-## Security and tenant boundaries
+## Query and Search
 
-- Optional API key enforcement (`x-api-key`).
-- Optional tenant enforcement (`x-tenant-id`).
-- Lock-free global and tenant fixed-window rate limiting.
-- Tenant slot table reuses stale-window slots to avoid permanent churn lockout.
-- Metrics endpoint can require API key independently (`VIDARAX_METRICS_REQUIRE_API_KEY`, default `true`).
-- CORS allowlist support via `VIDARAX_CORS_ALLOWED_ORIGINS` (comma-separated exact origins, `*` allowed).
-- API responses include security headers: `x-content-type-options`, `x-frame-options`, `referrer-policy`, `cache-control`.
-- Stream TTL is configurable via `VIDARAX_STREAM_TTL_SECS` (default `3600`).
-- Active-run cap is configurable via `VIDARAX_ACTIVE_STREAM_LIMIT` (default `5`).
-- Tenant label maps are configurable via `VIDARAX_TENANT_LABEL_MAPS_PATH` (JSON file).
-- Label-map fallback is emitted in frame metadata (`fallback.used=true`) when tenant-specific mapping is unavailable.
+| Method   | Path                              | Description                                    |
+|----------|-----------------------------------|------------------------------------------------|
+| `POST`   | `/v1/query`                       | Filter events by `run_id`, optional `kind`, and `from_seq`. |
+| `POST`   | `/v1/search`                      | Substring search over VLM descriptions. Accepts `query`, optional `run_id`, optional `limit` (default 50, max 500). |
 
-## Error handling
+## Feedback
 
-- Internal failures return a sanitized `internal server error` message while logging details server-side with `request_id`.
+| Method   | Path                              | Description                                    |
+|----------|-----------------------------------|------------------------------------------------|
+| `GET`    | `/v1/feedback`                    | List all feedback entries from SpacetimeDB.    |
 
-## Provider observability
+## Observability
 
-- Per-provider success/error totals.
-- Per-provider latency histogram buckets.
-- Fallback totals plus SLO/error-budget helper series via `/v1/metrics`.
-- Realtime reason responses include lag summaries (`lag_p95_ms`, `lag_p99_ms`) to track bounded-lag targets.
+| Method   | Path                              | Description                                    |
+|----------|-----------------------------------|------------------------------------------------|
+| `GET`    | `/v1/health`                      | Returns `{ "status": "ok" }`.                  |
+| `GET`    | `/v1/metrics`                     | Prometheus-format metrics (runs, events, inference latency, pipeline counters). |
 
-## Transport
+## WHIP WebRTC Ingestion (RFC 9725)
 
-- Main runtime: Axum/Hyper over HTTP/1.1 + HTTP/2.
-- Optional HTTP/3 path:
-  - `VIDARAX_TRANSPORT=h3`
-  - `cargo run -p vidarax-api --bin vidarax-api --features h3-experimental`
-  - UDP bind: `VIDARAX_H3_BIND_ADDR` (default `127.0.0.1:8443`)
-  - TLS paths:
-    - `VIDARAX_H3_TLS_CERT_PATH` (default `deploy/certs/dev.crt`)
-    - `VIDARAX_H3_TLS_KEY_PATH` (default `deploy/certs/dev.key`)
-    - local generation helper: `make dev-cert`
-  - h3 requests are translated into standard HTTP requests and dispatched through the same router as h1/h2.
+| Method   | Path                                          | Description                                    |
+|----------|-----------------------------------------------|------------------------------------------------|
+| `POST`   | `/v1/stream/whip`                             | SDP offer/answer exchange. Returns 201 + Location header. |
+| `PATCH`  | `/v1/stream/whip/{sess_id}`                   | Trickle ICE candidate.                         |
+| `DELETE` | `/v1/stream/whip/{sess_id}`                   | Terminate WebRTC session.                      |
+| `PATCH`  | `/v1/stream/whip/{sess_id}/prompt`            | Update the analysis prompt for a live session. |
 
-## Ingest source constraints
+---
 
-- `source_uri` accepts `http://`, `https://`, and local file paths (`file://` or plain path).
-- URL inputs reject localhost/local domains and direct private/link-local IP targets.
-- Local file paths are canonicalized and must be under `VIDARAX_INGEST_FILE_ROOTS` (default: process cwd + system temp dir).
-- ffmpeg/ffprobe decode/probe calls run with protocol allowlist: `file,http,https,tcp,tls`.
+## Key Request/Response Examples
 
-## Route parity guard
+### Create a run
+
+```
+POST /v1/runs
+Content-Type: application/json
+
+{ "mode": "batch", "model": "Qwen/Qwen3-VL-4B-Instruct" }
+```
+
+```json
+{
+  "run_id": "a1b2c3d4e5f6...",
+  "request_id": 1,
+  "status": "pending",
+  "mode": "batch",
+  "model": "Qwen/Qwen3-VL-4B-Instruct"
+}
+```
+
+### Ingest from file
+
+```
+POST /v1/runs/{run_id}/ingest
+Content-Type: application/json
+
+{
+  "source_uri": "/tmp/demo.mp4",
+  "sampling_policy": "fixed",
+  "fixed_fps": 5.0,
+  "max_frames": 512
+}
+```
+
+### Run semantic reasoning
+
+```
+POST /v1/runs/{run_id}/reason
+Content-Type: application/json
+
+{
+  "source_uri": "/tmp/demo.mp4",
+  "model": "Qwen/Qwen3-VL-4B-Instruct",
+  "semantic_inference": true,
+  "semantic_frames_per_chunk": 2,
+  "chunk_size": 30,
+  "fixed_fps": 5.0,
+  "sampling_policy": "fixed"
+}
+```
+
+---
+
+## Error Envelope
+
+All errors follow a consistent shape:
+
+```json
+{
+  "error": {
+    "code": "validation_error",
+    "message": "invalid ingest request",
+    "details": [
+      { "field": "source_uri", "message": "..." }
+    ]
+  },
+  "request_id": 42
+}
+```
+
+| Status | Code               | When                                              |
+|--------|--------------------|----------------------------------------------------|
+| 404    | `not_found`        | Unknown `run_id`.                                  |
+| 409    | `conflict`         | Action on a terminal run; active stream limit exceeded. |
+| 422    | `validation_error` | Field-level validation failure.                    |
+| 500    | (sanitized)        | Internal failure; details logged server-side.      |
+
+## Security
+
+- Optional API key enforcement via `x-api-key` header.
+- Optional tenant isolation via `x-tenant-id` header.
+- Lock-free fixed-window rate limiting (global and per-tenant).
+- CORS allowlist via `VIDARAX_CORS_ALLOWED_ORIGINS`.
+- Security headers on all responses: `x-content-type-options`, `x-frame-options`, `referrer-policy`, `cache-control`.
+
+## Route Parity Guard
 
 Startup computes a deterministic route manifest fingerprint and fails fast on mismatch.
