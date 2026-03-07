@@ -5,9 +5,10 @@ use axum::Router;
 use tower_http::compression::CompressionLayer;
 
 use crate::handlers::{
-    analyze_run, create_run, delete_run, get_events, get_markers, get_run, get_state, health,
-    infer, infer_batch, ingest_run, keepalive_run, list_feedback, list_models, list_runs, metrics,
-    query, reason_realtime_run, search, serve_file, stop_run, submit_feedback, upload_file,
+    analyze_run, create_run, delete_run, get_events, get_interactions, get_markers, get_run,
+    get_state, health, infer, infer_batch, ingest_run, keepalive_run, list_feedback, list_models,
+    list_runs, metrics, query, reason_realtime_run, search, serve_file, stop_run, submit_feedback,
+    upload_file,
 };
 use crate::security::enforce_security;
 use crate::state::AppState;
@@ -32,6 +33,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/v1/runs/{run_id}/events", get(get_events))
         .route("/v1/runs/{run_id}/markers", get(get_markers))
         .route("/v1/runs/{run_id}/state", get(get_state))
+        .route("/v1/runs/{run_id}/interactions", get(get_interactions))
         .route("/v1/runs/{run_id}/feedback", post(submit_feedback))
         .route("/v1/feedback", get(list_feedback))
         .route("/v1/query", post(query))

@@ -1319,6 +1319,11 @@ pub async fn reason_realtime_run(
         let sem = Arc::new(tokio::sync::Semaphore::new(4));
         let mut join_set: JoinSet<(usize, ChunkSemanticResult, Instant)> = JoinSet::new();
 
+        let guided_json_str: Option<String> = payload
+            .output_schema
+            .as_ref()
+            .and_then(|s| serde_json::to_string(s).ok());
+
         for (chunk_idx, prep) in chunk_preps.iter().enumerate() {
             let providers_c = providers.clone();
             let model_c = model.clone();
@@ -1329,6 +1334,7 @@ pub async fn reason_realtime_run(
             let pts_start_ms = prep.pts_start_ms;
             let pts_end_ms = prep.pts_end_ms;
             let tiered_config_c = tiered_config.clone();
+            let guided_json_c = guided_json_str.clone();
             join_set.spawn(async move {
                 let _permit = sem_c.acquire().await.unwrap();
                 let overlay = infer_chunk_semantics(
@@ -1344,6 +1350,7 @@ pub async fn reason_realtime_run(
                     pts_start_ms,
                     pts_end_ms,
                     tiered_config_c,
+                    guided_json_c,
                 )
                 .await;
                 (chunk_idx, overlay, Instant::now())
@@ -1752,6 +1759,143 @@ pub async fn search(
         scanned,
         total_hits,
         hits,
+    }))
+}
+
+/// Query parameters accepted by `GET /v1/runs/{run_id}/interactions`.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct InteractionsQueryParams {
+    /// When set, only events whose payload contains `"index_name": "<value>"`
+    /// are included.  Mirrors the filter on GET /events.
+    pub index: Option<String>,
+}
+
+pub async fn get_interactions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+    Query(query): Query<InteractionsQueryParams>,
+) -> impl IntoResponse {
+    if let Some(error) = validate_run_id_or_error(&state, &run_id, "invalid interactions request") {
+        return error;
+    }
+    if let Err(error) = load_run_snapshot(&state, &headers, &run_id) {
+        return error;
+    }
+    let events = match load_existing_events(&state, &run_id).await {
+        Ok(events) => events,
+        Err(error) => return error,
+    };
+
+    // Build chunk timing map from semantic_chunk_generated events.
+    // Key: chunk_index  Value: (pts_start_ms, pts_end_ms)
+    let mut chunk_timing: std::collections::HashMap<u64, (u64, u64)> =
+        std::collections::HashMap::new();
+    for event in events.iter().filter(|e| e.kind == "semantic_chunk_generated") {
+        let payload = parse_payload(&event.payload);
+        if let Some(idx) = payload.get("chunk_index").and_then(|v| v.as_u64()) {
+            let pts_start = payload
+                .get("pts_start_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(event.pts_ms);
+            let pts_end = payload
+                .get("pts_end_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(event.pts_ms);
+            chunk_timing.insert(idx, (pts_start, pts_end));
+        }
+    }
+
+    // Filter semantic_chunk_inferred events, optionally by index_name.
+    let inferred_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == "semantic_chunk_inferred")
+        .filter(|e| match &query.index {
+            None => true,
+            Some(wanted) => serde_json::from_str::<Value>(&e.payload)
+                .ok()
+                .and_then(|v| {
+                    v.get("index_name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s == wanted.as_str())
+                })
+                .unwrap_or(false),
+        })
+        .collect();
+
+    let mut interactions: Vec<Value> = Vec::new();
+
+    for event in &inferred_events {
+        let payload = parse_payload(&event.payload);
+
+        let chunk_index = payload.get("chunk_index").and_then(|v| v.as_u64());
+        let (pts_start_ms, pts_end_ms) = chunk_index
+            .and_then(|idx| chunk_timing.get(&idx).copied())
+            .unwrap_or((event.pts_ms, event.pts_ms));
+
+        // Extract raw_output from the payload — this is what the VLM returned
+        // when an output_schema (guided JSON) was provided.
+        let raw_output = payload.get("raw_output");
+
+        match raw_output {
+            // Guided-JSON mode: raw_output is an array — flatten all items.
+            Some(Value::Array(items)) => {
+                for item in items {
+                    let mut enriched = item.clone();
+                    if let Some(obj) = enriched.as_object_mut() {
+                        obj.entry("chunk_index")
+                            .or_insert_with(|| json!(chunk_index));
+                        obj.entry("pts_start_ms")
+                            .or_insert_with(|| json!(pts_start_ms));
+                        obj.entry("pts_end_ms")
+                            .or_insert_with(|| json!(pts_end_ms));
+                    }
+                    interactions.push(enriched);
+                }
+            }
+            // Guided-JSON mode: raw_output is a single object.
+            Some(Value::Object(_)) => {
+                let mut enriched = raw_output.unwrap().clone();
+                if let Some(obj) = enriched.as_object_mut() {
+                    obj.entry("chunk_index")
+                        .or_insert_with(|| json!(chunk_index));
+                    obj.entry("pts_start_ms")
+                        .or_insert_with(|| json!(pts_start_ms));
+                    obj.entry("pts_end_ms")
+                        .or_insert_with(|| json!(pts_end_ms));
+                }
+                interactions.push(enriched);
+            }
+            // Legacy / classification mode: synthesise an item from
+            // object_label and event_type fields (backward compat).
+            _ => {
+                let object_label = payload
+                    .get("object_label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let event_type = payload
+                    .get("event_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if object_label.is_empty() && event_type.is_empty() {
+                    continue;
+                }
+                interactions.push(json!({
+                    "chunk_index": chunk_index,
+                    "pts_start_ms": pts_start_ms,
+                    "pts_end_ms": pts_end_ms,
+                    "object_label": object_label,
+                    "event_type": event_type,
+                }));
+            }
+        }
+    }
+
+    let count = interactions.len();
+    ok(json!({
+        "run_id": run_id,
+        "count": count,
+        "interactions": interactions,
     }))
 }
 
@@ -2489,6 +2633,8 @@ struct SemanticOverlay {
 #[derive(Debug, Default)]
 struct ChunkSemanticResult {
     overlay: Option<SemanticOverlay>,
+    /// Raw VLM output text when using custom `output_schema` (passthrough mode).
+    raw_output: Option<Value>,
     provider: Option<String>,
     provider_fallback_used: bool,
     used_fallback: bool,
@@ -2510,7 +2656,8 @@ impl ChunkSemanticResult {
                 "semantic_error": self.error,
                 "event_type": self.overlay.as_ref().map(|o| o.event_type.clone()),
                 "object_label": self.overlay.as_ref().map(|o| o.object_label.clone()),
-                "confidence": self.overlay.as_ref().map(|o| o.confidence)
+                "confidence": self.overlay.as_ref().map(|o| o.confidence),
+                "raw_output": self.raw_output,
             })
         })
     }
@@ -2626,6 +2773,7 @@ async fn infer_chunk_semantics(
     pts_start_ms: u64,
     pts_end_ms: u64,
     tiered_config: vidarax_core::tiered_vlm::TieredVlmConfig,
+    guided_json: Option<String>,
 ) -> ChunkSemanticResult {
     if !semantic_available {
         return ChunkSemanticResult::default();
@@ -2664,11 +2812,11 @@ async fn infer_chunk_semantics(
         model: tiered_config.first_pass_model.clone(),
         prompt: prompt.clone(),
         input_images: images.clone(),
-        max_tokens: 160,
+        max_tokens: if guided_json.is_some() { 1024 } else { 160 },
         temperature: 0.0,
         timeout_ms,
         allow_fallback: true,
-        guided_json: None,
+        guided_json: guided_json.clone(),
     };
 
     let first_result = match tokio::task::spawn_blocking({
@@ -2707,7 +2855,7 @@ async fn infer_chunk_semantics(
                 temperature: 0.0,
                 timeout_ms,
                 allow_fallback: true,
-                guided_json: None,
+                guided_json: guided_json.clone(),
             };
             match tokio::task::spawn_blocking(move || {
                 infer_from_endpoints(&endpoints, primary_provider, &second_request)
@@ -2728,16 +2876,25 @@ async fn infer_chunk_semantics(
     result.provider_fallback_used = provider_result.fallback_used;
     result.finish_reason = provider_result.finish_reason.clone();
 
-    match parse_semantic_overlay(&provider_result.output_text) {
-        Some(overlay) => {
-            result.overlay = Some(overlay);
-            result.used_fallback = provider_result.fallback_used;
-            result
-        }
-        None => {
-            result.used_fallback = true;
-            result.error = Some("semantic_parse_failed".to_string());
-            result
+    if guided_json.is_some() {
+        // Passthrough mode: store raw VLM output as JSON, skip overlay parsing.
+        let parsed = serde_json::from_str::<Value>(&provider_result.output_text)
+            .unwrap_or_else(|_| json!({"raw": provider_result.output_text}));
+        result.raw_output = Some(parsed);
+        result.overlay = None;
+        result
+    } else {
+        match parse_semantic_overlay(&provider_result.output_text) {
+            Some(overlay) => {
+                result.overlay = Some(overlay);
+                result.used_fallback = provider_result.fallback_used;
+                result
+            }
+            None => {
+                result.used_fallback = true;
+                result.error = Some("semantic_parse_failed".to_string());
+                result
+            }
         }
     }
 }
