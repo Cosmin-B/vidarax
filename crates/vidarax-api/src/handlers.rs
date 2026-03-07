@@ -2811,15 +2811,17 @@ async fn infer_chunk_semantics(
             data_base64: BASE64_STANDARD.encode(&frame.jpeg_bytes),
         })
         .collect::<Vec<_>>();
+    let prompt_arc: Arc<str> = Arc::from(prompt);
+    let guided_json_arc: Option<Arc<str>> = guided_json.as_deref().map(Arc::from);
     let first_request = InferenceRequest {
         model: tiered_config.first_pass_model.clone(),
-        prompt: Arc::from(prompt.as_str()),
+        prompt: Arc::clone(&prompt_arc),
         input_images: images.clone(),
         max_tokens: if guided_json.is_some() { 1024 } else { 160 },
         temperature: 0.0,
         timeout_ms,
         allow_fallback: true,
-        guided_json: guided_json.as_deref().map(Arc::from),
+        guided_json: guided_json_arc.clone(),
     };
 
     let first_result = match tokio::task::spawn_blocking({
@@ -2852,13 +2854,13 @@ async fn infer_chunk_semantics(
         if tiered_config.needs_second_pass(first_conf) {
             let second_request = InferenceRequest {
                 model: tiered_config.second_pass_model.clone(),
-                prompt: Arc::from(prompt),
+                prompt: prompt_arc,
                 input_images: images,
                 max_tokens: tiered_config.second_pass_max_tokens,
                 temperature: 0.0,
                 timeout_ms,
                 allow_fallback: true,
-                guided_json: guided_json.as_deref().map(Arc::from),
+                guided_json: guided_json_arc,
             };
             match tokio::task::spawn_blocking(move || {
                 infer_from_endpoints(&endpoints, primary_provider, &second_request)
