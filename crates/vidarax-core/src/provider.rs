@@ -81,7 +81,7 @@ pub enum ProviderError {
     UnsupportedModel(String),
     HttpStatus(u16),
     Transport(String),
-    InvalidResponse(&'static str),
+    InvalidResponse(std::borrow::Cow<'static, str>),
 }
 
 impl ProviderError {
@@ -371,13 +371,13 @@ struct CompletionMessage {
 /// Returns `(output_text, finish_reason)`.
 fn parse_completion(raw: &str) -> Result<(String, Option<String>), ProviderError> {
     let resp: CompletionResponse = serde_json::from_str(raw)
-        .map_err(|_| ProviderError::InvalidResponse("invalid json response"))?;
+        .map_err(|e| ProviderError::InvalidResponse(format!("invalid json response: {e}").into()))?;
 
     let first = resp
         .choices
         .into_iter()
         .next()
-        .ok_or(ProviderError::InvalidResponse("choices array is empty"))?;
+        .ok_or(ProviderError::InvalidResponse("choices array is empty".into()))?;
 
     let finish_reason = first.finish_reason;
 
@@ -385,7 +385,7 @@ fn parse_completion(raw: &str) -> Result<(String, Option<String>), ProviderError
         .message
         .map(|m| m.content)
         .or(first.text)
-        .ok_or(ProviderError::InvalidResponse("missing choices[0].message.content"))?;
+        .ok_or(ProviderError::InvalidResponse("missing choices[0].message.content".into()))?;
 
     parse_content_value(content).map(|text| (text, finish_reason))
 }
@@ -408,12 +408,12 @@ fn parse_content_value(value: Value) -> Result<String, ProviderError> {
             }
 
             if out.is_empty() {
-                Err(ProviderError::InvalidResponse("content array does not contain text"))
+                Err(ProviderError::InvalidResponse("content array does not contain text".into()))
             } else {
                 Ok(out)
             }
         }
-        _ => Err(ProviderError::InvalidResponse("unsupported content shape")),
+        _ => Err(ProviderError::InvalidResponse("unsupported content shape".into())),
     }
 }
 

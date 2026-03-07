@@ -75,7 +75,7 @@ pub struct RtpFrame {
     ///
     /// - H.264: Annex B encoded (starts with `00 00 00 01`).
     /// - VP8: raw bitstream payload.
-    pub nals: Vec<u8>,
+    pub nals: Arc<[u8]>,
     /// Presentation timestamp derived from the 90 kHz RTP clock (in ms).
     pub pts_ms: u64,
     /// Per-session monotonically increasing sequence number.
@@ -298,8 +298,8 @@ impl WebRtcSession {
                         let seq = Arc::clone(&seq_counter);
 
                         tokio::spawn(async move {
-                            // Buffer moved into each RtpFrame via mem::take (zero-copy);
-                            // re-allocated each frame via reserve below.
+                            // Reusable scratch buffer — capacity is retained across frames
+                            // so reserve() is a no-op after the first frame.
                             let mut nals_buf: Vec<u8> = Vec::new();
                             loop {
                                 match track.recv().await {
@@ -329,7 +329,7 @@ impl WebRtcSession {
                                         let pts_ms = frame.rtp_timestamp as u64 / 90;
 
                                         let rtp_frame = RtpFrame {
-                                            nals: std::mem::take(&mut nals_buf),
+                                            nals: Arc::from(nals_buf.as_slice()),
                                             pts_ms,
                                             seq: nal_seq,
                                             codec,
@@ -398,6 +398,8 @@ impl WebRtcSession {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{RtpFrame, WebRtcConfig};
     use crate::webrtc::decode::VideoCodec;
 
@@ -416,16 +418,16 @@ mod tests {
     #[test]
     fn rtp_frame_vp8_no_annex_b() {
         // VP8 payloads should be forwarded without Annex B start codes.
-        let payload = vec![0x30, 0x01, 0x02, 0x03]; // synthetic VP8 bytes
+        let payload: Arc<[u8]> = vec![0x30, 0x01, 0x02, 0x03].into(); // synthetic VP8 bytes
         let frame = RtpFrame {
-            nals: payload.clone(),
+            nals: Arc::clone(&payload),
             pts_ms: 0,
             seq: 0,
             codec: VideoCodec::Vp8,
         };
         // No Annex B prefix — first byte should be the raw VP8 payload byte.
         assert_eq!(frame.nals[0], 0x30);
-        assert_eq!(frame.nals, payload);
+        assert_eq!(*frame.nals, *payload);
     }
 
     #[test]
@@ -467,7 +469,7 @@ mod tests {
     #[test]
     fn rtp_frame_is_clone_and_debug() {
         let frame = RtpFrame {
-            nals: vec![0x00, 0x00, 0x00, 0x01, 0x65],
+            nals: vec![0x00, 0x00, 0x00, 0x01, 0x65].into(),
             pts_ms: 33,
             seq: 0,
             codec: VideoCodec::H264,
@@ -481,7 +483,7 @@ mod tests {
     #[test]
     fn rtp_frame_vp8_is_clone_and_debug() {
         let frame = RtpFrame {
-            nals: vec![0x30, 0x01],
+            nals: vec![0x30, 0x01].into(),
             pts_ms: 100,
             seq: 5,
             codec: VideoCodec::Vp8,
