@@ -13,8 +13,8 @@ fn default_config_uses_same_model_for_both_passes() {
 #[test]
 fn tiered_config_detects_when_second_pass_needed() {
     let config = TieredVlmConfig {
-        first_pass_model: "Qwen/Qwen3-VL-2B-Instruct".to_string(),
-        second_pass_model: "Qwen/Qwen3-VL-8B-Instruct".to_string(),
+        first_pass_model: Arc::from("Qwen/Qwen3-VL-2B-Instruct"),
+        second_pass_model: Arc::from("Qwen/Qwen3-VL-8B-Instruct"),
         second_pass_threshold: 0.7,
         second_pass_max_tokens: 256,
     };
@@ -33,8 +33,8 @@ fn single_model_config_never_needs_second_pass() {
 #[test]
 fn is_tiered_returns_true_only_when_models_differ() {
     let tiered = TieredVlmConfig {
-        first_pass_model: "Qwen/Qwen3-VL-2B-Instruct".to_string(),
-        second_pass_model: "Qwen/Qwen3-VL-8B-Instruct".to_string(),
+        first_pass_model: Arc::from("Qwen/Qwen3-VL-2B-Instruct"),
+        second_pass_model: Arc::from("Qwen/Qwen3-VL-8B-Instruct"),
         second_pass_threshold: 0.7,
         second_pass_max_tokens: 256,
     };
@@ -59,5 +59,5 @@ fn keyframe_work_has_prompt_field() {
         prompt: "Describe this frame.".into(),
         loop_active: false,
     };
-    assert_eq!(kw.prompt, "Describe this frame.");
+    assert_eq!(&*kw.prompt, "Describe this frame.");
 }

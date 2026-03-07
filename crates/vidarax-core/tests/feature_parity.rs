@@ -32,8 +32,8 @@ fn completion_with_reason(text: &str, reason: &str) -> String {
 /// Minimal valid request used as a base for most tests.
 fn base_request() -> InferenceRequest {
     InferenceRequest {
-        model: "openbmb/MiniCPM-V-4.5".to_string(),
-        prompt: "describe".to_string(),
+        model: Arc::from("openbmb/MiniCPM-V-4.5"),
+        prompt: Arc::from("describe"),
         input_images: Vec::new(),
         max_tokens: 64,
         temperature: 0.0,
@@ -134,7 +134,7 @@ fn output_schema_adds_guided_json_to_payload() {
     let (transport, captured) = MockTransport::capturing(&completion_json("ok"));
     let provider = VllmProvider::new(transport);
     let mut req = base_request();
-    req.guided_json = Some(schema.to_string());
+    req.guided_json = Some(Arc::from(schema.to_string()));
 
     provider.infer(&req).unwrap();
 
@@ -174,7 +174,7 @@ fn output_schema_is_forwarded_verbatim_to_payload() {
     let (transport, captured) = MockTransport::capturing(&completion_json("ok"));
     let provider = SglangProvider::new(transport);
     let mut req = base_request();
-    req.guided_json = Some(schema.to_string());
+    req.guided_json = Some(Arc::from(schema.to_string()));
 
     provider.infer(&req).unwrap();
 
@@ -201,7 +201,7 @@ fn output_schema_with_nested_properties_round_trips() {
     let (transport, captured) = MockTransport::capturing(&completion_json("ok"));
     let provider = VllmProvider::new(transport);
     let mut req = base_request();
-    req.guided_json = Some(schema.to_string());
+    req.guided_json = Some(Arc::from(schema.to_string()));
 
     provider.infer(&req).unwrap();
 
@@ -332,7 +332,7 @@ fn accumulator_emits_clip_after_window_fills() {
         delay_seconds: 0.0,
     };
     let mut acc =
-        ClipAccumulator::new(cfg, "run-a".to_string(), "sess-a".to_string(), "describe".to_string());
+        ClipAccumulator::new(cfg, "run-a".into(), "sess-a".into(), "describe".into());
 
     // Feed frames at 100ms intervals; 500ms window requires 6 frames (pts 0..500).
     let mut emitted = None;
@@ -346,9 +346,9 @@ fn accumulator_emits_clip_after_window_fills() {
     let clip = emitted.expect("a clip should have been emitted");
     assert!(!clip.frames.is_empty(), "clip must contain at least one frame");
     assert!(clip.pts_end >= clip.pts_start, "pts must be ordered");
-    assert_eq!(clip.run_id, "run-a");
-    assert_eq!(clip.session_id, "sess-a");
-    assert_eq!(clip.prompt, "describe");
+    assert_eq!(&*clip.run_id, "run-a");
+    assert_eq!(&*clip.session_id, "sess-a");
+    assert_eq!(&*clip.prompt, "describe");
 }
 
 #[test]
@@ -358,7 +358,7 @@ fn accumulator_does_not_emit_before_window_is_full() {
         clip_length_seconds: 2.0, // 2 seconds required
         delay_seconds: 0.0,
     };
-    let mut acc = ClipAccumulator::new(cfg, "r".to_string(), "s".to_string(), String::new());
+    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into(), "".into());
 
     // Send 10 frames at 100ms each — only 1 second elapsed, below 2s window.
     for i in 0..10u64 {
@@ -375,7 +375,7 @@ fn accumulator_rate_limits_to_target_fps() {
         clip_length_seconds: 2.0, // 2fps * 2s = 4 frames minimum
         delay_seconds: 0.0,
     };
-    let mut acc = ClipAccumulator::new(cfg, "r".to_string(), "s".to_string(), String::new());
+    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into(), "".into());
 
     // Push 20 frames at 100ms intervals (0, 100, 200, …, 1900ms).
     // At 500ms interval only frames at 0, 500, 1000, 1500, 2000ms are accepted.
@@ -404,7 +404,7 @@ fn accumulator_drops_frames_with_no_jpeg() {
         clip_length_seconds: 0.1,
         delay_seconds: 0.0,
     };
-    let mut acc = ClipAccumulator::new(cfg, "r".to_string(), "s".to_string(), String::new());
+    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into(), "".into());
 
     let mut no_jpeg = make_stream_frame(0, 0);
     no_jpeg.jpeg = None;
@@ -447,7 +447,7 @@ fn clip_accumulator_delay_suppresses_rapid_second_emission() {
         clip_length_seconds: 0.5,
         delay_seconds: 60.0, // impossible to satisfy in test time
     };
-    let mut acc = ClipAccumulator::new(cfg, "r".to_string(), "s".to_string(), String::new());
+    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into(), "".into());
 
     // Fill first window (pts 0–600ms) and trigger emission.
     let mut first = None;
@@ -481,7 +481,7 @@ fn accumulator_buffer_cleared_after_emission() {
         clip_length_seconds: 0.5,
         delay_seconds: 0.0,
     };
-    let mut acc = ClipAccumulator::new(cfg, "r".to_string(), "s".to_string(), String::new());
+    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into(), "".into());
 
     // Trigger first emission.
     let mut first_clip = None;
@@ -509,7 +509,7 @@ fn clip_work_pts_span_covers_window() {
         clip_length_seconds: 0.5,
         delay_seconds: 0.0,
     };
-    let mut acc = ClipAccumulator::new(cfg, "r".to_string(), "s".to_string(), String::new());
+    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into(), "".into());
 
     let mut clip = None;
     for i in 0..8u64 {

@@ -13,8 +13,8 @@ pub enum ProviderKind {
 
 #[derive(Debug, Clone)]
 pub struct InferenceRequest {
-    pub model: String,
-    pub prompt: String,
+    pub model: Arc<str>,
+    pub prompt: Arc<str>,
     pub input_images: Vec<InferenceImage>,
     pub max_tokens: u32,
     pub temperature: f32,
@@ -22,7 +22,7 @@ pub struct InferenceRequest {
     pub allow_fallback: bool,
     /// Optional JSON schema string for constrained decoding.
     /// Sent as `response_format.json_schema` for vLLM ≥0.15 compatibility.
-    pub guided_json: Option<String>,
+    pub guided_json: Option<Arc<str>>,
 }
 
 /// Structured label emitted by the teacher VLM.
@@ -69,7 +69,7 @@ pub struct InferenceImage {
 #[derive(Debug, Clone)]
 pub struct InferenceResult {
     pub provider: ProviderKind,
-    pub model: String,
+    pub model: &'static str,
     pub output_text: String,
     pub fallback_used: bool,
     pub finish_reason: Option<String>,
@@ -81,7 +81,7 @@ pub enum ProviderError {
     UnsupportedModel(String),
     HttpStatus(u16),
     Transport(String),
-    InvalidResponse(String),
+    InvalidResponse(&'static str),
 }
 
 impl ProviderError {
@@ -193,7 +193,7 @@ impl<T: Transport> InferenceProvider for VllmProvider<T> {
 
         Ok(InferenceResult {
             provider: ProviderKind::Vllm,
-            model: model.to_string(),
+            model,
             output_text,
             fallback_used: false,
             finish_reason,
@@ -219,7 +219,7 @@ impl<T: Transport> InferenceProvider for SglangProvider<T> {
 
         Ok(InferenceResult {
             provider: ProviderKind::Sglang,
-            model: model.to_string(),
+            model,
             output_text,
             fallback_used: false,
             finish_reason,
@@ -308,12 +308,12 @@ fn canonical_model(model: &str) -> Result<&'static str, ProviderError> {
 
 fn build_payload(model: &str, request: &InferenceRequest) -> String {
     let user_content = if request.input_images.is_empty() {
-        Value::String(request.prompt.clone())
+        Value::String(request.prompt.to_string())
     } else {
         let mut content = Vec::with_capacity(request.input_images.len() + 1);
         content.push(serde_json::json!({
             "type": "text",
-            "text": request.prompt
+            "text": &*request.prompt
         }));
         for image in &request.input_images {
             content.push(serde_json::json!({
@@ -371,13 +371,13 @@ struct CompletionMessage {
 /// Returns `(output_text, finish_reason)`.
 fn parse_completion(raw: &str) -> Result<(String, Option<String>), ProviderError> {
     let resp: CompletionResponse = serde_json::from_str(raw)
-        .map_err(|err| ProviderError::InvalidResponse(format!("invalid json: {err}")))?;
+        .map_err(|_| ProviderError::InvalidResponse("invalid json response"))?;
 
     let first = resp
         .choices
         .into_iter()
         .next()
-        .ok_or_else(|| ProviderError::InvalidResponse("choices array is empty".to_string()))?;
+        .ok_or(ProviderError::InvalidResponse("choices array is empty"))?;
 
     let finish_reason = first.finish_reason;
 
@@ -385,21 +385,19 @@ fn parse_completion(raw: &str) -> Result<(String, Option<String>), ProviderError
         .message
         .map(|m| m.content)
         .or(first.text)
-        .ok_or_else(|| {
-            ProviderError::InvalidResponse("missing choices[0].message.content".to_string())
-        })?;
+        .ok_or(ProviderError::InvalidResponse("missing choices[0].message.content"))?;
 
-    parse_content_value(&content).map(|text| (text, finish_reason))
+    parse_content_value(content).map(|text| (text, finish_reason))
 }
 
-fn parse_content_value(value: &Value) -> Result<String, ProviderError> {
+fn parse_content_value(value: Value) -> Result<String, ProviderError> {
     match value {
-        Value::String(s) => Ok(s.clone()),
+        Value::String(s) => Ok(s),
         Value::Array(parts) => {
             let mut out = String::new();
             for part in parts {
                 match part {
-                    Value::String(s) => out.push_str(s),
+                    Value::String(s) => out.push_str(&s),
                     Value::Object(map) => {
                         if let Some(text) = map.get("text").and_then(|v| v.as_str()) {
                             out.push_str(text);
@@ -410,16 +408,12 @@ fn parse_content_value(value: &Value) -> Result<String, ProviderError> {
             }
 
             if out.is_empty() {
-                Err(ProviderError::InvalidResponse(
-                    "content array does not contain text".to_string(),
-                ))
+                Err(ProviderError::InvalidResponse("content array does not contain text"))
             } else {
                 Ok(out)
             }
         }
-        _ => Err(ProviderError::InvalidResponse(
-            "unsupported content shape".to_string(),
-        )),
+        _ => Err(ProviderError::InvalidResponse("unsupported content shape")),
     }
 }
 
@@ -433,7 +427,7 @@ mod tests {
     use serde_json::Value;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
     use std::thread;
 
     struct MockTransport {
@@ -471,8 +465,8 @@ mod tests {
 
     fn request() -> InferenceRequest {
         InferenceRequest {
-            model: "openbmb/MiniCPM-V-4.5".to_string(),
-            prompt: "hello".to_string(),
+            model: Arc::from("openbmb/MiniCPM-V-4.5"),
+            prompt: Arc::from("hello"),
             input_images: Vec::new(),
             max_tokens: 64,
             temperature: 0.0,
@@ -511,7 +505,7 @@ mod tests {
     fn rejects_unsupported_model() {
         let provider = VllmProvider::new(MockTransport::ok(&completion_json("ok")));
         let mut req = request();
-        req.model = "unknown/model".to_string();
+        req.model = Arc::from("unknown/model");
         let err = provider.infer(&req).unwrap_err();
         assert!(matches!(err, ProviderError::UnsupportedModel(_)));
     }
@@ -575,7 +569,7 @@ mod tests {
     #[test]
     fn payload_includes_guided_json_when_set() {
         let mut req = request();
-        req.guided_json = Some(r#"{"type":"object","properties":{"event_type":{"type":"string"}}}"#.to_string());
+        req.guided_json = Some(Arc::from(r#"{"type":"object","properties":{"event_type":{"type":"string"}}}"#));
         let body = build_payload("openbmb/MiniCPM-V-4_5", &req);
         let value: Value = serde_json::from_str(&body).unwrap();
         let schema = &value["response_format"]["json_schema"]["schema"];

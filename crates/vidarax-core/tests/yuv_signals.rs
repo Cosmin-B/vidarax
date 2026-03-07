@@ -57,7 +57,8 @@ fn different_frames_have_nonzero_flicker() {
 #[test]
 fn jpeg_encoding_produces_valid_jpeg() {
     let frame = make_gray_frame(128, 64, 64);
-    let jpeg = yuv_to_jpeg(&frame, 80);
+    let mut scratch = Vec::new();
+    let jpeg = yuv_to_jpeg(&frame, 80, &mut scratch);
     assert!(jpeg.len() > 100, "JPEG too small: {} bytes", jpeg.len());
     assert_eq!(&jpeg[0..2], &[0xFF, 0xD8], "not a JPEG header");
 }

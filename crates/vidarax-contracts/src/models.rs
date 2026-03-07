@@ -21,7 +21,16 @@ pub const REQUIRED_MODELS: &[&str] = &[
 ];
 
 pub fn normalize_model_id(input: &str) -> Option<&'static str> {
-    match input.to_ascii_lowercase().as_str() {
+    if input.len() > 64 {
+        return None;
+    }
+    let mut buf = [0u8; 64];
+    let bytes = input.as_bytes();
+    buf[..bytes.len()].copy_from_slice(bytes);
+    let lower = &mut buf[..bytes.len()];
+    lower.make_ascii_lowercase();
+    // make_ascii_lowercase only modifies ASCII bytes, so UTF-8 validity is preserved.
+    match std::str::from_utf8(lower).unwrap_or("") {
         "qwen/qwen3-vl-8b-instruct" => Some("Qwen/Qwen3-VL-8B-Instruct"),
         "allenai/molmo2-8b" => Some("allenai/Molmo2-8B"),
         "qwen/qwen3-vl-4b-instruct" => Some("Qwen/Qwen3-VL-4B-Instruct"),
@@ -38,13 +47,13 @@ pub fn is_required_model(input: &str) -> bool {
     normalize_model_id(input).is_some()
 }
 
-pub fn fallback_candidates(requested: &str) -> Vec<&'static str> {
+pub fn fallback_candidates(requested: &str) -> &'static [&'static str] {
     let Some(canonical) = normalize_model_id(requested) else {
-        return REQUIRED_MODELS.to_vec();
+        return REQUIRED_MODELS;
     };
 
     match canonical {
-        "Qwen/Qwen3-VL-8B-Instruct" | "allenai/Molmo2-8B" => REQUIRED_MEDIUM_MODELS.to_vec(),
-        _ => REQUIRED_SMALL_MODELS.to_vec(),
+        "Qwen/Qwen3-VL-8B-Instruct" | "allenai/Molmo2-8B" => REQUIRED_MEDIUM_MODELS,
+        _ => REQUIRED_SMALL_MODELS,
     }
 }

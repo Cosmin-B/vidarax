@@ -28,25 +28,23 @@ pub struct TimelineEvent {
 
 impl TimelineEvent {
     fn encode_line(&self) -> String {
-        // Pre-allocate enough for the numeric fields plus the string fields
-        // (worst-case escape doubles every char, so reserve full field lengths).
+        // Pre-allocate enough for numeric fields plus worst-case escaped strings
+        // (every char could be doubled by escaping).
         let cap = 40
-            + self.run_id.len()
-            + self.stream_id.len()
-            + self.kind.len()
-            + self.payload.len();
+            + self.run_id.len() * 2
+            + self.stream_id.len() * 2
+            + self.kind.len() * 2
+            + self.payload.len() * 2;
         let mut buf = String::with_capacity(cap);
         use std::fmt::Write as _;
-        let _ = write!(
-            buf,
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            self.seq,
-            sanitize(&self.run_id),
-            sanitize(&self.stream_id),
-            self.pts_ms,
-            sanitize(&self.kind),
-            sanitize(&self.payload)
-        );
+        let _ = write!(buf, "{}\t", self.seq);
+        sanitize_into(&self.run_id, &mut buf);
+        buf.push('\t');
+        sanitize_into(&self.stream_id, &mut buf);
+        let _ = write!(buf, "\t{}\t", self.pts_ms);
+        sanitize_into(&self.kind, &mut buf);
+        buf.push('\t');
+        sanitize_into(&self.payload, &mut buf);
         buf
     }
 
@@ -181,33 +179,49 @@ impl<I: EventIndex> DualWriter<I> {
     }
 }
 
+/// Single-pass escape: `\` → `\\`, tab → `\t`, newline → `\n`.
+/// Writes directly into `out` with no intermediate allocations.
 #[inline]
-fn sanitize(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('\t', "\\t")
-        .replace('\n', "\\n")
+fn sanitize_into(s: &str, out: &mut String) {
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let esc = match b {
+            b'\\' => "\\\\",
+            b'\t' => "\\t",
+            b'\n' => "\\n",
+            _ => continue,
+        };
+        out.push_str(&s[start..i]);
+        out.push_str(esc);
+        start = i + 1;
+    }
+    out.push_str(&s[start..]);
 }
 
 #[inline]
 fn restore(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('t') => out.push('\t'),
-                Some('n') => out.push('\n'),
-                Some('\\') => out.push('\\'),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'),
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut start = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            out.push_str(&s[start..i]);
+            i += 1;
+            match bytes.get(i).copied() {
+                Some(b't')  => { out.push('\t'); i += 1; }
+                Some(b'n')  => { out.push('\n'); i += 1; }
+                Some(b'\\') => { out.push('\\'); i += 1; }
+                Some(_)     => { out.push('\\'); /* leave i at the unrecognised byte */ }
+                None        => out.push('\\'),
             }
+            start = i;
         } else {
-            out.push(c);
+            i += 1;
         }
     }
+    out.push_str(&s[start..]);
     out
 }
 

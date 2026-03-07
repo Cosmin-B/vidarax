@@ -1,5 +1,6 @@
 use std::env;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use vidarax_core::ingest::pipeline::PipelineBackend;
 use vidarax_core::tiered_vlm::DistillationConfig;
@@ -382,7 +383,7 @@ fn parse_distillation_config() -> Result<DistillationConfig, String> {
     Ok(DistillationConfig {
         enabled,
         embedding_server_url,
-        teacher_model,
+        teacher_model: Arc::from(teacher_model),
         max_pairs_per_tenant,
         collection_rate,
         distance_threshold,

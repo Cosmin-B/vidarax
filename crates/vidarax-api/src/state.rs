@@ -268,10 +268,10 @@ impl AppState {
         let seq = self.event_seq.fetch_add(1, Ordering::AcqRel) + 1;
         let event = TimelineEvent {
             seq,
-            run_id: run_id.to_string(),
-            stream_id: "stream-0".to_string(),
+            run_id: run_id.to_owned(),
+            stream_id: "stream-0".to_owned(),
             pts_ms: now_epoch_ms(),
-            kind: kind.to_string(),
+            kind: kind.to_owned(),
             payload: payload.to_string(),
         };
         append_event(self.wal_path.as_ref(), &event).map_err(|err| err.to_string())?;
@@ -288,10 +288,10 @@ impl AppState {
         let seq = self.event_seq.fetch_add(1, Ordering::AcqRel) + 1;
         let event = TimelineEvent {
             seq,
-            run_id: run_id.to_string(),
-            stream_id: "stream-0".to_string(),
+            run_id: run_id.to_owned(),
+            stream_id: "stream-0".to_owned(),
             pts_ms: now_epoch_ms(),
-            kind: kind.to_string(),
+            kind: kind.to_owned(),
             payload: payload.to_string(),
         };
         let wal_path = Arc::clone(&self.wal_path);
@@ -305,6 +305,8 @@ impl AppState {
     }
 
     pub fn read_run_events(&self, run_id: &str) -> Result<Vec<TimelineEvent>, String> {
+        // TODO(perf): Full WAL scan per request. A per-run index (run_id → file
+        // offset range) would make this O(1) seek instead of O(total events).
         let events = read_all_events(self.wal_path.as_ref()).map_err(|err| err.to_string())?;
         Ok(events
             .into_iter()
@@ -396,7 +398,7 @@ impl AppState {
         }
         let ttl_ms = self.stream_ttl_secs.saturating_mul(1000);
         Some(RunRuntimeSnapshot {
-            principal_key: summary.principal_key.clone(),
+            principal_key: summary.principal_key.to_string(),
             state: apply_expiry(summary.state, summary.last_activity_ms, now_ms, ttl_ms),
             last_activity_ms: summary.last_activity_ms,
         })
@@ -456,15 +458,14 @@ pub struct RunRuntimeSnapshot {
 #[derive(Clone, Default)]
 struct RunRegistry {
     runs: HashMap<String, RunSummary>,
-    by_principal: HashMap<String, HashSet<String>>,
+    by_principal: HashMap<Arc<str>, HashSet<String>>,
 }
 
 impl RunRegistry {
     fn apply_event(&mut self, event: &TimelineEvent) {
-        let run_id = event.run_id.clone();
         let entry = self
             .runs
-            .entry(run_id.clone())
+            .entry(event.run_id.clone())
             .or_insert_with(RunSummary::default_public);
         let was_created = entry.created;
         let previous_principal = entry.principal_key.clone();
@@ -484,24 +485,24 @@ impl RunRegistry {
         }
 
         if was_created && previous_principal != entry.principal_key {
-            if let Some(set) = self.by_principal.get_mut(&previous_principal) {
-                set.remove(&run_id);
+            if let Some(set) = self.by_principal.get_mut(&*previous_principal) {
+                set.remove(&event.run_id);
                 if set.is_empty() {
-                    self.by_principal.remove(&previous_principal);
+                    self.by_principal.remove(&*previous_principal);
                 }
             }
         }
         self.by_principal
             .entry(entry.principal_key.clone())
             .or_default()
-            .insert(run_id);
+            .insert(event.run_id.clone());
     }
 }
 
 #[derive(Clone)]
 struct RunSummary {
     created: bool,
-    principal_key: String,
+    principal_key: Arc<str>,
     state: StreamState,
     last_activity_ms: u64,
 }
@@ -510,7 +511,7 @@ impl RunSummary {
     fn default_public() -> Self {
         Self {
             created: false,
-            principal_key: "public".to_string(),
+            principal_key: Arc::from("public"),
             state: StreamState::Pending,
             last_activity_ms: 0,
         }
@@ -525,12 +526,12 @@ fn build_run_registry(events: &[TimelineEvent]) -> Arc<RunRegistry> {
     Arc::new(registry)
 }
 
-fn principal_key_from_payload(raw: &str) -> Option<String> {
+fn principal_key_from_payload(raw: &str) -> Option<Arc<str>> {
     serde_json::from_str::<Value>(raw).ok().and_then(|payload| {
         payload
             .get("principal_key")
             .and_then(|value| value.as_str())
-            .map(ToString::to_string)
+            .map(Arc::from)
     })
 }
 

@@ -18,4 +18,15 @@ impl StreamState {
                 | StreamState::Expired
         )
     }
+
+    pub fn as_lowercase_str(self) -> &'static str {
+        match self {
+            StreamState::Pending => "pending",
+            StreamState::Processing => "processing",
+            StreamState::Completed => "completed",
+            StreamState::Failed => "failed",
+            StreamState::Cancelled => "cancelled",
+            StreamState::Expired => "expired",
+        }
+    }
 }

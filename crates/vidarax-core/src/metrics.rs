@@ -93,16 +93,15 @@ impl LatencyHistogram {
         let sum = self.sum.load(Ordering::Relaxed);
 
         let mut out = String::with_capacity(256);
+        use std::fmt::Write as _;
         let mut cumulative: u64 = 0;
         for (idx, &bound) in self.bounds.iter().enumerate() {
             cumulative += self.buckets[idx].load(Ordering::Relaxed);
-            out.push_str(&format!(
-                "{metric_name}_bucket{{le=\"{bound}\"}} {cumulative}\n"
-            ));
+            let _ = writeln!(out, "{metric_name}_bucket{{le=\"{bound}\"}} {cumulative}");
         }
-        out.push_str(&format!("{metric_name}_bucket{{le=\"+Inf\"}} {count}\n"));
-        out.push_str(&format!("{metric_name}_sum {sum}\n"));
-        out.push_str(&format!("{metric_name}_count {count}\n"));
+        let _ = writeln!(out, "{metric_name}_bucket{{le=\"+Inf\"}} {count}");
+        let _ = writeln!(out, "{metric_name}_sum {sum}");
+        let _ = writeln!(out, "{metric_name}_count {count}");
         out
     }
 }

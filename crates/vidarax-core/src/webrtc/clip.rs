@@ -25,6 +25,7 @@
 //! and starts a fresh window.  A minimum inter-emission delay of
 //! `delay_seconds` (wall-clock) prevents bursting.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -120,8 +121,8 @@ impl Default for ClipConfig {
 /// A batch of frames assembled by [`ClipAccumulator`] for multi-image VLM inference.
 #[derive(Debug, Clone)]
 pub struct ClipWork {
-    pub run_id: String,
-    pub session_id: String,
+    pub run_id: Arc<str>,
+    pub session_id: Arc<str>,
     /// Frames in this clip: `(signal, JPEG bytes)`.
     ///
     /// JPEG buffers are `Arc<[u8]>` so cloning `ClipWork` copies only the
@@ -132,7 +133,7 @@ pub struct ClipWork {
     /// PTS of the last frame in the batch (milliseconds).
     pub pts_end: u64,
     /// Semantic prompt forwarded to the VLM.
-    pub prompt: String,
+    pub prompt: Arc<str>,
 }
 
 // ─── ClipAccumulator ──────────────────────────────────────────────────────────
@@ -146,11 +147,11 @@ pub struct ClipWork {
 /// integrating into the pipeline.
 pub struct ClipAccumulator {
     config: ClipConfig,
-    run_id: String,
-    session_id: String,
-    prompt: String,
+    run_id: Arc<str>,
+    session_id: Arc<str>,
+    prompt: Arc<str>,
     /// Buffered frames for the current window.
-    buffer: Vec<(FrameSignal, Arc<[u8]>)>,
+    buffer: VecDeque<(FrameSignal, Arc<[u8]>)>,
     /// Minimum inter-sample distance in ms (1000 / target_fps).
     sample_interval_ms: u64,
     /// PTS of the last frame accepted into the buffer (for rate limiting).
@@ -167,14 +168,14 @@ impl ClipAccumulator {
     ///
     /// Does **not** panic; validation must be done by the caller via
     /// [`ClipConfig::validate`] before constructing.
-    pub fn new(config: ClipConfig, run_id: String, session_id: String, prompt: String) -> Self {
+    pub fn new(config: ClipConfig, run_id: Arc<str>, session_id: Arc<str>, prompt: Arc<str>) -> Self {
         let sample_interval_ms = 1000u64 / (config.target_fps as u64).max(1);
         Self {
             config,
             run_id,
             session_id,
             prompt,
-            buffer: Vec::new(),
+            buffer: VecDeque::new(),
             sample_interval_ms,
             last_accepted_pts: None,
             last_emit: None,
@@ -205,10 +206,10 @@ impl ClipAccumulator {
         };
 
         self.last_accepted_pts = Some(sf.pts_ms);
-        self.buffer.push((sf.signal, jpeg_bytes));
+        self.buffer.push_back((sf.signal, jpeg_bytes));
 
         // ── Check window duration ──────────────────────────────────────────
-        let window_start_pts = match self.buffer.first() {
+        let window_start_pts = match self.buffer.front() {
             Some((sig, _)) => sig.pts_ms,
             None => return None,
         };
@@ -224,25 +225,27 @@ impl ClipAccumulator {
         let now = Instant::now();
         if let Some(last) = self.last_emit {
             if delay_ms > 0 && last.elapsed().as_millis() < delay_ms as u128 {
-                // Slide the window forward by dropping the oldest frame.
-                self.buffer.remove(0);
+                // Slide the window forward by dropping the oldest frame — O(1) with VecDeque.
+                self.buffer.pop_front();
                 return None;
             }
         }
 
         // ── Emit ───────────────────────────────────────────────────────────
-        let frames = std::mem::take(&mut self.buffer);
-        let pts_start = frames.first().map(|(s, _)| s.pts_ms).unwrap_or(0);
+        let deque = std::mem::take(&mut self.buffer);
+        let pts_start = deque.front().map(|(s, _)| s.pts_ms).unwrap_or(0);
         let pts_end = sf.pts_ms;
         self.last_emit = Some(now);
+        // Collect into Vec for ClipWork (O(n) but done once per clip emission).
+        let frames: Vec<(FrameSignal, Arc<[u8]>)> = deque.into_iter().collect();
 
         Some(ClipWork {
-            run_id: self.run_id.clone(),
-            session_id: self.session_id.clone(),
+            run_id: Arc::clone(&self.run_id),
+            session_id: Arc::clone(&self.session_id),
             frames,
             pts_start,
             pts_end,
-            prompt: self.prompt.clone(),
+            prompt: Arc::clone(&self.prompt),
         })
     }
 }
@@ -261,9 +264,9 @@ pub fn spawn_clip_accumulator(
     frame_rx: kanal::Receiver<StreamFrame>,
     clip_tx: kanal::Sender<ClipWork>,
     config: ClipConfig,
-    run_id: String,
-    session_id: String,
-    prompt: String,
+    run_id: Arc<str>,
+    session_id: Arc<str>,
+    prompt: Arc<str>,
     session_span: tracing::Span,
 ) {
     std::thread::Builder::new()
@@ -317,10 +320,10 @@ pub fn spawn_clip_vlm_workers<I>(
                     let _guard = session_span.enter();
                     metrics.inc_vlm_inferences();
 
-                    let prompt = if work.prompt.is_empty() {
-                        "Briefly describe what is happening across these video frames.".to_string()
+                    let prompt: Arc<str> = if work.prompt.is_empty() {
+                        Arc::from("Briefly describe what is happening across these video frames.")
                     } else {
-                        work.prompt.clone()
+                        Arc::clone(&work.prompt)
                     };
 
                     // Build multi-image request — all frames sent together.
@@ -532,8 +535,8 @@ mod tests {
         let clip = result.expect("should have emitted a clip");
         assert!(!clip.frames.is_empty(), "clip must contain frames");
         assert!(clip.pts_end >= clip.pts_start);
-        assert_eq!(clip.run_id, "run1");
-        assert_eq!(clip.session_id, "sess1");
+        assert_eq!(&*clip.run_id, "run1");
+        assert_eq!(&*clip.session_id, "sess1");
     }
 
     #[test]
@@ -618,8 +621,8 @@ mod tests {
         }
 
         let c = clip.expect("clip should be emitted");
-        assert_eq!(c.run_id, "my-run");
-        assert_eq!(c.session_id, "my-session");
-        assert_eq!(c.prompt, "test prompt");
+        assert_eq!(&*c.run_id, "my-run");
+        assert_eq!(&*c.session_id, "my-session");
+        assert_eq!(&*c.prompt, "test prompt");
     }
 }
