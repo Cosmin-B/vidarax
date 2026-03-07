@@ -422,6 +422,9 @@ impl Decoder {
             .decode(nals)
             .map_err(|e| DecodeError::SoftwareDecode(format!("{e}")))?;
 
+        // openh264 returns None when the codec is accumulating parameter sets
+        // (SPS/PPS) or partial slices — this is benign buffering, not an error.
+        // Hard decode failures surface as Err(...) above (→ SoftwareDecode).
         let yuv = maybe_yuv.ok_or(DecodeError::Buffered)?;
 
         // dimensions() returns (width, height) in pixels.
