@@ -271,8 +271,8 @@ pub struct CreateRunResponse {
     pub run_id: String,
     pub request_id: String,
     pub status: &'static str,
-    pub mode: String,
-    pub model: Option<String>,
+    pub mode: &'static str,
+    pub model: Option<&'static str>,
 }
 
 // ─── Semantic search ─────────────────────────────────────────────────────────

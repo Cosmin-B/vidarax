@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 /// Configuration for tiered VLM inference routing.
 ///
 /// First-pass: fast, cheap model (e.g. Qwen3-VL-2B, <200ms).
@@ -7,11 +9,12 @@
 /// # Examples
 ///
 /// ```
+/// use std::sync::Arc;
 /// use vidarax_core::tiered_vlm::TieredVlmConfig;
 ///
 /// let config = TieredVlmConfig {
-///     first_pass_model: "Qwen/Qwen3-VL-2B-Instruct".to_string(),
-///     second_pass_model: "Qwen/Qwen3-VL-8B-Instruct".to_string(),
+///     first_pass_model: Arc::from("Qwen/Qwen3-VL-2B-Instruct"),
+///     second_pass_model: Arc::from("Qwen/Qwen3-VL-8B-Instruct"),
 ///     second_pass_threshold: 0.7,
 ///     second_pass_max_tokens: 256,
 /// };
@@ -22,9 +25,9 @@
 #[derive(Debug, Clone)]
 pub struct TieredVlmConfig {
     /// Model ID for the fast first-pass inference.
-    pub first_pass_model: String,
+    pub first_pass_model: Arc<str>,
     /// Model ID for the accurate second-pass inference.
-    pub second_pass_model: String,
+    pub second_pass_model: Arc<str>,
     /// Confidence threshold: if first-pass confidence < this, run second-pass.
     /// Range: 0.0 to 1.0. Default: 0.7.
     pub second_pass_threshold: f32,
@@ -36,8 +39,8 @@ impl TieredVlmConfig {
     /// Create a config that uses the same model for both passes (no tiering).
     pub fn single_model(model: &str) -> Self {
         Self {
-            first_pass_model: model.to_string(),
-            second_pass_model: model.to_string(),
+            first_pass_model: Arc::from(model),
+            second_pass_model: Arc::from(model),
             second_pass_threshold: 0.7,
             second_pass_max_tokens: 256,
         }
@@ -60,8 +63,8 @@ impl TieredVlmConfig {
 impl Default for TieredVlmConfig {
     fn default() -> Self {
         Self {
-            first_pass_model: "Qwen/Qwen3-VL-8B-Instruct".to_string(),
-            second_pass_model: "Qwen/Qwen3-VL-8B-Instruct".to_string(),
+            first_pass_model: Arc::from("Qwen/Qwen3-VL-8B-Instruct"),
+            second_pass_model: Arc::from("Qwen/Qwen3-VL-8B-Instruct"),
             second_pass_threshold: 0.7,
             second_pass_max_tokens: 256,
         }
@@ -92,7 +95,7 @@ pub struct DistillationConfig {
     /// Base URL of the SigLIP2 embedding server (e.g. `http://127.0.0.1:8765`).
     pub embedding_server_url: Option<String>,
     /// Model ID used for teacher labeling (guided-JSON structured output).
-    pub teacher_model: String,
+    pub teacher_model: Arc<str>,
     /// Maximum training pairs stored per tenant before the oldest are evicted.
     pub max_pairs_per_tenant: usize,
     /// Fraction of keyframes to sample for collection (0.0 – 1.0).
@@ -108,7 +111,7 @@ impl Default for DistillationConfig {
         Self {
             enabled: false,
             embedding_server_url: None,
-            teacher_model: "Qwen/Qwen3-VL-8B-Instruct".to_string(),
+            teacher_model: Arc::from("Qwen/Qwen3-VL-8B-Instruct"),
             max_pairs_per_tenant: 10_000,
             collection_rate: 0.1,
             distance_threshold: 0.2,

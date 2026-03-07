@@ -128,7 +128,7 @@ impl Default for WebRtcConfig {
 pub struct WebRtcSession {
     pc: PeerConnection,
     /// Dynamic VLM prompt; updated via `PATCH /v1/stream/whip/{sess_id}/prompt`.
-    pub prompt: Arc<RwLock<String>>,
+    pub prompt: Arc<RwLock<Arc<str>>>,
     /// Token output rate cap (tokens/s) for backpressure in VLM workers.
     pub max_output_tokens_per_second: u32,
     /// Video codec negotiated from the SDP offer (H.264 or VP8).
@@ -217,7 +217,7 @@ impl WebRtcSession {
         Ok((
             Self {
                 pc,
-                prompt: Arc::new(RwLock::new(String::new())),
+                prompt: Arc::new(RwLock::new(Arc::from(""))),
                 max_output_tokens_per_second: config.max_output_tokens_per_second,
                 codec,
             },
@@ -298,8 +298,8 @@ impl WebRtcSession {
                         let seq = Arc::clone(&seq_counter);
 
                         tokio::spawn(async move {
-                            // Reuse a single allocation across frames; grows to the
-                            // largest NAL seen and is never freed until the task exits.
+                            // Buffer moved into each RtpFrame via mem::take (zero-copy);
+                            // re-allocated each frame via reserve below.
                             let mut nals_buf: Vec<u8> = Vec::new();
                             loop {
                                 match track.recv().await {
@@ -329,7 +329,7 @@ impl WebRtcSession {
                                         let pts_ms = frame.rtp_timestamp as u64 / 90;
 
                                         let rtp_frame = RtpFrame {
-                                            nals: nals_buf.clone(),
+                                            nals: std::mem::take(&mut nals_buf),
                                             pts_ms,
                                             seq: nal_seq,
                                             codec,
@@ -362,20 +362,22 @@ impl WebRtcSession {
     /// picked up by analysis workers on the next keyframe decision.
     pub fn update_prompt(&self, text: String) {
         if let Ok(mut guard) = self.prompt.write() {
-            *guard = text;
+            *guard = Arc::from(text);
         }
     }
 
     /// Read the current VLM prompt (empty string means use the default).
-    pub fn read_prompt(&self) -> String {
+    ///
+    /// Clones only the `Arc<str>` pointer (pointer-width), not the string data.
+    pub fn read_prompt(&self) -> Arc<str> {
         self.prompt
             .read()
-            .map(|g| g.clone())
+            .map(|g| Arc::clone(&*g))
             .unwrap_or_default()
     }
 
     /// Clone the prompt handle for sharing with analysis workers.
-    pub fn prompt_arc(&self) -> Arc<RwLock<String>> {
+    pub fn prompt_arc(&self) -> Arc<RwLock<Arc<str>>> {
         Arc::clone(&self.prompt)
     }
 

@@ -51,7 +51,7 @@ impl<T, const N: usize> Inner<T, N> {
 
     #[inline]
     fn index(pos: usize) -> usize {
-        pos % N
+        pos & (N - 1)
     }
 }
 
@@ -103,7 +103,7 @@ impl<T, const N: usize> Producer<T, N> {
     #[inline]
     pub fn len(&self) -> usize {
         let head = self.inner.head.load(Ordering::Acquire);
-        let tail = self.inner.tail.load(Ordering::Acquire);
+        let tail = self.inner.tail.load(Ordering::Relaxed);
         tail.wrapping_sub(head)
     }
 
@@ -144,7 +144,7 @@ impl<T, const N: usize> Consumer<T, N> {
 
     #[inline]
     pub fn len(&self) -> usize {
-        let head = self.inner.head.load(Ordering::Acquire);
+        let head = self.inner.head.load(Ordering::Relaxed);
         let tail = self.inner.tail.load(Ordering::Acquire);
         tail.wrapping_sub(head)
     }

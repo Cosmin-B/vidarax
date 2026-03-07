@@ -34,8 +34,8 @@ async fn main() {
         sglang_base_url: format!("http://{}", server.addr),
     };
     let request = InferenceRequest {
-        model: "Qwen/Qwen3-VL-2B-Instruct".to_string(),
-        prompt: "benchmark".to_string(),
+        model: Arc::from("Qwen/Qwen3-VL-2B-Instruct"),
+        prompt: Arc::from("benchmark"),
         input_images: Vec::new(),
         max_tokens: 16,
         temperature: 0.0,

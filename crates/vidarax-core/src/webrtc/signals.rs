@@ -4,6 +4,8 @@
 //! to the gate engine's [`crate::gate::FrameSignal`] type, and provides JPEG
 //! thumbnail encoding for downstream consumers.
 
+use std::sync::Arc;
+
 use crate::gate::FrameSignal;
 use crate::webrtc::decode::YuvFrame;
 
@@ -135,7 +137,7 @@ pub fn yuv_to_frame_signal(
     }
 }
 
-/// Encode a YUV 4:2:0 frame as a JPEG byte buffer.
+/// Encode a YUV 4:2:0 frame as a shared JPEG byte buffer.
 ///
 /// Builds interleaved YCbCr directly from the planar YUV420 data — no
 /// float-point BT.601 conversion. The jpeg-encoder accepts YCbCr natively
@@ -143,32 +145,35 @@ pub fn yuv_to_frame_signal(
 /// 6 float ops/pixel with a single nearest-neighbor integer lookup for the
 /// chroma upsample.
 ///
+/// `scratch` is a caller-provided buffer reused across frames to avoid
+/// re-allocating the ~6 MB YCbCr interleave buffer on every call.
+///
 /// # Panics
 ///
 /// Panics only if the frame dimensions are inconsistent with the plane buffers
 /// (i.e. a bug in the caller, not a user error).
-pub fn yuv_to_jpeg(yuv: &YuvFrame, quality: u8) -> Vec<u8> {
+pub fn yuv_to_jpeg(yuv: &YuvFrame, quality: u8, scratch: &mut Vec<u8>) -> Arc<[u8]> {
     let w = yuv.width as usize;
     let h = yuv.height as usize;
     let half_w = w / 2;
 
-    // Interleave Y, Cb (U), Cr (V) at full resolution via nearest-neighbor
-    // upsample of the chroma planes. Integer-only, no float math.
-    let mut ycbcr = Vec::with_capacity(w * h * 3);
+    // Reuse scratch buffer for YCbCr interleave; avoids per-frame heap allocation.
+    scratch.clear();
+    scratch.reserve(w * h * 3);
     for py in 0..h {
         let y_row = py * w;
         let c_row = (py / 2) * half_w;
         for px in 0..w {
-            ycbcr.push(yuv.y[y_row + px]);
-            ycbcr.push(yuv.u[c_row + px / 2]);
-            ycbcr.push(yuv.v[c_row + px / 2]);
+            scratch.push(yuv.y[y_row + px]);
+            scratch.push(yuv.u[c_row + px / 2]);
+            scratch.push(yuv.v[c_row + px / 2]);
         }
     }
 
     let mut buf = Vec::new();
     let encoder = jpeg_encoder::Encoder::new(&mut buf, quality);
     encoder
-        .encode(&ycbcr, yuv.width as u16, yuv.height as u16, jpeg_encoder::ColorType::Ycbcr)
+        .encode(scratch, yuv.width as u16, yuv.height as u16, jpeg_encoder::ColorType::Ycbcr)
         .expect("JPEG encoding failed");
-    buf
+    Arc::from(buf.into_boxed_slice())
 }

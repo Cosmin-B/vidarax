@@ -526,7 +526,7 @@ pub async fn get_state(
     ok(json!({
         "request_id": state.next_request_id(),
         "run_id": run_id,
-        "state": format!("{state_value:?}").to_ascii_lowercase()
+        "state": state_value.as_lowercase_str()
     }))
 }
 
@@ -755,7 +755,7 @@ pub async fn analyze_run(
             );
         }
     };
-    let model = match normalize_model(Some(payload.model.clone())) {
+    let model = match normalize_model(Some(payload.model)) {
         Ok(Some(model)) => model,
         Ok(None) => unreachable!("model is required for analyze payload"),
         Err(message) => {
@@ -1017,7 +1017,7 @@ pub async fn reason_realtime_run(
             );
         }
     };
-    let model = match normalize_model(Some(payload.model.clone())) {
+    let model = match normalize_model(Some(payload.model)) {
         Ok(Some(model)) => model,
         Ok(None) => unreachable!("model is required"),
         Err(message) => {
@@ -1118,8 +1118,8 @@ pub async fn reason_realtime_run(
         let second = payload.second_pass_model.as_deref().unwrap_or(&model);
         let threshold = payload.second_pass_threshold.unwrap_or(0.7);
         TieredVlmConfig {
-            first_pass_model: first.to_string(),
-            second_pass_model: second.to_string(),
+            first_pass_model: Arc::from(first),
+            second_pass_model: Arc::from(second),
             second_pass_threshold: threshold.clamp(0.0, 1.0),
             second_pass_max_tokens: 256,
         }
@@ -1326,7 +1326,6 @@ pub async fn reason_realtime_run(
 
         for (chunk_idx, prep) in chunk_preps.iter().enumerate() {
             let providers_c = providers.clone();
-            let model_c = model.clone();
             let prompt_c = semantic_prompt.clone();
             let chunk_jpegs_c = prep.chunk_jpegs.clone();
             let sem_c = Arc::clone(&sem);
@@ -1341,7 +1340,7 @@ pub async fn reason_realtime_run(
                     providers_c.as_ref(),
                     true,
                     semantic_primary_provider,
-                    &model_c,
+                    model,
                     &prompt_c,
                     semantic_timeout_ms,
                     semantic_frames_per_chunk,
@@ -1574,7 +1573,12 @@ pub async fn get_markers(
             markers.push(marker);
         }
     }
-    markers.sort_by_key(|m| (m.start_frame, m.end_frame, m.marker_id.clone()));
+    markers.sort_by(|a, b| {
+        a.start_frame
+            .cmp(&b.start_frame)
+            .then(a.end_frame.cmp(&b.end_frame))
+            .then(a.marker_id.as_str().cmp(b.marker_id.as_str()))
+    });
 
     ok(json!({
         "request_id": state.next_request_id(),
@@ -1943,7 +1947,7 @@ async fn validate_infer_request(
         }
     }
 
-    let model = match normalize_model(Some(payload.model.clone())) {
+    let model = match normalize_model(Some(payload.model)) {
         Ok(Some(model)) => model,
         Ok(None) => unreachable!("model is required in infer request"),
         Err(message) => {
@@ -2027,8 +2031,8 @@ async fn validate_infer_request(
     Ok(PreparedInferRequest {
         run_id: payload.run_id,
         request: InferenceRequest {
-            model,
-            prompt: prompt.to_string(),
+            model: Arc::from(model),
+            prompt: Arc::from(prompt),
             input_images: Vec::new(),
             max_tokens,
             temperature,
@@ -2129,7 +2133,7 @@ async fn execute_infer_request(
         request_id,
         run_id: prepared.run_id,
         provider: provider_name(result.provider).to_string(),
-        model: result.model,
+        model: result.model.to_string(),
         fallback_used: result.fallback_used,
         output_text: result.output_text,
         finish_reason: result.finish_reason,
@@ -2286,7 +2290,7 @@ pub async fn list_runs(
             let (mode, model, source_uri, created_at_ms, updated_at_ms) =
                 extract_run_metadata(&events);
             let snapshot = state.run_runtime_snapshot(&run_id, now_ms)?;
-            let status = format!("{:?}", snapshot.state).to_ascii_lowercase();
+            let status = snapshot.state.as_lowercase_str();
             Some(json!({
                 "run_id": run_id,
                 "status": status,
@@ -2334,7 +2338,7 @@ pub async fn get_run(
         );
     }
     let (mode, model, source_uri, created_at_ms, updated_at_ms) = extract_run_metadata(&events);
-    let status = format!("{:?}", snapshot.state).to_ascii_lowercase();
+    let status = snapshot.state.as_lowercase_str();
     ok(json!({
         "run_id": run_id,
         "status": status,
@@ -2400,8 +2404,7 @@ pub async fn serve_file(
     }
 
     // Search each allowed root for a file with this name.
-    let roots = state.ingest_file_roots().to_vec();
-    for root in &roots {
+    for root in state.ingest_file_roots() {
         let candidate = root.join(&filename);
         // Canonicalize to resolve any symlinks and check containment.
         let canonical = match candidate.canonicalize() {
@@ -2810,13 +2813,13 @@ async fn infer_chunk_semantics(
         .collect::<Vec<_>>();
     let first_request = InferenceRequest {
         model: tiered_config.first_pass_model.clone(),
-        prompt: prompt.clone(),
+        prompt: Arc::from(prompt.as_str()),
         input_images: images.clone(),
         max_tokens: if guided_json.is_some() { 1024 } else { 160 },
         temperature: 0.0,
         timeout_ms,
         allow_fallback: true,
-        guided_json: guided_json.clone(),
+        guided_json: guided_json.as_deref().map(Arc::from),
     };
 
     let first_result = match tokio::task::spawn_blocking({
@@ -2849,13 +2852,13 @@ async fn infer_chunk_semantics(
         if tiered_config.needs_second_pass(first_conf) {
             let second_request = InferenceRequest {
                 model: tiered_config.second_pass_model.clone(),
-                prompt,
+                prompt: Arc::from(prompt),
                 input_images: images,
                 max_tokens: tiered_config.second_pass_max_tokens,
                 temperature: 0.0,
                 timeout_ms,
                 allow_fallback: true,
-                guided_json: guided_json.clone(),
+                guided_json: guided_json.as_deref().map(Arc::from),
             };
             match tokio::task::spawn_blocking(move || {
                 infer_from_endpoints(&endpoints, primary_provider, &second_request)

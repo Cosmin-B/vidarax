@@ -109,7 +109,7 @@ pub struct KeyframeWork {
     pub frame_index: u64,
     pub pts_ms: u64,
     /// Gate reason code: `"scene_cut"` | `"periodic_keepalive"` | `"initial_frame"`.
-    pub event_type: String,
+    pub event_type: &'static str,
     /// Gate confidence score in \[0.0, 1.0\].
     pub confidence: f32,
     /// Raw JPEG bytes — base64-encoded on-demand for VLM, stored raw in SpacetimeDB.
@@ -117,7 +117,7 @@ pub struct KeyframeWork {
     /// Shared via `Arc<[u8]>` so cloning this work item copies only a pointer.
     pub jpeg_bytes: Arc<[u8]>,
     /// Semantic prompt to pass to the VLM.
-    pub prompt: String,
+    pub prompt: Arc<str>,
     /// When `true` the analysis worker detected an active visual loop at the
     /// time this work item was queued.  VLM workers use this flag to skip
     /// inference entirely (the scene has not changed), avoiding redundant
@@ -172,6 +172,8 @@ pub fn spawn_decode_workers(
                 let mut decoder: Option<Decoder> = None;
                 let mut active_codec: Option<VideoCodec> = None;
                 let mut prev_signal: Option<crate::gate::FrameSignal> = None;
+                // Reused across frames to avoid per-frame 6MB YCbCr allocation.
+                let mut ycbcr_scratch: Vec<u8> = Vec::with_capacity(1920 * 1080 * 3);
 
                 while let Ok(frame) = rtp_rx.recv() {
                     let _guard = session_span.enter();
@@ -204,8 +206,8 @@ pub fn spawn_decode_workers(
                         frame.pts_ms,
                         prev_signal.as_ref(),
                     );
-                    // Allocate once; all downstream consumers share the Arc pointer.
-                    let jpeg: Arc<[u8]> = Arc::from(yuv_to_jpeg(&yuv, 75));
+                    // Encode JPEG; scratch buffer reused per-worker to avoid allocation.
+                    let jpeg: Arc<[u8]> = yuv_to_jpeg(&yuv, 75, &mut ycbcr_scratch);
                     prev_signal = Some(signal);
 
                     // Record decode latency (decode + signal + JPEG encoding).
@@ -327,7 +329,7 @@ pub fn spawn_analysis_workers(
                                 .clone()
                                 .unwrap_or_else(|| Arc::from([] as [u8; 0]));
 
-                            let event_type = if meta.scene_cut {
+                            let event_type: &'static str = if meta.scene_cut {
                                 "scene_cut"
                             } else {
                                 "periodic_keepalive"
@@ -338,10 +340,10 @@ pub fn spawn_analysis_workers(
                                 session_id: Arc::clone(&session_id),
                                 frame_index: sf.signal.frame_index,
                                 pts_ms: sf.pts_ms,
-                                event_type: event_type.to_string(),
+                                event_type,
                                 confidence: meta.confidence,
                                 jpeg_bytes,
-                                prompt: String::new(),
+                                prompt: Arc::from(""),
                                 loop_active,
                             };
 
@@ -371,14 +373,14 @@ enum SinkEvent {
         pts_ms: u64,
         event_type: &'static str,
         confidence: f32,
-        description: String,
+        description: Arc<str>,
     },
     StoreKeyframe {
         run_id: Arc<str>,
         frame_index: u64,
         pts_ms: u64,
-        event_type: String,
-        description: String,
+        event_type: &'static str,
+        description: Arc<str>,
         jpeg_bytes: Arc<[u8]>,
     },
 }
@@ -519,9 +521,11 @@ pub fn spawn_vlm_workers<I>(
                     // already exceeded the per-second output token budget.
                     if max_output_tokens_per_second > 0 {
                         let now = std::time::Instant::now();
-                        let entry = token_budget
-                            .entry(work.session_id.clone())
-                            .or_insert((now, 0));
+                        // Avoid Arc clone on hit: check with &str borrow first.
+                        if !token_budget.contains_key(work.session_id.as_ref()) {
+                            token_budget.insert(Arc::clone(&work.session_id), (now, 0));
+                        }
+                        let entry = token_budget.get_mut(work.session_id.as_ref()).unwrap();
                         if now.duration_since(entry.0).as_secs() >= 1 {
                             *entry = (now, 0); // reset 1-second window
                         }
@@ -532,10 +536,10 @@ pub fn spawn_vlm_workers<I>(
                     }
 
                     metrics.inc_vlm_inferences();
-                    let prompt = if work.prompt.is_empty() {
-                        "Briefly describe what is happening in this video frame.".to_string()
+                    let prompt: Arc<str> = if work.prompt.is_empty() {
+                        Arc::from("Briefly describe what is happening in this video frame.")
                     } else {
-                        work.prompt.clone()
+                        Arc::clone(&work.prompt)
                     };
 
                     // Base64-encode the JPEG once for both embedding and VLM calls.
@@ -582,7 +586,7 @@ pub fn spawn_vlm_workers<I>(
 
                     // ── Tiers 2+3: VLM inference (when KNN misses or disabled) ──────
                     let vlm_start = std::time::Instant::now();
-                    let (description, used_second_pass) = if let Some(hit) = knn_hit {
+                    let (description_str, used_second_pass) = if let Some(hit) = knn_hit {
                         hit
                     } else {
                         let first_request = InferenceRequest {
@@ -615,9 +619,9 @@ pub fn spawn_vlm_workers<I>(
                                         temperature: 0.0,
                                         timeout_ms: 10_000,
                                         allow_fallback: true,
-                                        guided_json: Some(
-                                            crate::provider::teacher_label_schema().to_string(),
-                                        ),
+                                        guided_json: Some(Arc::from(
+                                            crate::provider::teacher_label_schema(),
+                                        )),
                                     };
                                     match provider.infer(&second_request) {
                                         Ok(second) => (second.output_text, true),
@@ -637,13 +641,18 @@ pub fn spawn_vlm_workers<I>(
                     // Charge output tokens against the session budget.
                     // Approximate: 4 bytes per token (UTF-8 average).
                     if max_output_tokens_per_second > 0 {
-                        let token_count = (description.len() / 4).max(1) as u32;
+                        let token_count = (description_str.len() / 4).max(1) as u32;
                         if let Some(entry) = token_budget.get_mut(work.session_id.as_ref()) {
                             entry.1 = entry.1.saturating_add(token_count);
                         }
                     }
 
-                    let event_type = if used_second_pass { "vlm_tiered" } else { "vlm" };
+                    let event_type: &'static str =
+                        if used_second_pass { "vlm_tiered" } else { "vlm" };
+
+                    // Wrap description in Arc<str> so both SinkEvent sends share
+                    // the same allocation without cloning the String content.
+                    let description: Arc<str> = Arc::from(description_str.into_boxed_str());
 
                     // ── Dedup filter ─────────────────────────────────────
                     // Skip emitting when the VLM produced the same description
@@ -659,15 +668,15 @@ pub fn spawn_vlm_workers<I>(
                             pts_ms: work.pts_ms,
                             event_type,
                             confidence: work.confidence,
-                            description: description.clone(),
+                            description: Arc::clone(&description),
                         });
                     }
                     let _ = event_tx.send(SinkEvent::StoreKeyframe {
                         run_id: Arc::clone(&work.run_id),
                         frame_index: work.frame_index,
                         pts_ms: work.pts_ms,
-                        event_type: work.event_type.clone(),
-                        description: description.clone(),
+                        event_type: work.event_type,
+                        description,
                         jpeg_bytes: Arc::clone(&work.jpeg_bytes),
                     });
 
@@ -889,10 +898,10 @@ mod tests {
             session_id: "s1".into(),
             frame_index: 0,
             pts_ms: 0,
-            event_type: "scene_cut".into(),
+            event_type: "scene_cut",
             confidence: 0.9,
             jpeg_bytes: Arc::from([0xFF_u8, 0xD8, 0xFF, 0xD9] as [u8; 4]),
-            prompt: String::new(),
+            prompt: Arc::from(""),
             loop_active: false,
         };
         let _ = kw.clone();

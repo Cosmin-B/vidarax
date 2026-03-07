@@ -48,43 +48,28 @@ impl InferenceMetrics {
     }
 
     fn render_provider(&self, name: &str, p: &ProviderMetrics, out: &mut String) {
+        use std::fmt::Write as _;
         let ok = p.success_total.load(Ordering::Relaxed);
         let err = p.error_total.load(Ordering::Relaxed);
         let fallback = p.fallback_total.load(Ordering::Relaxed);
         let sum_ms = p.latency_sum_ms.load(Ordering::Relaxed);
         let count = p.latency_count.load(Ordering::Relaxed);
 
-        out.push_str(&format!(
-            "vidarax_infer_requests_total{{provider=\"{name}\",status=\"ok\"}} {ok}\n"
-        ));
-        out.push_str(&format!(
-            "vidarax_infer_requests_total{{provider=\"{name}\",status=\"error\"}} {err}\n"
-        ));
-        out.push_str(&format!(
-            "vidarax_infer_fallback_total{{provider=\"{name}\"}} {fallback}\n"
-        ));
+        let _ = writeln!(out, "vidarax_infer_requests_total{{provider=\"{name}\",status=\"ok\"}} {ok}");
+        let _ = writeln!(out, "vidarax_infer_requests_total{{provider=\"{name}\",status=\"error\"}} {err}");
+        let _ = writeln!(out, "vidarax_infer_fallback_total{{provider=\"{name}\"}} {fallback}");
 
         let mut cumulative = 0u64;
         for (idx, le) in LATENCY_BUCKETS_MS.iter().enumerate() {
             cumulative += p.latency_buckets[idx].load(Ordering::Relaxed);
-            out.push_str(&format!(
-                "vidarax_infer_latency_ms_bucket{{provider=\"{name}\",le=\"{le}\"}} {cumulative}\n"
-            ));
+            let _ = writeln!(out, "vidarax_infer_latency_ms_bucket{{provider=\"{name}\",le=\"{le}\"}} {cumulative}");
         }
-        out.push_str(&format!(
-            "vidarax_infer_latency_ms_bucket{{provider=\"{name}\",le=\"+Inf\"}} {count}\n"
-        ));
-        out.push_str(&format!(
-            "vidarax_infer_latency_ms_sum{{provider=\"{name}\"}} {sum_ms}\n"
-        ));
-        out.push_str(&format!(
-            "vidarax_infer_latency_ms_count{{provider=\"{name}\"}} {count}\n"
-        ));
+        let _ = writeln!(out, "vidarax_infer_latency_ms_bucket{{provider=\"{name}\",le=\"+Inf\"}} {count}");
+        let _ = writeln!(out, "vidarax_infer_latency_ms_sum{{provider=\"{name}\"}} {sum_ms}");
+        let _ = writeln!(out, "vidarax_infer_latency_ms_count{{provider=\"{name}\"}} {count}");
 
         // SLO tracking baselines for dashboards/alerts.
-        out.push_str(&format!(
-            "vidarax_infer_slo_target_ratio{{provider=\"{name}\"}} 0.99\n"
-        ));
+        let _ = writeln!(out, "vidarax_infer_slo_target_ratio{{provider=\"{name}\"}} 0.99");
         let total = ok + err;
         let error_budget_remaining = if total == 0 {
             1.0
@@ -92,10 +77,7 @@ impl InferenceMetrics {
             let error_rate = err as f64 / total as f64;
             (0.01_f64 - error_rate).max(0.0) / 0.01_f64
         };
-        out.push_str(&format!(
-            "vidarax_infer_error_budget_remaining_ratio{{provider=\"{name}\"}} {:.6}\n",
-            error_budget_remaining
-        ));
+        let _ = writeln!(out, "vidarax_infer_error_budget_remaining_ratio{{provider=\"{name}\"}} {error_budget_remaining:.6}");
     }
 
     fn provider(&self, provider: ProviderKind) -> &ProviderMetrics {
