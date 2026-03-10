@@ -154,6 +154,10 @@ pub struct RealtimeReasonRequest {
     /// Duration of each video clip in seconds when `video_clip_mode` is true.
     /// Must be > 0.  Default: 0.5.
     pub video_clip_duration_s: Option<f32>,
+    /// Maximum number of concurrent VLM inference requests in parallel mode.
+    /// Higher values increase throughput but may cause queueing on the GPU.
+    /// Default: 4.
+    pub vlm_concurrency: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]

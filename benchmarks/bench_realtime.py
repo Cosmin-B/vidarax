@@ -12,28 +12,17 @@ Usage:
     python benchmarks/bench_realtime.py --api http://localhost:8080 --fps 2 --chunk-size 10
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WHIP STREAMING ANALYSIS (from crates/vidarax-api/src/whip.rs)
+# NOTE ON APPROACH
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# The WHIP endpoint (POST /v1/stream/whip) implements RFC 9725 WebRTC-HTTP
-# Ingestion Protocol:
-#   1. Client POSTs an SDP offer (Content-Type: application/sdp)
-#   2. Server returns 201 + SDP answer + Location: /v1/stream/whip/{sess_id}
-#   3. Client sends trickle ICE candidates via PATCH /v1/stream/whip/{sess_id}
-#   4. Client DELETEs /v1/stream/whip/{sess_id} to terminate
+# The WHIP endpoint (POST /v1/stream/whip) now has a full pipeline wired:
+#   session.run(frame_tx) → spawn_decode_workers → spawn_analysis_workers →
+#   spawn_vlm_workers.  Frames are decoded and reach VLM workers; results
+#   appear in WAL events via GET /v1/runs/{id}/events.
 #
-# VERDICT: Full WebRTC via WHIP is NOT suitable for a simple benchmark harness.
-# Reasons:
-#   - Requires a real WebRTC stack (ICE negotiation, DTLS-SRTP, RTP packetizing)
-#   - The drain task in whip.rs (line 178-189) currently DISCARDS all incoming
-#     H.264 NAL units — the decode pipeline (x02.3) is not yet wired in.
-#     Sending frames via WHIP would produce no detections at all right now.
-#   - There is no simpler "chunked HTTP frame upload" path on the WHIP handler;
-#     it only speaks full WebRTC signalling.
-#   - The prompt-update endpoint (PATCH .../prompt) is interesting for live
-#     reconfiguration but is irrelevant until the decode pipeline lands.
-#
-# CHOSEN APPROACH: Approach 3 — /reason + event polling
+# However, WHIP requires a real WebRTC stack (ICE, DTLS-SRTP, RTP) which is
+# too heavy for a simple benchmark harness.  This script uses /reason + event
+# polling instead:
 #   - POST to /v1/runs/{id}/reason with source_uri=file:///tmp/...
 #   - Poll /v1/runs/{id}/events every 200ms
 #   - Capture semantic_chunk_inferred events with non-empty raw_output

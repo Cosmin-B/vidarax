@@ -760,10 +760,10 @@ pub fn build_select_expr(indices: &[u64]) -> String {
 
 /// Extract a short MP4 clip from `source` starting at `start_s` for `duration_s` seconds.
 ///
-/// The clip is written to stdout by ffmpeg (`pipe:1`) so no temporary files are
-/// created.  Uses `-c copy` (stream copy) when the source is a local file path
-/// so the operation is near-instant; falls back to `-c:v libx264 -preset ultrafast`
-/// for remote/HLS sources where a re-encode is required.
+/// Uses `-c copy` (stream copy) when the source is a local file path so the
+/// operation is near-instant; falls back to `-c:v libx264 -preset ultrafast`
+/// for remote/HLS sources where a re-encode is required.  Output is written to
+/// a temporary file (MP4 requires seekable output) then read back.
 ///
 /// Returns the raw MP4 bytes on success.
 ///
@@ -796,9 +796,14 @@ pub fn extract_video_clip(
     let start_str = format!("{start_s:.6}");
     let duration_str = format!("{duration_s:.6}");
 
+    // For local files use stream copy (near-instant, no re-encode).
+    // Remote/HLS sources need a re-encode to produce a self-contained clip.
+    let use_stream_copy = matches!(source, InputSource::FilePath(_));
+
     // MP4 requires seekable output, so we write to a temp file and read back.
     let tmp = std::env::temp_dir().join(format!(
-        "vidarax_clip_{}.mp4",
+        "vidarax_clip_{}_{}.mp4",
+        std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -806,21 +811,38 @@ pub fn extract_video_clip(
     ));
     let tmp_str = tmp.to_string_lossy().to_string();
 
-    let output = Command::new(ffmpeg_path())
-        .args([
-            "-v", "error",
-            "-protocol_whitelist", FFMPEG_PROTOCOL_WHITELIST,
-            "-ss", &start_str,
-            "-t", &duration_str,
-            "-i", source_uri,
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-an",
-            "-y",
-            &tmp_str,
-        ])
-        .output()
-        .map_err(|_| "failed to run ffmpeg".to_string())?;
+    let output = if use_stream_copy {
+        Command::new(ffmpeg_path())
+            .args([
+                "-v", "error",
+                "-protocol_whitelist", FFMPEG_PROTOCOL_WHITELIST,
+                "-ss", &start_str,
+                "-t", &duration_str,
+                "-i", source_uri,
+                "-c", "copy",
+                "-movflags", "+faststart",
+                "-y",
+                &tmp_str,
+            ])
+            .output()
+            .map_err(|_| "failed to run ffmpeg".to_string())?
+    } else {
+        Command::new(ffmpeg_path())
+            .args([
+                "-v", "error",
+                "-protocol_whitelist", FFMPEG_PROTOCOL_WHITELIST,
+                "-ss", &start_str,
+                "-t", &duration_str,
+                "-i", source_uri,
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-an",
+                "-y",
+                &tmp_str,
+            ])
+            .output()
+            .map_err(|_| "failed to run ffmpeg".to_string())?
+    };
 
     if !output.status.success() {
         let _ = std::fs::remove_file(&tmp);

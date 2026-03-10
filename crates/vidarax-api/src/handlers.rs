@@ -1325,22 +1325,31 @@ pub async fn reason_realtime_run(
             .unwrap_or_default();
 
         // In video_clip_mode, extract an MP4 segment covering this chunk's
-        // time window.  Clip boundaries are derived from chunk index and the
-        // requested clip duration, independent of frame PTS, so every chunk
-        // receives exactly `video_clip_duration_s` seconds of footage even
-        // if the source FPS is unknown at this point.
+        // time window.  Clip start is derived from actual frame PTS so the
+        // VLM sees footage matching the decoded frames, not sequential offsets.
+        let pts_start_ms_for_clip = chunk.first().map(|f| f.pts_ms).unwrap_or(0);
         let chunk_video_clip: Option<Vec<u8>> = if video_clip_mode && semantic_decode_enabled {
-            let clip_start = chunk_idx as f32 * video_clip_duration_s;
-            match extract_video_clip(&decode_source_ref, clip_start, video_clip_duration_s) {
-                Ok(bytes) => Some(bytes),
-                Err(err) => {
+            let clip_start = pts_start_ms_for_clip as f32 / 1000.0;
+            let source_for_clip = decode_source_ref.clone();
+            let duration = video_clip_duration_s;
+            match tokio::task::spawn_blocking(move || {
+                extract_video_clip(&source_for_clip, clip_start, duration)
+            })
+            .await
+            {
+                Ok(Ok(bytes)) => Some(bytes),
+                Ok(Err(err)) => {
                     tracing::warn!(
                         chunk_idx,
-                        clip_start,
+                        clip_start_ms = pts_start_ms_for_clip,
                         duration = video_clip_duration_s,
                         error = %err,
                         "video clip extraction failed for chunk; falling back to no-video"
                     );
+                    None
+                }
+                Err(err) => {
+                    tracing::warn!(chunk_idx, error = %err, "clip extraction task panicked");
                     None
                 }
             }
@@ -1437,7 +1446,8 @@ pub async fn reason_realtime_run(
             }
         } else {
             // Parallel mode (default): fire all chunks concurrently.
-            let sem = Arc::new(tokio::sync::Semaphore::new(16));
+            let vlm_concurrency = payload.vlm_concurrency.unwrap_or(4).clamp(1, 64);
+            let sem = Arc::new(tokio::sync::Semaphore::new(vlm_concurrency));
             let mut join_set: JoinSet<(usize, ChunkSemanticResult, Instant)> = JoinSet::new();
 
             for (chunk_idx, prep) in chunk_preps.iter().enumerate() {
