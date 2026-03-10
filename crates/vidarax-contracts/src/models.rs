@@ -29,6 +29,14 @@ pub const REQUIRED_MODELS: &[&str] = &[
     "LiquidAI/LFM2.5-VL-1.6B",
 ];
 
+/// Canonical Gemini model IDs recognised by Vidarax.
+pub const GEMINI_MODELS: &[&str] = &[
+    "gemini-2.5-flash-preview-05-20",
+    "gemini-2.5-pro-preview-05-06",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+];
+
 pub fn normalize_model_id(input: &str) -> Option<&'static str> {
     if input.len() > 64 {
         return None;
@@ -51,6 +59,13 @@ pub fn normalize_model_id(input: &str) -> Option<&'static str> {
         "openbmb/minicpm-v-4_5" | "openbmb/minicpm-v-4.5" => Some("openbmb/MiniCPM-V-4_5"),
         "liquidai/lfm2-vl-450m" => Some("LiquidAI/LFM2-VL-450M"),
         "liquidai/lfm2.5-vl-1.6b" | "lfm2.5-vl-1.6b-q4_0.gguf" => Some("LiquidAI/LFM2.5-VL-1.6B"),
+        // Gemini cloud models — short aliases map to their canonical preview IDs.
+        "gemini-2.5-flash" | "gemini-2.5-flash-preview-05-20" => {
+            Some("gemini-2.5-flash-preview-05-20")
+        }
+        "gemini-2.5-pro" | "gemini-2.5-pro-preview-05-06" => Some("gemini-2.5-pro-preview-05-06"),
+        "gemini-2.0-flash" => Some("gemini-2.0-flash"),
+        "gemini-2.0-flash-lite" => Some("gemini-2.0-flash-lite"),
         _ => None,
     }
 }

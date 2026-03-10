@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
+use crate::gemini::GeminiProvider;
 use crate::provider::{HttpTransport, InferenceProvider, OpenAiCompatProvider, ProviderKind, ProviderRouter};
 
 // ── Config structs ────────────────────────────────────────────────────────────
@@ -181,7 +182,25 @@ fn build_single_provider(
 
             Ok(Box::new(OpenAiCompatProvider::new(transport, kind)))
         }
-        "gemini" => Err("gemini backend not yet implemented".to_string()),
+        "gemini" => {
+            let api_key = interpolate_env_vars(entry.api_key.as_deref().unwrap_or(""));
+            let model = interpolate_env_vars(
+                entry
+                    .model
+                    .as_deref()
+                    .unwrap_or("gemini-2.5-flash-preview-05-20"),
+            );
+            if api_key.is_empty() || api_key.contains("${") {
+                return Err(format!(
+                    "backend '{}': gemini requires api_key",
+                    entry.name
+                ));
+            }
+            Ok(Box::new(
+                GeminiProvider::new(api_key, model)
+                    .map_err(|e| format!("backend '{}': {e:?}", entry.name))?,
+            ))
+        }
         other => Err(format!("backend '{}': unknown type '{other}'", entry.name)),
     }
 }
@@ -322,19 +341,50 @@ base_url = "${_VDX_TEST_URL}"
     }
 
     #[test]
-    fn build_chain_gemini_returns_not_implemented_err() {
+    fn build_chain_gemini_succeeds_with_api_key() {
         let entry = BackendEntry {
             name: "gemini".into(),
             backend_type: "gemini".into(),
             base_url: None,
-            api_key: Some("key".into()),
+            api_key: Some("test-api-key".into()),
             model: Some("gemini-2.5-flash".into()),
             priority: 1,
         };
         let result = build_provider_chain(&[entry]);
-        assert!(result.is_err(), "gemini should return an error");
+        assert!(result.is_ok(), "gemini with api_key should succeed, got: {:?}", result.err());
+        assert_eq!(result.unwrap().kind(), ProviderKind::Gemini);
+    }
+
+    #[test]
+    fn build_chain_gemini_missing_api_key_returns_err() {
+        let entry = BackendEntry {
+            name: "gemini".into(),
+            backend_type: "gemini".into(),
+            base_url: None,
+            api_key: None,
+            model: Some("gemini-2.5-flash".into()),
+            priority: 1,
+        };
+        let result = build_provider_chain(&[entry]);
+        assert!(result.is_err(), "gemini without api_key should fail");
         let err = result.err().unwrap();
-        assert!(err.contains("not yet implemented"), "expected not-yet-implemented, got: {err}");
+        assert!(err.contains("api_key"), "expected api_key error, got: {err}");
+    }
+
+    #[test]
+    fn build_chain_gemini_unresolved_env_var_api_key_returns_err() {
+        // Ensure the env var is not set so ${...} remains unresolved.
+        std::env::remove_var("_VDX_NONEXISTENT_GEMINI_KEY");
+        let entry = BackendEntry {
+            name: "gemini".into(),
+            backend_type: "gemini".into(),
+            base_url: None,
+            api_key: Some("${_VDX_NONEXISTENT_GEMINI_KEY}".into()),
+            model: None,
+            priority: 1,
+        };
+        let result = build_provider_chain(&[entry]);
+        assert!(result.is_err(), "unresolved api_key should fail");
     }
 
     #[test]
