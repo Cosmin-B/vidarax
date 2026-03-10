@@ -5,6 +5,46 @@ use std::sync::Arc;
 use vidarax_core::ingest::pipeline::PipelineBackend;
 use vidarax_core::tiered_vlm::DistillationConfig;
 
+/// Load the backend config from a TOML file, falling back to legacy env vars.
+///
+/// Reads `config_path` (default: `"vidarax.toml"`).  If the file is absent or
+/// unreadable the function synthesises a [`vidarax_core::backends::VidaraxConfig`]
+/// from the legacy `VIDARAX_VLLM_BASE_URL` / `VIDARAX_SGLANG_BASE_URL` env vars
+/// so that existing deployments continue to work unchanged.
+pub fn load_backend_config(config_path: &str) -> Result<vidarax_core::backends::VidaraxConfig, String> {
+    match std::fs::read_to_string(config_path) {
+        Ok(contents) => vidarax_core::backends::parse_config(&contents),
+        Err(_) => {
+            // Fallback: synthesise config from legacy env vars so that deployments
+            // that don't have a vidarax.toml continue to work.
+            let vllm = std::env::var("VIDARAX_VLLM_BASE_URL").ok();
+            let sglang = std::env::var("VIDARAX_SGLANG_BASE_URL").ok();
+            let mut backends = Vec::new();
+            if let Some(url) = vllm {
+                backends.push(vidarax_core::backends::BackendEntry {
+                    name: "vllm".to_string(),
+                    backend_type: "openai_compat".to_string(),
+                    base_url: Some(url),
+                    api_key: None,
+                    model: None,
+                    priority: 1,
+                });
+            }
+            if let Some(url) = sglang {
+                backends.push(vidarax_core::backends::BackendEntry {
+                    name: "sglang".to_string(),
+                    backend_type: "openai_compat".to_string(),
+                    base_url: Some(url),
+                    api_key: None,
+                    model: None,
+                    priority: 2,
+                });
+            }
+            Ok(vidarax_core::backends::VidaraxConfig { backends })
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportMode {
     H1H2,

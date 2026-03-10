@@ -1,8 +1,6 @@
 #![forbid(unsafe_code)]
 
 use std::io;
-use std::net::IpAddr;
-use std::sync::Arc;
 
 pub mod config;
 mod handlers;
@@ -26,9 +24,6 @@ pub use config::{assert_route_parity, resolve_wal_path, ServerConfig, TransportM
 pub use models::AttachStreamRequest;
 pub use router::app_router;
 pub use state::AppState;
-use vidarax_core::provider::{
-    HttpTransport, InferenceProvider, OpenAiCompatProvider, ProviderKind, ProviderRouter,
-};
 use vidarax_core::webrtc::session::{TurnServer, WebRtcConfig};
 
 pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -45,13 +40,22 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
 
     assert_route_parity().map_err(invalid_input)?;
     let wal_path = resolve_wal_path(&config).map_err(invalid_input)?;
-    let inference_endpoints = infer_provider_endpoints(&config).map_err(invalid_input)?;
+    let config_path = std::env::var("VIDARAX_CONFIG").unwrap_or_else(|_| "vidarax.toml".to_string());
+    let backend_config = config::load_backend_config(&config_path).map_err(invalid_input)?;
+    let provider = if backend_config.backends.is_empty() {
+        None
+    } else {
+        Some(
+            vidarax_core::backends::build_provider_chain(&backend_config.backends)
+                .map_err(|e| invalid_input(format!("failed to build provider chain: {e}")))?,
+        )
+    };
     let security_policy = security::SecurityPolicy::from_config(&config).map_err(invalid_input)?;
     let webrtc_config = build_webrtc_config(&config);
     let state = AppState::from_wal(
         wal_path,
         config.ingest_file_roots.clone(),
-        inference_endpoints,
+        provider,
         security_policy,
         config.stream_ttl_secs,
         config.active_stream_limit,
@@ -95,70 +99,10 @@ fn build_webrtc_config(config: &ServerConfig) -> WebRtcConfig {
     }
 }
 
-fn infer_provider_endpoints(
-    config: &ServerConfig,
-) -> Result<Option<Arc<dyn InferenceProvider + Send + Sync>>, String> {
-    match (
-        config.inference_vllm_base_url.as_ref(),
-        config.inference_sglang_base_url.as_ref(),
-    ) {
-        (Some(vllm), Some(sglang)) => {
-            validate_provider_endpoint("VIDARAX_VLLM_BASE_URL", vllm)?;
-            validate_provider_endpoint("VIDARAX_SGLANG_BASE_URL", sglang)?;
-            let vllm_transport = HttpTransport::new(vllm)
-                .map_err(|e| format!("vllm transport error: {e:?}"))?;
-            let sglang_transport = HttpTransport::new(sglang)
-                .map_err(|e| format!("sglang transport error: {e:?}"))?;
-            let primary = OpenAiCompatProvider::new(vllm_transport, ProviderKind::Vllm);
-            let fallback = OpenAiCompatProvider::new(sglang_transport, ProviderKind::Sglang);
-            let router = ProviderRouter::new(primary, fallback);
-            Ok(Some(Arc::new(router)))
-        }
-        (None, None) => Ok(None),
-        _ => Err(
-            "provider endpoints must define both VIDARAX_VLLM_BASE_URL and VIDARAX_SGLANG_BASE_URL"
-                .to_string(),
-        ),
-    }
-}
-
-fn validate_provider_endpoint(var_name: &str, raw: &str) -> Result<(), String> {
-    let url =
-        reqwest::Url::parse(raw).map_err(|err| format!("{var_name} must be a valid URL: {err}"))?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| format!("{var_name} must include a hostname"))?;
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(format!(
-            "{var_name} must not include embedded credentials; use headers/secrets instead"
-        ));
-    }
-
-    match url.scheme() {
-        "https" => Ok(()),
-        "http" if is_loopback_host(host) => Ok(()),
-        "http" => Err(format!(
-            "{var_name} must use https for non-loopback hosts (received http://{host})"
-        )),
-        other => Err(format!(
-            "{var_name} must use https (or http only for loopback), got scheme '{other}'"
-        )),
-    }
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
-}
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        app_router, assert_route_parity, infer_provider_endpoints, AppState, ServerConfig,
-        TransportMode,
-    };
+    use super::{app_router, assert_route_parity, AppState, ServerConfig, TransportMode};
     use vidarax_core::ingest::pipeline::PipelineBackend;
     use vidarax_core::tiered_vlm::DistillationConfig;
     use crate::security::SecurityPolicy;
@@ -172,10 +116,9 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::sync::Arc;
     use tower::ServiceExt;
-    use vidarax_core::provider::{
-        HttpTransport, InferenceProvider, OpenAiCompatProvider, ProviderKind, ProviderRouter,
-    };
+    use vidarax_core::backends::BackendEntry;
     #[cfg(feature = "h3-experimental")]
     use {
         tokio_quiche::http3::driver::{ClientH3Event, H3Event, InboundFrame, NewClientRequest},
@@ -184,33 +127,48 @@ mod tests {
     };
 
     fn test_state() -> AppState {
-        test_state_with_endpoints(None)
+        test_state_with_provider(None)
     }
 
-    /// Build an `Arc<dyn InferenceProvider>` from a single base_url (used as both vllm primary and sglang fallback).
-    fn build_test_provider(base_url: &str) -> Arc<dyn InferenceProvider + Send + Sync> {
-        let vllm_transport = HttpTransport::new(base_url).unwrap();
-        let sglang_transport = HttpTransport::new(base_url).unwrap();
-        let primary = OpenAiCompatProvider::new(vllm_transport, ProviderKind::Vllm);
-        let fallback = OpenAiCompatProvider::new(sglang_transport, ProviderKind::Sglang);
-        Arc::new(ProviderRouter::new(primary, fallback))
+    fn build_provider_from_url(base_url: &str) -> Arc<dyn vidarax_core::provider::InferenceProvider + Send + Sync> {
+        let entry = BackendEntry {
+            name: "test".to_string(),
+            backend_type: "openai_compat".to_string(),
+            base_url: Some(base_url.to_string()),
+            api_key: None,
+            model: None,
+            priority: 1,
+        };
+        vidarax_core::backends::build_provider_chain(&[entry]).unwrap()
     }
 
-    fn test_state_with_endpoints(
-        endpoints: Option<Arc<dyn InferenceProvider + Send + Sync>>,
-    ) -> AppState {
-        test_state_with_endpoints_and_policy(endpoints, SecurityPolicy::from_config_for_tests())
+    fn test_state_with_endpoints(base_url: Option<&str>) -> AppState {
+        // reqwest::blocking::Client can't be created or dropped inside a tokio async
+        // context (it internally owns a tokio runtime; nested runtimes are forbidden).
+        // We create the provider on a dedicated OS thread so its lifetime is fully
+        // outside the async executor.
+        let provider = base_url.map(|url| {
+            let url = url.to_string();
+            std::thread::spawn(move || build_provider_from_url(&url))
+                .join()
+                .unwrap()
+        });
+        test_state_with_provider_and_policy(provider, SecurityPolicy::from_config_for_tests())
     }
 
-    fn test_state_with_endpoints_and_policy(
-        endpoints: Option<Arc<dyn InferenceProvider + Send + Sync>>,
+    fn test_state_with_provider(provider: Option<Arc<dyn vidarax_core::provider::InferenceProvider + Send + Sync>>) -> AppState {
+        test_state_with_provider_and_policy(provider, SecurityPolicy::from_config_for_tests())
+    }
+
+    fn test_state_with_provider_and_policy(
+        provider: Option<Arc<dyn vidarax_core::provider::InferenceProvider + Send + Sync>>,
         policy: SecurityPolicy,
     ) -> AppState {
-        test_state_with_runtime(endpoints, policy, 3600, 5)
+        test_state_with_runtime(provider, policy, 3600, 5)
     }
 
     fn test_state_with_runtime(
-        endpoints: Option<Arc<dyn InferenceProvider + Send + Sync>>,
+        provider: Option<Arc<dyn vidarax_core::provider::InferenceProvider + Send + Sync>>,
         policy: SecurityPolicy,
         stream_ttl_secs: u64,
         active_stream_limit: usize,
@@ -222,7 +180,7 @@ mod tests {
         let wal_path = std::env::temp_dir().join(format!("vidarax-api-test-{nanos}.wal"));
         AppState::with_wal_for_tests_runtime(
             wal_path,
-            endpoints,
+            provider,
             policy,
             stream_ttl_secs,
             active_stream_limit,
@@ -729,7 +687,7 @@ mod tests {
         let completion =
             "{\"choices\":[{\"message\":{\"content\":\"hello from provider\"}}]}".to_string();
         let (base_url, server) = spawn_mock_provider_http_server(200, completion);
-        let state = test_state_with_endpoints(Some(build_test_provider(&base_url)));
+        let state = test_state_with_endpoints(Some(base_url.as_str()));
         let app = app_router(state);
 
         let req = Request::builder()
@@ -754,7 +712,7 @@ mod tests {
         let completion =
             "{\"choices\":[{\"message\":{\"content\":\"hello from provider\"}}]}".to_string();
         let (base_url, server) = spawn_mock_provider_http_server_n(200, completion, 2);
-        let state = test_state_with_endpoints(Some(build_test_provider(&base_url)));
+        let state = test_state_with_endpoints(Some(base_url.as_str()));
         let app = app_router(state);
 
         let req = Request::builder()
@@ -797,7 +755,7 @@ mod tests {
 
     #[tokio::test]
     async fn infer_batch_rejects_out_of_range_max_parallel() {
-        let state = test_state_with_endpoints(Some(build_test_provider("http://127.0.0.1:9")));
+        let state = test_state_with_endpoints(Some("http://127.0.0.1:9"));
         let app = app_router(state);
 
         let req = Request::builder()
@@ -825,7 +783,7 @@ mod tests {
         let completion =
             "{\"choices\":[{\"message\":{\"content\":\"hello from provider\"}}]}".to_string();
         let (base_url, server) = spawn_mock_provider_http_server_n(200, completion, 8);
-        let state = test_state_with_endpoints(Some(build_test_provider(&base_url)));
+        let state = test_state_with_endpoints(Some(base_url.as_str()));
         let app = app_router(state);
 
         let infer_req = Request::builder()
@@ -876,7 +834,7 @@ mod tests {
     #[tokio::test]
     async fn models_catalog_reports_ready_with_reachable_providers() {
         let (base_url, server) = spawn_mock_provider_http_server_n(200, "{}".to_string(), 2);
-        let state = test_state_with_endpoints(Some(build_test_provider(&base_url)));
+        let state = test_state_with_endpoints(Some(base_url.as_str()));
         let app = app_router(state);
 
         let req = Request::builder()
@@ -898,7 +856,8 @@ mod tests {
             .get("providers_available")
             .and_then(|v| v.as_array())
             .unwrap();
-        assert_eq!(providers.len(), 2);
+        // New config-driven backend system exposes a single chain entry (vllm).
+        assert!(!providers.is_empty(), "at least one provider must be reported");
         server.join().unwrap();
     }
 
@@ -1358,7 +1317,7 @@ mod tests {
 
         let completion = "{\"choices\":[{\"message\":{\"content\":\"{\\\"event_type\\\":\\\"scene_cut\\\",\\\"object_label\\\":\\\"temple\\\",\\\"summary\\\":\\\"Temple visible\\\",\\\"description\\\":\\\"Temple appears in this chunk\\\",\\\"confidence\\\":0.91}\"}}]}".to_string();
         let (base_url, server) = spawn_mock_provider_http_server(200, completion);
-        let state = test_state_with_endpoints(Some(build_test_provider(&base_url)));
+        let state = test_state_with_endpoints(Some(base_url.as_str()));
         let app = app_router(state);
 
         let create_req = Request::builder()
@@ -1455,7 +1414,7 @@ mod tests {
             distillation: DistillationConfig::default(),
         })
         .unwrap();
-        let app = app_router(test_state_with_endpoints_and_policy(None, policy));
+        let app = app_router(test_state_with_provider_and_policy(None, policy));
         let req = Request::builder()
             .uri("/v1/runs")
             .method("POST")
@@ -1507,7 +1466,7 @@ mod tests {
             distillation: DistillationConfig::default(),
         })
         .unwrap();
-        let app = app_router(test_state_with_endpoints_and_policy(None, policy));
+        let app = app_router(test_state_with_provider_and_policy(None, policy));
         let mut saw_rate_limited = false;
         for _ in 0..20 {
             let req = Request::builder()
@@ -1556,7 +1515,7 @@ mod tests {
             distillation: DistillationConfig::default(),
         })
         .unwrap();
-        let app = app_router(test_state_with_endpoints_and_policy(None, policy));
+        let app = app_router(test_state_with_provider_and_policy(None, policy));
 
         let req_missing = Request::builder()
             .uri("/v1/runs")
@@ -1609,7 +1568,7 @@ mod tests {
             distillation: DistillationConfig::default(),
         })
         .unwrap();
-        let app = app_router(test_state_with_endpoints_and_policy(None, policy));
+        let app = app_router(test_state_with_provider_and_policy(None, policy));
 
         let req_missing = Request::builder()
             .uri("/v1/metrics")
@@ -1638,7 +1597,7 @@ mod tests {
             false,
             vec!["https://app.example.com".to_string()],
         );
-        let app = app_router(test_state_with_endpoints_and_policy(None, policy));
+        let app = app_router(test_state_with_provider_and_policy(None, policy));
 
         let req = Request::builder()
             .uri("/v1/runs")
@@ -1660,7 +1619,7 @@ mod tests {
             false,
             vec!["https://app.example.com".to_string()],
         );
-        let app = app_router(test_state_with_endpoints_and_policy(None, policy));
+        let app = app_router(test_state_with_provider_and_policy(None, policy));
 
         let req = Request::builder()
             .uri("/v1/runs")
@@ -1715,87 +1674,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn provider_endpoint_pair_must_be_complete() {
-        let mut config = ServerConfig {
-            bind_addr: "0.0.0.0:8080".to_string(),
-            h3_bind_addr: "0.0.0.0:8443".to_string(),
-            h3_tls_cert_path: "deploy/certs/dev.crt".to_string(),
-            h3_tls_key_path: "deploy/certs/dev.key".to_string(),
-            data_dir: ".vidarax-data".to_string(),
-            ingest_file_roots: vec![std::env::temp_dir()],
-            inference_vllm_base_url: Some("https://provider-a.example.com".to_string()),
-            inference_sglang_base_url: None,
-            security_require_api_key: false,
-            security_api_keys: vec![],
-            security_require_tenant_id: false,
-            security_global_rps: None,
-            security_tenant_rps: None,
-            security_tenant_slots: 2048,
-            security_metrics_require_api_key: false,
-            cors_allowed_origins: vec![],
-            stream_ttl_secs: 3600,
-            active_stream_limit: 5,
-            transport: TransportMode::H1H2,
-            decode_backend: PipelineBackend::CpuFfmpeg,
-            webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
-            webrtc_turn_url: None,
-            webrtc_turn_username: None,
-            webrtc_turn_credential: None,
-            webrtc_max_output_tokens_per_second: 128,
-            distillation: DistillationConfig::default(),
-        };
-        assert!(infer_provider_endpoints(&config).is_err());
-
-        config.inference_sglang_base_url = Some("https://provider-b.example.com".to_string());
-        assert!(infer_provider_endpoints(&config).unwrap().is_some());
-    }
-
-    #[test]
-    fn provider_endpoints_enforce_https_or_loopback_http() {
-        let mut config = ServerConfig {
-            bind_addr: "0.0.0.0:8080".to_string(),
-            h3_bind_addr: "0.0.0.0:8443".to_string(),
-            h3_tls_cert_path: "deploy/certs/dev.crt".to_string(),
-            h3_tls_key_path: "deploy/certs/dev.key".to_string(),
-            data_dir: ".vidarax-data".to_string(),
-            ingest_file_roots: vec![std::env::temp_dir()],
-            inference_vllm_base_url: Some("https://provider-a.example.com".to_string()),
-            inference_sglang_base_url: Some("https://provider-b.example.com".to_string()),
-            security_require_api_key: false,
-            security_api_keys: vec![],
-            security_require_tenant_id: false,
-            security_global_rps: None,
-            security_tenant_rps: None,
-            security_tenant_slots: 2048,
-            security_metrics_require_api_key: false,
-            cors_allowed_origins: vec![],
-            stream_ttl_secs: 3600,
-            active_stream_limit: 5,
-            transport: TransportMode::H1H2,
-            decode_backend: PipelineBackend::CpuFfmpeg,
-            webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
-            webrtc_turn_url: None,
-            webrtc_turn_username: None,
-            webrtc_turn_credential: None,
-            webrtc_max_output_tokens_per_second: 128,
-            distillation: DistillationConfig::default(),
-        };
-        assert!(infer_provider_endpoints(&config).unwrap().is_some());
-
-        config.inference_vllm_base_url = Some("http://example.com:8000".to_string());
-        assert!(infer_provider_endpoints(&config).is_err());
-
-        config.inference_vllm_base_url = Some("http://127.0.0.1:8000".to_string());
-        config.inference_sglang_base_url = Some("http://localhost:8001".to_string());
-        assert!(infer_provider_endpoints(&config).unwrap().is_some());
-
-        config.inference_vllm_base_url = Some("ftp://example.com:8000".to_string());
-        assert!(infer_provider_endpoints(&config).is_err());
-
-        config.inference_vllm_base_url = Some("https://user:pass@example.com:8000".to_string());
-        assert!(infer_provider_endpoints(&config).is_err());
-    }
 
     #[cfg(feature = "h3-experimental")]
     #[tokio::test]

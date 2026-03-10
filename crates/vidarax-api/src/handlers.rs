@@ -19,8 +19,7 @@ use vidarax_core::ingest::{
 };
 use vidarax_core::pipeline::{FrameMetadata, TwoPassConfig, TwoPassPipeline};
 use vidarax_core::provider::{
-    InferenceImage, InferenceProvider, InferenceRequest, InferenceResult, InferenceVideo,
-    ProviderError, ProviderKind,
+    InferenceImage, InferenceProvider, InferenceRequest, InferenceVideo, ProviderError, ProviderKind,
 };
 use vidarax_core::timeline::TimelineEvent;
 
@@ -580,7 +579,7 @@ pub async fn infer(
     headers: HeaderMap,
     Json(payload): Json<InferRequest>,
 ) -> impl IntoResponse {
-    if state.inference_provider().is_none() {
+    if state.provider().is_none() {
         return internal_error(
             &state,
             "inference providers are not configured; set VIDARAX_VLLM_BASE_URL and VIDARAX_SGLANG_BASE_URL",
@@ -603,7 +602,7 @@ pub async fn infer_batch(
     headers: HeaderMap,
     Json(payload): Json<InferBatchRequest>,
 ) -> impl IntoResponse {
-    if state.inference_provider().is_none() {
+    if state.provider().is_none() {
         return internal_error(
             &state,
             "inference providers are not configured; set VIDARAX_VLLM_BASE_URL and VIDARAX_SGLANG_BASE_URL",
@@ -1166,7 +1165,7 @@ pub async fn reason_realtime_run(
         );
     }
 
-    let semantic_decode_enabled = semantic_inference && state.inference_provider().is_some();
+    let semantic_decode_enabled = semantic_inference && state.provider().is_some();
     // Keep a clone of the source for video clip extraction in Phase 1 (decode_source
     // is moved into the spawn_blocking closure below).
     let decode_source_ref = decode_source.clone();
@@ -1272,7 +1271,7 @@ pub async fn reason_realtime_run(
     let mut metadata = Vec::with_capacity(decoded.frame_signals.len());
     let mut marker_inputs = Vec::with_capacity(decoded.frame_signals.len());
     let mut chunk_lags = Vec::new();
-    let providers = state.inference_provider().cloned();
+    let providers = state.provider().cloned();
     let semantic_available = semantic_inference && providers.is_some();
     let semantic_segment_ms = payload.segment_ms.unwrap_or(250);
     if semantic_inference && !semantic_available {
@@ -1403,7 +1402,7 @@ pub async fn reason_realtime_run(
                 let prev_jpeg_ref = if visual_diff { last_jpeg.as_deref() } else { None };
 
                 let result = infer_chunk_semantics(
-                    providers.as_ref(),
+                    providers.clone(),
                     true,
                     semantic_primary_provider,
                     &model,
@@ -1464,7 +1463,7 @@ pub async fn reason_realtime_run(
                 join_set.spawn(async move {
                     let _permit = sem_c.acquire().await.unwrap();
                     let overlay = infer_chunk_semantics(
-                        providers_c.as_ref(),
+                        providers_c,
                         true,
                         semantic_primary_provider,
                         model,
@@ -1719,11 +1718,11 @@ pub async fn get_markers(
 
 pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
     let request_id = state.next_request_id();
-    let endpoints = state.inference_provider().cloned();
+    let provider = state.provider().cloned();
     let is_saturated = state.inference_metrics().is_high_latency();
     let availability =
         match tokio::task::spawn_blocking(move || {
-            runtime_model_availability(endpoints, is_saturated)
+            runtime_model_availability(provider, is_saturated)
         })
         .await
         {
@@ -2175,21 +2174,12 @@ async fn validate_infer_request(
     })
 }
 
-/// Build a provider router from raw endpoints and run a single inference call.
-/// Forward an inference request to the pre-built provider.
-fn infer_with_provider(
-    provider: &dyn InferenceProvider,
-    request: &InferenceRequest,
-) -> Result<InferenceResult, ProviderError> {
-    provider.infer(request)
-}
-
 async fn execute_infer_request(
     state: AppState,
     prepared: PreparedInferRequest,
 ) -> Result<InferResponse, InferExecutionError> {
     let provider = state
-        .inference_provider()
+        .provider()
         .cloned()
         .ok_or(InferExecutionError {
             code: "internal_error",
@@ -2201,10 +2191,7 @@ async fn execute_infer_request(
     let primary_provider_for_metrics = prepared.primary_provider;
     let request_for_provider = prepared.request.clone();
     let result = match tokio::task::spawn_blocking(move || {
-        infer_with_provider(
-            &*provider,
-            &request_for_provider,
-        )
+        provider.infer(&request_for_provider)
     })
     .await
     {
@@ -2890,7 +2877,7 @@ fn load_decoded_signals_from_events(events: &[TimelineEvent]) -> Result<DecodedS
 
 #[allow(clippy::too_many_arguments)]
 async fn infer_chunk_semantics(
-    providers: Option<&Arc<dyn InferenceProvider + Send + Sync>>,
+    providers: Option<Arc<dyn InferenceProvider + Send + Sync>>,
     semantic_available: bool,
     _primary_provider: ProviderKind,
     _model: &str,
@@ -2916,7 +2903,7 @@ async fn infer_chunk_semantics(
         used_fallback: false,
         ..ChunkSemanticResult::default()
     };
-    let Some(provider) = providers.cloned() else {
+    let Some(provider) = providers else {
         result.used_fallback = true;
         result.error = Some("provider_not_configured".to_string());
         return result;
@@ -2985,7 +2972,7 @@ async fn infer_chunk_semantics(
 
     let first_result = match tokio::task::spawn_blocking({
         let provider = Arc::clone(&provider);
-        move || infer_with_provider(&*provider, &first_request)
+        move || provider.infer(&first_request)
     })
     .await
     {
@@ -3023,7 +3010,7 @@ async fn infer_chunk_semantics(
                 guided_json: guided_json_arc,
             };
             match tokio::task::spawn_blocking(move || {
-                infer_with_provider(&*provider, &second_request)
+                provider.infer(&second_request)
             })
             .await
             {

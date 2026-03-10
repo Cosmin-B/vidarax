@@ -7,6 +7,7 @@ const LATENCY_BUCKETS_MS: [u64; 10] = [10, 25, 50, 100, 250, 500, 1000, 2500, 50
 pub struct InferenceMetrics {
     vllm: ProviderMetrics,
     sglang: ProviderMetrics,
+    gemini: ProviderMetrics,
 }
 
 impl InferenceMetrics {
@@ -14,6 +15,7 @@ impl InferenceMetrics {
         Self {
             vllm: ProviderMetrics::new(),
             sglang: ProviderMetrics::new(),
+            gemini: ProviderMetrics::new(),
         }
     }
 
@@ -37,13 +39,14 @@ impl InferenceMetrics {
     /// Used by `GET /v1/models` to report `"saturated"` availability status
     /// when inference providers are reachable but overloaded.
     pub fn is_high_latency(&self) -> bool {
-        self.vllm.is_high_latency() || self.sglang.is_high_latency()
+        self.vllm.is_high_latency() || self.sglang.is_high_latency() || self.gemini.is_high_latency()
     }
 
     pub fn render_prometheus(&self) -> String {
         let mut out = String::new();
         self.render_provider("vllm", &self.vllm, &mut out);
         self.render_provider("sglang", &self.sglang, &mut out);
+        self.render_provider("gemini", &self.gemini, &mut out);
         out
     }
 
@@ -84,6 +87,7 @@ impl InferenceMetrics {
         match provider {
             ProviderKind::Vllm | ProviderKind::Gemini => &self.vllm,
             ProviderKind::Sglang => &self.sglang,
+            ProviderKind::Gemini => &self.gemini,
         }
     }
 }
