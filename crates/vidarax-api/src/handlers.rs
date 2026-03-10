@@ -1095,20 +1095,7 @@ pub async fn reason_realtime_run(
             )],
         );
     }
-    let semantic_primary_provider = if semantic_inference {
-        match parse_provider(payload.primary_provider.as_deref()) {
-            Ok(provider) => provider,
-            Err(message) => {
-                return validation_error(
-                    &state,
-                    "invalid realtime reason request",
-                    vec![field_error("primary_provider", message.to_string())],
-                );
-            }
-        }
-    } else {
-        ProviderKind::Vllm
-    };
+
 
     let tiered_config = {
         use vidarax_core::tiered_vlm::TieredVlmConfig;
@@ -1404,7 +1391,6 @@ pub async fn reason_realtime_run(
                 let result = infer_chunk_semantics(
                     providers.clone(),
                     true,
-                    semantic_primary_provider,
                     &model,
                     &prompt_with_context,
                     semantic_timeout_ms,
@@ -1465,7 +1451,6 @@ pub async fn reason_realtime_run(
                     let overlay = infer_chunk_semantics(
                         providers_c,
                         true,
-                        semantic_primary_provider,
                         model,
                         &prompt_c,
                         semantic_timeout_ms,
@@ -2879,7 +2864,6 @@ fn load_decoded_signals_from_events(events: &[TimelineEvent]) -> Result<DecodedS
 async fn infer_chunk_semantics(
     providers: Option<Arc<dyn InferenceProvider + Send + Sync>>,
     semantic_available: bool,
-    _primary_provider: ProviderKind,
     _model: &str,
     semantic_prompt: &str,
     timeout_ms: u64,

@@ -166,9 +166,27 @@ fn build_single_provider(
 ) -> Result<Box<dyn InferenceProvider + Send + Sync>, String> {
     match entry.backend_type.as_str() {
         "openai_compat" => {
-            let base_url = entry.base_url.as_deref().ok_or_else(|| {
-                format!("backend '{}': openai_compat requires base_url", entry.name)
-            })?;
+            let base_url = interpolate_env_vars(entry.base_url.as_deref().unwrap_or(""));
+            if base_url.is_empty() || base_url.contains("${") {
+                return Err(format!(
+                    "backend '{}': openai_compat requires a valid base_url (unresolved env var?)",
+                    entry.name
+                ));
+            }
+
+            // Warn when a non-loopback backend is configured with plain HTTP.
+            if base_url.starts_with("http://") {
+                let is_loopback = base_url.contains("://localhost")
+                    || base_url.contains("://127.0.0.1")
+                    || base_url.contains("://[::1]");
+                if !is_loopback {
+                    tracing::warn!(
+                        backend = %entry.name,
+                        url = %base_url,
+                        "backend uses plain HTTP on a non-loopback host — consider HTTPS in production"
+                    );
+                }
+            }
 
             // Derive ProviderKind from the entry name for backwards-compatible
             // telemetry labelling.  Unknown names fall back to Vllm.
@@ -177,7 +195,7 @@ fn build_single_provider(
                 _ => ProviderKind::Vllm,
             };
 
-            let transport = HttpTransport::new(base_url)
+            let transport = HttpTransport::new(&base_url)
                 .map_err(|e| format!("backend '{}': transport error: {e:?}", entry.name))?;
 
             Ok(Box::new(OpenAiCompatProvider::new(transport, kind)))
@@ -398,6 +416,24 @@ base_url = "${_VDX_TEST_URL}"
             priority: 1,
         };
         assert!(build_provider_chain(&[entry]).is_err());
+    }
+
+    #[test]
+    fn build_chain_openai_compat_unresolved_env_var_base_url_returns_err() {
+        // Ensure the env var is not set so ${...} remains unresolved.
+        std::env::remove_var("_VDX_NONEXISTENT_VLLM_URL");
+        let entry = BackendEntry {
+            name: "vllm".into(),
+            backend_type: "openai_compat".into(),
+            base_url: Some("${_VDX_NONEXISTENT_VLLM_URL}".into()),
+            api_key: None,
+            model: None,
+            priority: 1,
+        };
+        let result = build_provider_chain(&[entry]);
+        assert!(result.is_err(), "unresolved base_url should fail");
+        let err = result.err().unwrap();
+        assert!(err.contains("base_url"), "expected base_url error, got: {err}");
     }
 
     #[test]

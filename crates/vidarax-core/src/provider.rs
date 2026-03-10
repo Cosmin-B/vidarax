@@ -198,14 +198,7 @@ impl<T: Transport> InferenceProvider for OpenAiCompatProvider<T> {
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
-        // Skip local registry validation for Gemini — models are cloud-side.
-        let model = if self.kind == ProviderKind::Gemini {
-            // Use the shared interning cache so we never leak more than one allocation
-            // per unique model name, even when called millions of times.
-            crate::gemini::intern_model(&request.model)
-        } else {
-            canonical_model(&request.model)?
-        };
+        let model = canonical_model(&request.model)?;
         let body = build_payload(model, request);
         let t0 = Instant::now();
         let response = self
