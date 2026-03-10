@@ -1,5 +1,6 @@
 pub mod backends;
 pub mod dedup;
+pub mod gemini;
 pub mod gate;
 pub mod ingest;
 pub mod webrtc;

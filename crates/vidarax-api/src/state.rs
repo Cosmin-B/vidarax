@@ -35,7 +35,7 @@ pub struct AppState {
     event_seq: Arc<AtomicU64>,
     wal_path: Arc<PathBuf>,
     ingest_file_roots: Arc<Vec<PathBuf>>,
-    inference_endpoints: Option<Arc<dyn InferenceProvider + Send + Sync>>,
+    provider: Option<Arc<dyn InferenceProvider + Send + Sync>>,
     security_policy: Arc<SecurityPolicy>,
     inference_metrics: Arc<InferenceMetrics>,
     pipeline_metrics: Arc<PipelineMetrics>,
@@ -55,7 +55,7 @@ impl AppState {
     pub fn from_wal(
         wal_path: PathBuf,
         ingest_file_roots: Vec<PathBuf>,
-        inference_endpoints: Option<Arc<dyn InferenceProvider + Send + Sync>>,
+        provider: Option<Arc<dyn InferenceProvider + Send + Sync>>,
         security_policy: SecurityPolicy,
         stream_ttl_secs: u64,
         active_stream_limit: usize,
@@ -85,7 +85,7 @@ impl AppState {
             event_seq: Arc::new(AtomicU64::new(max_event_seq)),
             wal_path: Arc::new(wal_path),
             ingest_file_roots: Arc::new(ingest_file_roots),
-            inference_endpoints,
+            provider,
             security_policy: Arc::new(security_policy),
             inference_metrics: Arc::new(InferenceMetrics::new()),
             pipeline_metrics: Arc::new(PipelineMetrics::new()),
@@ -107,7 +107,7 @@ impl AppState {
             event_seq: Arc::new(AtomicU64::new(0)),
             wal_path: Arc::new(wal_path),
             ingest_file_roots: Arc::new(default_test_ingest_roots()),
-            inference_endpoints: None,
+            provider: None,
             security_policy: Arc::new(SecurityPolicy::from_config_for_tests()),
             inference_metrics: Arc::new(InferenceMetrics::new()),
             pipeline_metrics: Arc::new(PipelineMetrics::new()),
@@ -124,18 +124,18 @@ impl AppState {
 
     pub fn with_wal_for_tests_and_endpoints(
         wal_path: PathBuf,
-        inference_endpoints: Option<Arc<dyn InferenceProvider + Send + Sync>>,
+        provider: Option<Arc<dyn InferenceProvider + Send + Sync>>,
     ) -> Self {
         Self::with_wal_for_tests_full(
             wal_path,
-            inference_endpoints,
+            provider,
             SecurityPolicy::from_config_for_tests(),
         )
     }
 
     pub fn with_wal_for_tests_full(
         wal_path: PathBuf,
-        inference_endpoints: Option<Arc<dyn InferenceProvider + Send + Sync>>,
+        provider: Option<Arc<dyn InferenceProvider + Send + Sync>>,
         security_policy: SecurityPolicy,
     ) -> Self {
         Self {
@@ -144,7 +144,7 @@ impl AppState {
             event_seq: Arc::new(AtomicU64::new(0)),
             wal_path: Arc::new(wal_path),
             ingest_file_roots: Arc::new(default_test_ingest_roots()),
-            inference_endpoints,
+            provider,
             security_policy: Arc::new(security_policy),
             inference_metrics: Arc::new(InferenceMetrics::new()),
             pipeline_metrics: Arc::new(PipelineMetrics::new()),
@@ -161,7 +161,7 @@ impl AppState {
 
     pub fn with_wal_for_tests_runtime(
         wal_path: PathBuf,
-        inference_endpoints: Option<Arc<dyn InferenceProvider + Send + Sync>>,
+        provider: Option<Arc<dyn InferenceProvider + Send + Sync>>,
         security_policy: SecurityPolicy,
         stream_ttl_secs: u64,
         active_stream_limit: usize,
@@ -172,7 +172,7 @@ impl AppState {
             event_seq: Arc::new(AtomicU64::new(0)),
             wal_path: Arc::new(wal_path),
             ingest_file_roots: Arc::new(default_test_ingest_roots()),
-            inference_endpoints,
+            provider,
             security_policy: Arc::new(security_policy),
             inference_metrics: Arc::new(InferenceMetrics::new()),
             pipeline_metrics: Arc::new(PipelineMetrics::new()),
@@ -347,8 +347,8 @@ impl AppState {
         (runs, events)
     }
 
-    pub fn inference_provider(&self) -> Option<&Arc<dyn InferenceProvider + Send + Sync>> {
-        self.inference_endpoints.as_ref()
+    pub fn provider(&self) -> Option<&Arc<dyn InferenceProvider + Send + Sync>> {
+        self.provider.as_ref()
     }
 
     pub fn ingest_file_roots(&self) -> &[PathBuf] {

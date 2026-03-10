@@ -250,7 +250,7 @@ pub async fn whip_offer(
     let session_span_for_workers = session_span.clone();
     let metrics_for_workers = Arc::clone(&metrics_arc);
     let vlm_config_for_workers = vlm_config.clone();
-    let provider_opt = state.inference_provider().cloned();
+    let provider = state.provider().cloned();
     // Share the session's guided_json handle with VLM workers so that
     // PATCH /prompt with output_schema takes effect on the next keyframe
     // without restarting the worker threads.
@@ -284,18 +284,14 @@ pub async fn whip_offer(
         );
 
         // ── VLM workers (2 threads) ────────────────────────────────────
-        // The provider is already an Arc<dyn InferenceProvider + Send + Sync>.
-        // spawn_vlm_workers expects Arc<I> where I: InferenceProvider + Sized.
-        // We implement InferenceProvider for Arc<dyn InferenceProvider + Send + Sync>
-        // in provider.rs, so Arc::new(provider_arc) gives I = Arc<dyn ...> which is Sized.
         let guided_json = guided_json_for_workers;
 
-        match provider_opt {
-            Some(provider) => {
+        match provider {
+            Some(p) => {
                 spawn_vlm_workers(
                     2,
                     vlm_rx,
-                    Arc::new(provider),
+                    Arc::new(p),
                     event_sink_for_workers,
                     vlm_config_for_workers,
                     metrics_for_workers,

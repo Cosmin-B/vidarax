@@ -198,15 +198,7 @@ impl<T: Transport> InferenceProvider for OpenAiCompatProvider<T> {
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
-        // Skip local registry validation for Gemini — models are cloud-side.
-        let model = if self.kind == ProviderKind::Gemini {
-            // SAFETY: we return a 'static ref only when the model is already &'static;
-            // for Gemini we leak the string once so that InferenceResult can hold &'static str.
-            // In practice Gemini model strings come from config and are long-lived.
-            Box::leak(request.model.to_string().into_boxed_str()) as &'static str
-        } else {
-            canonical_model(&request.model)?
-        };
+        let model = canonical_model(&request.model)?;
         let body = build_payload(model, request);
         let t0 = Instant::now();
         let response = self

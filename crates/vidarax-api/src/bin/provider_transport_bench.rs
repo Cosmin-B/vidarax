@@ -10,7 +10,6 @@ use serde_json::Value;
 use tokio::sync::Semaphore;
 use vidarax_core::provider::{
     HttpTransport, InferenceProvider, InferenceRequest, OpenAiCompatProvider, ProviderKind,
-    ProviderRouter,
 };
 
 #[derive(Debug, Serialize)]
@@ -31,12 +30,6 @@ struct BenchResult {
 async fn main() {
     let server = spawn_mock_server();
     let base_url = format!("http://{}", server.addr);
-    let vllm_transport = HttpTransport::new(&base_url).unwrap();
-    let sglang_transport = HttpTransport::new(&base_url).unwrap();
-    let primary = OpenAiCompatProvider::new(vllm_transport, ProviderKind::Vllm);
-    let fallback = OpenAiCompatProvider::new(sglang_transport, ProviderKind::Sglang);
-    let provider: Arc<dyn InferenceProvider + Send + Sync> =
-        Arc::new(ProviderRouter::new(primary, fallback));
     let request = InferenceRequest {
         model: Arc::from("Qwen/Qwen3-VL-2B-Instruct"),
         prompt: Arc::from("benchmark"),
@@ -52,7 +45,7 @@ async fn main() {
     let requests = 200usize;
     let concurrency = 16usize;
     let blocking =
-        bench_blocking_spawn(requests, concurrency, Arc::clone(&provider), request.clone()).await;
+        bench_blocking_spawn(requests, concurrency, base_url.clone(), request.clone()).await;
     let async_stats =
         bench_async_reqwest(requests, concurrency, base_url.clone()).await;
 
@@ -79,10 +72,12 @@ async fn main() {
 async fn bench_blocking_spawn(
     requests: usize,
     concurrency: usize,
-    provider: Arc<dyn InferenceProvider + Send + Sync>,
+    base_url: String,
     request: InferenceRequest,
 ) -> BenchStats {
-    let router = provider;
+    // Build the provider once so all tasks share the same connection pool.
+    let transport = HttpTransport::new(&base_url).unwrap();
+    let router = Arc::new(OpenAiCompatProvider::new(transport, ProviderKind::Vllm));
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut tasks = Vec::with_capacity(requests);
     let start = Instant::now();
