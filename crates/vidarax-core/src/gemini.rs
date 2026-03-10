@@ -33,24 +33,26 @@ const INLINE_SIZE_LIMIT: usize = 20 * 1024 * 1024; // 20 MB
 
 // ── Static model-string interning cache ──────────────────────────────────────
 
-/// Thread-safe cache that interns model name strings so that `InferenceResult`
-/// can hold `&'static str` without leaking memory on every call.
-///
-/// The cache grows monotonically (one entry per unique model name seen).
-/// In practice this is bounded by the number of distinct Gemini model IDs.
-static MODEL_CACHE: Mutex<Option<HashMap<String, &'static str>>> = Mutex::new(None);
+/// Thread-safe string interning cache.  Leaks exactly once per unique string
+/// so that callsites requiring `&'static str` don't leak on every call.
+/// Bounded by the number of distinct strings the process ever sees.
+static STRING_CACHE: Mutex<Option<HashMap<String, &'static str>>> = Mutex::new(None);
 
-pub(crate) fn intern_model(s: &str) -> &'static str {
-    let mut guard = MODEL_CACHE.lock().expect("model cache lock poisoned");
+/// Intern an arbitrary string, returning a `&'static str`.
+fn intern_str(s: &str) -> &'static str {
+    let mut guard = STRING_CACHE.lock().expect("string cache lock poisoned");
     let map = guard.get_or_insert_with(HashMap::new);
     if let Some(&cached) = map.get(s) {
         return cached;
     }
-    // Leak exactly once per unique model string — bounded by the number of
-    // distinct model IDs the process ever sees.
     let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
     map.insert(s.to_string(), leaked);
     leaked
+}
+
+/// Intern a model name string.  Thin wrapper over [`intern_str`].
+pub(crate) fn intern_model(s: &str) -> &'static str {
+    intern_str(s)
 }
 
 // ── Provider ─────────────────────────────────────────────────────────────────
@@ -360,7 +362,7 @@ fn map_finish_reason(raw: &str) -> &'static str {
         "SAFETY" => "content_filter",
         other => {
             // For unknown variants we intern a lowercase copy.
-            intern_model(&other.to_ascii_lowercase())
+            intern_str(&other.to_ascii_lowercase())
         }
     }
 }

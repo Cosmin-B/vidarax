@@ -166,7 +166,8 @@ fn build_single_provider(
 ) -> Result<Box<dyn InferenceProvider + Send + Sync>, String> {
     match entry.backend_type.as_str() {
         "openai_compat" => {
-            let base_url = interpolate_env_vars(entry.base_url.as_deref().unwrap_or(""));
+            // Note: env vars are already interpolated by parse_config().
+            let base_url = entry.base_url.as_deref().unwrap_or("");
             if base_url.is_empty() || base_url.contains("${") {
                 return Err(format!(
                     "backend '{}': openai_compat requires a valid base_url (unresolved env var?)",
@@ -201,13 +202,12 @@ fn build_single_provider(
             Ok(Box::new(OpenAiCompatProvider::new(transport, kind)))
         }
         "gemini" => {
-            let api_key = interpolate_env_vars(entry.api_key.as_deref().unwrap_or(""));
-            let model = interpolate_env_vars(
-                entry
-                    .model
-                    .as_deref()
-                    .unwrap_or("gemini-2.5-flash-preview-05-20"),
-            );
+            // Note: env vars are already interpolated by parse_config().
+            let api_key = entry.api_key.as_deref().unwrap_or("");
+            let model = entry
+                .model
+                .as_deref()
+                .unwrap_or("gemini-2.5-flash-preview-05-20");
             if api_key.is_empty() || api_key.contains("${") {
                 return Err(format!(
                     "backend '{}': gemini requires api_key",
@@ -215,7 +215,7 @@ fn build_single_provider(
                 ));
             }
             Ok(Box::new(
-                GeminiProvider::new(api_key, model)
+                GeminiProvider::new(api_key.to_string(), model.to_string())
                     .map_err(|e| format!("backend '{}': {e:?}", entry.name))?,
             ))
         }
