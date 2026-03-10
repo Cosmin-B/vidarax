@@ -602,4 +602,100 @@ mod tests {
         let b = intern_model("model-beta");
         assert!(!std::ptr::eq(a, b));
     }
+
+    // ── Live integration tests (require GEMINI_API_KEY) ─────────────────────
+
+    #[test]
+    #[ignore = "requires GEMINI_API_KEY env var"]
+    fn live_text_only() {
+        let key = std::env::var("GEMINI_API_KEY").unwrap();
+        let p = GeminiProvider::new(key, "gemini-2.0-flash".to_string()).unwrap();
+        let req = InferenceRequest {
+            model: std::sync::Arc::from("gemini-2.0-flash"),
+            prompt: std::sync::Arc::from("Say hello in exactly 3 words."),
+            input_images: vec![],
+            input_videos: vec![],
+            max_tokens: 50,
+            temperature: 0.0,
+            timeout_ms: 30000,
+            allow_fallback: false,
+            guided_json: None,
+        };
+        let r = p.infer(&req).expect("text-only inference failed");
+        assert_eq!(r.finish_reason.as_deref(), Some("stop"));
+        assert!(!r.output_text.is_empty());
+        println!("text-only: {:?} ({}ms)", r.output_text, r.inference_latency_ms);
+    }
+
+    #[test]
+    #[ignore = "requires GEMINI_API_KEY env var + /tmp/test_frame.jpg"]
+    fn live_image() {
+        let key = std::env::var("GEMINI_API_KEY").unwrap();
+        let p = GeminiProvider::new(key, "gemini-2.0-flash".to_string()).unwrap();
+        let jpeg = std::fs::read("/tmp/test_frame.jpg").expect("need /tmp/test_frame.jpg");
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &jpeg);
+        let req = InferenceRequest {
+            model: std::sync::Arc::from("gemini-2.0-flash"),
+            prompt: std::sync::Arc::from("What does this screenshot show? One sentence."),
+            input_images: vec![crate::provider::InferenceImage { media_type: "image/jpeg", data_base64: b64 }],
+            input_videos: vec![],
+            max_tokens: 100,
+            temperature: 0.0,
+            timeout_ms: 30000,
+            allow_fallback: false,
+            guided_json: None,
+        };
+        let r = p.infer(&req).expect("image inference failed");
+        assert!(!r.output_text.is_empty());
+        println!("image: {:?} ({}ms)", r.output_text, r.inference_latency_ms);
+    }
+
+    #[test]
+    #[ignore = "requires GEMINI_API_KEY env var + /tmp/test_clip.mp4"]
+    fn live_inline_video() {
+        let key = std::env::var("GEMINI_API_KEY").unwrap();
+        let p = GeminiProvider::new(key, "gemini-2.0-flash".to_string()).unwrap();
+        let mp4 = std::fs::read("/tmp/test_clip.mp4").expect("need /tmp/test_clip.mp4");
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &mp4);
+        let req = InferenceRequest {
+            model: std::sync::Arc::from("gemini-2.0-flash"),
+            prompt: std::sync::Arc::from("Describe what happens in this video in one sentence."),
+            input_images: vec![],
+            input_videos: vec![crate::provider::InferenceVideo { media_type: "video/mp4", data_base64: b64 }],
+            max_tokens: 100,
+            temperature: 0.0,
+            timeout_ms: 30000,
+            allow_fallback: false,
+            guided_json: None,
+        };
+        let r = p.infer(&req).expect("video inference failed");
+        assert!(!r.output_text.is_empty());
+        println!("video: {:?} ({}ms)", r.output_text, r.inference_latency_ms);
+    }
+
+    #[test]
+    #[ignore = "requires GEMINI_API_KEY env var + /tmp/test_frame.jpg"]
+    fn live_structured_json() {
+        let key = std::env::var("GEMINI_API_KEY").unwrap();
+        let p = GeminiProvider::new(key, "gemini-2.0-flash".to_string()).unwrap();
+        let jpeg = std::fs::read("/tmp/test_frame.jpg").expect("need /tmp/test_frame.jpg");
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &jpeg);
+        let schema = r#"{"type":"object","properties":{"title":{"type":"string"},"has_button":{"type":"boolean"}},"required":["title","has_button"]}"#;
+        let req = InferenceRequest {
+            model: std::sync::Arc::from("gemini-2.0-flash"),
+            prompt: std::sync::Arc::from("Extract the page title and whether there is a visible button."),
+            input_images: vec![crate::provider::InferenceImage { media_type: "image/jpeg", data_base64: b64 }],
+            input_videos: vec![],
+            max_tokens: 200,
+            temperature: 0.0,
+            timeout_ms: 30000,
+            allow_fallback: false,
+            guided_json: Some(std::sync::Arc::from(schema)),
+        };
+        let r = p.infer(&req).expect("structured json inference failed");
+        let parsed: serde_json::Value = serde_json::from_str(&r.output_text).expect("output not valid JSON");
+        assert!(parsed.get("title").is_some(), "missing 'title' field");
+        assert!(parsed.get("has_button").is_some(), "missing 'has_button' field");
+        println!("structured: {} ({}ms)", r.output_text, r.inference_latency_ms);
+    }
 }
