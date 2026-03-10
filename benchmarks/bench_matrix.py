@@ -19,10 +19,12 @@ DEFAULT_API = os.environ.get("VIDARAX_API", "http://localhost:8080")
 DEFAULT_GT = str(Path(__file__).parent / "wiki_ground_truth.json")
 DEFAULT_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 
+_UPLOAD_DIR = os.environ.get("VIDARAX_UPLOAD_DIR", "/tmp/vidarax-uploads")
+
 RESOLUTIONS = {
-    "1080p": "file:///tmp/vidarax-uploads/Wiki.mp4",
-    "720p": "file:///tmp/vidarax-uploads/Wiki_720p.mp4",
-    "480p": "file:///tmp/vidarax-uploads/Wiki_480p.mp4",
+    "1080p": f"file://{_UPLOAD_DIR}/Wiki.mp4",
+    "720p": f"file://{_UPLOAD_DIR}/Wiki_720p.mp4",
+    "480p": f"file://{_UPLOAD_DIR}/Wiki_480p.mp4",
 }
 
 # ─── Preset configs ──────────────────────────────────────────────────────────
@@ -362,7 +364,7 @@ def main():
     print(f"{'=' * 105}")
 
     # Save JSON
-    out_path = "/tmp/vidarax_bench_matrix.json"
+    out_path = os.environ.get("VIDARAX_BENCH_OUTPUT", "/tmp/vidarax_bench_matrix.json")
     with open(out_path, "w") as f:
         json.dump(all_results, f, indent=2)
     print(f"\nResults saved to {out_path}")

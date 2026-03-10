@@ -355,7 +355,9 @@ fn build_payload(model: &str, request: &InferenceRequest) -> String {
     // Disable thinking/reasoning tokens for Qwen3.5 models.
     // This prevents chain-of-thought noise in the output and
     // significantly reduces latency on MoE models.
-    body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
+    if model.contains("Qwen3.5") {
+        body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
+    }
     body.to_string()
 }
 

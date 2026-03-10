@@ -713,15 +713,22 @@ pub fn spawn_vlm_workers<I>(
                         // First frame — always emit as initial state.
                         true
                     } else {
-                        // Quick similarity check: if descriptions share <60% of
-                        // characters, the scene changed meaningfully.
-                        let shorter = prev_desc.len().min(description.len()).max(1);
-                        let common = prev_desc
-                            .chars()
-                            .zip(description.chars())
-                            .filter(|(a, b)| a == b)
-                            .count();
-                        (common as f32 / shorter as f32) < 0.6
+                        // Jaccard word-overlap: compare the *set* of words so
+                        // that paraphrases or reordering don't fool the check,
+                        // unlike the previous positional char comparison.
+                        use std::collections::HashSet;
+                        let prev_words: HashSet<&str> =
+                            prev_desc.split_whitespace().collect();
+                        let curr_words: HashSet<&str> =
+                            description.split_whitespace().collect();
+                        let intersection = prev_words.intersection(&curr_words).count();
+                        let union = prev_words.union(&curr_words).count();
+                        let jaccard = if union == 0 {
+                            1.0
+                        } else {
+                            intersection as f32 / union as f32
+                        };
+                        jaccard < 0.5
                     };
 
                     // Update temporal context for the next keyframe.

@@ -7,7 +7,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use std::cmp::min;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
 use vidarax_contracts::models::{
     fallback_candidates, REQUIRED_MEDIUM_MODELS, REQUIRED_SMALL_MODELS,
@@ -19,8 +19,8 @@ use vidarax_core::ingest::{
 };
 use vidarax_core::pipeline::{FrameMetadata, TwoPassConfig, TwoPassPipeline};
 use vidarax_core::provider::{
-    build_http_router, InferenceImage, InferenceRequest, InferenceResult, InferenceVideo,
-    ProviderEndpoints, ProviderError, ProviderKind,
+    InferenceImage, InferenceProvider, InferenceRequest, InferenceResult, InferenceVideo,
+    ProviderError, ProviderKind,
 };
 use vidarax_core::timeline::TimelineEvent;
 
@@ -580,7 +580,7 @@ pub async fn infer(
     headers: HeaderMap,
     Json(payload): Json<InferRequest>,
 ) -> impl IntoResponse {
-    if state.inference_endpoints().is_none() {
+    if state.inference_provider().is_none() {
         return internal_error(
             &state,
             "inference providers are not configured; set VIDARAX_VLLM_BASE_URL and VIDARAX_SGLANG_BASE_URL",
@@ -603,7 +603,7 @@ pub async fn infer_batch(
     headers: HeaderMap,
     Json(payload): Json<InferBatchRequest>,
 ) -> impl IntoResponse {
-    if state.inference_endpoints().is_none() {
+    if state.inference_provider().is_none() {
         return internal_error(
             &state,
             "inference providers are not configured; set VIDARAX_VLLM_BASE_URL and VIDARAX_SGLANG_BASE_URL",
@@ -1166,7 +1166,7 @@ pub async fn reason_realtime_run(
         );
     }
 
-    let semantic_decode_enabled = semantic_inference && state.inference_endpoints().is_some();
+    let semantic_decode_enabled = semantic_inference && state.inference_provider().is_some();
     // Keep a clone of the source for video clip extraction in Phase 1 (decode_source
     // is moved into the spawn_blocking closure below).
     let decode_source_ref = decode_source.clone();
@@ -1272,7 +1272,7 @@ pub async fn reason_realtime_run(
     let mut metadata = Vec::with_capacity(decoded.frame_signals.len());
     let mut marker_inputs = Vec::with_capacity(decoded.frame_signals.len());
     let mut chunk_lags = Vec::new();
-    let providers = state.inference_endpoints().cloned();
+    let providers = state.inference_provider().cloned();
     let semantic_available = semantic_inference && providers.is_some();
     let semantic_segment_ms = payload.segment_ms.unwrap_or(250);
     if semantic_inference && !semantic_available {
@@ -1719,7 +1719,7 @@ pub async fn get_markers(
 
 pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
     let request_id = state.next_request_id();
-    let endpoints = state.inference_endpoints().cloned();
+    let endpoints = state.inference_provider().cloned();
     let is_saturated = state.inference_metrics().is_high_latency();
     let availability =
         match tokio::task::spawn_blocking(move || {
@@ -2176,24 +2176,20 @@ async fn validate_infer_request(
 }
 
 /// Build a provider router from raw endpoints and run a single inference call.
-///
-/// Constructs [`HttpTransport`] instances (and their connection pools) each
-/// call.  For high-frequency paths, build the router once with
-/// [`build_http_router`] and reuse the [`Arc`].
-fn infer_from_endpoints(
-    endpoints: &ProviderEndpoints,
-    primary: ProviderKind,
+/// Forward an inference request to the pre-built provider.
+fn infer_with_provider(
+    provider: &dyn InferenceProvider,
     request: &InferenceRequest,
 ) -> Result<InferenceResult, ProviderError> {
-    build_http_router(endpoints, primary)?.infer(request)
+    provider.infer(request)
 }
 
 async fn execute_infer_request(
     state: AppState,
     prepared: PreparedInferRequest,
 ) -> Result<InferResponse, InferExecutionError> {
-    let endpoints = state
-        .inference_endpoints()
+    let provider = state
+        .inference_provider()
         .cloned()
         .ok_or(InferExecutionError {
             code: "internal_error",
@@ -2205,9 +2201,8 @@ async fn execute_infer_request(
     let primary_provider_for_metrics = prepared.primary_provider;
     let request_for_provider = prepared.request.clone();
     let result = match tokio::task::spawn_blocking(move || {
-        infer_from_endpoints(
-            &endpoints,
-            primary_provider_for_metrics,
+        infer_with_provider(
+            &*provider,
             &request_for_provider,
         )
     })
@@ -2895,9 +2890,9 @@ fn load_decoded_signals_from_events(events: &[TimelineEvent]) -> Result<DecodedS
 
 #[allow(clippy::too_many_arguments)]
 async fn infer_chunk_semantics(
-    providers: Option<&vidarax_core::provider::ProviderEndpoints>,
+    providers: Option<&Arc<dyn InferenceProvider + Send + Sync>>,
     semantic_available: bool,
-    primary_provider: ProviderKind,
+    _primary_provider: ProviderKind,
     _model: &str,
     semantic_prompt: &str,
     timeout_ms: u64,
@@ -2921,7 +2916,7 @@ async fn infer_chunk_semantics(
         used_fallback: false,
         ..ChunkSemanticResult::default()
     };
-    let Some(endpoints) = providers.cloned() else {
+    let Some(provider) = providers.cloned() else {
         result.used_fallback = true;
         result.error = Some("provider_not_configured".to_string());
         return result;
@@ -2989,8 +2984,8 @@ async fn infer_chunk_semantics(
     };
 
     let first_result = match tokio::task::spawn_blocking({
-        let endpoints = endpoints.clone();
-        move || infer_from_endpoints(&endpoints, primary_provider, &first_request)
+        let provider = Arc::clone(&provider);
+        move || infer_with_provider(&*provider, &first_request)
     })
     .await
     {
@@ -3028,7 +3023,7 @@ async fn infer_chunk_semantics(
                 guided_json: guided_json_arc,
             };
             match tokio::task::spawn_blocking(move || {
-                infer_from_endpoints(&endpoints, primary_provider, &second_request)
+                infer_with_provider(&*provider, &second_request)
             })
             .await
             {
@@ -3374,60 +3369,24 @@ struct RuntimeAvailability {
 }
 
 fn runtime_model_availability(
-    endpoints: Option<vidarax_core::provider::ProviderEndpoints>,
+    provider: Option<Arc<dyn InferenceProvider + Send + Sync>>,
     is_saturated: bool,
 ) -> RuntimeAvailability {
-    let Some(endpoints) = endpoints else {
+    let Some(provider) = provider else {
         return RuntimeAvailability {
             status: "unavailable",
             providers: Vec::new(),
         };
     };
-    let vllm_up = provider_endpoint_is_up(&endpoints.vllm_base_url);
-    let sglang_up = provider_endpoint_is_up(&endpoints.sglang_base_url);
-    let mut providers = Vec::with_capacity(2);
-    if vllm_up {
-        providers.push("vllm".to_string());
+    // With the abstract provider layer, we report the top-level kind as
+    // available.  Health-checking individual backends is deferred to a future
+    // backends health endpoint.
+    let kind_name = provider.kind().name().to_string();
+    let status = if is_saturated { "saturated" } else { "ready" };
+    RuntimeAvailability {
+        status,
+        providers: vec![kind_name],
     }
-    if sglang_up {
-        providers.push("sglang".to_string());
-    }
-
-    // Status ordering: ready > saturated > degraded > unavailable.
-    // "saturated" means providers are reachable but overloaded (p95 > 5 s).
-    let status = if vllm_up && sglang_up {
-        if is_saturated { "saturated" } else { "ready" }
-    } else if vllm_up || sglang_up {
-        if is_saturated { "saturated" } else { "degraded" }
-    } else {
-        "unavailable"
-    };
-    RuntimeAvailability { status, providers }
-}
-
-fn provider_endpoint_is_up(base_url: &str) -> bool {
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(400))
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return false,
-    };
-    for suffix in ["/health", "/v1/models"] {
-        let url = format!(
-            "{}/{}",
-            base_url.trim_end_matches('/'),
-            suffix.trim_start_matches('/')
-        );
-        let response = match client.get(&url).send() {
-            Ok(response) => response,
-            Err(_) => continue,
-        };
-        if response.status().is_success() {
-            return true;
-        }
-    }
-    false
 }
 
 fn now_epoch_ms() -> u64 {
@@ -3445,13 +3404,11 @@ fn parse_provider(raw: Option<&str>) -> Result<ProviderKind, &'static str> {
     match raw.unwrap_or("vllm").to_ascii_lowercase().as_str() {
         "vllm" => Ok(ProviderKind::Vllm),
         "sglang" => Ok(ProviderKind::Sglang),
-        _ => Err("primary_provider must be one of: vllm, sglang"),
+        "gemini" => Ok(ProviderKind::Gemini),
+        _ => Err("primary_provider must be one of: vllm, sglang, gemini"),
     }
 }
 
 fn provider_name(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::Vllm => "vllm",
-        ProviderKind::Sglang => "sglang",
-    }
+    kind.name()
 }

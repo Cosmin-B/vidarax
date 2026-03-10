@@ -37,9 +37,13 @@ struct Inner<T, const N: usize> {
 }
 
 impl<T, const N: usize> Inner<T, N> {
+    // Compile-time guarantee: bitmask index `pos & (N - 1)` requires power-of-two N.
+    const _ASSERT_POWER_OF_TWO: () = assert!(N.is_power_of_two(), "SPSC capacity N must be a power of two");
+
     fn new() -> Self {
+        #[allow(clippy::let_unit_value)]
+        let _ = Self::_ASSERT_POWER_OF_TWO;
         assert!(N > 0, "SPSC channel capacity must be > 0");
-        assert!(N.is_power_of_two(), "SPSC channel capacity must be a power of two");
         Self {
             head: AtomicUsize::new(0),
             _pad0: [0u8; 56],
