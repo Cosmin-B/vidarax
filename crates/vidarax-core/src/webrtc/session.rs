@@ -129,6 +129,12 @@ pub struct WebRtcSession {
     pc: PeerConnection,
     /// Dynamic VLM prompt; updated via `PATCH /v1/stream/whip/{sess_id}/prompt`.
     pub prompt: Arc<RwLock<Arc<str>>>,
+    /// Optional JSON schema string for guided/structured VLM output.
+    ///
+    /// When `Some`, passed as `guided_json` to the VLM inference request and
+    /// `max_tokens` is bumped to 1024 to accommodate structured output.
+    /// Updated via `PATCH /v1/stream/whip/{sess_id}/prompt` with `output_schema`.
+    pub guided_json: Arc<RwLock<Option<Arc<str>>>>,
     /// Token output rate cap (tokens/s) for backpressure in VLM workers.
     pub max_output_tokens_per_second: u32,
     /// Video codec negotiated from the SDP offer (H.264 or VP8).
@@ -218,6 +224,7 @@ impl WebRtcSession {
             Self {
                 pc,
                 prompt: Arc::new(RwLock::new(Arc::from(""))),
+                guided_json: Arc::new(RwLock::new(None)),
                 max_output_tokens_per_second: config.max_output_tokens_per_second,
                 codec,
             },
@@ -379,6 +386,22 @@ impl WebRtcSession {
     /// Clone the prompt handle for sharing with analysis workers.
     pub fn prompt_arc(&self) -> Arc<RwLock<Arc<str>>> {
         Arc::clone(&self.prompt)
+    }
+
+    /// Update the guided JSON schema for structured VLM output.
+    ///
+    /// Pass `None` to disable structured output and revert to free-text.
+    /// Called by `PATCH /v1/stream/whip/{sess_id}/prompt` when `output_schema`
+    /// is present in the request body.
+    pub fn update_guided_json(&self, schema: Option<String>) {
+        if let Ok(mut guard) = self.guided_json.write() {
+            *guard = schema.map(Arc::from);
+        }
+    }
+
+    /// Clone the guided-JSON handle for sharing with VLM worker threads.
+    pub fn guided_json_arc(&self) -> Arc<RwLock<Option<Arc<str>>>> {
+        Arc::clone(&self.guided_json)
     }
 
     /// Close the peer connection.

@@ -37,6 +37,7 @@ async fn main() {
         model: Arc::from("Qwen/Qwen3-VL-2B-Instruct"),
         prompt: Arc::from("benchmark"),
         input_images: Vec::new(),
+        input_videos: Vec::new(),
         max_tokens: 16,
         temperature: 0.0,
         timeout_ms: 10_000,

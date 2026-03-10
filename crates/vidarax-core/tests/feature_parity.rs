@@ -35,6 +35,7 @@ fn base_request() -> InferenceRequest {
         model: Arc::from("openbmb/MiniCPM-V-4.5"),
         prompt: Arc::from("describe"),
         input_images: Vec::new(),
+        input_videos: Vec::new(),
         max_tokens: 64,
         temperature: 0.0,
         timeout_ms: 1_000,

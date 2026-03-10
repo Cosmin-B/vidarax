@@ -26,7 +26,7 @@
 //! `delay_seconds` (wall-clock) prevents bursting.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use base64::Engine as _;
@@ -302,6 +302,10 @@ pub fn spawn_clip_vlm_workers<I>(
     config: TieredVlmConfig,
     metrics: Arc<PipelineMetrics>,
     session_span: tracing::Span,
+    // Shared guided-JSON schema handle.  When the inner `Option` is `Some`,
+    // the schema is passed to the first-pass VLM request and `max_tokens`
+    // is raised to 1024 to accommodate structured output.
+    guided_json: Arc<RwLock<Option<Arc<str>>>>,
 ) where
     I: InferenceProvider + 'static,
 {
@@ -312,6 +316,7 @@ pub fn spawn_clip_vlm_workers<I>(
         let config = config.clone();
         let metrics = Arc::clone(&metrics);
         let session_span = session_span.clone();
+        let guided_json = Arc::clone(&guided_json);
 
         std::thread::Builder::new()
             .name(format!("vx-clip-vlm-{i}"))
@@ -336,16 +341,24 @@ pub fn spawn_clip_vlm_workers<I>(
                         })
                         .collect();
 
+                    // Snapshot the current guided_json schema once per inference.
+                    let current_guided_json: Option<Arc<str>> = guided_json
+                        .read()
+                        .ok()
+                        .and_then(|g| g.clone());
+                    let first_max_tokens = if current_guided_json.is_some() { 1024 } else { 256 };
+
                     let first_request = InferenceRequest {
-                        model: config.first_pass_model.clone(),
-                        prompt: prompt.clone(),
+                        model: Arc::clone(&config.first_pass_model),
+                        prompt: Arc::clone(&prompt),
                         input_images,
+                        input_videos: vec![],
                         // Allow more tokens and time for multi-frame analysis.
-                        max_tokens: 256,
+                        max_tokens: first_max_tokens,
                         temperature: 0.0,
                         timeout_ms: 15_000,
                         allow_fallback: true,
-                        guided_json: None,
+                        guided_json: current_guided_json,
                     };
 
                     let (description, used_second_pass) = match provider.infer(&first_request) {
@@ -353,9 +366,10 @@ pub fn spawn_clip_vlm_workers<I>(
                             let first_conf = parse_confidence(&result.output_text);
                             if config.needs_second_pass(first_conf) {
                                 let second_request = InferenceRequest {
-                                    model: config.second_pass_model.clone(),
+                                    model: Arc::clone(&config.second_pass_model),
                                     prompt,
                                     input_images: first_request.input_images,
+                                    input_videos: vec![],
                                     max_tokens: config.second_pass_max_tokens,
                                     temperature: 0.0,
                                     timeout_ms: 20_000,

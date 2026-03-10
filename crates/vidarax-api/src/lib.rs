@@ -18,6 +18,7 @@ mod state;
 mod tenant_labels;
 pub mod telemetry;
 mod validation;
+pub mod wal_sink;
 mod whip;
 
 pub use config::{assert_route_parity, resolve_wal_path, ServerConfig, TransportMode};

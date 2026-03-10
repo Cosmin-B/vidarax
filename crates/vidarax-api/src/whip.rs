@@ -11,9 +11,18 @@
 //! # Frame pipeline
 //!
 //! On session creation a bounded `kanal` channel is created.  The ingest task
-//! (`session.run(tx)`) forwards H.264 NAL units through the channel.  Until the
-//! full decode pipeline (x02.3) is wired in, a drain task drops incoming frames
-//! while counting them for observability.
+//! (`session.run(tx)`) forwards H.264 NAL units through the channel.  Three
+//! worker pools form the real-time pipeline:
+//!
+//! ```text
+//! session.run(frame_tx)
+//!   ↓ kanal::Receiver<RtpFrame>  (128)
+//! spawn_decode_workers     — H.264 → YUV → FrameSignal + JPEG
+//!   ↓ kanal::Sender<StreamFrame> (64)
+//! spawn_analysis_workers   — gate engine, loop detection
+//!   ↓ kanal::Sender<KeyframeWork> (32)
+//! spawn_vlm_workers        — VLM inference → EventSink
+//! ```
 
 use std::sync::Arc;
 
@@ -23,9 +32,99 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
+use vidarax_core::provider::{InferenceProvider, InferenceRequest, InferenceResult, ProviderError, ProviderKind, build_http_router};
+use vidarax_core::tiered_vlm::TieredVlmConfig;
 use vidarax_core::webrtc::session::WebRtcSession;
+use vidarax_core::webrtc::workers::{EventSink, spawn_decode_workers, spawn_analysis_workers, spawn_vlm_workers};
 
 use crate::state::AppState;
+
+// ---------------------------------------------------------------------------
+// WalEventSink — fallback when no SpacetimeDB client is configured
+// ---------------------------------------------------------------------------
+
+/// An [`EventSink`] that writes VLM events to the WAL-backed run event log.
+///
+/// This is used when no SpacetimeDB client is configured.  Events written here
+/// are visible via `GET /v1/runs/{id}/events`.
+struct WalEventSink {
+    state: AppState,
+}
+
+impl EventSink for WalEventSink {
+    fn emit_event_sync(
+        &self,
+        run_id: &str,
+        _session_id: &str,
+        frame_index: u64,
+        pts_ms: u64,
+        event_type: &str,
+        confidence: f32,
+        description: &str,
+    ) -> Result<(), String> {
+        let payload = serde_json::json!({
+            "frame_index": frame_index,
+            "pts_ms": pts_ms,
+            "event_type": event_type,
+            "confidence": confidence,
+            "description": description,
+        });
+        self.state
+            .append_run_event(run_id, event_type, payload)
+            .map(|_| ())
+    }
+
+    fn store_keyframe_sync(
+        &self,
+        run_id: &str,
+        frame_index: u64,
+        pts_ms: u64,
+        event_type: &str,
+        description: &str,
+        _jpeg_data: &[u8],
+    ) -> Result<(), String> {
+        // Store the metadata in the WAL; the JPEG bytes are discarded since
+        // the WAL is not a blob store.  Callers that need keyframe images
+        // should configure a SpacetimeDB client.
+        let payload = serde_json::json!({
+            "frame_index": frame_index,
+            "pts_ms": pts_ms,
+            "event_type": event_type,
+            "description": description,
+        });
+        self.state
+            .append_run_event(run_id, "keyframe_stored", payload)
+            .map(|_| ())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NullInferenceProvider — used when no provider endpoints are configured
+// ---------------------------------------------------------------------------
+
+/// An [`InferenceProvider`] that always returns a placeholder response.
+///
+/// Used when no inference endpoints are configured so the pipeline can still
+/// run without VLM inference (frames are decoded and gated, but the VLM step
+/// is a no-op).
+struct NullInferenceProvider;
+
+impl InferenceProvider for NullInferenceProvider {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Vllm
+    }
+
+    fn infer(&self, _request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+        Ok(InferenceResult {
+            provider: ProviderKind::Vllm,
+            model: "null",
+            output_text: "(no inference provider configured)".to_string(),
+            fallback_used: false,
+            finish_reason: Some("stop".to_string()),
+            inference_latency_ms: 0,
+        })
+    }
+}
 
 const HEADER_API_KEY: &str = "x-api-key";
 const HEADER_TENANT_ID: &str = "x-tenant-id";
@@ -146,7 +245,7 @@ pub async fn whip_offer(
 
     // Store the session bound to the requesting principal.
     if !state
-        .insert_session(sess_id.clone(), principal, Arc::clone(&session))
+        .insert_session(sess_id.clone(), principal.clone(), Arc::clone(&session))
         .await
     {
         // Collision or global session limit reached.
@@ -161,31 +260,128 @@ pub async fn whip_offer(
     // Record the new session in pipeline metrics.
     state.pipeline_metrics().inc_sessions_created();
 
-    // Spawn the media ingestion task.
-    // Bounded channel (128 frames): provides backpressure without excessive
-    // buffering.  Frames are drained and discarded until the decode pipeline
-    // (x02.3) is wired in.
-    let (frame_tx, frame_rx) = kanal::bounded::<vidarax_core::webrtc::session::RtpFrame>(128);
+    // Create a run ID so VLM events have a home in the WAL / SpacetimeDB.
+    let run_id: Arc<str> = Arc::from(state.next_run_id().as_str());
+    let session_id_arc: Arc<str> = Arc::from(sess_id.as_str());
+
+    // Register the run in the WAL so `GET /v1/runs/{id}/events` works.
+    let _ = state.append_run_event(
+        &run_id,
+        "run_created",
+        serde_json::json!({
+            "principal_key": principal,
+            "session_id": sess_id,
+            "source": "whip",
+        }),
+    );
+
+    // ── Channel topology ───────────────────────────────────────────────────
+    // RTP frames (128) → decoded stream frames (64) → keyframe work (32).
+    let (frame_tx, frame_rx) =
+        kanal::bounded::<vidarax_core::webrtc::session::RtpFrame>(128);
+    let (stream_tx, stream_rx) =
+        kanal::bounded::<vidarax_core::webrtc::workers::StreamFrame>(64);
+    let (vlm_tx, vlm_rx) =
+        kanal::bounded::<vidarax_core::webrtc::workers::KeyframeWork>(32);
+
+    // ── Media ingestion task ───────────────────────────────────────────────
     let run_future = session.run(frame_tx);
     tokio::spawn(run_future);
 
-    // Drain task: counts received NAL units and increments pipeline metrics.
-    // Replace with full decode workers (spawn_decode_workers) once the
-    // pipeline (x02.3) is wired in.
-    let sess_id_drain = sess_id.clone();
-    let drain_metrics = std::sync::Arc::clone(state.pipeline_metrics_arc());
-    let drain_span = session_span.clone();
+    // ── EventSink selection ────────────────────────────────────────────────
+    // Prefer SpacetimeDB when the client is configured; fall back to WAL.
+    let event_sink: Arc<dyn EventSink> = if let Some(stdb) = state.spacetime_client() {
+        Arc::new(stdb.clone())
+    } else {
+        Arc::new(WalEventSink { state: state.clone() })
+    };
+
+    // ── InferenceProvider selection ────────────────────────────────────────
+    // Use the HTTP router when provider endpoints are configured.
+    let metrics_arc = Arc::clone(state.pipeline_metrics_arc());
+    let vlm_config = TieredVlmConfig::default();
+
+    // Capture everything needed by the spawn_blocking closure.
+    let run_id_for_workers = Arc::clone(&run_id);
+    let session_id_for_workers = Arc::clone(&session_id_arc);
+    let event_sink_for_workers = Arc::clone(&event_sink);
+    let session_span_for_workers = session_span.clone();
+    let metrics_for_workers = Arc::clone(&metrics_arc);
+    let vlm_config_for_workers = vlm_config.clone();
+    let endpoints = state.inference_endpoints().cloned();
+    // Share the session's guided_json handle with VLM workers so that
+    // PATCH /prompt with output_schema takes effect on the next keyframe
+    // without restarting the worker threads.
+    let guided_json_for_workers = session.guided_json_arc();
+
+    // Worker threads are long-running OS threads (not tokio tasks).
+    // Use spawn_blocking as a bridge from async context to the thread spawns;
+    // the actual worker threads are spawned inside and run independently.
     tokio::task::spawn_blocking(move || {
-        let mut total: u64 = 0;
-        while let Ok(_frame) = frame_rx.recv() {
-            let _guard = drain_span.enter();
-            drain_metrics.inc_rtp_received();
-            total += 1;
-            if total % 300 == 0 {
-                tracing::debug!(sess_id = %sess_id_drain, nals_received = total, "WHIP drain");
+        // ── Decode workers (2 threads) ─────────────────────────────────
+        spawn_decode_workers(
+            2,
+            frame_rx,
+            stream_tx,
+            false, // gpu_available — conservative default; no GPU assumed
+            Arc::clone(&metrics_for_workers),
+            session_span_for_workers.clone(),
+        );
+
+        // ── Analysis workers (1 thread) ────────────────────────────────
+        spawn_analysis_workers(
+            1,
+            stream_rx,
+            vlm_tx,
+            None, // clip_tx — normal keyframe mode, not clip mode
+            Arc::clone(&event_sink_for_workers),
+            Arc::clone(&run_id_for_workers),
+            Arc::clone(&session_id_for_workers),
+            Arc::clone(&metrics_for_workers),
+            session_span_for_workers.clone(),
+        );
+
+        // ── VLM workers (2 threads) ────────────────────────────────────
+        // build_http_router returns Arc<dyn InferenceProvider + Send + Sync>.
+        // spawn_vlm_workers expects Arc<I> where I: InferenceProvider + Sized.
+        // We implement InferenceProvider for Arc<dyn InferenceProvider + Send + Sync>
+        // in provider.rs, so Arc::new(provider_arc) gives I = Arc<dyn ...> which is Sized.
+        let guided_json = guided_json_for_workers;
+
+        match endpoints.as_ref().and_then(|ep| {
+            build_http_router(ep, vidarax_core::provider::ProviderKind::Vllm).ok()
+        }) {
+            Some(provider) => {
+                spawn_vlm_workers(
+                    2,
+                    vlm_rx,
+                    Arc::new(provider),
+                    event_sink_for_workers,
+                    vlm_config_for_workers,
+                    metrics_for_workers,
+                    session_span_for_workers,
+                    0, // max_output_tokens_per_second — 0 = unlimited
+                    Arc::clone(&guided_json),
+                    None, // _training_store
+                    vidarax_core::tiered_vlm::DistillationConfig::default(),
+                );
+            }
+            None => {
+                spawn_vlm_workers(
+                    2,
+                    vlm_rx,
+                    Arc::new(NullInferenceProvider),
+                    event_sink_for_workers,
+                    vlm_config_for_workers,
+                    metrics_for_workers,
+                    session_span_for_workers,
+                    0,
+                    Arc::clone(&guided_json),
+                    None,
+                    vidarax_core::tiered_vlm::DistillationConfig::default(),
+                );
             }
         }
-        tracing::info!(sess_id = %sess_id_drain, total_nals = total, "WHIP drain task ended");
     });
 
     // Build the 201 Created response with SDP answer.
@@ -309,23 +505,31 @@ pub async fn whip_terminate(
 #[derive(Debug, Deserialize)]
 pub struct UpdatePromptRequest {
     pub prompt: String,
+    /// Optional JSON schema for guided/structured VLM output.
+    ///
+    /// When present, the schema is passed as `guided_json` to VLM inference
+    /// requests and `max_tokens` is bumped to 1024 to accommodate structured
+    /// output.  Set to `null` or omit to revert to free-text inference.
+    pub output_schema: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct UpdatePromptResponse {
     session_id: String,
     prompt: String,
+    output_schema: Option<String>,
 }
 
 /// `PATCH /v1/stream/whip/{sess_id}/prompt`
 ///
-/// Replaces the VLM analysis prompt for a running WebRTC session.
-/// The new prompt is used by analysis workers on the next keyframe decision.
+/// Replaces the VLM analysis prompt for a running WebRTC session and
+/// optionally sets a JSON schema for structured output.
+/// The new prompt and schema are used by VLM workers on the next keyframe.
 ///
-/// Body: `{ "prompt": "new prompt text" }`
+/// Body: `{ "prompt": "new prompt text", "output_schema": "{...}" }`
 ///
 /// Response:
-/// - `200 OK` with `{ "session_id": "...", "prompt": "..." }`
+/// - `200 OK` with `{ "session_id": "...", "prompt": "...", "output_schema": ... }`
 /// - `404 Not Found` — unknown session
 /// - `403 Forbidden` — caller is not the session owner
 #[tracing::instrument(name = "whip.update_prompt", skip_all, fields(sess_id))]
@@ -347,11 +551,17 @@ pub async fn whip_update_prompt(
     }
 
     session.update_prompt(body.prompt.clone());
-    tracing::info!("WHIP prompt updated sess_id={sess_id}");
+    session.update_guided_json(body.output_schema.clone());
+    tracing::info!(
+        sess_id = %sess_id,
+        has_schema = body.output_schema.is_some(),
+        "WHIP prompt updated"
+    );
 
     Json(UpdatePromptResponse {
         session_id: sess_id,
         prompt: body.prompt,
+        output_schema: body.output_schema,
     })
     .into_response()
 }

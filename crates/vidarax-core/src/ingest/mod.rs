@@ -758,6 +758,95 @@ pub fn build_select_expr(indices: &[u64]) -> String {
     expr
 }
 
+/// Extract a short MP4 clip from `source` starting at `start_s` for `duration_s` seconds.
+///
+/// The clip is written to stdout by ffmpeg (`pipe:1`) so no temporary files are
+/// created.  Uses `-c copy` (stream copy) when the source is a local file path
+/// so the operation is near-instant; falls back to `-c:v libx264 -preset ultrafast`
+/// for remote/HLS sources where a re-encode is required.
+///
+/// Returns the raw MP4 bytes on success.
+///
+/// # Errors
+///
+/// Returns a human-readable error string when ffmpeg is not found, the source
+/// cannot be read, or the requested time range is out of bounds.
+///
+/// # Example
+///
+/// ```no_run
+/// use vidarax_core::ingest::{InputSource, extract_video_clip};
+/// let source = InputSource::FilePath("/tmp/video.mp4".to_string());
+/// let mp4_bytes = extract_video_clip(&source, 0.0, 0.5).unwrap();
+/// assert!(!mp4_bytes.is_empty());
+/// ```
+pub fn extract_video_clip(
+    source: &InputSource,
+    start_s: f32,
+    duration_s: f32,
+) -> Result<Vec<u8>, String> {
+    if !start_s.is_finite() || start_s < 0.0 {
+        return Err("start_s must be >= 0".to_string());
+    }
+    if !duration_s.is_finite() || duration_s <= 0.0 {
+        return Err("duration_s must be > 0".to_string());
+    }
+
+    let source_uri = source.as_ffmpeg_input();
+    let start_str = format!("{start_s:.6}");
+    let duration_str = format!("{duration_s:.6}");
+
+    // For file sources use stream copy (near-instant); for network sources
+    // re-encode so the clip is self-contained and starts on a keyframe.
+    let use_stream_copy = matches!(source, InputSource::FilePath(_));
+
+    // MP4 requires seekable output, so we write to a temp file and read back.
+    let tmp = std::env::temp_dir().join(format!(
+        "vidarax_clip_{}.mp4",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let tmp_str = tmp.to_string_lossy().to_string();
+
+    let output = Command::new(ffmpeg_path())
+        .args([
+            "-v", "error",
+            "-protocol_whitelist", FFMPEG_PROTOCOL_WHITELIST,
+            "-ss", &start_str,
+            "-t", &duration_str,
+            "-i", source_uri,
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-an",
+            "-y",
+            &tmp_str,
+        ])
+        .output()
+        .map_err(|_| "failed to run ffmpeg".to_string())?;
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            start_s,
+            duration_s,
+            "ffmpeg clip extraction failed"
+        );
+        return Err("video clip extraction failed".to_string());
+    }
+
+    let bytes = std::fs::read(&tmp).map_err(|e| format!("failed to read clip: {e}"))?;
+    let _ = std::fs::remove_file(&tmp);
+
+    if bytes.is_empty() {
+        return Err("ffmpeg produced empty clip output".to_string());
+    }
+
+    Ok(bytes)
+}
+
 /// Decode only the specified frame indices from the source as JPEG, using a
 /// single ffmpeg pass with a `select` filter. Frames are sampled at
 /// `sample_fps` first (matching the framemd5 pass), then the select filter

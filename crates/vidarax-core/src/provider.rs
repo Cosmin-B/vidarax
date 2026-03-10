@@ -16,6 +16,8 @@ pub struct InferenceRequest {
     pub model: Arc<str>,
     pub prompt: Arc<str>,
     pub input_images: Vec<InferenceImage>,
+    /// Short video clips (e.g. MP4 segments) to include after image parts.
+    pub input_videos: Vec<InferenceVideo>,
     pub max_tokens: u32,
     pub temperature: f32,
     pub timeout_ms: u64,
@@ -63,6 +65,12 @@ pub fn parse_teacher_label(text: &str) -> Option<TeacherLabel> {
 #[derive(Debug, Clone)]
 pub struct InferenceImage {
     pub media_type: &'static str,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct InferenceVideo {
+    pub media_type: &'static str, // e.g. "video/mp4"
     pub data_base64: String,
 }
 
@@ -272,6 +280,20 @@ impl<P: InferenceProvider, F: InferenceProvider> InferenceProvider for ProviderR
     }
 }
 
+/// Forward trait calls through an `Arc<dyn InferenceProvider + Send + Sync>`.
+///
+/// This allows passing the return value of [`build_http_router`] directly to
+/// generic functions that accept `Arc<I>` where `I: InferenceProvider`.
+impl InferenceProvider for Arc<dyn InferenceProvider + Send + Sync> {
+    fn kind(&self) -> ProviderKind {
+        (**self).kind()
+    }
+
+    fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+        (**self).infer(request)
+    }
+}
+
 /// Build an HTTP-backed [`ProviderRouter`] with `primary` as the first choice.
 ///
 /// Creates both [`HttpTransport`] instances — and their underlying
@@ -307,10 +329,12 @@ fn canonical_model(model: &str) -> Result<&'static str, ProviderError> {
 }
 
 fn build_payload(model: &str, request: &InferenceRequest) -> String {
-    let user_content = if request.input_images.is_empty() {
+    let has_media = !request.input_images.is_empty() || !request.input_videos.is_empty();
+    let user_content = if !has_media {
         Value::String(request.prompt.to_string())
     } else {
-        let mut content = Vec::with_capacity(request.input_images.len() + 1);
+        let mut content =
+            Vec::with_capacity(1 + request.input_images.len() + request.input_videos.len());
         content.push(serde_json::json!({
             "type": "text",
             "text": &*request.prompt
@@ -320,6 +344,14 @@ fn build_payload(model: &str, request: &InferenceRequest) -> String {
                 "type": "image_url",
                 "image_url": {
                     "url": format!("data:{};base64,{}", image.media_type, image.data_base64)
+                }
+            }));
+        }
+        for video in &request.input_videos {
+            content.push(serde_json::json!({
+                "type": "video_url",
+                "video_url": {
+                    "url": format!("data:{};base64,{}", video.media_type, video.data_base64)
                 }
             }));
         }
@@ -348,6 +380,10 @@ fn build_payload(model: &str, request: &InferenceRequest) -> String {
             }
         });
     }
+    // Disable thinking/reasoning tokens for Qwen3.5 models.
+    // This prevents chain-of-thought noise in the output and
+    // significantly reduces latency on MoE models.
+    body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": false});
     body.to_string()
 }
 
@@ -421,8 +457,8 @@ fn parse_content_value(value: Value) -> Result<String, ProviderError> {
 mod tests {
     use super::{
         build_payload, infer_with_endpoints, HttpTransport, InferenceImage, InferenceProvider,
-        InferenceRequest, ProviderError, ProviderKind, ProviderRouter, SglangProvider, Transport,
-        VllmProvider,
+        InferenceRequest, InferenceVideo, ProviderError, ProviderKind, ProviderRouter,
+        SglangProvider, Transport, VllmProvider,
     };
     use serde_json::Value;
     use std::io::{Read, Write};
@@ -468,6 +504,7 @@ mod tests {
             model: Arc::from("openbmb/MiniCPM-V-4.5"),
             prompt: Arc::from("hello"),
             input_images: Vec::new(),
+            input_videos: Vec::new(),
             max_tokens: 64,
             temperature: 0.0,
             timeout_ms: 500,
@@ -563,6 +600,51 @@ mod tests {
         assert_eq!(
             content[1]["image_url"]["url"].as_str(),
             Some("data:image/jpeg;base64,YWJj")
+        );
+    }
+
+    #[test]
+    fn payload_includes_video_content_parts_after_images() {
+        let mut req = request();
+        req.input_images = vec![InferenceImage {
+            media_type: "image/jpeg",
+            data_base64: "aW1n".to_string(),
+        }];
+        req.input_videos = vec![InferenceVideo {
+            media_type: "video/mp4",
+            data_base64: "dmlk".to_string(),
+        }];
+        let body = build_payload("openbmb/MiniCPM-V-4_5", &req);
+        let value: Value = serde_json::from_str(&body).unwrap();
+        let content = value["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"].as_str(), Some("text"));
+        assert_eq!(content[1]["type"].as_str(), Some("image_url"));
+        assert_eq!(
+            content[1]["image_url"]["url"].as_str(),
+            Some("data:image/jpeg;base64,aW1n")
+        );
+        assert_eq!(content[2]["type"].as_str(), Some("video_url"));
+        assert_eq!(
+            content[2]["video_url"]["url"].as_str(),
+            Some("data:video/mp4;base64,dmlk")
+        );
+    }
+
+    #[test]
+    fn payload_videos_only_produces_array_content() {
+        let mut req = request();
+        req.input_videos = vec![InferenceVideo {
+            media_type: "video/mp4",
+            data_base64: "dmlk".to_string(),
+        }];
+        let body = build_payload("openbmb/MiniCPM-V-4_5", &req);
+        let value: Value = serde_json::from_str(&body).unwrap();
+        let content = value["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"].as_str(), Some("text"));
+        assert_eq!(content[1]["type"].as_str(), Some("video_url"));
+        assert_eq!(
+            content[1]["video_url"]["url"].as_str(),
+            Some("data:video/mp4;base64,dmlk")
         );
     }
 
