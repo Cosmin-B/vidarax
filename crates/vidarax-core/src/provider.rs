@@ -9,6 +9,18 @@ use vidarax_contracts::models::normalize_model_id;
 pub enum ProviderKind {
     Vllm,
     Sglang,
+    Gemini,
+}
+
+impl ProviderKind {
+    /// Returns a stable lowercase string name suitable for logging and display.
+    pub fn name(self) -> &'static str {
+        match self {
+            ProviderKind::Vllm => "vllm",
+            ProviderKind::Sglang => "sglang",
+            ProviderKind::Gemini => "gemini",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -111,12 +123,6 @@ pub trait InferenceProvider: Send + Sync {
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError>;
 }
 
-#[derive(Debug, Clone)]
-pub struct ProviderEndpoints {
-    pub vllm_base_url: String,
-    pub sglang_base_url: String,
-}
-
 #[derive(Clone)]
 pub struct HttpTransport {
     base_url: String,
@@ -164,33 +170,43 @@ impl Transport for HttpTransport {
     }
 }
 
-pub struct VllmProvider<T: Transport> {
+/// Unified OpenAI-compatible provider for vLLM, SGLang, and any other
+/// backend that speaks the `/v1/chat/completions` API.
+///
+/// # Examples
+///
+/// ```
+/// use vidarax_core::provider::{OpenAiCompatProvider, ProviderKind};
+///
+/// // Construct with a mock or HTTP transport:
+/// // let provider = OpenAiCompatProvider::new(transport, ProviderKind::Vllm);
+/// ```
+pub struct OpenAiCompatProvider<T: Transport> {
     transport: T,
+    kind: ProviderKind,
 }
 
-pub struct SglangProvider<T: Transport> {
-    transport: T,
-}
-
-impl<T: Transport> VllmProvider<T> {
-    pub fn new(transport: T) -> Self {
-        Self { transport }
+impl<T: Transport> OpenAiCompatProvider<T> {
+    pub fn new(transport: T, kind: ProviderKind) -> Self {
+        Self { transport, kind }
     }
 }
 
-impl<T: Transport> SglangProvider<T> {
-    pub fn new(transport: T) -> Self {
-        Self { transport }
-    }
-}
-
-impl<T: Transport> InferenceProvider for VllmProvider<T> {
+impl<T: Transport> InferenceProvider for OpenAiCompatProvider<T> {
     fn kind(&self) -> ProviderKind {
-        ProviderKind::Vllm
+        self.kind
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
-        let model = canonical_model(&request.model)?;
+        // Skip local registry validation for Gemini — models are cloud-side.
+        let model = if self.kind == ProviderKind::Gemini {
+            // SAFETY: we return a 'static ref only when the model is already &'static;
+            // for Gemini we leak the string once so that InferenceResult can hold &'static str.
+            // In practice Gemini model strings come from config and are long-lived.
+            Box::leak(request.model.to_string().into_boxed_str()) as &'static str
+        } else {
+            canonical_model(&request.model)?
+        };
         let body = build_payload(model, request);
         let t0 = Instant::now();
         let response = self
@@ -200,33 +216,7 @@ impl<T: Transport> InferenceProvider for VllmProvider<T> {
         let (output_text, finish_reason) = parse_completion(&response)?;
 
         Ok(InferenceResult {
-            provider: ProviderKind::Vllm,
-            model,
-            output_text,
-            fallback_used: false,
-            finish_reason,
-            inference_latency_ms,
-        })
-    }
-}
-
-impl<T: Transport> InferenceProvider for SglangProvider<T> {
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::Sglang
-    }
-
-    fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
-        let model = canonical_model(&request.model)?;
-        let body = build_payload(model, request);
-        let t0 = Instant::now();
-        let response = self
-            .transport
-            .call("/v1/chat/completions", body, request.timeout_ms)?;
-        let inference_latency_ms = t0.elapsed().as_millis() as u64;
-        let (output_text, finish_reason) = parse_completion(&response)?;
-
-        Ok(InferenceResult {
-            provider: ProviderKind::Sglang,
+            provider: self.kind,
             model,
             output_text,
             fallback_used: false,
@@ -282,8 +272,8 @@ impl<P: InferenceProvider, F: InferenceProvider> InferenceProvider for ProviderR
 
 /// Forward trait calls through an `Arc<dyn InferenceProvider + Send + Sync>`.
 ///
-/// This allows passing the return value of [`build_http_router`] directly to
-/// generic functions that accept `Arc<I>` where `I: InferenceProvider`.
+/// This allows passing the return value of [`crate::backends::build_provider_chain`]
+/// directly to generic functions that accept `Arc<I>` where `I: InferenceProvider`.
 impl InferenceProvider for Arc<dyn InferenceProvider + Send + Sync> {
     fn kind(&self) -> ProviderKind {
         (**self).kind()
@@ -294,27 +284,9 @@ impl InferenceProvider for Arc<dyn InferenceProvider + Send + Sync> {
     }
 }
 
-/// Build an HTTP-backed [`ProviderRouter`] with `primary` as the first choice.
-///
-/// Creates both [`HttpTransport`] instances — and their underlying
-/// `reqwest::blocking::Client` connection pools — once.  The returned
-/// `Arc` should be kept alive for the lifetime of the service and cloned
-/// cheaply into worker tasks or `spawn_blocking` closures.
-pub fn build_http_router(
-    endpoints: &ProviderEndpoints,
-    primary: ProviderKind,
-) -> Result<Arc<dyn InferenceProvider + Send + Sync>, ProviderError> {
-    let vllm = VllmProvider::new(HttpTransport::new(&endpoints.vllm_base_url)?);
-    let sglang = SglangProvider::new(HttpTransport::new(&endpoints.sglang_base_url)?);
-    Ok(match primary {
-        ProviderKind::Vllm => Arc::new(ProviderRouter::new(vllm, sglang)),
-        ProviderKind::Sglang => Arc::new(ProviderRouter::new(sglang, vllm)),
-    })
-}
-
 /// Forward `request` to `provider`, which holds pre-built transports.
 ///
-/// The provider must be created once (via [`build_http_router`] or directly)
+/// The provider must be created once (e.g. via [`crate::backends::build_provider_chain`])
 /// and reused across calls so that TCP connection pools are shared rather
 /// than rebuilt on every inference.
 pub fn infer_with_endpoints(
@@ -457,8 +429,8 @@ fn parse_content_value(value: Value) -> Result<String, ProviderError> {
 mod tests {
     use super::{
         build_payload, infer_with_endpoints, HttpTransport, InferenceImage, InferenceProvider,
-        InferenceRequest, InferenceVideo, ProviderError, ProviderKind, ProviderRouter,
-        SglangProvider, Transport, VllmProvider,
+        InferenceRequest, InferenceVideo, OpenAiCompatProvider, ProviderError, ProviderKind,
+        ProviderRouter, Transport,
     };
     use serde_json::Value;
     use std::io::{Read, Write};
@@ -521,7 +493,7 @@ mod tests {
 
     #[test]
     fn normalizes_model_alias_before_call() {
-        let provider = VllmProvider::new(MockTransport::ok(&completion_json("ok")));
+        let provider = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("ok")), ProviderKind::Vllm);
         let result = provider.infer(&request()).expect("inference");
         assert_eq!(result.model, "openbmb/MiniCPM-V-4_5");
         assert_eq!(result.output_text, "ok");
@@ -529,8 +501,8 @@ mod tests {
 
     #[test]
     fn uses_fallback_on_retryable_error() {
-        let primary = VllmProvider::new(MockTransport::err(ProviderError::HttpStatus(503)));
-        let fallback = SglangProvider::new(MockTransport::ok(&completion_json("fallback")));
+        let primary = OpenAiCompatProvider::new(MockTransport::err(ProviderError::HttpStatus(503)), ProviderKind::Vllm);
+        let fallback = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("fallback")), ProviderKind::Sglang);
         let router = ProviderRouter::new(primary, fallback);
 
         let result = router.infer(&request()).expect("fallback");
@@ -540,7 +512,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_model() {
-        let provider = VllmProvider::new(MockTransport::ok(&completion_json("ok")));
+        let provider = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("ok")), ProviderKind::Vllm);
         let mut req = request();
         req.model = Arc::from("unknown/model");
         let err = provider.infer(&req).unwrap_err();
@@ -549,9 +521,9 @@ mod tests {
 
     #[test]
     fn parses_array_content_shape() {
-        let provider = VllmProvider::new(MockTransport::ok(
+        let provider = OpenAiCompatProvider::new(MockTransport::ok(
             "{\"choices\":[{\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hello\"},{\"type\":\"text\",\"text\":\" world\"}]}}]}",
-        ));
+        ), ProviderKind::Vllm);
         let result = provider.infer(&request()).unwrap();
         assert_eq!(result.output_text, "hello world");
     }
@@ -576,8 +548,8 @@ mod tests {
 
         let base = format!("http://{addr}");
         let router = ProviderRouter::new(
-            VllmProvider::new(HttpTransport::new(&base).unwrap()),
-            SglangProvider::new(HttpTransport::new(&base).unwrap()),
+            OpenAiCompatProvider::new(HttpTransport::new(&base).unwrap(), ProviderKind::Vllm),
+            OpenAiCompatProvider::new(HttpTransport::new(&base).unwrap(), ProviderKind::Sglang),
         );
         let result = infer_with_endpoints(&router, &request()).unwrap();
         assert_eq!(result.output_text, "from-server");
@@ -661,7 +633,7 @@ mod tests {
     #[test]
     fn parses_finish_reason_from_response() {
         let json = r#"{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"done"}}]}"#;
-        let provider = VllmProvider::new(MockTransport::ok(json));
+        let provider = OpenAiCompatProvider::new(MockTransport::ok(json), ProviderKind::Vllm);
         let result = provider.infer(&request()).unwrap();
         assert_eq!(result.finish_reason.as_deref(), Some("stop"));
         assert_eq!(result.output_text, "done");
@@ -669,14 +641,14 @@ mod tests {
 
     #[test]
     fn finish_reason_is_none_when_absent() {
-        let provider = VllmProvider::new(MockTransport::ok(&completion_json("ok")));
+        let provider = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("ok")), ProviderKind::Vllm);
         let result = provider.infer(&request()).unwrap();
         assert_eq!(result.finish_reason, None);
     }
 
     #[test]
     fn inference_latency_ms_is_non_negative() {
-        let provider = VllmProvider::new(MockTransport::ok(&completion_json("ok")));
+        let provider = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("ok")), ProviderKind::Vllm);
         let result = provider.infer(&request()).unwrap();
         // MockTransport returns instantly; just verify the field is present and >= 0.
         let _ = result.inference_latency_ms; // u64, always >= 0

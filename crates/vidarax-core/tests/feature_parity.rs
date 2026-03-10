@@ -7,8 +7,8 @@ use vidarax_core::gate::FrameSignal;
 use vidarax_core::ingest::InputSource;
 use vidarax_core::loop_detector::LoopDetector;
 use vidarax_core::provider::{
-    InferenceProvider, InferenceRequest, ProviderError, ProviderRouter, SglangProvider, Transport,
-    VllmProvider,
+    InferenceProvider, InferenceRequest, OpenAiCompatProvider, ProviderError, ProviderKind,
+    ProviderRouter, Transport,
 };
 use vidarax_core::webrtc::clip::{ClipAccumulator, ClipConfig};
 use vidarax_core::webrtc::workers::StreamFrame;
@@ -133,7 +133,7 @@ fn output_schema_adds_guided_json_to_payload() {
     });
 
     let (transport, captured) = MockTransport::capturing(&completion_json("ok"));
-    let provider = VllmProvider::new(transport);
+    let provider = OpenAiCompatProvider::new(transport, ProviderKind::Vllm);
     let mut req = base_request();
     req.guided_json = Some(Arc::from(schema.to_string()));
 
@@ -157,7 +157,7 @@ fn output_schema_adds_guided_json_to_payload() {
 #[test]
 fn no_output_schema_omits_response_format_from_payload() {
     let (transport, captured) = MockTransport::capturing(&completion_json("ok"));
-    let provider = VllmProvider::new(transport);
+    let provider = OpenAiCompatProvider::new(transport, ProviderKind::Vllm);
 
     provider.infer(&base_request()).unwrap();
 
@@ -173,7 +173,7 @@ fn no_output_schema_omits_response_format_from_payload() {
 fn output_schema_is_forwarded_verbatim_to_payload() {
     let schema = serde_json::json!({"type": "array", "items": {"type": "string"}});
     let (transport, captured) = MockTransport::capturing(&completion_json("ok"));
-    let provider = SglangProvider::new(transport);
+    let provider = OpenAiCompatProvider::new(transport, ProviderKind::Sglang);
     let mut req = base_request();
     req.guided_json = Some(Arc::from(schema.to_string()));
 
@@ -200,7 +200,7 @@ fn output_schema_with_nested_properties_round_trips() {
     });
 
     let (transport, captured) = MockTransport::capturing(&completion_json("ok"));
-    let provider = VllmProvider::new(transport);
+    let provider = OpenAiCompatProvider::new(transport, ProviderKind::Vllm);
     let mut req = base_request();
     req.guided_json = Some(Arc::from(schema.to_string()));
 
@@ -216,7 +216,7 @@ fn output_schema_with_nested_properties_round_trips() {
 
 #[test]
 fn finish_reason_stop_is_parsed() {
-    let provider = VllmProvider::new(MockTransport::ok(&completion_with_reason("done", "stop")));
+    let provider = OpenAiCompatProvider::new(MockTransport::ok(&completion_with_reason("done", "stop")), ProviderKind::Vllm);
     let result = provider.infer(&base_request()).unwrap();
     assert_eq!(result.finish_reason.as_deref(), Some("stop"));
     assert_eq!(result.output_text, "done");
@@ -225,14 +225,14 @@ fn finish_reason_stop_is_parsed() {
 #[test]
 fn finish_reason_length_is_parsed() {
     let provider =
-        VllmProvider::new(MockTransport::ok(&completion_with_reason("partial", "length")));
+        OpenAiCompatProvider::new(MockTransport::ok(&completion_with_reason("partial", "length")), ProviderKind::Vllm);
     let result = provider.infer(&base_request()).unwrap();
     assert_eq!(result.finish_reason.as_deref(), Some("length"));
 }
 
 #[test]
 fn finish_reason_absent_yields_none() {
-    let provider = VllmProvider::new(MockTransport::ok(&completion_json("ok")));
+    let provider = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("ok")), ProviderKind::Vllm);
     let result = provider.infer(&base_request()).unwrap();
     assert_eq!(result.finish_reason, None);
 }
@@ -241,7 +241,7 @@ fn finish_reason_absent_yields_none() {
 fn finish_reason_null_yields_none() {
     let json =
         r#"{"choices":[{"finish_reason":null,"message":{"role":"assistant","content":"ok"}}]}"#;
-    let provider = VllmProvider::new(MockTransport::ok(json));
+    let provider = OpenAiCompatProvider::new(MockTransport::ok(json), ProviderKind::Vllm);
     let result = provider.infer(&base_request()).unwrap();
     assert_eq!(result.finish_reason, None);
 }
@@ -249,7 +249,7 @@ fn finish_reason_null_yields_none() {
 #[test]
 fn finish_reason_custom_value_is_preserved() {
     let provider =
-        VllmProvider::new(MockTransport::ok(&completion_with_reason("text", "content_filter")));
+        OpenAiCompatProvider::new(MockTransport::ok(&completion_with_reason("text", "content_filter")), ProviderKind::Vllm);
     let result = provider.infer(&base_request()).unwrap();
     assert_eq!(result.finish_reason.as_deref(), Some("content_filter"));
 }
@@ -257,7 +257,7 @@ fn finish_reason_custom_value_is_preserved() {
 #[test]
 fn sglang_provider_also_parses_finish_reason() {
     let provider =
-        SglangProvider::new(MockTransport::ok(&completion_with_reason("sglang-out", "stop")));
+        OpenAiCompatProvider::new(MockTransport::ok(&completion_with_reason("sglang-out", "stop")), ProviderKind::Sglang);
     let result = provider.infer(&base_request()).unwrap();
     assert_eq!(result.finish_reason.as_deref(), Some("stop"));
 }
@@ -271,7 +271,7 @@ fn inference_latency_reflects_transport_duration() {
         delay_ms,
         response: completion_with_reason("response", "stop"),
     };
-    let provider = VllmProvider::new(transport);
+    let provider = OpenAiCompatProvider::new(transport, ProviderKind::Vllm);
     let result = provider.infer(&base_request()).unwrap();
     assert!(
         result.inference_latency_ms >= delay_ms,
@@ -283,7 +283,7 @@ fn inference_latency_reflects_transport_duration() {
 
 #[test]
 fn fast_transport_yields_non_negative_latency() {
-    let provider = VllmProvider::new(MockTransport::ok(&completion_json("ok")));
+    let provider = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("ok")), ProviderKind::Vllm);
     let result = provider.infer(&base_request()).unwrap();
     // u64 is always non-negative; this test documents the contract
     let _: u64 = result.inference_latency_ms;
@@ -294,7 +294,7 @@ fn latency_is_independent_of_output_content() {
     let delay_ms = 20u64;
     let long_response = completion_with_reason(&"x".repeat(4096), "stop");
     let transport = DelayTransport { delay_ms, response: long_response };
-    let provider = VllmProvider::new(transport);
+    let provider = OpenAiCompatProvider::new(transport, ProviderKind::Vllm);
     let result = provider.infer(&base_request()).unwrap();
     assert!(
         result.inference_latency_ms >= delay_ms,
@@ -304,12 +304,12 @@ fn latency_is_independent_of_output_content() {
 
 #[test]
 fn fallback_result_also_carries_latency() {
-    let primary = VllmProvider::new(MockTransport::err(ProviderError::HttpStatus(503)));
+    let primary = OpenAiCompatProvider::new(MockTransport::err(ProviderError::HttpStatus(503)), ProviderKind::Vllm);
     let fallback_transport = DelayTransport {
         delay_ms: 15,
         response: completion_with_reason("fallback", "stop"),
     };
-    let fallback = SglangProvider::new(fallback_transport);
+    let fallback = OpenAiCompatProvider::new(fallback_transport, ProviderKind::Sglang);
     let router = ProviderRouter::new(primary, fallback);
 
     let mut req = base_request();
