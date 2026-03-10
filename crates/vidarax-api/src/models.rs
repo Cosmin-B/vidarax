@@ -132,6 +132,32 @@ pub struct RealtimeReasonRequest {
     /// Then `GET /v1/runs/{id}/events?index=safety` returns only events from
     /// the first pass.  When absent all events are returned regardless of index.
     pub index_name: Option<String>,
+    /// When true, chunks are processed sequentially and each VLM call receives
+    /// the previous chunk's description as temporal context. Slower but more
+    /// accurate for interaction detection. Default: false (parallel).
+    #[serde(default)]
+    pub temporal_chain: Option<bool>,
+    /// When true, each VLM call includes the previous chunk's frame as an
+    /// additional image so the model can visually diff the two states.
+    /// Implies temporal_chain=true. Default: false.
+    #[serde(default)]
+    pub visual_diff: Option<bool>,
+    /// When true, only chunks containing a gate-detected scene cut are sent
+    /// to VLM. Skips static chunks entirely. Default: false.
+    #[serde(default)]
+    pub gate_filter: Option<bool>,
+    /// When true, extract short MP4 clips instead of JPEG frames for VLM
+    /// input.  Each chunk becomes one video segment sent via `input_videos`.
+    /// Default: false (JPEG frame mode).
+    #[serde(default)]
+    pub video_clip_mode: Option<bool>,
+    /// Duration of each video clip in seconds when `video_clip_mode` is true.
+    /// Must be > 0.  Default: 0.5.
+    pub video_clip_duration_s: Option<f32>,
+    /// Maximum number of concurrent VLM inference requests in parallel mode.
+    /// Higher values increase throughput but may cause queueing on the GPU.
+    /// Default: 4.
+    pub vlm_concurrency: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]

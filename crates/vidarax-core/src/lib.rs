@@ -1,3 +1,4 @@
+pub mod backends;
 pub mod dedup;
 pub mod gate;
 pub mod ingest;

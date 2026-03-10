@@ -24,7 +24,7 @@
 //! indefinitely; they are called from worker threads that must keep up with
 //! the frame rate.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use base64::Engine as _;
 
@@ -112,6 +112,10 @@ pub struct KeyframeWork {
     pub event_type: &'static str,
     /// Gate confidence score in \[0.0, 1.0\].
     pub confidence: f32,
+    /// Gate-derived novelty score (0=familiar, 1=novel).
+    pub novelty_score: f32,
+    /// Gate-derived motion score (0=static, 1=high motion).
+    pub motion_score: f32,
     /// Raw JPEG bytes — base64-encoded on-demand for VLM, stored raw in SpacetimeDB.
     ///
     /// Shared via `Arc<[u8]>` so cloning this work item copies only a pointer.
@@ -342,6 +346,8 @@ pub fn spawn_analysis_workers(
                                 pts_ms: sf.pts_ms,
                                 event_type,
                                 confidence: meta.confidence,
+                                novelty_score: meta.novelty_score,
+                                motion_score: meta.motion_score,
                                 jpeg_bytes,
                                 prompt: Arc::from(""),
                                 loop_active,
@@ -417,6 +423,10 @@ pub fn spawn_vlm_workers<I>(
     metrics: Arc<PipelineMetrics>,
     session_span: tracing::Span,
     max_output_tokens_per_second: u32,
+    // Shared guided-JSON schema handle.  When the inner `Option` is `Some`,
+    // the schema is passed to the first-pass VLM request and `max_tokens`
+    // is raised to 1024 to accommodate structured output.
+    guided_json: Arc<RwLock<Option<Arc<str>>>>,
     #[cfg(feature = "training")]
     training_store: Option<Arc<Mutex<TrainingStore>>>,
     #[cfg(not(feature = "training"))]
@@ -469,6 +479,7 @@ pub fn spawn_vlm_workers<I>(
         let config = config.clone();
         let metrics = Arc::clone(&metrics);
         let session_span = session_span.clone();
+        let guided_json = Arc::clone(&guided_json);
         #[cfg(feature = "training")]
         let training_store = training_store.clone();
         #[cfg(feature = "training")]
@@ -505,6 +516,12 @@ pub fn spawn_vlm_workers<I>(
                 // with repeated identical events.
                 let mut dedup = DedupFilter::new();
 
+                // Temporal context: carry the previous keyframe's VLM description
+                // so the next inference knows what came before without sending a
+                // second image (saves ~2000 tokens per call).
+                let mut last_description = String::new();
+                let mut last_pts_ms: u64 = 0;
+
                 while let Ok(work) = vlm_rx.recv() {
                     let _guard = session_span.enter();
 
@@ -536,10 +553,31 @@ pub fn spawn_vlm_workers<I>(
                     }
 
                     metrics.inc_vlm_inferences();
+
+                    // Build prompt with temporal context injected as a prefix.
+                    // Default prompt asks for scene description (not interaction
+                    // detection) — state diffs are computed server-side below.
                     let prompt: Arc<str> = if work.prompt.is_empty() {
                         Arc::from("Briefly describe what is happening in this video frame.")
                     } else {
                         Arc::clone(&work.prompt)
+                    };
+
+                    let base_prompt: &str = &prompt;
+
+                    let prompt_str = if last_description.is_empty() {
+                        format!(
+                            "{base_prompt}\n\
+                             [gate: trigger={}, confidence={:.2}, novelty={:.2}, motion={:.2}, pts_ms={}]",
+                            work.event_type, work.confidence, work.novelty_score, work.motion_score, work.pts_ms,
+                        )
+                    } else {
+                        format!(
+                            "{base_prompt}\n\
+                             [previous_state ({last_pts_ms}ms): {last_description}]\n\
+                             [gate: trigger={}, confidence={:.2}, novelty={:.2}, motion={:.2}, pts_ms={}]",
+                            work.event_type, work.confidence, work.novelty_score, work.motion_score, work.pts_ms,
+                        )
                     };
 
                     // Base64-encode the JPEG once for both embedding and VLM calls.
@@ -589,18 +627,26 @@ pub fn spawn_vlm_workers<I>(
                     let (description_str, used_second_pass) = if let Some(hit) = knn_hit {
                         hit
                     } else {
+                        // Snapshot the current guided_json schema once per inference.
+                        let current_guided_json: Option<Arc<str>> = guided_json
+                            .read()
+                            .ok()
+                            .and_then(|g| g.clone());
+                        let first_max_tokens = if current_guided_json.is_some() { 1024 } else { 128 };
+                        let prompt_arc: Arc<str> = Arc::from(prompt_str.as_str());
                         let first_request = InferenceRequest {
-                            model: config.first_pass_model.clone(),
-                            prompt: prompt.clone(),
+                            model: Arc::clone(&config.first_pass_model),
+                            prompt: Arc::clone(&prompt_arc),
                             input_images: vec![InferenceImage {
                                 media_type: "image/jpeg",
                                 data_base64: jpeg_b64.clone(),
                             }],
-                            max_tokens: 128,
+                            input_videos: Vec::new(),
+                            max_tokens: first_max_tokens,
                             temperature: 0.0,
                             timeout_ms: 5_000,
                             allow_fallback: true,
-                            guided_json: None,
+                            guided_json: current_guided_json,
                         };
 
                         match provider.infer(&first_request) {
@@ -612,9 +658,10 @@ pub fn spawn_vlm_workers<I>(
                                     // forces structured TeacherLabel output so downstream
                                     // parse_teacher_label() never sees unstructured free text.
                                     let second_request = InferenceRequest {
-                                        model: config.second_pass_model.clone(),
-                                        prompt,
+                                        model: Arc::clone(&config.second_pass_model),
+                                        prompt: prompt_arc,
                                         input_images: first_request.input_images,
+                                        input_videos: Vec::new(),
                                         max_tokens: config.second_pass_max_tokens,
                                         temperature: 0.0,
                                         timeout_ms: 10_000,
@@ -654,13 +701,43 @@ pub fn spawn_vlm_workers<I>(
                     // the same allocation without cloning the String content.
                     let description: Arc<str> = Arc::from(description_str.into_boxed_str());
 
-                    // ── Dedup filter ─────────────────────────────────────
-                    // Skip emitting when the VLM produced the same description
-                    // as the last one (e.g. a near-static scene between scene
-                    // cuts). The keyframe is still stored so the JPEG archive
-                    // remains complete; only the event is suppressed.
+                    // ── Temporal diff: detect state transitions ───────────
+                    // Compare current VLM description against the previous one.
+                    // When descriptions differ significantly, emit a
+                    // `state_transition` event with both states.  This is the
+                    // core interaction detection mechanism: the VLM describes
+                    // what it sees (cheap, always succeeds), and state changes
+                    // are detected server-side (instant, deterministic).
+                    let prev_desc = last_description.clone();
+                    let state_changed = if prev_desc.is_empty() {
+                        // First frame — always emit as initial state.
+                        true
+                    } else {
+                        // Jaccard word-overlap: compare the *set* of words so
+                        // that paraphrases or reordering don't fool the check,
+                        // unlike the previous positional char comparison.
+                        use std::collections::HashSet;
+                        let prev_words: HashSet<&str> =
+                            prev_desc.split_whitespace().collect();
+                        let curr_words: HashSet<&str> =
+                            description.split_whitespace().collect();
+                        let intersection = prev_words.intersection(&curr_words).count();
+                        let union = prev_words.union(&curr_words).count();
+                        let jaccard = if union == 0 {
+                            1.0
+                        } else {
+                            intersection as f32 / union as f32
+                        };
+                        jaccard < 0.5
+                    };
+
+                    // Update temporal context for the next keyframe.
+                    last_description.clear();
+                    last_description.push_str(&description[..description.len().min(200)]);
+                    last_pts_ms = work.pts_ms;
+
+                    // Always emit the VLM description event.
                     if dedup.should_emit(&description) {
-                        // Fire-and-forget: VLM threads don't block on SpacetimeDB HTTP.
                         let _ = event_tx.send(SinkEvent::Emit {
                             run_id: Arc::clone(&work.run_id),
                             session_id: Arc::clone(&work.session_id),
@@ -669,6 +746,26 @@ pub fn spawn_vlm_workers<I>(
                             event_type,
                             confidence: work.confidence,
                             description: Arc::clone(&description),
+                        });
+                    }
+
+                    // Emit state_transition when the scene changed.
+                    if state_changed && !prev_desc.is_empty() {
+                        let transition_desc = format!(
+                            "{{\"from_state\":{},\"to_state\":{},\"trigger\":\"{}\",\"confidence\":{:.2}}}",
+                            serde_json::Value::String(prev_desc),
+                            serde_json::Value::String(description.to_string()),
+                            work.event_type,
+                            work.confidence,
+                        );
+                        let _ = event_tx.send(SinkEvent::Emit {
+                            run_id: Arc::clone(&work.run_id),
+                            session_id: Arc::clone(&work.session_id),
+                            frame_index: work.frame_index,
+                            pts_ms: work.pts_ms,
+                            event_type: "state_transition",
+                            confidence: work.confidence,
+                            description: Arc::from(transition_desc),
                         });
                     }
                     let _ = event_tx.send(SinkEvent::StoreKeyframe {
@@ -900,6 +997,8 @@ mod tests {
             pts_ms: 0,
             event_type: "scene_cut",
             confidence: 0.9,
+            novelty_score: 0.8,
+            motion_score: 0.5,
             jpeg_bytes: Arc::from([0xFF_u8, 0xD8, 0xFF, 0xD9] as [u8; 4]),
             prompt: Arc::from(""),
             loop_active: false,

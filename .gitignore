@@ -19,3 +19,9 @@ crates/vendor/zvec/
 scripts/__pycache__/
 crates/zvec-sys-patched/target/
 presentation/node_modules/
+.DS_Store
+screenshots/
+ui/node_modules/
+ui/dist/
+__pycache__/
+*.pyc

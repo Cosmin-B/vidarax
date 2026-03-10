@@ -2,6 +2,7 @@
 
 use std::io;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 pub mod config;
 mod handlers;
@@ -18,13 +19,16 @@ mod state;
 mod tenant_labels;
 pub mod telemetry;
 mod validation;
+pub mod wal_sink;
 mod whip;
 
 pub use config::{assert_route_parity, resolve_wal_path, ServerConfig, TransportMode};
 pub use models::AttachStreamRequest;
 pub use router::app_router;
 pub use state::AppState;
-use vidarax_core::provider::ProviderEndpoints;
+use vidarax_core::provider::{
+    HttpTransport, InferenceProvider, OpenAiCompatProvider, ProviderKind, ProviderRouter,
+};
 use vidarax_core::webrtc::session::{TurnServer, WebRtcConfig};
 
 pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -91,7 +95,9 @@ fn build_webrtc_config(config: &ServerConfig) -> WebRtcConfig {
     }
 }
 
-fn infer_provider_endpoints(config: &ServerConfig) -> Result<Option<ProviderEndpoints>, String> {
+fn infer_provider_endpoints(
+    config: &ServerConfig,
+) -> Result<Option<Arc<dyn InferenceProvider + Send + Sync>>, String> {
     match (
         config.inference_vllm_base_url.as_ref(),
         config.inference_sglang_base_url.as_ref(),
@@ -99,10 +105,14 @@ fn infer_provider_endpoints(config: &ServerConfig) -> Result<Option<ProviderEndp
         (Some(vllm), Some(sglang)) => {
             validate_provider_endpoint("VIDARAX_VLLM_BASE_URL", vllm)?;
             validate_provider_endpoint("VIDARAX_SGLANG_BASE_URL", sglang)?;
-            Ok(Some(ProviderEndpoints {
-                vllm_base_url: vllm.clone(),
-                sglang_base_url: sglang.clone(),
-            }))
+            let vllm_transport = HttpTransport::new(vllm)
+                .map_err(|e| format!("vllm transport error: {e:?}"))?;
+            let sglang_transport = HttpTransport::new(sglang)
+                .map_err(|e| format!("sglang transport error: {e:?}"))?;
+            let primary = OpenAiCompatProvider::new(vllm_transport, ProviderKind::Vllm);
+            let fallback = OpenAiCompatProvider::new(sglang_transport, ProviderKind::Sglang);
+            let router = ProviderRouter::new(primary, fallback);
+            Ok(Some(Arc::new(router)))
         }
         (None, None) => Ok(None),
         _ => Err(
@@ -163,7 +173,9 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tower::ServiceExt;
-    use vidarax_core::provider::ProviderEndpoints;
+    use vidarax_core::provider::{
+        HttpTransport, InferenceProvider, OpenAiCompatProvider, ProviderKind, ProviderRouter,
+    };
     #[cfg(feature = "h3-experimental")]
     use {
         tokio_quiche::http3::driver::{ClientH3Event, H3Event, InboundFrame, NewClientRequest},
@@ -175,19 +187,30 @@ mod tests {
         test_state_with_endpoints(None)
     }
 
-    fn test_state_with_endpoints(endpoints: Option<ProviderEndpoints>) -> AppState {
+    /// Build an `Arc<dyn InferenceProvider>` from a single base_url (used as both vllm primary and sglang fallback).
+    fn build_test_provider(base_url: &str) -> Arc<dyn InferenceProvider + Send + Sync> {
+        let vllm_transport = HttpTransport::new(base_url).unwrap();
+        let sglang_transport = HttpTransport::new(base_url).unwrap();
+        let primary = OpenAiCompatProvider::new(vllm_transport, ProviderKind::Vllm);
+        let fallback = OpenAiCompatProvider::new(sglang_transport, ProviderKind::Sglang);
+        Arc::new(ProviderRouter::new(primary, fallback))
+    }
+
+    fn test_state_with_endpoints(
+        endpoints: Option<Arc<dyn InferenceProvider + Send + Sync>>,
+    ) -> AppState {
         test_state_with_endpoints_and_policy(endpoints, SecurityPolicy::from_config_for_tests())
     }
 
     fn test_state_with_endpoints_and_policy(
-        endpoints: Option<ProviderEndpoints>,
+        endpoints: Option<Arc<dyn InferenceProvider + Send + Sync>>,
         policy: SecurityPolicy,
     ) -> AppState {
         test_state_with_runtime(endpoints, policy, 3600, 5)
     }
 
     fn test_state_with_runtime(
-        endpoints: Option<ProviderEndpoints>,
+        endpoints: Option<Arc<dyn InferenceProvider + Send + Sync>>,
         policy: SecurityPolicy,
         stream_ttl_secs: u64,
         active_stream_limit: usize,
@@ -706,10 +729,7 @@ mod tests {
         let completion =
             "{\"choices\":[{\"message\":{\"content\":\"hello from provider\"}}]}".to_string();
         let (base_url, server) = spawn_mock_provider_http_server(200, completion);
-        let state = test_state_with_endpoints(Some(ProviderEndpoints {
-            vllm_base_url: base_url.clone(),
-            sglang_base_url: base_url,
-        }));
+        let state = test_state_with_endpoints(Some(build_test_provider(&base_url)));
         let app = app_router(state);
 
         let req = Request::builder()
@@ -734,10 +754,7 @@ mod tests {
         let completion =
             "{\"choices\":[{\"message\":{\"content\":\"hello from provider\"}}]}".to_string();
         let (base_url, server) = spawn_mock_provider_http_server_n(200, completion, 2);
-        let state = test_state_with_endpoints(Some(ProviderEndpoints {
-            vllm_base_url: base_url.clone(),
-            sglang_base_url: base_url,
-        }));
+        let state = test_state_with_endpoints(Some(build_test_provider(&base_url)));
         let app = app_router(state);
 
         let req = Request::builder()
@@ -780,10 +797,7 @@ mod tests {
 
     #[tokio::test]
     async fn infer_batch_rejects_out_of_range_max_parallel() {
-        let state = test_state_with_endpoints(Some(ProviderEndpoints {
-            vllm_base_url: "http://127.0.0.1:9".to_string(),
-            sglang_base_url: "http://127.0.0.1:9".to_string(),
-        }));
+        let state = test_state_with_endpoints(Some(build_test_provider("http://127.0.0.1:9")));
         let app = app_router(state);
 
         let req = Request::builder()
@@ -811,10 +825,7 @@ mod tests {
         let completion =
             "{\"choices\":[{\"message\":{\"content\":\"hello from provider\"}}]}".to_string();
         let (base_url, server) = spawn_mock_provider_http_server_n(200, completion, 8);
-        let state = test_state_with_endpoints(Some(ProviderEndpoints {
-            vllm_base_url: base_url.clone(),
-            sglang_base_url: base_url,
-        }));
+        let state = test_state_with_endpoints(Some(build_test_provider(&base_url)));
         let app = app_router(state);
 
         let infer_req = Request::builder()
@@ -865,10 +876,7 @@ mod tests {
     #[tokio::test]
     async fn models_catalog_reports_ready_with_reachable_providers() {
         let (base_url, server) = spawn_mock_provider_http_server_n(200, "{}".to_string(), 2);
-        let state = test_state_with_endpoints(Some(ProviderEndpoints {
-            vllm_base_url: base_url.clone(),
-            sglang_base_url: base_url,
-        }));
+        let state = test_state_with_endpoints(Some(build_test_provider(&base_url)));
         let app = app_router(state);
 
         let req = Request::builder()
@@ -1350,10 +1358,7 @@ mod tests {
 
         let completion = "{\"choices\":[{\"message\":{\"content\":\"{\\\"event_type\\\":\\\"scene_cut\\\",\\\"object_label\\\":\\\"temple\\\",\\\"summary\\\":\\\"Temple visible\\\",\\\"description\\\":\\\"Temple appears in this chunk\\\",\\\"confidence\\\":0.91}\"}}]}".to_string();
         let (base_url, server) = spawn_mock_provider_http_server(200, completion);
-        let state = test_state_with_endpoints(Some(ProviderEndpoints {
-            vllm_base_url: base_url.clone(),
-            sglang_base_url: base_url,
-        }));
+        let state = test_state_with_endpoints(Some(build_test_provider(&base_url)));
         let app = app_router(state);
 
         let create_req = Request::builder()

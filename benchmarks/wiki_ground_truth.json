@@ -1,0 +1,127 @@
+{
+  "video": "Wiki.mp4",
+  "duration_s": 157,
+  "source": "manual annotation by Cosmin",
+  "interactions": [
+    {
+      "timestamp": "00:08",
+      "timestamp_ms": 8000,
+      "element": "View Documentation",
+      "action": "click",
+      "from_state": "Home screen: Platform Documentation title",
+      "to_state": "Documentation sidebar navigation open"
+    },
+    {
+      "timestamp": "00:18",
+      "timestamp_ms": 18000,
+      "element": "Shared Systems",
+      "action": "click",
+      "from_state": "Documentation sidebar closed",
+      "to_state": "Shared Systems dropdown expanded"
+    },
+    {
+      "timestamp": "00:27",
+      "timestamp_ms": 27000,
+      "element": "Browse Space Client",
+      "action": "click",
+      "from_state": "Documentation list view",
+      "to_state": "Platform Space Client documentation page"
+    },
+    {
+      "timestamp": "00:46",
+      "timestamp_ms": 46000,
+      "element": "page body",
+      "action": "scroll",
+      "from_state": "Top of Platform Space Client page",
+      "to_state": "Middle of page (Technology Stack)"
+    },
+    {
+      "timestamp": "01:12",
+      "timestamp_ms": 72000,
+      "element": "Experience Loading",
+      "action": "click",
+      "from_state": "Platform Space Client page",
+      "to_state": "Experience Loading documentation page"
+    },
+    {
+      "timestamp": "01:21",
+      "timestamp_ms": 81000,
+      "element": "page body",
+      "action": "scroll",
+      "from_state": "Top of Experience Loading page",
+      "to_state": "Bottom of Experience Loading page (diagrams)"
+    },
+    {
+      "timestamp": "01:50",
+      "timestamp_ms": 110000,
+      "element": "Shared Systems",
+      "action": "click",
+      "from_state": "Platform Space Client section",
+      "to_state": "Shared Systems expanded"
+    },
+    {
+      "timestamp": "01:53",
+      "timestamp_ms": 113000,
+      "element": "PlatformFormat",
+      "action": "click",
+      "from_state": "Shared Systems list",
+      "to_state": "PlatformFormat sub-menu expanded"
+    },
+    {
+      "timestamp": "01:55",
+      "timestamp_ms": 115000,
+      "element": "Binary Format",
+      "action": "click",
+      "from_state": "PlatformFormat list",
+      "to_state": "Binary Format documentation page"
+    },
+    {
+      "timestamp": "02:05",
+      "timestamp_ms": 125000,
+      "element": "Data Model",
+      "action": "click",
+      "from_state": "Binary Format page",
+      "to_state": "Data Model documentation page"
+    },
+    {
+      "timestamp": "02:11",
+      "timestamp_ms": 131000,
+      "element": "File management",
+      "action": "click",
+      "from_state": "Data Model page",
+      "to_state": "File management sub-menu expanded"
+    },
+    {
+      "timestamp": "02:13",
+      "timestamp_ms": 133000,
+      "element": "Native File System",
+      "action": "click",
+      "from_state": "File management list",
+      "to_state": "Native File System documentation page"
+    },
+    {
+      "timestamp": "02:26",
+      "timestamp_ms": 146000,
+      "element": "Online services",
+      "action": "click",
+      "from_state": "File management page",
+      "to_state": "Online services sub-menu expanded"
+    },
+    {
+      "timestamp": "02:27",
+      "timestamp_ms": 147000,
+      "element": "Authentication",
+      "action": "click",
+      "from_state": "Online services list",
+      "to_state": "Authentication documentation page"
+    },
+    {
+      "timestamp": "02:29",
+      "timestamp_ms": 149000,
+      "element": "Builder Service",
+      "action": "click",
+      "from_state": "Authentication page",
+      "to_state": "Builder Service documentation page"
+    }
+  ]
+}

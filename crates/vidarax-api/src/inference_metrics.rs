@@ -82,7 +82,7 @@ impl InferenceMetrics {
 
     fn provider(&self, provider: ProviderKind) -> &ProviderMetrics {
         match provider {
-            ProviderKind::Vllm => &self.vllm,
+            ProviderKind::Vllm | ProviderKind::Gemini => &self.vllm,
             ProviderKind::Sglang => &self.sglang,
         }
     }

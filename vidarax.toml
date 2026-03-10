@@ -1,0 +1,23 @@
+# Vidarax backend configuration.
+# Backends are tried in priority order (lowest = first).
+# String values support ${ENV_VAR} interpolation.
+
+[[backends]]
+name = "vllm"
+type = "openai_compat"
+base_url = "${VIDARAX_VLLM_BASE_URL}"
+priority = 1
+
+[[backends]]
+name = "sglang"
+type = "openai_compat"
+base_url = "${VIDARAX_SGLANG_BASE_URL}"
+priority = 2
+
+# Uncomment to add Gemini as a fallback/teacher model:
+# [[backends]]
+# name = "gemini-flash"
+# type = "gemini"
+# api_key = "${GEMINI_API_KEY}"
+# model = "gemini-2.5-flash-preview-05-20"
+# priority = 10

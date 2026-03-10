@@ -7,7 +7,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use std::cmp::min;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
 use vidarax_contracts::models::{
     fallback_candidates, REQUIRED_MEDIUM_MODELS, REQUIRED_SMALL_MODELS,
@@ -15,11 +15,11 @@ use vidarax_contracts::models::{
 use vidarax_core::gate::{FrameSignal, GateConfig, GateEventType};
 use vidarax_core::ingest::{
     compute_semantic_frame_indices, decode_mp4_to_frame_signals, decode_selective_jpeg_frames,
-    probe_source_fps, DecodedJpegFrame, InputSource, Mp4DecodeConfig,
+    extract_video_clip, probe_source_fps, DecodedJpegFrame, InputSource, Mp4DecodeConfig,
 };
 use vidarax_core::pipeline::{FrameMetadata, TwoPassConfig, TwoPassPipeline};
 use vidarax_core::provider::{
-    build_http_router, InferenceImage, InferenceRequest, InferenceResult, ProviderEndpoints,
+    InferenceImage, InferenceProvider, InferenceRequest, InferenceResult, InferenceVideo,
     ProviderError, ProviderKind,
 };
 use vidarax_core::timeline::TimelineEvent;
@@ -580,7 +580,7 @@ pub async fn infer(
     headers: HeaderMap,
     Json(payload): Json<InferRequest>,
 ) -> impl IntoResponse {
-    if state.inference_endpoints().is_none() {
+    if state.inference_provider().is_none() {
         return internal_error(
             &state,
             "inference providers are not configured; set VIDARAX_VLLM_BASE_URL and VIDARAX_SGLANG_BASE_URL",
@@ -603,7 +603,7 @@ pub async fn infer_batch(
     headers: HeaderMap,
     Json(payload): Json<InferBatchRequest>,
 ) -> impl IntoResponse {
-    if state.inference_endpoints().is_none() {
+    if state.inference_provider().is_none() {
         return internal_error(
             &state,
             "inference providers are not configured; set VIDARAX_VLLM_BASE_URL and VIDARAX_SGLANG_BASE_URL",
@@ -1084,8 +1084,7 @@ pub async fn reason_realtime_run(
         );
     }
     let semantic_prompt = payload.semantic_prompt.unwrap_or_else(|| {
-        "You are classifying a short video chunk. Return strict JSON with keys: event_type, object_label, summary, description, confidence (0..1). event_type must be one of: scene_cut, artifact_suspected, keyframe_keep, context_observation."
-            .to_string()
+        "You are classifying a short video chunk. Return strict JSON with keys: event_type, object_label, summary, description, confidence (0..1). event_type must be one of: scene_cut, artifact_suspected, keyframe_keep, context_observation.".to_string()
     });
     if semantic_prompt.trim().is_empty() || semantic_prompt.len() > 4_096 {
         return validation_error(
@@ -1137,6 +1136,24 @@ pub async fn reason_realtime_run(
             }
         };
 
+    let video_clip_mode = payload.video_clip_mode.unwrap_or(false);
+    let video_clip_duration_s = payload.video_clip_duration_s.unwrap_or(0.5);
+    if video_clip_mode {
+        if !video_clip_duration_s.is_finite()
+            || video_clip_duration_s <= 0.0
+            || video_clip_duration_s > 60.0
+        {
+            return validation_error(
+                &state,
+                "invalid realtime reason request",
+                vec![field_error(
+                    "video_clip_duration_s",
+                    "video_clip_duration_s must be in (0, 60]".to_string(),
+                )],
+            );
+        }
+    }
+
     let fixed_fps = payload.fixed_fps.unwrap_or(1.0);
     if sampling_policy == SamplingPolicy::Fixed && !(0.2..=120.0).contains(&fixed_fps) {
         return validation_error(
@@ -1149,7 +1166,10 @@ pub async fn reason_realtime_run(
         );
     }
 
-    let semantic_decode_enabled = semantic_inference && state.inference_endpoints().is_some();
+    let semantic_decode_enabled = semantic_inference && state.inference_provider().is_some();
+    // Keep a clone of the source for video clip extraction in Phase 1 (decode_source
+    // is moved into the spawn_blocking closure below).
+    let decode_source_ref = decode_source.clone();
     let (decoded, source_fps, sample_fps, decoded_jpegs) =
         match tokio::task::spawn_blocking(move || {
             let source_fps = probe_source_fps(&decode_source);
@@ -1166,8 +1186,10 @@ pub async fn reason_realtime_run(
             // Pass 1: frame signals (cheap, no encoding)
             let decoded = decode_mp4_to_frame_signals(&decode_source, decode_config)?;
 
-            // Pre-compute which frames go to VLM (pure math, zero I/O)
-            let decoded_jpegs = if semantic_decode_enabled {
+            // Pre-compute which frames go to VLM (pure math, zero I/O).
+            // In video_clip_mode, JPEG decoding is skipped here; clips are
+            // extracted per-chunk during Phase 1 below.
+            let decoded_jpegs = if semantic_decode_enabled && !video_clip_mode {
                 let indices = compute_semantic_frame_indices(
                     decoded.frame_signals.len(),
                     chunk_size,
@@ -1250,7 +1272,7 @@ pub async fn reason_realtime_run(
     let mut metadata = Vec::with_capacity(decoded.frame_signals.len());
     let mut marker_inputs = Vec::with_capacity(decoded.frame_signals.len());
     let mut chunk_lags = Vec::new();
-    let providers = state.inference_endpoints().cloned();
+    let providers = state.inference_provider().cloned();
     let semantic_available = semantic_inference && providers.is_some();
     let semantic_segment_ms = payload.segment_ms.unwrap_or(250);
     if semantic_inference && !semantic_available {
@@ -1279,6 +1301,8 @@ pub async fn reason_realtime_run(
         analyzed: Vec<FrameMetadata>,
         frame_offset: usize,
         chunk_jpegs: Vec<DecodedJpegFrame>,
+        /// MP4 clip bytes for this chunk, present only when video_clip_mode is true.
+        chunk_video_clip: Option<Vec<u8>>,
         pts_start_ms: u64,
         pts_end_ms: u64,
         chunk_len: usize,
@@ -1299,66 +1323,172 @@ pub async fn reason_realtime_run(
                 jpegs
             })
             .unwrap_or_default();
+
+        // In video_clip_mode, extract an MP4 segment covering this chunk's
+        // time window.  Clip start is derived from actual frame PTS so the
+        // VLM sees footage matching the decoded frames, not sequential offsets.
+        let pts_start_ms_for_clip = chunk.first().map(|f| f.pts_ms).unwrap_or(0);
+        let chunk_video_clip: Option<Vec<u8>> = if video_clip_mode && semantic_decode_enabled {
+            let clip_start = pts_start_ms_for_clip as f32 / 1000.0;
+            let source_for_clip = decode_source_ref.clone();
+            let duration = video_clip_duration_s;
+            match tokio::task::spawn_blocking(move || {
+                extract_video_clip(&source_for_clip, clip_start, duration)
+            })
+            .await
+            {
+                Ok(Ok(bytes)) => Some(bytes),
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        chunk_idx,
+                        clip_start_ms = pts_start_ms_for_clip,
+                        duration = video_clip_duration_s,
+                        error = %err,
+                        "video clip extraction failed for chunk; falling back to no-video"
+                    );
+                    None
+                }
+                Err(err) => {
+                    tracing::warn!(chunk_idx, error = %err, "clip extraction task panicked");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         chunk_preps.push(ChunkPrep {
             started,
             analyzed,
             frame_offset,
             chunk_jpegs,
+            chunk_video_clip,
             pts_start_ms: chunk.first().map(|f| f.pts_ms).unwrap_or(0),
             pts_end_ms: chunk.last().map(|f| f.pts_ms).unwrap_or(0),
             chunk_len: chunk.len(),
         });
     }
 
-    // --- Phase 2: parallel VLM inference (≤4 concurrent, saturates vLLM batching) ---
+    // --- Phase 2: VLM inference ---
     let num_chunks = chunk_preps.len();
     let mut semantic_results: Vec<Option<ChunkSemanticResult>> = (0..num_chunks).map(|_| None).collect();
     let mut task_end_times: Vec<Instant> = vec![Instant::now(); num_chunks];
+    let visual_diff = payload.visual_diff.unwrap_or(false);
+    let temporal_chain = visual_diff || payload.temporal_chain.unwrap_or(false);
 
     if semantic_available {
-        let sem = Arc::new(tokio::sync::Semaphore::new(4));
-        let mut join_set: JoinSet<(usize, ChunkSemanticResult, Instant)> = JoinSet::new();
-
         let guided_json_str: Option<String> = payload
             .output_schema
             .as_ref()
             .and_then(|s| serde_json::to_string(s).ok());
 
-        for (chunk_idx, prep) in chunk_preps.iter().enumerate() {
-            let providers_c = providers.clone();
-            let prompt_c = semantic_prompt.clone();
-            let chunk_jpegs_c = prep.chunk_jpegs.clone();
-            let sem_c = Arc::clone(&sem);
-            let frame_offset = prep.frame_offset as u64;
-            let pts_start_ms = prep.pts_start_ms;
-            let pts_end_ms = prep.pts_end_ms;
-            let tiered_config_c = tiered_config.clone();
-            let guided_json_c = guided_json_str.clone();
-            join_set.spawn(async move {
-                let _permit = sem_c.acquire().await.unwrap();
-                let overlay = infer_chunk_semantics(
-                    providers_c.as_ref(),
+        if temporal_chain {
+            // Sequential mode: each chunk gets the previous chunk's VLM output
+            // as context. When visual_diff is on, also sends the previous
+            // chunk's representative frame as a second image.
+            let mut last_description = String::new();
+            let mut last_pts_ms: u64 = 0;
+            let mut last_jpeg: Option<Vec<u8>> = None;
+
+            for (chunk_idx, prep) in chunk_preps.iter().enumerate() {
+                let prompt_with_context = if last_description.is_empty() {
+                    semantic_prompt.clone()
+                } else {
+                    format!(
+                        "{semantic_prompt}\n[previous_state ({last_pts_ms}ms): {}]",
+                        &last_description[..last_description.len().min(200)]
+                    )
+                };
+
+                let prev_jpeg_ref = if visual_diff { last_jpeg.as_deref() } else { None };
+
+                let result = infer_chunk_semantics(
+                    providers.as_ref(),
                     true,
                     semantic_primary_provider,
-                    model,
-                    &prompt_c,
+                    &model,
+                    &prompt_with_context,
                     semantic_timeout_ms,
                     semantic_frames_per_chunk,
-                    &chunk_jpegs_c,
-                    frame_offset,
-                    pts_start_ms,
-                    pts_end_ms,
-                    tiered_config_c,
-                    guided_json_c,
+                    &prep.chunk_jpegs,
+                    prep.frame_offset as u64,
+                    prep.pts_start_ms,
+                    prep.pts_end_ms,
+                    tiered_config.clone(),
+                    guided_json_str.clone(),
+                    prev_jpeg_ref,
+                    prep.chunk_video_clip.clone(),
                 )
                 .await;
-                (chunk_idx, overlay, Instant::now())
-            });
-        }
 
-        while let Some(Ok((idx, result, finished))) = join_set.join_next().await {
-            semantic_results[idx] = Some(result);
-            task_end_times[idx] = finished;
+                // Track last JPEG for visual_diff.
+                if visual_diff {
+                    if let Some(frame) = select_semantic_images(&prep.chunk_jpegs, 1).first() {
+                        last_jpeg = Some(frame.jpeg_bytes.clone());
+                    }
+                }
+
+                if let Some(ref raw) = result.raw_output {
+                    let s = raw.to_string();
+                    if s.len() > 4 {
+                        last_description.clear();
+                        last_description.push_str(&s[..s.len().min(200)]);
+                        last_pts_ms = prep.pts_end_ms;
+                    }
+                } else if let Some(ref overlay) = result.overlay {
+                    last_description.clear();
+                    last_description.push_str(&overlay.description[..overlay.description.len().min(200)]);
+                    last_pts_ms = prep.pts_end_ms;
+                }
+
+                semantic_results[chunk_idx] = Some(result);
+                task_end_times[chunk_idx] = Instant::now();
+            }
+        } else {
+            // Parallel mode (default): fire all chunks concurrently.
+            let vlm_concurrency = payload.vlm_concurrency.unwrap_or(4).clamp(1, 64);
+            let sem = Arc::new(tokio::sync::Semaphore::new(vlm_concurrency));
+            let mut join_set: JoinSet<(usize, ChunkSemanticResult, Instant)> = JoinSet::new();
+
+            for (chunk_idx, prep) in chunk_preps.iter().enumerate() {
+                let providers_c = providers.clone();
+                let prompt_c = semantic_prompt.clone();
+                let chunk_jpegs_c = prep.chunk_jpegs.clone();
+                let chunk_video_clip_c = prep.chunk_video_clip.clone();
+                let sem_c = Arc::clone(&sem);
+                let frame_offset = prep.frame_offset as u64;
+                let pts_start_ms = prep.pts_start_ms;
+                let pts_end_ms = prep.pts_end_ms;
+                let tiered_config_c = tiered_config.clone();
+                let guided_json_c = guided_json_str.clone();
+                join_set.spawn(async move {
+                    let _permit = sem_c.acquire().await.unwrap();
+                    let overlay = infer_chunk_semantics(
+                        providers_c.as_ref(),
+                        true,
+                        semantic_primary_provider,
+                        model,
+                        &prompt_c,
+                        semantic_timeout_ms,
+                        semantic_frames_per_chunk,
+                        &chunk_jpegs_c,
+                        frame_offset,
+                        pts_start_ms,
+                        pts_end_ms,
+                        tiered_config_c,
+                        guided_json_c,
+                        None, // no visual_diff in parallel mode
+                        chunk_video_clip_c,
+                    )
+                    .await;
+                    (chunk_idx, overlay, Instant::now())
+                });
+            }
+
+            while let Some(Ok((idx, result, finished))) = join_set.join_next().await {
+                semantic_results[idx] = Some(result);
+                task_end_times[idx] = finished;
+            }
         }
     }
 
@@ -1589,7 +1719,7 @@ pub async fn get_markers(
 
 pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
     let request_id = state.next_request_id();
-    let endpoints = state.inference_endpoints().cloned();
+    let endpoints = state.inference_provider().cloned();
     let is_saturated = state.inference_metrics().is_high_latency();
     let availability =
         match tokio::task::spawn_blocking(move || {
@@ -2034,6 +2164,7 @@ async fn validate_infer_request(
             model: Arc::from(model),
             prompt: Arc::from(prompt),
             input_images: Vec::new(),
+            input_videos: Vec::new(),
             max_tokens,
             temperature,
             timeout_ms,
@@ -2045,24 +2176,20 @@ async fn validate_infer_request(
 }
 
 /// Build a provider router from raw endpoints and run a single inference call.
-///
-/// Constructs [`HttpTransport`] instances (and their connection pools) each
-/// call.  For high-frequency paths, build the router once with
-/// [`build_http_router`] and reuse the [`Arc`].
-fn infer_from_endpoints(
-    endpoints: &ProviderEndpoints,
-    primary: ProviderKind,
+/// Forward an inference request to the pre-built provider.
+fn infer_with_provider(
+    provider: &dyn InferenceProvider,
     request: &InferenceRequest,
 ) -> Result<InferenceResult, ProviderError> {
-    build_http_router(endpoints, primary)?.infer(request)
+    provider.infer(request)
 }
 
 async fn execute_infer_request(
     state: AppState,
     prepared: PreparedInferRequest,
 ) -> Result<InferResponse, InferExecutionError> {
-    let endpoints = state
-        .inference_endpoints()
+    let provider = state
+        .inference_provider()
         .cloned()
         .ok_or(InferExecutionError {
             code: "internal_error",
@@ -2074,9 +2201,8 @@ async fn execute_infer_request(
     let primary_provider_for_metrics = prepared.primary_provider;
     let request_for_provider = prepared.request.clone();
     let result = match tokio::task::spawn_blocking(move || {
-        infer_from_endpoints(
-            &endpoints,
-            primary_provider_for_metrics,
+        infer_with_provider(
+            &*provider,
             &request_for_provider,
         )
     })
@@ -2764,9 +2890,9 @@ fn load_decoded_signals_from_events(events: &[TimelineEvent]) -> Result<DecodedS
 
 #[allow(clippy::too_many_arguments)]
 async fn infer_chunk_semantics(
-    providers: Option<&vidarax_core::provider::ProviderEndpoints>,
+    providers: Option<&Arc<dyn InferenceProvider + Send + Sync>>,
     semantic_available: bool,
-    primary_provider: ProviderKind,
+    _primary_provider: ProviderKind,
     _model: &str,
     semantic_prompt: &str,
     timeout_ms: u64,
@@ -2777,6 +2903,9 @@ async fn infer_chunk_semantics(
     pts_end_ms: u64,
     tiered_config: vidarax_core::tiered_vlm::TieredVlmConfig,
     guided_json: Option<String>,
+    prev_jpeg: Option<&[u8]>,
+    // When `Some`, send this MP4 clip via `input_videos` instead of JPEG frames.
+    video_clip: Option<Vec<u8>>,
 ) -> ChunkSemanticResult {
     if !semantic_available {
         return ChunkSemanticResult::default();
@@ -2787,36 +2916,66 @@ async fn infer_chunk_semantics(
         used_fallback: false,
         ..ChunkSemanticResult::default()
     };
-    let Some(endpoints) = providers.cloned() else {
+    let Some(provider) = providers.cloned() else {
         result.used_fallback = true;
         result.error = Some("provider_not_configured".to_string());
         return result;
     };
 
-    let selected = select_semantic_images(chunk_jpegs, semantic_frames_per_chunk);
-    if selected.is_empty() {
-        result.used_fallback = true;
-        result.error = Some("chunk_has_no_jpeg_frames".to_string());
-        return result;
-    }
+    // In video_clip_mode the clip replaces JPEG frames entirely.  In JPEG mode
+    // we require at least one selected frame.
+    let use_video_clip = video_clip.is_some();
+    let selected = if use_video_clip {
+        Vec::new()
+    } else {
+        let sel = select_semantic_images(chunk_jpegs, semantic_frames_per_chunk);
+        if sel.is_empty() {
+            result.used_fallback = true;
+            result.error = Some("chunk_has_no_jpeg_frames".to_string());
+            return result;
+        }
+        sel
+    };
 
     let prompt = format!(
         "{semantic_prompt}\nchunk_frame_start={frame_start_index}\nchunk_frame_end={}\nchunk_pts_start_ms={pts_start_ms}\nchunk_pts_end_ms={pts_end_ms}",
         frame_start_index.saturating_add(chunk_jpegs.len() as u64).saturating_sub(1)
     );
-    let images = selected
-        .iter()
-        .map(|frame| InferenceImage {
+
+    // Build image and video lists for the request.
+    // video_clip_mode: send the MP4 clip via input_videos, no images.
+    // JPEG mode: send selected frames via input_images (+ optional prev_jpeg for
+    //            visual_diff), no videos.
+    let (images, videos) = if let Some(clip_bytes) = video_clip {
+        let vids = vec![InferenceVideo {
+            media_type: "video/mp4",
+            data_base64: BASE64_STANDARD.encode(&clip_bytes),
+        }];
+        (Vec::new(), vids)
+    } else {
+        let mut imgs: Vec<InferenceImage> = Vec::with_capacity(selected.len() + 1);
+        // When visual_diff is active, prepend the previous chunk's frame so the
+        // VLM can see both "before" and "after" states.
+        if let Some(prev) = prev_jpeg {
+            imgs.push(InferenceImage {
+                media_type: "image/jpeg",
+                data_base64: BASE64_STANDARD.encode(prev),
+            });
+        }
+        imgs.extend(selected.iter().map(|frame| InferenceImage {
             media_type: "image/jpeg",
             data_base64: BASE64_STANDARD.encode(&frame.jpeg_bytes),
-        })
-        .collect::<Vec<_>>();
+        }));
+        (imgs, Vec::new())
+    };
+
     let prompt_arc: Arc<str> = Arc::from(prompt);
     let guided_json_arc: Option<Arc<str>> = guided_json.as_deref().map(Arc::from);
     let first_request = InferenceRequest {
         model: tiered_config.first_pass_model.clone(),
         prompt: Arc::clone(&prompt_arc),
         input_images: images.clone(),
+        input_videos: videos.clone(),
         max_tokens: if guided_json.is_some() { 1024 } else { 160 },
         temperature: 0.0,
         timeout_ms,
@@ -2825,8 +2984,8 @@ async fn infer_chunk_semantics(
     };
 
     let first_result = match tokio::task::spawn_blocking({
-        let endpoints = endpoints.clone();
-        move || infer_from_endpoints(&endpoints, primary_provider, &first_request)
+        let provider = Arc::clone(&provider);
+        move || infer_with_provider(&*provider, &first_request)
     })
     .await
     {
@@ -2856,6 +3015,7 @@ async fn infer_chunk_semantics(
                 model: tiered_config.second_pass_model.clone(),
                 prompt: prompt_arc,
                 input_images: images,
+                input_videos: videos,
                 max_tokens: tiered_config.second_pass_max_tokens,
                 temperature: 0.0,
                 timeout_ms,
@@ -2863,7 +3023,7 @@ async fn infer_chunk_semantics(
                 guided_json: guided_json_arc,
             };
             match tokio::task::spawn_blocking(move || {
-                infer_from_endpoints(&endpoints, primary_provider, &second_request)
+                infer_with_provider(&*provider, &second_request)
             })
             .await
             {
@@ -3209,60 +3369,24 @@ struct RuntimeAvailability {
 }
 
 fn runtime_model_availability(
-    endpoints: Option<vidarax_core::provider::ProviderEndpoints>,
+    provider: Option<Arc<dyn InferenceProvider + Send + Sync>>,
     is_saturated: bool,
 ) -> RuntimeAvailability {
-    let Some(endpoints) = endpoints else {
+    let Some(provider) = provider else {
         return RuntimeAvailability {
             status: "unavailable",
             providers: Vec::new(),
         };
     };
-    let vllm_up = provider_endpoint_is_up(&endpoints.vllm_base_url);
-    let sglang_up = provider_endpoint_is_up(&endpoints.sglang_base_url);
-    let mut providers = Vec::with_capacity(2);
-    if vllm_up {
-        providers.push("vllm".to_string());
+    // With the abstract provider layer, we report the top-level kind as
+    // available.  Health-checking individual backends is deferred to a future
+    // backends health endpoint.
+    let kind_name = provider.kind().name().to_string();
+    let status = if is_saturated { "saturated" } else { "ready" };
+    RuntimeAvailability {
+        status,
+        providers: vec![kind_name],
     }
-    if sglang_up {
-        providers.push("sglang".to_string());
-    }
-
-    // Status ordering: ready > saturated > degraded > unavailable.
-    // "saturated" means providers are reachable but overloaded (p95 > 5 s).
-    let status = if vllm_up && sglang_up {
-        if is_saturated { "saturated" } else { "ready" }
-    } else if vllm_up || sglang_up {
-        if is_saturated { "saturated" } else { "degraded" }
-    } else {
-        "unavailable"
-    };
-    RuntimeAvailability { status, providers }
-}
-
-fn provider_endpoint_is_up(base_url: &str) -> bool {
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(400))
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return false,
-    };
-    for suffix in ["/health", "/v1/models"] {
-        let url = format!(
-            "{}/{}",
-            base_url.trim_end_matches('/'),
-            suffix.trim_start_matches('/')
-        );
-        let response = match client.get(&url).send() {
-            Ok(response) => response,
-            Err(_) => continue,
-        };
-        if response.status().is_success() {
-            return true;
-        }
-    }
-    false
 }
 
 fn now_epoch_ms() -> u64 {
@@ -3280,13 +3404,11 @@ fn parse_provider(raw: Option<&str>) -> Result<ProviderKind, &'static str> {
     match raw.unwrap_or("vllm").to_ascii_lowercase().as_str() {
         "vllm" => Ok(ProviderKind::Vllm),
         "sglang" => Ok(ProviderKind::Sglang),
-        _ => Err("primary_provider must be one of: vllm, sglang"),
+        "gemini" => Ok(ProviderKind::Gemini),
+        _ => Err("primary_provider must be one of: vllm, sglang, gemini"),
     }
 }
 
 fn provider_name(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::Vllm => "vllm",
-        ProviderKind::Sglang => "sglang",
-    }
+    kind.name()
 }

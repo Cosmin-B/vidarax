@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 
 use serde_json::Value;
 use vidarax_contracts::lifecycle::StreamState;
-use vidarax_core::provider::ProviderEndpoints;
+use vidarax_core::provider::InferenceProvider;
 use vidarax_core::tiered_vlm::DistillationConfig;
 use vidarax_core::timeline::{append_event, read_all_events, TimelineEvent};
 use vidarax_core::webrtc::session::WebRtcSession;
@@ -35,7 +35,7 @@ pub struct AppState {
     event_seq: Arc<AtomicU64>,
     wal_path: Arc<PathBuf>,
     ingest_file_roots: Arc<Vec<PathBuf>>,
-    inference_endpoints: Option<ProviderEndpoints>,
+    inference_endpoints: Option<Arc<dyn InferenceProvider + Send + Sync>>,
     security_policy: Arc<SecurityPolicy>,
     inference_metrics: Arc<InferenceMetrics>,
     pipeline_metrics: Arc<PipelineMetrics>,
@@ -55,7 +55,7 @@ impl AppState {
     pub fn from_wal(
         wal_path: PathBuf,
         ingest_file_roots: Vec<PathBuf>,
-        inference_endpoints: Option<ProviderEndpoints>,
+        inference_endpoints: Option<Arc<dyn InferenceProvider + Send + Sync>>,
         security_policy: SecurityPolicy,
         stream_ttl_secs: u64,
         active_stream_limit: usize,
@@ -124,7 +124,7 @@ impl AppState {
 
     pub fn with_wal_for_tests_and_endpoints(
         wal_path: PathBuf,
-        inference_endpoints: Option<ProviderEndpoints>,
+        inference_endpoints: Option<Arc<dyn InferenceProvider + Send + Sync>>,
     ) -> Self {
         Self::with_wal_for_tests_full(
             wal_path,
@@ -135,7 +135,7 @@ impl AppState {
 
     pub fn with_wal_for_tests_full(
         wal_path: PathBuf,
-        inference_endpoints: Option<ProviderEndpoints>,
+        inference_endpoints: Option<Arc<dyn InferenceProvider + Send + Sync>>,
         security_policy: SecurityPolicy,
     ) -> Self {
         Self {
@@ -161,7 +161,7 @@ impl AppState {
 
     pub fn with_wal_for_tests_runtime(
         wal_path: PathBuf,
-        inference_endpoints: Option<ProviderEndpoints>,
+        inference_endpoints: Option<Arc<dyn InferenceProvider + Send + Sync>>,
         security_policy: SecurityPolicy,
         stream_ttl_secs: u64,
         active_stream_limit: usize,
@@ -347,7 +347,7 @@ impl AppState {
         (runs, events)
     }
 
-    pub fn inference_endpoints(&self) -> Option<&ProviderEndpoints> {
+    pub fn inference_provider(&self) -> Option<&Arc<dyn InferenceProvider + Send + Sync>> {
         self.inference_endpoints.as_ref()
     }
 
