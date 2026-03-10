@@ -31,6 +31,7 @@ pub const REQUIRED_MODELS: &[&str] = &[
 
 /// Canonical Gemini model IDs recognised by Vidarax.
 pub const GEMINI_MODELS: &[&str] = &[
+    "gemini-3-flash-preview",
     "gemini-3.1-flash-lite-preview",
     "gemini-2.5-flash-preview-05-20",
     "gemini-2.5-pro-preview-05-06",
@@ -70,6 +71,7 @@ pub fn normalize_model_id(input: &str) -> Option<&'static str> {
         "gemini-3.1-flash-lite-preview" | "gemini-3.1-flash-lite" => {
             Some("gemini-3.1-flash-lite-preview")
         }
+        "gemini-3-flash-preview" | "gemini-3-flash" => Some("gemini-3-flash-preview"),
         _ => None,
     }
 }

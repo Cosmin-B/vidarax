@@ -8,7 +8,7 @@
       "timestamp_ms": 8000,
       "element": "View Documentation",
       "action": "click",
-      "from_state": "Home screen: Platform Documentation title",
+      "from_state": "Home screen: Documentation title",
       "to_state": "Documentation sidebar navigation open"
     },
     {
@@ -25,14 +25,14 @@
       "element": "Browse Space Client",
       "action": "click",
       "from_state": "Documentation list view",
-      "to_state": "Platform Space Client documentation page"
+      "to_state": "Space Client documentation page"
     },
     {
       "timestamp": "00:46",
       "timestamp_ms": 46000,
       "element": "page body",
       "action": "scroll",
-      "from_state": "Top of Platform Space Client page",
+      "from_state": "Top of Space Client page",
       "to_state": "Middle of page (Technology Stack)"
     },
     {
@@ -40,7 +40,7 @@
       "timestamp_ms": 72000,
       "element": "Experience Loading",
       "action": "click",
-      "from_state": "Platform Space Client page",
+      "from_state": "Space Client page",
       "to_state": "Experience Loading documentation page"
     },
     {
@@ -56,23 +56,23 @@
       "timestamp_ms": 110000,
       "element": "Shared Systems",
       "action": "click",
-      "from_state": "Platform Space Client section",
+      "from_state": "Space Client section",
       "to_state": "Shared Systems expanded"
     },
     {
       "timestamp": "01:53",
       "timestamp_ms": 113000,
-      "element": "PlatformFormat",
+      "element": "CustomFormat",
       "action": "click",
       "from_state": "Shared Systems list",
-      "to_state": "PlatformFormat sub-menu expanded"
+      "to_state": "CustomFormat sub-menu expanded"
     },
     {
       "timestamp": "01:55",
       "timestamp_ms": 115000,
       "element": "Binary Format",
       "action": "click",
-      "from_state": "PlatformFormat list",
+      "from_state": "CustomFormat list",
       "to_state": "Binary Format documentation page"
     },
     {
