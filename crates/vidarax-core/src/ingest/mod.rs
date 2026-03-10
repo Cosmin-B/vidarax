@@ -796,10 +796,6 @@ pub fn extract_video_clip(
     let start_str = format!("{start_s:.6}");
     let duration_str = format!("{duration_s:.6}");
 
-    // For file sources use stream copy (near-instant); for network sources
-    // re-encode so the clip is self-contained and starts on a keyframe.
-    let use_stream_copy = matches!(source, InputSource::FilePath(_));
-
     // MP4 requires seekable output, so we write to a temp file and read back.
     let tmp = std::env::temp_dir().join(format!(
         "vidarax_clip_{}.mp4",

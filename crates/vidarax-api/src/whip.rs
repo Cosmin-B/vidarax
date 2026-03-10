@@ -38,65 +38,7 @@ use vidarax_core::webrtc::session::WebRtcSession;
 use vidarax_core::webrtc::workers::{EventSink, spawn_decode_workers, spawn_analysis_workers, spawn_vlm_workers};
 
 use crate::state::AppState;
-
-// ---------------------------------------------------------------------------
-// WalEventSink — fallback when no SpacetimeDB client is configured
-// ---------------------------------------------------------------------------
-
-/// An [`EventSink`] that writes VLM events to the WAL-backed run event log.
-///
-/// This is used when no SpacetimeDB client is configured.  Events written here
-/// are visible via `GET /v1/runs/{id}/events`.
-struct WalEventSink {
-    state: AppState,
-}
-
-impl EventSink for WalEventSink {
-    fn emit_event_sync(
-        &self,
-        run_id: &str,
-        _session_id: &str,
-        frame_index: u64,
-        pts_ms: u64,
-        event_type: &str,
-        confidence: f32,
-        description: &str,
-    ) -> Result<(), String> {
-        let payload = serde_json::json!({
-            "frame_index": frame_index,
-            "pts_ms": pts_ms,
-            "event_type": event_type,
-            "confidence": confidence,
-            "description": description,
-        });
-        self.state
-            .append_run_event(run_id, event_type, payload)
-            .map(|_| ())
-    }
-
-    fn store_keyframe_sync(
-        &self,
-        run_id: &str,
-        frame_index: u64,
-        pts_ms: u64,
-        event_type: &str,
-        description: &str,
-        _jpeg_data: &[u8],
-    ) -> Result<(), String> {
-        // Store the metadata in the WAL; the JPEG bytes are discarded since
-        // the WAL is not a blob store.  Callers that need keyframe images
-        // should configure a SpacetimeDB client.
-        let payload = serde_json::json!({
-            "frame_index": frame_index,
-            "pts_ms": pts_ms,
-            "event_type": event_type,
-            "description": description,
-        });
-        self.state
-            .append_run_event(run_id, "keyframe_stored", payload)
-            .map(|_| ())
-    }
-}
+use crate::wal_sink::WalEventSink;
 
 // ---------------------------------------------------------------------------
 // NullInferenceProvider — used when no provider endpoints are configured
@@ -293,7 +235,7 @@ pub async fn whip_offer(
     let event_sink: Arc<dyn EventSink> = if let Some(stdb) = state.spacetime_client() {
         Arc::new(stdb.clone())
     } else {
-        Arc::new(WalEventSink { state: state.clone() })
+        WalEventSink::arc(state.clone(), run_id.to_string())
     };
 
     // ── InferenceProvider selection ────────────────────────────────────────
