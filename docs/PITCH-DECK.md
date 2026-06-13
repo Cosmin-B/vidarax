@@ -18,7 +18,7 @@
 3. **Emit** -- Structured events into SpacetimeDB in real time. Queryable and searchable.
 
 Result: most frames never reach a VLM, so inference cost tracks the sampled
-keyframes rather than the full frame rate.
+frames rather than the full frame rate.
 
 ## SLIDE 3: Live Demo
 
@@ -49,7 +49,7 @@ keyframes rather than the full frame rate.
 ## Q&A
 
 **"How is this different from cloud video APIs?"**
-Runs entirely on your hardware with open-source models. The pipeline samples and gates frames, so only a fraction ever reach a model -- you pay for the moments that matter, not the frame rate.
+Runs entirely on your hardware with open-source models. Only a sampled subset of frames reaches a model; the gate engine turns the rest into lightweight deterministic markers -- you pay for the moments that matter, not the frame rate.
 
 **"Why not send everything to a large model?"**
 Economics. 100 cameras at 24/7 is hundreds of thousands per year. Vidarax filters first, infers second, routes intelligently between model tiers.

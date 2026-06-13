@@ -2,7 +2,7 @@
 
 Real-time video intelligence engine. Any stream in, structured semantic events out.
 
-Vidarax decodes live or file-based video, runs a deterministic gate engine (scene cuts, flicker, ghosting, exposure shifts, loop detection) to extract keyframes, routes them through tiered Vision Language Models for semantic analysis, and emits structured events in real time. Self-hosted, open-source VLMs, no external API dependencies.
+Vidarax decodes live or file-based video, runs a deterministic gate engine (scene cuts, flicker, ghosting, exposure shifts, loop detection) to mark every frame, samples a subset of frames through tiered Vision Language Models for semantic analysis, and emits structured events in real time. Self-hosted, open-source VLMs, no external API dependencies.
 
 ## Architecture
 
