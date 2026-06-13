@@ -3,7 +3,6 @@ use std::time::Duration;
 use reqwest::StatusCode;
 use serde_json::Value;
 use vidarax_api::{run, ServerConfig, TransportMode};
-use vidarax_core::ingest::pipeline::PipelineBackend;
 use vidarax_core::tiered_vlm::DistillationConfig;
 
 #[tokio::test]
@@ -41,7 +40,7 @@ async fn staging_live_provider_e2e_opt_in() {
         stream_ttl_secs: 3600,
         active_stream_limit: 5,
         transport: TransportMode::H1H2,
-        decode_backend: PipelineBackend::CpuFfmpeg,
+        decode_backend: "cpu-ffmpeg".to_string(),
         webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
         webrtc_turn_url: None,
         webrtc_turn_username: None,

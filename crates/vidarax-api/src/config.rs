@@ -2,7 +2,6 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use vidarax_core::ingest::pipeline::PipelineBackend;
 use vidarax_core::tiered_vlm::DistillationConfig;
 
 /// Load the backend config from a TOML file, falling back to legacy env vars.
@@ -91,7 +90,7 @@ pub struct ServerConfig {
     pub stream_ttl_secs: u64,
     pub active_stream_limit: usize,
     pub transport: TransportMode,
-    pub decode_backend: PipelineBackend,
+    pub decode_backend: String,
     /// STUN server URIs (comma-separated). Defaults to Google's public STUN server.
     pub webrtc_stun_servers: Vec<String>,
     /// Optional TURN relay URL (`VIDARAX_WEBRTC_TURN_URL`).
@@ -108,10 +107,8 @@ pub struct ServerConfig {
 impl ServerConfig {
     pub fn from_env() -> Result<Self, String> {
         let transport = TransportMode::parse(env::var("VIDARAX_TRANSPORT").ok().as_deref())?;
-        let decode_backend = match env::var("VIDARAX_DECODE_BACKEND").ok().as_deref() {
-            Some("auto") | None => PipelineBackend::auto_detect(),
-            Some(val) => PipelineBackend::parse(val)?,
-        };
+        let decode_backend =
+            env::var("VIDARAX_DECODE_BACKEND").unwrap_or_else(|_| "auto".to_string());
         let bind_addr = env::var("VIDARAX_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
         let h3_bind_addr =
             env::var("VIDARAX_H3_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8443".into());
@@ -476,6 +473,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn server_config_preserves_custom_decode_backend_name() {
+        std::env::set_var("VIDARAX_DECODE_BACKEND", "test-custom-backend");
+        std::env::set_var("VIDARAX_REQUIRE_API_KEY", "false");
+
+        let cfg = ServerConfig::from_env().expect("custom decode backend should parse");
+
+        std::env::remove_var("VIDARAX_DECODE_BACKEND");
+        std::env::remove_var("VIDARAX_REQUIRE_API_KEY");
+
+        assert_eq!(cfg.decode_backend, "test-custom-backend");
+    }
+
     // ─── WebRtcConfig defaults (STUN / token-rate) ───────────────────────────
 
     #[test]
@@ -510,7 +520,6 @@ mod tests {
 
     #[test]
     fn server_config_turn_fields_roundtrip() {
-        use vidarax_core::ingest::pipeline::PipelineBackend;
         let cfg = ServerConfig {
             bind_addr: "127.0.0.1:8080".into(),
             h3_bind_addr: "127.0.0.1:8443".into(),
@@ -531,7 +540,7 @@ mod tests {
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
-            decode_backend: PipelineBackend::CpuFfmpeg,
+            decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:custom.example.com:3478".into()],
             webrtc_turn_url: Some("turn:relay.example.com:3478".into()),
             webrtc_turn_username: Some("alice".into()),
@@ -552,7 +561,6 @@ mod tests {
 
     #[test]
     fn server_config_turn_absent_fields_are_none() {
-        use vidarax_core::ingest::pipeline::PipelineBackend;
         let cfg = ServerConfig {
             bind_addr: "127.0.0.1:8080".into(),
             h3_bind_addr: "127.0.0.1:8443".into(),
@@ -573,7 +581,7 @@ mod tests {
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
-            decode_backend: PipelineBackend::CpuFfmpeg,
+            decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".into()],
             webrtc_turn_url: None,
             webrtc_turn_username: None,

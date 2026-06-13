@@ -14,8 +14,8 @@ use vidarax_contracts::models::{
 };
 use vidarax_core::gate::{FrameSignal, GateConfig, GateEventType};
 use vidarax_core::ingest::{
-    compute_semantic_frame_indices, decode_mp4_to_frame_signals, decode_selective_jpeg_frames,
-    extract_video_clip, probe_source_fps, DecodedJpegFrame, InputSource, Mp4DecodeConfig,
+    compute_semantic_frame_indices, extract_video_clip, probe_source_fps, DecodedJpegFrame,
+    InputSource, Mp4DecodeConfig,
 };
 use vidarax_core::pipeline::{FrameMetadata, TwoPassConfig, TwoPassPipeline};
 use vidarax_core::provider::{
@@ -237,6 +237,7 @@ pub async fn ingest_run(
                 }
             };
         let requested_sample_fps = sample_fps.unwrap_or(2.0);
+        let decode_pipeline = state.decode_pipeline();
         let decoded = match tokio::task::spawn_blocking(move || {
             let source_fps = probe_source_fps(&decode_source);
             let effective_sample_fps = match sampling_policy {
@@ -249,7 +250,8 @@ pub async fn ingest_run(
                 sample_fps: effective_sample_fps,
                 max_frames: max_frames as usize,
             };
-            decode_mp4_to_frame_signals(&decode_source, decode_config)
+            decode_pipeline
+                .decode_signals(&decode_source, decode_config)
                 .map(|decoded| (decoded, source_fps, effective_sample_fps))
         })
         .await
@@ -1156,6 +1158,7 @@ pub async fn reason_realtime_run(
     // Keep a clone of the source for video clip extraction in Phase 1 (decode_source
     // is moved into the spawn_blocking closure below).
     let decode_source_ref = decode_source.clone();
+    let decode_pipeline = state.decode_pipeline();
     let (decoded, source_fps, sample_fps, decoded_jpegs) =
         match tokio::task::spawn_blocking(move || {
             let source_fps = probe_source_fps(&decode_source);
@@ -1170,7 +1173,7 @@ pub async fn reason_realtime_run(
                 max_frames: max_frames as usize,
             };
             // Pass 1: frame signals (cheap, no encoding)
-            let decoded = decode_mp4_to_frame_signals(&decode_source, decode_config)?;
+            let decoded = decode_pipeline.decode_signals(&decode_source, decode_config)?;
 
             // Pre-compute which frames go to VLM (pure math, zero I/O).
             // In video_clip_mode, JPEG decoding is skipped here; clips are
@@ -1182,7 +1185,7 @@ pub async fn reason_realtime_run(
                     semantic_frames_per_chunk,
                 );
                 // Pass 2: selective JPEG — only the ~4% of frames needed
-                let jpegs = decode_selective_jpeg_frames(
+                let jpegs = decode_pipeline.decode_jpegs(
                     &decode_source,
                     sample_fps,
                     &indices,
