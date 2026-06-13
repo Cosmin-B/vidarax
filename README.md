@@ -2,7 +2,7 @@
 
 Real-time video intelligence engine. Any stream in, structured semantic events out.
 
-Vidarax decodes live or file-based video, runs a lock-free deterministic gate engine (scene cuts, flicker, ghosting, exposure shifts, loop detection) to extract keyframes, routes them through tiered Vision Language Models for semantic analysis, and emits structured events in real time. Self-hosted, open-source VLMs, no external API dependencies.
+Vidarax decodes live or file-based video, runs a deterministic gate engine (scene cuts, flicker, ghosting, exposure shifts, loop detection) to extract keyframes, routes them through tiered Vision Language Models for semantic analysis, and emits structured events in real time. Self-hosted, open-source VLMs, no external API dependencies.
 
 ## Architecture
 
@@ -21,11 +21,13 @@ Vidarax decodes live or file-based video, runs a lock-free deterministic gate en
 
 ## Performance
 
-Benchmarked with Qwen3-VL 2B + 8B tiered routing:
-
-- **6.7x real-time** — 10s video processed in 1.5s wall time
-- **42 ns p95** gate processing per frame, zero allocations
-- **2.99 ms p95** full API workflow (create + ingest + analyze + query)
+Throughput depends on your hardware, the models you run, and the input video, so
+there is no single headline number worth quoting. Measure on your own setup: the
+Python harnesses in `benchmarks/`, the bench binaries under `crates/*/src/bin`,
+and the scripts in `scripts/` cover the gate engine, provider transport, and the
+end-to-end API path. The gate engine is the cheap stage that runs on every frame;
+tiered routing keeps the small model on the common case and escalates to a larger
+one only when it is uncertain.
 
 ## Quick start
 
@@ -111,7 +113,7 @@ Full configuration reference in [docs/deployment.md](docs/deployment.md).
 | Layer | Technology |
 |-------|------------|
 | Backend | Rust, Axum, Hyper (HTTP/1.1 + H2, optional H3) |
-| Gate engine | Lock-free, zero-alloc deterministic frame analysis |
+| Gate engine | Deterministic frame analysis on a single-threaded hot path |
 | Inference | vLLM, SGLang, MLX — tiered routing with fallback |
 | Persistence | WAL-backed event log, SpacetimeDB, Supabase |
 | Frontend | Vue 3, dark command-center UI |

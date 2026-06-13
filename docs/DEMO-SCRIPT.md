@@ -36,7 +36,7 @@ Navigate to Tracing (`/tracing`).
 
 Point out: pipeline flow diagram, live metrics grid (2s refresh), trace timeline waterfall.
 
-> "Gate engine is lock-free Rust. Two-pass sliding window -- deterministic metadata first, refined markers second."
+> "Gate engine is deterministic Rust. Two-pass sliding window -- deterministic metadata first, refined markers second."
 
 ## 2:10 -- 2:45 | Settings and Model Routing
 
