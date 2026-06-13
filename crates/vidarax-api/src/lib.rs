@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::io;
+use std::{io, sync::Arc};
 
 pub mod config;
 mod handlers;
@@ -24,6 +24,7 @@ pub use config::{assert_route_parity, resolve_wal_path, ServerConfig, TransportM
 pub use models::AttachStreamRequest;
 pub use router::app_router;
 pub use state::AppState;
+use vidarax_core::ingest::pipeline::{build_decode_pipeline, DecodePipeline, PipelineBackend};
 use vidarax_core::webrtc::session::{TurnServer, WebRtcConfig};
 
 pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -52,10 +53,12 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
     };
     let security_policy = security::SecurityPolicy::from_config(&config).map_err(invalid_input)?;
     let webrtc_config = build_webrtc_config(&config);
+    let decode_pipeline = build_configured_decode_pipeline(&config.decode_backend)?;
     let state = AppState::from_wal(
         wal_path,
         config.ingest_file_roots.clone(),
         provider,
+        decode_pipeline,
         security_policy,
         config.stream_ttl_secs,
         config.active_stream_limit,
@@ -75,6 +78,18 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
 
 pub fn invalid_input(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn build_configured_decode_pipeline(
+    configured_backend: &str,
+) -> Result<Arc<dyn DecodePipeline>, io::Error> {
+    let decode_backend = if configured_backend == "auto" {
+        PipelineBackend::auto_detect().label()
+    } else {
+        configured_backend
+    };
+    build_decode_pipeline(decode_backend)
+        .map_err(|e| invalid_input(format!("failed to build decode pipeline: {e}")))
 }
 
 fn build_webrtc_config(config: &ServerConfig) -> WebRtcConfig {
@@ -103,7 +118,7 @@ fn build_webrtc_config(config: &ServerConfig) -> WebRtcConfig {
 #[cfg(test)]
 mod tests {
     use super::{app_router, assert_route_parity, AppState, ServerConfig, TransportMode};
-    use vidarax_core::ingest::pipeline::PipelineBackend;
+    use vidarax_core::ingest::pipeline::{register_decode_backend, CpuFfmpegPipeline, PipelineBackend};
     use vidarax_core::tiered_vlm::DistillationConfig;
     use crate::security::SecurityPolicy;
     use axum::body::Body;
@@ -263,6 +278,18 @@ mod tests {
             }
         });
         (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn startup_decode_backend_resolution_uses_registry_name() {
+        register_decode_backend("api-test-custom-backend", || {
+            Arc::new(CpuFfmpegPipeline::new())
+        });
+
+        let pipeline = super::build_configured_decode_pipeline("api-test-custom-backend")
+            .expect("registered backend should build");
+
+        assert!(matches!(pipeline.backend(), PipelineBackend::CpuFfmpeg));
     }
 
     fn ffmpeg_available() -> bool {
@@ -1405,7 +1432,7 @@ mod tests {
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
-            decode_backend: PipelineBackend::CpuFfmpeg,
+            decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
             webrtc_turn_url: None,
             webrtc_turn_username: None,
@@ -1457,7 +1484,7 @@ mod tests {
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
-            decode_backend: PipelineBackend::CpuFfmpeg,
+            decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
             webrtc_turn_url: None,
             webrtc_turn_username: None,
@@ -1506,7 +1533,7 @@ mod tests {
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
-            decode_backend: PipelineBackend::CpuFfmpeg,
+            decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
             webrtc_turn_url: None,
             webrtc_turn_username: None,
@@ -1559,7 +1586,7 @@ mod tests {
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
             transport: TransportMode::H1H2,
-            decode_backend: PipelineBackend::CpuFfmpeg,
+            decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
             webrtc_turn_url: None,
             webrtc_turn_username: None,
@@ -1712,7 +1739,7 @@ mod tests {
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
             transport: TransportMode::H3Experimental,
-            decode_backend: PipelineBackend::CpuFfmpeg,
+            decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
             webrtc_turn_url: None,
             webrtc_turn_username: None,
@@ -1841,7 +1868,7 @@ mod tests {
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
             transport: TransportMode::H3Experimental,
-            decode_backend: PipelineBackend::CpuFfmpeg,
+            decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
             webrtc_turn_url: None,
             webrtc_turn_username: None,

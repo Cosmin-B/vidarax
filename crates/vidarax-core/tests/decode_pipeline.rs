@@ -1,28 +1,102 @@
+use std::sync::Arc;
 use vidarax_core::ingest::pipeline::{
-    CpuFfmpegPipeline, DecodePipeline, DecodePipelineConfig, PipelineBackend,
+    build_decode_pipeline, register_decode_backend, BackendCapabilities, DecodePipeline,
+    PipelineBackend,
 };
-use vidarax_core::ingest::InputSource;
-use std::path::PathBuf;
+use vidarax_core::ingest::{DecodedJpegFrame, DecodedMp4Batch, InputSource, Mp4DecodeConfig};
 
 #[test]
-fn cpu_pipeline_config_defaults() {
-    let config = DecodePipelineConfig::default();
-    assert!(matches!(config.backend, PipelineBackend::CpuFfmpeg));
-    assert!(config.sample_fps > 0.0);
+fn registry_builds_known_backend() {
+    let pipeline = build_decode_pipeline("cpu").expect("cpu backend should build");
+
+    assert!(matches!(pipeline.backend(), PipelineBackend::CpuFfmpeg));
 }
 
 #[test]
 fn backend_from_env_string() {
-    assert!(matches!(PipelineBackend::parse("cpu"), Ok(PipelineBackend::CpuFfmpeg)));
-    assert!(matches!(PipelineBackend::parse("ffmpeg"), Ok(PipelineBackend::CpuFfmpeg)));
-    assert!(matches!(PipelineBackend::parse("nvdec"), Ok(PipelineBackend::NvdecCuda)));
-    assert!(matches!(PipelineBackend::parse("cuda"), Ok(PipelineBackend::NvdecCuda)));
-    assert!(matches!(PipelineBackend::parse("mlx"), Ok(PipelineBackend::Mlx)));
+    assert!(matches!(
+        PipelineBackend::parse("cpu"),
+        Ok(PipelineBackend::CpuFfmpeg)
+    ));
+    assert!(matches!(
+        PipelineBackend::parse("ffmpeg"),
+        Ok(PipelineBackend::CpuFfmpeg)
+    ));
+    assert!(matches!(
+        PipelineBackend::parse("nvdec"),
+        Ok(PipelineBackend::NvdecCuda)
+    ));
+    assert!(matches!(
+        PipelineBackend::parse("cuda"),
+        Ok(PipelineBackend::NvdecCuda)
+    ));
+    assert!(matches!(
+        PipelineBackend::parse("mlx"),
+        Ok(PipelineBackend::Mlx)
+    ));
     assert!(PipelineBackend::parse("invalid").is_err());
 }
 
 #[test]
-fn cpu_pipeline_creates_without_panic() {
-    let config = DecodePipelineConfig::default();
-    let _pipeline = CpuFfmpegPipeline::new(config);
+fn unknown_registry_backend_returns_error() {
+    let err = match build_decode_pipeline("missing-backend") {
+        Ok(_) => panic!("unknown backend should fail"),
+        Err(err) => err,
+    };
+
+    assert!(err.contains("unknown decode backend"));
+    assert!(err.contains("missing-backend"));
+}
+
+#[test]
+fn registered_backend_round_trips_by_name() {
+    register_decode_backend("test-custom-backend", || Arc::new(CustomPipeline));
+
+    let pipeline =
+        build_decode_pipeline("test-custom-backend").expect("registered backend should build");
+
+    assert!(matches!(pipeline.backend(), PipelineBackend::CpuFfmpeg));
+    assert_eq!(pipeline.capabilities().notes, "custom test backend");
+}
+
+#[test]
+fn auto_detect_resolves_to_buildable_pipeline() {
+    let detected = PipelineBackend::auto_detect();
+
+    let pipeline = build_decode_pipeline(detected.label()).expect("auto backend should build");
+
+    assert_eq!(pipeline.backend(), detected);
+}
+
+struct CustomPipeline;
+
+impl DecodePipeline for CustomPipeline {
+    fn decode_signals(
+        &self,
+        _source: &InputSource,
+        _config: Mp4DecodeConfig,
+    ) -> Result<DecodedMp4Batch, String> {
+        unimplemented!("test backend is only built, not executed")
+    }
+
+    fn decode_jpegs(
+        &self,
+        _source: &InputSource,
+        _sample_fps: f32,
+        _frame_indices: &[u64],
+        _max_frames: usize,
+    ) -> Result<Vec<DecodedJpegFrame>, String> {
+        unimplemented!("test backend is only built, not executed")
+    }
+
+    fn backend(&self) -> PipelineBackend {
+        PipelineBackend::CpuFfmpeg
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            hardware_decode: false,
+            notes: "custom test backend",
+        }
+    }
 }

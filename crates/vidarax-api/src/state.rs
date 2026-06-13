@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 
 use serde_json::Value;
 use vidarax_contracts::lifecycle::StreamState;
+use vidarax_core::ingest::pipeline::{create_pipeline, DecodePipeline, PipelineBackend};
 use vidarax_core::provider::InferenceProvider;
 use vidarax_core::tiered_vlm::DistillationConfig;
 use vidarax_core::timeline::{append_event, read_all_events, TimelineEvent};
@@ -36,6 +37,7 @@ pub struct AppState {
     wal_path: Arc<PathBuf>,
     ingest_file_roots: Arc<Vec<PathBuf>>,
     provider: Option<Arc<dyn InferenceProvider + Send + Sync>>,
+    decode_pipeline: Arc<dyn DecodePipeline>,
     security_policy: Arc<SecurityPolicy>,
     inference_metrics: Arc<InferenceMetrics>,
     pipeline_metrics: Arc<PipelineMetrics>,
@@ -56,6 +58,7 @@ impl AppState {
         wal_path: PathBuf,
         ingest_file_roots: Vec<PathBuf>,
         provider: Option<Arc<dyn InferenceProvider + Send + Sync>>,
+        decode_pipeline: Arc<dyn DecodePipeline>,
         security_policy: SecurityPolicy,
         stream_ttl_secs: u64,
         active_stream_limit: usize,
@@ -86,6 +89,7 @@ impl AppState {
             wal_path: Arc::new(wal_path),
             ingest_file_roots: Arc::new(ingest_file_roots),
             provider,
+            decode_pipeline,
             security_policy: Arc::new(security_policy),
             inference_metrics: Arc::new(InferenceMetrics::new()),
             pipeline_metrics: Arc::new(PipelineMetrics::new()),
@@ -108,6 +112,7 @@ impl AppState {
             wal_path: Arc::new(wal_path),
             ingest_file_roots: Arc::new(default_test_ingest_roots()),
             provider: None,
+            decode_pipeline: default_test_decode_pipeline(),
             security_policy: Arc::new(SecurityPolicy::from_config_for_tests()),
             inference_metrics: Arc::new(InferenceMetrics::new()),
             pipeline_metrics: Arc::new(PipelineMetrics::new()),
@@ -145,6 +150,7 @@ impl AppState {
             wal_path: Arc::new(wal_path),
             ingest_file_roots: Arc::new(default_test_ingest_roots()),
             provider,
+            decode_pipeline: default_test_decode_pipeline(),
             security_policy: Arc::new(security_policy),
             inference_metrics: Arc::new(InferenceMetrics::new()),
             pipeline_metrics: Arc::new(PipelineMetrics::new()),
@@ -173,6 +179,7 @@ impl AppState {
             wal_path: Arc::new(wal_path),
             ingest_file_roots: Arc::new(default_test_ingest_roots()),
             provider,
+            decode_pipeline: default_test_decode_pipeline(),
             security_policy: Arc::new(security_policy),
             inference_metrics: Arc::new(InferenceMetrics::new()),
             pipeline_metrics: Arc::new(PipelineMetrics::new()),
@@ -351,6 +358,10 @@ impl AppState {
         self.provider.as_ref()
     }
 
+    pub fn decode_pipeline(&self) -> Arc<dyn DecodePipeline> {
+        Arc::clone(&self.decode_pipeline)
+    }
+
     pub fn ingest_file_roots(&self) -> &[PathBuf] {
         self.ingest_file_roots.as_ref().as_slice()
     }
@@ -446,6 +457,10 @@ fn now_epoch_ms() -> u64 {
 fn default_test_ingest_roots() -> Vec<PathBuf> {
     let tmp = std::env::temp_dir();
     vec![tmp.canonicalize().unwrap_or(tmp)]
+}
+
+fn default_test_decode_pipeline() -> Arc<dyn DecodePipeline> {
+    create_pipeline(PipelineBackend::CpuFfmpeg)
 }
 
 #[derive(Clone)]
