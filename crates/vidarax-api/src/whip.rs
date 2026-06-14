@@ -39,6 +39,7 @@ use vidarax_core::webrtc::workers::{
     EventSink, VlmWorkerParams, spawn_analysis_workers, spawn_decode_workers, spawn_vlm_workers,
 };
 
+use crate::auth::principal_key_from_headers;
 use crate::state::AppState;
 use crate::wal_sink::WalEventSink;
 
@@ -68,26 +69,6 @@ impl InferenceProvider for NullInferenceProvider {
             inference_latency_ms: 0,
         })
     }
-}
-
-const HEADER_API_KEY: &str = "x-api-key";
-const HEADER_TENANT_ID: &str = "x-tenant-id";
-
-/// Derive a principal key from the request headers, matching the scheme used
-/// by the main API handlers.
-fn principal_key_from_headers(headers: &HeaderMap) -> String {
-    if let Some(tid) = headers.get(HEADER_TENANT_ID).and_then(|v| v.to_str().ok()) {
-        return format!("tenant:{tid}");
-    }
-    if let Some(key) = headers.get(HEADER_API_KEY).and_then(|v| v.to_str().ok()) {
-        let mut hash = 1469598103934665603u64;
-        for b in key.bytes() {
-            hash ^= b as u64;
-            hash = hash.wrapping_mul(1099511628211);
-        }
-        return format!("api-key:{hash:016x}");
-    }
-    "public".to_string()
 }
 
 // ---------------------------------------------------------------------------

@@ -10,11 +10,9 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
+use crate::auth::{fnv1a64, HEADER_API_KEY, HEADER_TENANT_ID};
 use crate::config::ServerConfig;
 use crate::state::AppState;
-
-const HEADER_API_KEY: &str = "x-api-key";
-const HEADER_TENANT_ID: &str = "x-tenant-id";
 
 #[derive(Clone)]
 pub struct SecurityPolicy {
@@ -495,12 +493,7 @@ impl TenantSlot {
 }
 
 fn stable_hash(value: &str) -> u64 {
-    let mut hash = 1469598103934665603u64;
-    for b in value.bytes() {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(1099511628211);
-    }
-    hash | 1
+    fnv1a64(value) | 1
 }
 
 #[inline]
