@@ -26,7 +26,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use base64::Engine as _;
 
 use crate::dedup::DedupFilter;
@@ -271,6 +271,7 @@ pub fn spawn_analysis_workers(
     stdb: Arc<dyn EventSink>,
     run_id: Arc<str>,
     session_id: Arc<str>,
+    prompt: Arc<ArcSwap<Arc<str>>>,
     metrics: Arc<PipelineMetrics>,
     session_span: tracing::Span,
 ) {
@@ -281,6 +282,7 @@ pub fn spawn_analysis_workers(
         let stdb = Arc::clone(&stdb);
         let run_id = Arc::clone(&run_id);
         let session_id = Arc::clone(&session_id);
+        let prompt = Arc::clone(&prompt);
         let metrics = Arc::clone(&metrics);
         let session_span = session_span.clone();
 
@@ -356,7 +358,7 @@ pub fn spawn_analysis_workers(
                                 novelty_score: meta.novelty_score,
                                 motion_score: meta.motion_score,
                                 jpeg_bytes,
-                                prompt: Arc::from(""),
+                                prompt: Arc::clone(&*prompt.load_full()),
                                 loop_active,
                             };
 
@@ -542,8 +544,16 @@ where
                 // Temporal context: carry the previous keyframe's VLM description
                 // so the next inference knows what came before without sending a
                 // second image (saves ~2000 tokens per call).
-                let mut last_description = String::new();
+                let default_prompt: Arc<str> =
+                    Arc::from("Briefly describe what is happening in this video frame.");
+                let teacher_label_schema: Arc<str> = Arc::from(crate::provider::teacher_label_schema());
+                let mut last_description: Arc<str> = Arc::from("");
                 let mut last_pts_ms: u64 = 0;
+                let mut prompt_buf = String::with_capacity(512);
+                let mut jpeg_b64 = String::new();
+                let mut input_images: Vec<InferenceImage> = Vec::with_capacity(1);
+                let mut prev_word_hashes = std::collections::HashSet::new();
+                let mut curr_word_hashes = std::collections::HashSet::new();
 
                 while let Ok(work) = vlm_rx.recv() {
                     let _guard = session_span.enter();
@@ -581,31 +591,34 @@ where
                     // Default prompt asks for scene description (not interaction
                     // detection) — state diffs are computed server-side below.
                     let prompt: Arc<str> = if work.prompt.is_empty() {
-                        Arc::from("Briefly describe what is happening in this video frame.")
+                        Arc::clone(&default_prompt)
                     } else {
                         Arc::clone(&work.prompt)
                     };
 
                     let base_prompt: &str = &prompt;
 
-                    let prompt_str = if last_description.is_empty() {
-                        format!(
-                            "{base_prompt}\n\
-                             [gate: trigger={}, confidence={:.2}, novelty={:.2}, motion={:.2}, pts_ms={}]",
-                            work.event_type, work.confidence, work.novelty_score, work.motion_score, work.pts_ms,
-                        )
+                    prompt_buf.clear();
+                    if last_description.is_empty() {
+                        use std::fmt::Write as _;
+                        let _ = write!(
+                            prompt_buf,
+                            "{base_prompt}\n[gate: trigger={}, confidence={:.2}, novelty={:.2}, motion={:.2}, pts_ms={}]",
+                            work.event_type, work.confidence, work.novelty_score, work.motion_score, work.pts_ms
+                        );
                     } else {
-                        format!(
-                            "{base_prompt}\n\
-                             [previous_state ({last_pts_ms}ms): {last_description}]\n\
-                             [gate: trigger={}, confidence={:.2}, novelty={:.2}, motion={:.2}, pts_ms={}]",
-                            work.event_type, work.confidence, work.novelty_score, work.motion_score, work.pts_ms,
-                        )
-                    };
+                        use std::fmt::Write as _;
+                        let _ = write!(
+                            prompt_buf,
+                            "{base_prompt}\n[previous_state ({last_pts_ms}ms): {last_description}]\n[gate: trigger={}, confidence={:.2}, novelty={:.2}, motion={:.2}, pts_ms={}]",
+                            work.event_type, work.confidence, work.novelty_score, work.motion_score, work.pts_ms
+                        );
+                    }
 
                     // Base64-encode the JPEG once for both embedding and VLM calls.
-                    let jpeg_b64 = base64::engine::general_purpose::STANDARD
-                        .encode(&work.jpeg_bytes);
+                    jpeg_b64.clear();
+                    base64::engine::general_purpose::STANDARD
+                        .encode_string(&work.jpeg_bytes, &mut jpeg_b64);
 
                     // ── Step 1 (training only): fetch embedding for KNN + pair collection ──
                     #[cfg(feature = "training")]
@@ -654,14 +667,23 @@ where
                         let current_guided_json: Option<Arc<str>> =
                             guided_json.load_full().map(|schema| Arc::clone(&*schema));
                         let first_max_tokens = if current_guided_json.is_some() { 1024 } else { 128 };
-                        let prompt_arc: Arc<str> = Arc::from(prompt_str.as_str());
-                        let first_request = InferenceRequest {
+                        let prompt_arc: Arc<str> = Arc::from(prompt_buf.as_str());
+                        let mut request_images = std::mem::take(&mut input_images);
+                        if request_images.is_empty() {
+                            request_images.push(InferenceImage {
+                                media_type: "image/jpeg",
+                                data_base64: String::new(),
+                            });
+                        } else {
+                            request_images.truncate(1);
+                            request_images[0].media_type = "image/jpeg";
+                        }
+                        std::mem::swap(&mut request_images[0].data_base64, &mut jpeg_b64);
+
+                        let mut first_request = InferenceRequest {
                             model: Arc::clone(&config.first_pass_model),
                             prompt: Arc::clone(&prompt_arc),
-                            input_images: vec![InferenceImage {
-                                media_type: "image/jpeg",
-                                data_base64: jpeg_b64.clone(),
-                            }],
+                            input_images: request_images,
                             input_videos: Vec::new(),
                             max_tokens: first_max_tokens,
                             temperature: 0.0,
@@ -681,25 +703,38 @@ where
                                     let second_request = InferenceRequest {
                                         model: Arc::clone(&config.second_pass_model),
                                         prompt: prompt_arc,
-                                        input_images: first_request.input_images,
+                                        input_images: std::mem::take(&mut first_request.input_images),
                                         input_videos: Vec::new(),
                                         max_tokens: config.second_pass_max_tokens,
                                         temperature: 0.0,
                                         timeout_ms: 10_000,
                                         allow_fallback: true,
-                                        guided_json: Some(Arc::from(
-                                            crate::provider::teacher_label_schema(),
-                                        )),
+                                        guided_json: Some(Arc::clone(&teacher_label_schema)),
                                     };
-                                    match provider.infer(&second_request) {
+                                    let second_result = provider.infer(&second_request);
+                                    input_images = second_request.input_images;
+                                    if let Some(image) = input_images.get_mut(0) {
+                                        std::mem::swap(&mut image.data_base64, &mut jpeg_b64);
+                                    }
+                                    match second_result {
                                         Ok(second) => (second.output_text, true),
                                         Err(_) => (result.output_text, false),
                                     }
                                 } else {
+                                    input_images = first_request.input_images;
+                                    if let Some(image) = input_images.get_mut(0) {
+                                        std::mem::swap(&mut image.data_base64, &mut jpeg_b64);
+                                    }
                                     (result.output_text, false)
                                 }
                             }
-                            Err(err) => (format!("vlm_error: {err:?}"), false),
+                            Err(err) => {
+                                input_images = first_request.input_images;
+                                if let Some(image) = input_images.get_mut(0) {
+                                    std::mem::swap(&mut image.data_base64, &mut jpeg_b64);
+                                }
+                                (format!("vlm_error: {err:?}"), false)
+                            }
                         }
                     };
                     // Record VLM latency (covers both tier-2 and tier-3 calls).
@@ -729,7 +764,7 @@ where
                     // core interaction detection mechanism: the VLM describes
                     // what it sees (cheap, always succeeds), and state changes
                     // are detected server-side (instant, deterministic).
-                    let prev_desc = last_description.clone();
+                    let prev_desc = Arc::clone(&last_description);
                     let state_changed = if prev_desc.is_empty() {
                         // First frame — always emit as initial state.
                         true
@@ -737,24 +772,24 @@ where
                         // Jaccard word-overlap: compare the *set* of words so
                         // that paraphrases or reordering don't fool the check,
                         // unlike the previous positional char comparison.
-                        use std::collections::HashSet;
-                        let prev_words: HashSet<&str> =
-                            prev_desc.split_whitespace().collect();
-                        let curr_words: HashSet<&str> =
-                            description.split_whitespace().collect();
-                        let intersection = prev_words.intersection(&curr_words).count();
-                        let union = prev_words.union(&curr_words).count();
+                        prev_word_hashes.clear();
+                        curr_word_hashes.clear();
+                        prev_word_hashes.extend(prev_desc.split_whitespace().map(hash_word));
+                        curr_word_hashes.extend(description.split_whitespace().map(hash_word));
+                        let intersection = prev_word_hashes.intersection(&curr_word_hashes).count();
+                        let union = prev_word_hashes.union(&curr_word_hashes).count();
                         let jaccard = if union == 0 {
                             1.0
                         } else {
                             intersection as f32 / union as f32
                         };
+                        prev_word_hashes.clear();
+                        curr_word_hashes.clear();
                         jaccard < 0.5
                     };
 
                     // Update temporal context for the next keyframe.
-                    last_description.clear();
-                    last_description.push_str(&description[..description.len().min(200)]);
+                    last_description = truncate_arc_str(&description, 200);
                     last_pts_ms = work.pts_ms;
 
                     // Always emit the VLM description event.
@@ -774,7 +809,7 @@ where
                     if state_changed && !prev_desc.is_empty() {
                         let transition_desc = format!(
                             "{{\"from_state\":{},\"to_state\":{},\"trigger\":\"{}\",\"confidence\":{:.2}}}",
-                            serde_json::Value::String(prev_desc),
+                            serde_json::Value::String(prev_desc.to_string()),
                             serde_json::Value::String(description.to_string()),
                             work.event_type,
                             work.confidence,
@@ -836,6 +871,27 @@ fn parse_confidence_from_output(text: &str) -> f32 {
     }
     // Default: assume low confidence to trigger second pass when tiered.
     0.5
+}
+
+fn truncate_arc_str(text: &Arc<str>, max_bytes: usize) -> Arc<str> {
+    if text.len() <= max_bytes {
+        return Arc::clone(text);
+    }
+
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Arc::from(&text[..end])
+}
+
+fn hash_word(word: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in word.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// POST `jpeg_b64` to the SigLIP2 embedding server and return a 768-dim vector.
@@ -1042,6 +1098,7 @@ mod tests {
         use super::spawn_analysis_workers;
 
         let sink = MockSink::new();
+        let prompt = Arc::new(arc_swap::ArcSwap::from(Arc::new(Arc::from(""))));
         let (frame_tx, frame_rx) = kanal::bounded::<StreamFrame>(64);
         let (vlm_tx, _vlm_rx) = kanal::bounded::<KeyframeWork>(64);
 
@@ -1053,6 +1110,7 @@ mod tests {
             Arc::clone(&sink) as Arc<dyn EventSink>,
             "run-test".into(),
             "sess-test".into(),
+            prompt,
             Arc::new(crate::metrics::PipelineMetrics::new()),
             tracing::Span::none(),
         );
@@ -1089,5 +1147,47 @@ mod tests {
             events.iter().any(|e| e == "loop_detected"),
             "expected at least one loop_detected event, got: {events:?}"
         );
+    }
+
+    #[test]
+    fn analysis_workers_load_latest_prompt_for_keyframes() {
+        use super::spawn_analysis_workers;
+
+        let sink = MockSink::new();
+        let prompt = Arc::new(arc_swap::ArcSwap::from(Arc::new(Arc::from(""))));
+        let (frame_tx, frame_rx) = kanal::bounded::<StreamFrame>(64);
+        let (vlm_tx, vlm_rx) = kanal::bounded::<KeyframeWork>(64);
+
+        spawn_analysis_workers(
+            1,
+            frame_rx,
+            vlm_tx,
+            None,
+            Arc::clone(&sink) as Arc<dyn EventSink>,
+            "run-test".into(),
+            "sess-test".into(),
+            Arc::clone(&prompt),
+            Arc::new(crate::metrics::PipelineMetrics::new()),
+            tracing::Span::none(),
+        );
+
+        frame_tx.send(make_stream_frame(0)).unwrap();
+        let first = vlm_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("initial keyframe work");
+        assert_eq!(&*first.prompt, "");
+
+        prompt.store(Arc::new(Arc::from("describe updated prompt")));
+
+        let mut scene_cut = make_stream_frame(1);
+        scene_cut.signal.perceptual_hash = !scene_cut.signal.perceptual_hash;
+        frame_tx.send(scene_cut).unwrap();
+
+        let second = vlm_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("scene-cut keyframe work");
+        assert_eq!(&*second.prompt, "describe updated prompt");
+
+        drop(frame_tx);
     }
 }

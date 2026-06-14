@@ -1289,9 +1289,9 @@ pub async fn reason_realtime_run(
     struct ChunkPrep {
         analyzed: Vec<FrameMetadata>,
         frame_offset: usize,
-        chunk_jpegs: Vec<DecodedJpegFrame>,
+        chunk_jpegs: Arc<[DecodedJpegFrame]>,
         /// MP4 clip bytes for this chunk, present only when video_clip_mode is true.
-        chunk_video_clip: Option<Vec<u8>>,
+        chunk_video_clip: Option<Arc<[u8]>>,
         pts_start_ms: u64,
         pts_end_ms: u64,
         chunk_len: usize,
@@ -1302,22 +1302,22 @@ pub async fn reason_realtime_run(
         let started = Instant::now();
         let analyzed = pipeline.analyze_batch(chunk).to_vec();
         let frame_offset = chunk_idx * chunk_size;
-        let chunk_jpegs: Vec<DecodedJpegFrame> = decoded_jpegs
+        let chunk_jpegs: Arc<[DecodedJpegFrame]> = decoded_jpegs
             .as_ref()
             .map(|lookup| {
                 let mut jpegs: Vec<DecodedJpegFrame> = (frame_offset..frame_offset + chunk.len())
                     .filter_map(|idx| lookup.get(&(idx as u64)).cloned())
                     .collect();
                 jpegs.sort_by_key(|f| f.frame_index);
-                jpegs
+                Arc::from(jpegs)
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| Arc::from([]));
 
         // In video_clip_mode, extract an MP4 segment covering this chunk's
         // time window.  Clip start is derived from actual frame PTS so the
         // VLM sees footage matching the decoded frames, not sequential offsets.
         let pts_start_ms_for_clip = chunk.first().map(|f| f.pts_ms).unwrap_or(0);
-        let chunk_video_clip: Option<Vec<u8>> = if video_clip_mode && semantic_decode_enabled {
+        let chunk_video_clip: Option<Arc<[u8]>> = if video_clip_mode && semantic_decode_enabled {
             let clip_start = pts_start_ms_for_clip as f32 / 1000.0;
             let source_for_clip = decode_source_ref.clone();
             let duration = video_clip_duration_s;
@@ -1326,7 +1326,7 @@ pub async fn reason_realtime_run(
             })
             .await
             {
-                Ok(Ok(bytes)) => Some(bytes),
+                Ok(Ok(bytes)) => Some(Arc::from(bytes)),
                 Ok(Err(err)) => {
                     tracing::warn!(
                         chunk_idx,
@@ -1441,8 +1441,8 @@ pub async fn reason_realtime_run(
             for (chunk_idx, prep) in chunk_preps.iter().enumerate() {
                 let providers_c = providers.clone();
                 let prompt_c = semantic_prompt.clone();
-                let chunk_jpegs_c = prep.chunk_jpegs.clone();
-                let chunk_video_clip_c = prep.chunk_video_clip.clone();
+                let chunk_jpegs_c = Arc::clone(&prep.chunk_jpegs);
+                let chunk_video_clip_c = prep.chunk_video_clip.as_ref().map(Arc::clone);
                 let sem_c = Arc::clone(&sem);
                 let frame_offset = prep.frame_offset as u64;
                 let pts_start_ms = prep.pts_start_ms;
@@ -2879,7 +2879,7 @@ async fn infer_chunk_semantics(
     guided_json: Option<String>,
     prev_jpeg: Option<&[u8]>,
     // When `Some`, send this MP4 clip via `input_videos` instead of JPEG frames.
-    video_clip: Option<Vec<u8>>,
+    video_clip: Option<Arc<[u8]>>,
 ) -> ChunkSemanticResult {
     if !semantic_available {
         return ChunkSemanticResult::default();
@@ -2923,7 +2923,7 @@ async fn infer_chunk_semantics(
     let (images, videos) = if let Some(clip_bytes) = video_clip {
         let vids = vec![InferenceVideo {
             media_type: "video/mp4",
-            data_base64: BASE64_STANDARD.encode(&clip_bytes),
+            data_base64: BASE64_STANDARD.encode(clip_bytes.as_ref()),
         }];
         (Vec::new(), vids)
     } else {
