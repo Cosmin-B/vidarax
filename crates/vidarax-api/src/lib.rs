@@ -11,6 +11,7 @@ mod response;
 mod router;
 mod security;
 mod semantic;
+mod semantic_infer;
 mod server;
 pub mod spacetime_client;
 mod state;

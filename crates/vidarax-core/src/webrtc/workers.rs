@@ -35,7 +35,7 @@ use crate::loop_detector::LoopDetector;
 use crate::metrics::PipelineMetrics;
 use crate::pipeline::{TwoPassConfig, TwoPassPipeline};
 use crate::provider::{InferenceImage, InferenceProvider, InferenceRequest};
-use crate::tiered_vlm::{DistillationConfig, TieredVlmConfig};
+use crate::tiered_vlm::{run_tiered, DistillationConfig, TieredVlmConfig};
 #[cfg(feature = "training")]
 use crate::training_data::TrainingStore;
 #[cfg(not(feature = "training"))]
@@ -546,7 +546,6 @@ where
                 // second image (saves ~2000 tokens per call).
                 let default_prompt: Arc<str> =
                     Arc::from("Briefly describe what is happening in this video frame.");
-                let teacher_label_schema: Arc<str> = Arc::from(crate::provider::teacher_label_schema());
                 let mut last_description: Arc<str> = Arc::from("");
                 let mut last_pts_ms: u64 = 0;
                 let mut prompt_buf = String::with_capacity(512);
@@ -666,7 +665,6 @@ where
                         // Snapshot the current guided_json schema once per inference.
                         let current_guided_json: Option<Arc<str>> =
                             guided_json.load_full().map(|schema| Arc::clone(&*schema));
-                        let first_max_tokens = if current_guided_json.is_some() { 1024 } else { 128 };
                         let prompt_arc: Arc<str> = Arc::from(prompt_buf.as_str());
                         let mut request_images = std::mem::take(&mut input_images);
                         if request_images.is_empty() {
@@ -680,60 +678,32 @@ where
                         }
                         std::mem::swap(&mut request_images[0].data_base64, &mut jpeg_b64);
 
-                        let mut first_request = InferenceRequest {
+                        let request = InferenceRequest {
                             model: Arc::clone(&config.first_pass_model),
                             prompt: Arc::clone(&prompt_arc),
                             input_images: request_images,
                             input_videos: Vec::new(),
-                            max_tokens: first_max_tokens,
+                            max_tokens: 128,
                             temperature: 0.0,
                             timeout_ms: 5_000,
                             allow_fallback: true,
                             guided_json: current_guided_json,
                         };
 
-                        match provider.infer(&first_request) {
-                            Ok(result) => {
-                                let first_conf =
-                                    parse_confidence_from_output(&result.output_text);
-                                if config.needs_second_pass(first_conf) {
-                                    // Tier 3: accurate / teacher model — constrained decoding
-                                    // forces structured TeacherLabel output so downstream
-                                    // parse_teacher_label() never sees unstructured free text.
-                                    let second_request = InferenceRequest {
-                                        model: Arc::clone(&config.second_pass_model),
-                                        prompt: prompt_arc,
-                                        input_images: std::mem::take(&mut first_request.input_images),
-                                        input_videos: Vec::new(),
-                                        max_tokens: config.second_pass_max_tokens,
-                                        temperature: 0.0,
-                                        timeout_ms: 10_000,
-                                        allow_fallback: true,
-                                        guided_json: Some(Arc::clone(&teacher_label_schema)),
-                                    };
-                                    let second_result = provider.infer(&second_request);
-                                    input_images = second_request.input_images;
-                                    if let Some(image) = input_images.get_mut(0) {
-                                        std::mem::swap(&mut image.data_base64, &mut jpeg_b64);
-                                    }
-                                    match second_result {
-                                        Ok(second) => (second.output_text, true),
-                                        Err(_) => (result.output_text, false),
-                                    }
-                                } else {
-                                    input_images = first_request.input_images;
-                                    if let Some(image) = input_images.get_mut(0) {
-                                        std::mem::swap(&mut image.data_base64, &mut jpeg_b64);
-                                    }
-                                    (result.output_text, false)
-                                }
-                            }
-                            Err(err) => {
-                                input_images = first_request.input_images;
+                        match run_tiered(provider.as_ref(), &config, request, 1024, 10_000) {
+                            Ok(output) => {
+                                input_images = output.request.input_images;
                                 if let Some(image) = input_images.get_mut(0) {
                                     std::mem::swap(&mut image.data_base64, &mut jpeg_b64);
                                 }
-                                (format!("vlm_error: {err:?}"), false)
+                                (output.result.output_text, output.used_second_pass)
+                            }
+                            Err(err) => {
+                                input_images = err.request.input_images;
+                                if let Some(image) = input_images.get_mut(0) {
+                                    std::mem::swap(&mut image.data_base64, &mut jpeg_b64);
+                                }
+                                (format!("vlm_error: {:?}", err.error), false)
                             }
                         }
                     };
@@ -858,20 +828,6 @@ where
 }
 
 // ─── VLM worker helpers ────────────────────────────────────────────────────────
-
-/// Try to extract a confidence float from VLM JSON output.
-///
-/// Looks for `"confidence": 0.XX` in JSON output, or falls back to `0.5`
-/// (which triggers a second pass at the default threshold of 0.7).
-fn parse_confidence_from_output(text: &str) -> f32 {
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
-        if let Some(conf) = val.get("confidence").and_then(|v| v.as_f64()) {
-            return conf as f32;
-        }
-    }
-    // Default: assume low confidence to trigger second pass when tiered.
-    0.5
-}
 
 fn truncate_arc_str(text: &Arc<str>, max_bytes: usize) -> Arc<str> {
     if text.len() <= max_bytes {

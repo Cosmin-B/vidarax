@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use crate::provider::{InferenceProvider, InferenceRequest, InferenceResult, ProviderError};
+
 /// Configuration for tiered VLM inference routing.
 ///
 /// First-pass: fast, cheap model (e.g. Qwen3-VL-2B, <200ms).
@@ -68,6 +70,156 @@ impl Default for TieredVlmConfig {
             second_pass_threshold: 0.7,
             second_pass_max_tokens: 256,
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct TieredVlmRun {
+    pub result: InferenceResult,
+    pub used_second_pass: bool,
+    pub request: InferenceRequest,
+}
+
+#[derive(Debug)]
+pub struct TieredVlmError {
+    pub error: ProviderError,
+    pub request: InferenceRequest,
+}
+
+pub fn run_tiered<I>(
+    provider: &I,
+    config: &TieredVlmConfig,
+    mut request: InferenceRequest,
+    guided_json_first_max_tokens: u32,
+    second_pass_timeout_ms: u64,
+) -> Result<TieredVlmRun, TieredVlmError>
+where
+    I: InferenceProvider + ?Sized,
+{
+    request.model = Arc::clone(&config.first_pass_model);
+    if request.guided_json.is_some() {
+        request.max_tokens = guided_json_first_max_tokens;
+    }
+    let first_result = match provider.infer(&request) {
+        Ok(result) => result,
+        Err(error) => return Err(TieredVlmError { error, request }),
+    };
+
+    let first_conf = parse_confidence_from_output(&first_result.output_text);
+    if config.needs_second_pass(first_conf) {
+        request.model = Arc::clone(&config.second_pass_model);
+        request.max_tokens = config.second_pass_max_tokens;
+        request.timeout_ms = second_pass_timeout_ms;
+        match provider.infer(&request) {
+            Ok(result) => {
+                return Ok(TieredVlmRun {
+                    result,
+                    used_second_pass: true,
+                    request,
+                });
+            }
+            Err(_) => {
+                return Ok(TieredVlmRun {
+                    result: first_result,
+                    used_second_pass: false,
+                    request,
+                });
+            }
+        }
+    }
+
+    Ok(TieredVlmRun {
+        result: first_result,
+        used_second_pass: false,
+        request,
+    })
+}
+
+pub fn parse_confidence_from_output(text: &str) -> f32 {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
+        if let Some(conf) = val.get("confidence").and_then(|v| v.as_f64()) {
+            return conf as f32;
+        }
+    }
+    0.5
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{
+        InferenceProvider, InferenceRequest, InferenceResult, ProviderError, ProviderKind,
+    };
+    use std::sync::Mutex;
+
+    struct RecordingProvider {
+        requests: Mutex<Vec<InferenceRequest>>,
+    }
+
+    impl RecordingProvider {
+        fn requests(&self) -> Vec<InferenceRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl InferenceProvider for RecordingProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Vllm
+        }
+
+        fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request.clone());
+            let output_text = if requests.len() == 1 {
+                r#"{"confidence":0.2,"description":"first"}"#
+            } else {
+                r#"{"confidence":0.9,"description":"second"}"#
+            };
+            Ok(InferenceResult {
+                provider: ProviderKind::Vllm,
+                model: request.model.clone(),
+                output_text: output_text.to_string(),
+                fallback_used: false,
+                finish_reason: None,
+                inference_latency_ms: 0,
+            })
+        }
+    }
+
+    #[test]
+    fn tiered_run_preserves_guided_json_on_second_pass() {
+        let provider = RecordingProvider {
+            requests: Mutex::new(Vec::new()),
+        };
+        let config = TieredVlmConfig {
+            first_pass_model: Arc::from("small"),
+            second_pass_model: Arc::from("teacher"),
+            second_pass_threshold: 0.7,
+            second_pass_max_tokens: 512,
+        };
+        let schema: Arc<str> = Arc::from(r#"{"type":"object"}"#);
+        let request = InferenceRequest {
+            model: Arc::from("placeholder"),
+            prompt: Arc::from("prompt"),
+            input_images: Vec::new(),
+            input_videos: Vec::new(),
+            max_tokens: 128,
+            temperature: 0.0,
+            timeout_ms: 1000,
+            allow_fallback: true,
+            guided_json: Some(Arc::clone(&schema)),
+        };
+
+        let output = run_tiered(&provider, &config, request, 1024, 1000).unwrap();
+
+        assert!(output.used_second_pass);
+        assert_eq!(&*output.result.model, "teacher");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(&*requests[0].model, "small");
+        assert_eq!(&*requests[1].model, "teacher");
+        assert_eq!(requests[1].max_tokens, 512);
+        assert_eq!(requests[1].guided_json.as_deref(), Some(&*schema));
     }
 }
 

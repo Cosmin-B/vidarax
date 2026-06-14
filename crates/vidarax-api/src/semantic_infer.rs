@@ -1,0 +1,761 @@
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
+use serde_json::{json, Value};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::task::JoinSet;
+use vidarax_core::gate::{FrameSignal, GateEventType};
+use vidarax_core::ingest::{extract_video_clip, DecodedJpegFrame, InputSource};
+use vidarax_core::pipeline::{FrameMetadata, TwoPassPipeline};
+use vidarax_core::provider::{
+    InferenceImage, InferenceProvider, InferenceRequest, InferenceVideo, ProviderError,
+};
+use vidarax_core::tiered_vlm::{run_tiered, TieredVlmConfig};
+use vidarax_core::timeline::TimelineEvent;
+
+use crate::models::{
+    AnalyzeAnnotations, AnalyzeEvent, AnalyzeFallback, AnalyzeFrameMetadata, AnalyzeMarker,
+    AnalyzeObject, AnalyzeTrace, AnalyzeWindow, SamplingPolicy,
+};
+use crate::semantic::{MarkerInput, SemanticMarker};
+use crate::state::AppState;
+
+pub struct DecodedSignals {
+    pub signals: Vec<FrameSignal>,
+    pub sampling_policy: SamplingPolicy,
+    pub sample_fps: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct SemanticOverlay {
+    pub event_type: String,
+    pub object_label: String,
+    pub summary: String,
+    pub description: String,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Default)]
+pub struct ChunkSemanticResult {
+    pub overlay: Option<SemanticOverlay>,
+    pub raw_output: Option<Value>,
+    pub provider: Option<String>,
+    pub provider_fallback_used: bool,
+    pub used_fallback: bool,
+    pub error: Option<String>,
+    pub attempted: bool,
+    pub finish_reason: Option<String>,
+}
+
+impl ChunkSemanticResult {
+    pub fn event_payload(&self, chunk_idx: usize, request_id: &str, stream_id: &str) -> Option<Value> {
+        self.attempted.then(|| {
+            json!({
+                "request_id": request_id,
+                "stream_id": stream_id,
+                "chunk_index": chunk_idx,
+                "provider": self.provider,
+                "provider_fallback_used": self.provider_fallback_used,
+                "semantic_fallback_used": self.used_fallback,
+                "semantic_error": self.error,
+                "event_type": self.overlay.as_ref().map(|o| o.event_type.clone()),
+                "object_label": self.overlay.as_ref().map(|o| o.object_label.clone()),
+                "confidence": self.overlay.as_ref().map(|o| o.confidence),
+                "raw_output": self.raw_output,
+            })
+        })
+    }
+}
+
+pub struct ChunkPrep {
+    pub analyzed: Vec<FrameMetadata>,
+    pub frame_offset: usize,
+    pub chunk_jpegs: Arc<[DecodedJpegFrame]>,
+    pub chunk_video_clip: Option<Arc<[u8]>>,
+    pub pts_start_ms: u64,
+    pub pts_end_ms: u64,
+    pub chunk_len: usize,
+    pub started: Instant,
+}
+
+pub fn load_decoded_signals_from_events(events: &[TimelineEvent]) -> Result<DecodedSignals, String> {
+    let Some(decoded_event) = events
+        .iter()
+        .rev()
+        .find(|event| event.kind == "frames_decoded")
+    else {
+        return Err("frames must be provided when no decoded ingest frames exist".to_string());
+    };
+
+    let payload = serde_json::from_str::<Value>(&decoded_event.payload)
+        .map_err(|_| "decoded ingest payload is invalid json".to_string())?;
+    let sampling_policy = SamplingPolicy::parse(
+        payload
+            .get("sampling_policy")
+            .and_then(|value| value.as_str()),
+    )
+    .map_err(ToString::to_string)?;
+    let Some(signals) = payload.get("signals").and_then(|value| value.as_array()) else {
+        return Err("decoded ingest payload is missing signals array".to_string());
+    };
+    if signals.is_empty() {
+        return Err("decoded ingest payload contains no frame signals".to_string());
+    }
+    if signals.len() > 500_000 {
+        return Err("decoded ingest frame signals exceed limit of 500000".to_string());
+    }
+
+    let mut out = Vec::with_capacity(signals.len());
+    for signal in signals {
+        let frame_index = signal
+            .get("frame_index")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| "decoded signal is missing frame_index".to_string())?;
+        let pts_ms = signal
+            .get("pts_ms")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| "decoded signal is missing pts_ms".to_string())?;
+        let perceptual_hash = signal
+            .get("perceptual_hash")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| "decoded signal is missing perceptual_hash".to_string())?;
+        let luma_mean = signal
+            .get("luma_mean")
+            .and_then(|value| value.as_f64())
+            .ok_or_else(|| "decoded signal is missing luma_mean".to_string())?
+            as f32;
+        let flicker_score = signal
+            .get("flicker_score")
+            .and_then(|value| value.as_f64())
+            .ok_or_else(|| "decoded signal is missing flicker_score".to_string())?
+            as f32;
+        let ghosting_score = signal
+            .get("ghosting_score")
+            .and_then(|value| value.as_f64())
+            .ok_or_else(|| "decoded signal is missing ghosting_score".to_string())?
+            as f32;
+        let noise_variance_score = signal
+            .get("noise_variance_score")
+            .and_then(|value| value.as_f64())
+            .ok_or_else(|| "decoded signal is missing noise_variance_score".to_string())?
+            as f32;
+        if !(0.0..=1.0).contains(&luma_mean)
+            || !(0.0..=1.0).contains(&flicker_score)
+            || !(0.0..=1.0).contains(&ghosting_score)
+            || !(0.0..=1.0).contains(&noise_variance_score)
+        {
+            return Err("decoded signal values must be normalized to [0.0, 1.0]".to_string());
+        }
+
+        out.push(FrameSignal {
+            frame_index,
+            pts_ms,
+            perceptual_hash,
+            luma_mean,
+            flicker_score,
+            ghosting_score,
+            noise_variance_score,
+        });
+    }
+
+    let sample_fps = payload
+        .get("sample_fps")
+        .and_then(|value| value.as_f64())
+        .map(|value| value as f32)
+        .or_else(|| estimate_sample_fps(&out))
+        .unwrap_or(1.0);
+
+    Ok(DecodedSignals {
+        signals: out,
+        sampling_policy,
+        sample_fps,
+    })
+}
+
+pub async fn prepare_realtime_chunks(
+    signals: &[FrameSignal],
+    chunk_size: usize,
+    decoded_jpegs: Option<&std::collections::HashMap<u64, DecodedJpegFrame>>,
+    pipeline: &mut TwoPassPipeline,
+    decode_source: &InputSource,
+    video_clip_mode: bool,
+    semantic_decode_enabled: bool,
+    video_clip_duration_s: f32,
+) -> Vec<ChunkPrep> {
+    let mut chunk_preps: Vec<ChunkPrep> = Vec::new();
+    for (chunk_idx, chunk) in signals.chunks(chunk_size).enumerate() {
+        let started = Instant::now();
+        let analyzed = pipeline.analyze_batch(chunk).to_vec();
+        let frame_offset = chunk_idx * chunk_size;
+        let chunk_jpegs: Arc<[DecodedJpegFrame]> = decoded_jpegs
+            .map(|lookup| {
+                let mut jpegs: Vec<DecodedJpegFrame> = (frame_offset..frame_offset + chunk.len())
+                    .filter_map(|idx| lookup.get(&(idx as u64)).cloned())
+                    .collect();
+                jpegs.sort_by_key(|f| f.frame_index);
+                Arc::from(jpegs)
+            })
+            .unwrap_or_else(|| Arc::from([]));
+
+        let pts_start_ms_for_clip = chunk.first().map(|f| f.pts_ms).unwrap_or(0);
+        let chunk_video_clip: Option<Arc<[u8]>> = if video_clip_mode && semantic_decode_enabled {
+            let clip_start = pts_start_ms_for_clip as f32 / 1000.0;
+            let source_for_clip = decode_source.clone();
+            let duration = video_clip_duration_s;
+            match tokio::task::spawn_blocking(move || {
+                extract_video_clip(&source_for_clip, clip_start, duration)
+            })
+            .await
+            {
+                Ok(Ok(bytes)) => Some(Arc::from(bytes)),
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        chunk_idx,
+                        clip_start_ms = pts_start_ms_for_clip,
+                        duration = video_clip_duration_s,
+                        error = %err,
+                        "video clip extraction failed for chunk; falling back to no-video"
+                    );
+                    None
+                }
+                Err(err) => {
+                    tracing::warn!(chunk_idx, error = %err, "clip extraction task panicked");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        chunk_preps.push(ChunkPrep {
+            started,
+            analyzed,
+            frame_offset,
+            chunk_jpegs,
+            chunk_video_clip,
+            pts_start_ms: chunk.first().map(|f| f.pts_ms).unwrap_or(0),
+            pts_end_ms: chunk.last().map(|f| f.pts_ms).unwrap_or(0),
+            chunk_len: chunk.len(),
+        });
+    }
+    chunk_preps
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_semantic_dispatch(
+    chunk_preps: &[ChunkPrep],
+    providers: Option<Arc<dyn InferenceProvider + Send + Sync>>,
+    semantic_available: bool,
+    semantic_prompt: &str,
+    semantic_timeout_ms: u64,
+    semantic_frames_per_chunk: usize,
+    tiered_config: TieredVlmConfig,
+    guided_json_str: Option<String>,
+    visual_diff: bool,
+    temporal_chain: bool,
+    vlm_concurrency: usize,
+) -> (Vec<Option<ChunkSemanticResult>>, Vec<Instant>) {
+    let num_chunks = chunk_preps.len();
+    let mut semantic_results: Vec<Option<ChunkSemanticResult>> = (0..num_chunks).map(|_| None).collect();
+    let mut task_end_times: Vec<Instant> = vec![Instant::now(); num_chunks];
+
+    if !semantic_available {
+        return (semantic_results, task_end_times);
+    }
+
+    if temporal_chain {
+        let mut last_description = String::new();
+        let mut last_pts_ms: u64 = 0;
+        let mut last_jpeg: Option<Vec<u8>> = None;
+
+        for (chunk_idx, prep) in chunk_preps.iter().enumerate() {
+            let prompt_with_context = if last_description.is_empty() {
+                semantic_prompt.to_string()
+            } else {
+                format!(
+                    "{semantic_prompt}\n[previous_state ({last_pts_ms}ms): {}]",
+                    &last_description[..last_description.len().min(200)]
+                )
+            };
+
+            let prev_jpeg_ref = if visual_diff { last_jpeg.as_deref() } else { None };
+            let result = infer_chunk_semantics(
+                providers.clone(),
+                true,
+                &prompt_with_context,
+                semantic_timeout_ms,
+                semantic_frames_per_chunk,
+                &prep.chunk_jpegs,
+                prep.frame_offset as u64,
+                prep.pts_start_ms,
+                prep.pts_end_ms,
+                tiered_config.clone(),
+                guided_json_str.clone(),
+                prev_jpeg_ref,
+                prep.chunk_video_clip.clone(),
+            )
+            .await;
+
+            if visual_diff {
+                if let Some(frame) = select_semantic_images(&prep.chunk_jpegs, 1).first() {
+                    last_jpeg = Some(frame.jpeg_bytes.clone());
+                }
+            }
+
+            if let Some(ref raw) = result.raw_output {
+                let s = raw.to_string();
+                if s.len() > 4 {
+                    last_description.clear();
+                    last_description.push_str(&s[..s.len().min(200)]);
+                    last_pts_ms = prep.pts_end_ms;
+                }
+            } else if let Some(ref overlay) = result.overlay {
+                last_description.clear();
+                last_description.push_str(&overlay.description[..overlay.description.len().min(200)]);
+                last_pts_ms = prep.pts_end_ms;
+            }
+
+            semantic_results[chunk_idx] = Some(result);
+            task_end_times[chunk_idx] = Instant::now();
+        }
+    } else {
+        let sem = Arc::new(tokio::sync::Semaphore::new(vlm_concurrency));
+        let mut join_set: JoinSet<(usize, ChunkSemanticResult, Instant)> = JoinSet::new();
+
+        for (chunk_idx, prep) in chunk_preps.iter().enumerate() {
+            let providers_c = providers.clone();
+            let prompt_c = semantic_prompt.to_string();
+            let chunk_jpegs_c = Arc::clone(&prep.chunk_jpegs);
+            let chunk_video_clip_c = prep.chunk_video_clip.as_ref().map(Arc::clone);
+            let sem_c = Arc::clone(&sem);
+            let frame_offset = prep.frame_offset as u64;
+            let pts_start_ms = prep.pts_start_ms;
+            let pts_end_ms = prep.pts_end_ms;
+            let tiered_config_c = tiered_config.clone();
+            let guided_json_c = guided_json_str.clone();
+            join_set.spawn(async move {
+                let _permit = sem_c.acquire().await.unwrap();
+                let overlay = infer_chunk_semantics(
+                    providers_c,
+                    true,
+                    &prompt_c,
+                    semantic_timeout_ms,
+                    semantic_frames_per_chunk,
+                    &chunk_jpegs_c,
+                    frame_offset,
+                    pts_start_ms,
+                    pts_end_ms,
+                    tiered_config_c,
+                    guided_json_c,
+                    None,
+                    chunk_video_clip_c,
+                )
+                .await;
+                (chunk_idx, overlay, Instant::now())
+            });
+        }
+
+        while let Some(Ok((idx, result, finished))) = join_set.join_next().await {
+            semantic_results[idx] = Some(result);
+            task_end_times[idx] = finished;
+        }
+    }
+
+    (semantic_results, task_end_times)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn infer_chunk_semantics(
+    providers: Option<Arc<dyn InferenceProvider + Send + Sync>>,
+    semantic_available: bool,
+    semantic_prompt: &str,
+    timeout_ms: u64,
+    semantic_frames_per_chunk: usize,
+    chunk_jpegs: &[DecodedJpegFrame],
+    frame_start_index: u64,
+    pts_start_ms: u64,
+    pts_end_ms: u64,
+    tiered_config: TieredVlmConfig,
+    guided_json: Option<String>,
+    prev_jpeg: Option<&[u8]>,
+    video_clip: Option<Arc<[u8]>>,
+) -> ChunkSemanticResult {
+    if !semantic_available {
+        return ChunkSemanticResult::default();
+    }
+
+    let mut result = ChunkSemanticResult {
+        attempted: true,
+        used_fallback: false,
+        ..ChunkSemanticResult::default()
+    };
+    let Some(provider) = providers else {
+        result.used_fallback = true;
+        result.error = Some("provider_not_configured".to_string());
+        return result;
+    };
+
+    let use_video_clip = video_clip.is_some();
+    let selected = if use_video_clip {
+        Vec::new()
+    } else {
+        let sel = select_semantic_images(chunk_jpegs, semantic_frames_per_chunk);
+        if sel.is_empty() {
+            result.used_fallback = true;
+            result.error = Some("chunk_has_no_jpeg_frames".to_string());
+            return result;
+        }
+        sel
+    };
+
+    let prompt = format!(
+        "{semantic_prompt}\nchunk_frame_start={frame_start_index}\nchunk_frame_end={}\nchunk_pts_start_ms={pts_start_ms}\nchunk_pts_end_ms={pts_end_ms}",
+        frame_start_index.saturating_add(chunk_jpegs.len() as u64).saturating_sub(1)
+    );
+
+    let (images, videos) = if let Some(clip_bytes) = video_clip {
+        let vids = vec![InferenceVideo {
+            media_type: "video/mp4",
+            data_base64: BASE64_STANDARD.encode(clip_bytes.as_ref()),
+        }];
+        (Vec::new(), vids)
+    } else {
+        let mut imgs: Vec<InferenceImage> = Vec::with_capacity(selected.len() + 1);
+        if let Some(prev) = prev_jpeg {
+            imgs.push(InferenceImage {
+                media_type: "image/jpeg",
+                data_base64: BASE64_STANDARD.encode(prev),
+            });
+        }
+        imgs.extend(selected.iter().map(|frame| InferenceImage {
+            media_type: "image/jpeg",
+            data_base64: BASE64_STANDARD.encode(&frame.jpeg_bytes),
+        }));
+        (imgs, Vec::new())
+    };
+
+    let guided_json_arc: Option<Arc<str>> = guided_json.as_deref().map(Arc::from);
+    let request = InferenceRequest {
+        model: tiered_config.first_pass_model.clone(),
+        prompt: Arc::from(prompt),
+        input_images: images,
+        input_videos: videos,
+        max_tokens: 160,
+        temperature: 0.0,
+        timeout_ms,
+        allow_fallback: true,
+        guided_json: guided_json_arc,
+    };
+
+    let provider_result = match tokio::task::spawn_blocking({
+        let provider = Arc::clone(&provider);
+        move || run_tiered(provider.as_ref(), &tiered_config, request, 1024, timeout_ms)
+    })
+    .await
+    {
+        Ok(Ok(output)) => output.result,
+        Ok(Err(err)) => {
+            result.used_fallback = true;
+            result.error = Some(match err.error {
+                ProviderError::UnsupportedModel(_) => "unsupported_model".to_string(),
+                ProviderError::HttpStatus(code) => format!("http_status_{code}"),
+                ProviderError::Transport(_) => "transport_error".to_string(),
+                ProviderError::InvalidResponse(_) => "invalid_response".to_string(),
+            });
+            return result;
+        }
+        Err(err) => {
+            result.used_fallback = true;
+            result.error = Some(format!("join_error:{err}"));
+            return result;
+        }
+    };
+
+    result.provider = Some(provider_result.provider.name().to_string());
+    result.provider_fallback_used = provider_result.fallback_used;
+    result.finish_reason = provider_result.finish_reason.clone();
+
+    if guided_json.is_some() {
+        let parsed = serde_json::from_str::<Value>(&provider_result.output_text)
+            .unwrap_or_else(|_| json!({"raw": provider_result.output_text}));
+        result.raw_output = Some(parsed);
+        result.overlay = None;
+        result
+    } else {
+        match parse_semantic_overlay(&provider_result.output_text) {
+            Some(overlay) => {
+                result.overlay = Some(overlay);
+                result.used_fallback = provider_result.fallback_used;
+                result
+            }
+            None => {
+                result.used_fallback = true;
+                result.error = Some("semantic_parse_failed".to_string());
+                result
+            }
+        }
+    }
+}
+
+pub fn select_semantic_images<'a>(
+    chunk_jpegs: &'a [DecodedJpegFrame],
+    semantic_frames_per_chunk: usize,
+) -> Vec<&'a DecodedJpegFrame> {
+    if chunk_jpegs.is_empty() {
+        return Vec::new();
+    }
+    if semantic_frames_per_chunk >= chunk_jpegs.len() {
+        return chunk_jpegs.iter().collect();
+    }
+
+    let mut out = Vec::with_capacity(semantic_frames_per_chunk);
+    if semantic_frames_per_chunk == 1 {
+        out.push(&chunk_jpegs[chunk_jpegs.len() / 2]);
+        return out;
+    }
+
+    let mut last_idx = usize::MAX;
+    for i in 0..semantic_frames_per_chunk {
+        let idx = i * (chunk_jpegs.len() - 1) / (semantic_frames_per_chunk - 1);
+        if idx != last_idx {
+            out.push(&chunk_jpegs[idx]);
+            last_idx = idx;
+        }
+    }
+    out
+}
+
+fn parse_semantic_overlay(raw: &str) -> Option<SemanticOverlay> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let json_text = if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        trimmed
+    } else {
+        let start = trimmed.find('{')?;
+        let end = trimmed.rfind('}')?;
+        if start >= end {
+            return None;
+        }
+        &trimmed[start..=end]
+    };
+    let value: Value = serde_json::from_str(json_text).ok()?;
+
+    let event_type = normalize_semantic_event(
+        value
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("context_observation"),
+    );
+    let object_label = normalize_semantic_object(
+        value
+            .get("object_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("frame_context"),
+    );
+    let summary = value
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("semantic summary unavailable")
+        .to_string();
+    let description = value
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("semantic description unavailable")
+        .to_string();
+    let confidence = value
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .map(|v| (v as f32).clamp(0.0, 1.0))
+        .unwrap_or(0.5);
+
+    Some(SemanticOverlay {
+        event_type,
+        object_label,
+        summary,
+        description,
+        confidence,
+    })
+}
+
+fn normalize_semantic_event(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "scene_cut" => "scene_cut".to_string(),
+        "artifact_suspected" => "artifact_suspected".to_string(),
+        "keyframe_keep" => "keyframe_keep".to_string(),
+        "context_observation" => "context_observation".to_string(),
+        _ => "context_observation".to_string(),
+    }
+}
+
+fn normalize_semantic_object(raw: &str) -> String {
+    let normalized = raw.trim().to_ascii_lowercase().replace(' ', "_");
+    if normalized.is_empty() {
+        "frame_context".to_string()
+    } else {
+        normalized
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compose_frame_metadata(
+    state: &AppState,
+    tenant_id: Option<&str>,
+    run_id: &str,
+    stream_id: &str,
+    mode: &str,
+    model: &str,
+    sampling_policy: SamplingPolicy,
+    sample_fps: f32,
+    segment_ms: u64,
+    request_id: &str,
+    trace_id: &str,
+    m: FrameMetadata,
+    semantic: Option<&SemanticOverlay>,
+    semantic_fallback: bool,
+    finish_reason: Option<String>,
+) -> (AnalyzeFrameMetadata, MarkerInput) {
+    let (det_event_type, det_description) = match (m.scene_cut, m.suspect_artifact, m.gate_event) {
+        (true, _, _) => ("scene_cut", "Hard transition detected from pass-1 gate"),
+        (_, true, _) => ("artifact_suspected", "Temporal artifact signal elevated"),
+        (_, _, GateEventType::KeepKeyframe) => {
+            ("keyframe_keep", "Keyframe retained by deterministic gate")
+        }
+        _ => (
+            "context_observation",
+            "No hard trigger; contextual metadata only",
+        ),
+    };
+    let det_object_label = if m.gate_event == GateEventType::KeepKeyframe {
+        "keyframe_candidate"
+    } else {
+        "frame_context"
+    };
+    let event_type = semantic
+        .map(|s| s.event_type.as_str())
+        .unwrap_or(det_event_type);
+    let object_label = semantic
+        .map(|s| s.object_label.as_str())
+        .unwrap_or(det_object_label);
+    let description = semantic
+        .map(|s| s.description.as_str())
+        .unwrap_or(det_description);
+    let confidence = semantic
+        .map(|s| s.confidence)
+        .unwrap_or(m.confidence)
+        .clamp(0.0, 1.0);
+    let mapped_event = state.map_event_label(tenant_id, event_type);
+    let mapped_object = state.map_object_label(tenant_id, object_label);
+    let summary = semantic.map(|s| s.summary.clone()).unwrap_or_else(|| {
+        format!(
+            "novelty={:.3}, stability={:.3}, motion={:.3}",
+            m.novelty_score, m.temporal_stability, m.motion_score
+        )
+    });
+    (
+        AnalyzeFrameMetadata {
+            run_id: run_id.to_string(),
+            stream_id: stream_id.to_string(),
+            frame_index: m.frame_index,
+            pts_ms: m.pts_ms,
+            mode: mode.to_string(),
+            model: model.to_string(),
+            sampling_policy: sampling_policy.as_str().to_string(),
+            sample_fps,
+            window: AnalyzeWindow {
+                start_ms: m.segment_start_ms,
+                end_ms: m.segment_end_ms,
+                segment_id: format!("seg-{:08x}", (m.segment_start_ms / segment_ms) as u32),
+                source: "frame",
+            },
+            annotations: AnalyzeAnnotations {
+                summary,
+                objects: vec![AnalyzeObject {
+                    label: mapped_object.label,
+                    score: confidence,
+                }],
+                events: vec![AnalyzeEvent {
+                    r#type: mapped_event.label.clone(),
+                    score: confidence,
+                    description: description.to_string(),
+                }],
+            },
+            confidence,
+            fallback: AnalyzeFallback {
+                used: semantic_fallback
+                    || mapped_event.used_fallback
+                    || mapped_object.used_fallback,
+            },
+            trace: AnalyzeTrace {
+                request_id: request_id.to_string(),
+                trace_id: trace_id.to_string(),
+                span_id: format!("span-{:016x}", m.frame_index),
+            },
+            ordering_key: format!("{}:{}:{}", run_id, m.pts_ms, m.frame_index),
+            finish_reason,
+        },
+        MarkerInput {
+            frame_index: m.frame_index,
+            pts_ms: m.pts_ms,
+            event_type: mapped_event.label,
+            confidence,
+        },
+    )
+}
+
+pub fn semantic_marker_to_api_marker(marker: SemanticMarker) -> AnalyzeMarker {
+    AnalyzeMarker {
+        marker_id: marker.marker_id,
+        run_id: marker.run_id,
+        stream_id: marker.stream_id,
+        event_type: marker.event_type,
+        status: marker.status,
+        start_frame: marker.start_frame,
+        end_frame: marker.end_frame,
+        start_pts_ms: marker.start_pts_ms,
+        end_pts_ms: marker.end_pts_ms,
+        confidence: marker.confidence,
+        supersedes_marker_id: marker.supersedes_marker_id,
+    }
+}
+
+pub fn percentile_ms(values: &[u64], percentile: u64) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let n = sorted.len();
+    let p = percentile.clamp(0, 100) as f64 / 100.0;
+    let idx = ((n as f64 - 1.0) * p).round() as usize;
+    sorted[idx]
+}
+
+pub fn estimate_sample_fps(signals: &[FrameSignal]) -> Option<f32> {
+    if signals.len() < 2 {
+        return None;
+    }
+    let mut delta_sum = 0u64;
+    let mut delta_count = 0u64;
+    for window in signals.windows(2) {
+        let delta = window[1].pts_ms.saturating_sub(window[0].pts_ms);
+        if delta > 0 {
+            delta_sum += delta;
+            delta_count += 1;
+        }
+    }
+    if delta_count == 0 {
+        return None;
+    }
+    let avg_ms = delta_sum as f32 / delta_count as f32;
+    Some((1000.0 / avg_ms).clamp(0.2, 120.0))
+}
+
+pub fn adaptive_sample_fps(source_fps: f32) -> f32 {
+    source_fps.clamp(0.2, 120.0)
+}
