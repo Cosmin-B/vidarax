@@ -41,6 +41,9 @@ use crate::webrtc::workers::{token_budget_entry, EventSink, StreamFrame};
 
 // ─── ClipConfig ───────────────────────────────────────────────────────────────
 
+pub const MAX_CLIP_TARGET_FPS: u32 = 30;
+pub const MAX_CLIP_LENGTH_SECONDS: u32 = 60;
+
 /// Parameters controlling clip-mode temporal batching.
 ///
 /// # Constraints
@@ -73,7 +76,7 @@ pub struct ClipConfig {
 impl ClipConfig {
     /// Validate all fields and the composite frame-count constraint.
     pub fn validate(&self) -> Result<(), String> {
-        if self.target_fps < 1 || self.target_fps > 30 {
+        if self.target_fps < 1 || self.target_fps > MAX_CLIP_TARGET_FPS {
             return Err(format!(
                 "target_fps must be between 1 and 30, got {}",
                 self.target_fps
@@ -81,7 +84,7 @@ impl ClipConfig {
         }
         if !self.clip_length_seconds.is_finite()
             || self.clip_length_seconds < 0.1
-            || self.clip_length_seconds > 60.0
+            || self.clip_length_seconds > MAX_CLIP_LENGTH_SECONDS as f32
         {
             return Err(format!(
                 "clip_length_seconds must be between 0.1 and 60, got {}",

@@ -19,12 +19,13 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use base64::Engine as _;
 use serde_json::Value;
 
 use crate::provider::{
-    InferenceProvider, InferenceRequest, InferenceResult, InferenceVideo, ProviderError,
-    ProviderKind,
+    cached_arc_str, new_arc_str_cache, InferenceProvider, InferenceRequest, InferenceResult,
+    InferenceVideo, ProviderError, ProviderKind,
 };
 
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
@@ -36,6 +37,7 @@ pub struct GeminiProvider {
     api_key: String,
     default_model: String,
     client: reqwest::blocking::Client,
+    model_cache: ArcSwap<Arc<str>>,
 }
 
 impl GeminiProvider {
@@ -52,6 +54,7 @@ impl GeminiProvider {
             api_key,
             default_model,
             client,
+            model_cache: new_arc_str_cache(),
         })
     }
 
@@ -278,7 +281,7 @@ impl GeminiProvider {
 
         Ok(InferenceResult {
             provider: ProviderKind::Gemini,
-            model: Arc::from(model),
+            model: cached_arc_str(&self.model_cache, model),
             output_text: text,
             fallback_used: false,
             finish_reason,
@@ -543,6 +546,21 @@ mod tests {
             .unwrap();
         let _: Arc<str> = result.model.clone();
         assert_eq!(&*result.model, "gemini-3.0-custom");
+    }
+
+    #[test]
+    fn parse_response_reuses_cached_model_arc() {
+        let p = provider();
+        let raw = make_gemini_response("hi", "STOP");
+
+        let first = p
+            .parse_response(&raw, "gemini-3.0-custom", Instant::now())
+            .unwrap();
+        let second = p
+            .parse_response(&raw, "gemini-3.0-custom", Instant::now())
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first.model, &second.model));
     }
 
     #[test]

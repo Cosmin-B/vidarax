@@ -57,7 +57,11 @@ use crate::webrtc::recycle::{RecycledBytes, VecPool};
 /// ffmpeg expect them prepended.  VP8 payloads are passed through unchanged
 /// (no start code wrapping).
 const ANNEX_B_START: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
-const RTP_NAL_POOL_SLOTS: usize = 8;
+pub const RTP_FRAME_QUEUE_CAPACITY: usize = 128;
+
+pub fn rtp_nal_pool_slots(decode_workers: usize) -> usize {
+    RTP_FRAME_QUEUE_CAPACITY + decode_workers.max(1) + 1
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -151,6 +155,7 @@ pub struct WebRtcSession {
     pub max_output_tokens_per_second: u32,
     /// Video codec negotiated from the SDP offer (H.264 or VP8).
     pub codec: VideoCodec,
+    rtp_nal_pool_slots: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +244,7 @@ impl WebRtcSession {
                 guided_json: Arc::new(ArcSwapOption::from(None::<Arc<Arc<str>>>)),
                 max_output_tokens_per_second: config.max_output_tokens_per_second,
                 codec,
+                rtp_nal_pool_slots: rtp_nal_pool_slots(config.decode_workers),
             },
             answer_sdp,
         ))
@@ -298,6 +304,7 @@ impl WebRtcSession {
         let pc = self.pc.clone();
         let seq_counter = Arc::new(AtomicU64::new(0));
         let codec = self.codec;
+        let rtp_nal_pool_slots = self.rtp_nal_pool_slots;
 
         async move {
             while let Some(event) = pc.recv().await {
@@ -317,7 +324,7 @@ impl WebRtcSession {
                         let seq = Arc::clone(&seq_counter);
 
                         tokio::spawn(async move {
-                            let nals_pool = VecPool::with_slots(RTP_NAL_POOL_SLOTS);
+                            let nals_pool = VecPool::with_slots(rtp_nal_pool_slots);
                             loop {
                                 match track.recv().await {
                                     Ok(MediaSample::Video(frame)) => {
@@ -425,10 +432,19 @@ fn frame_payload_to_nals(codec: VideoCodec, payload: &[u8], pool: &VecPool) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{frame_payload_to_nals, RtpFrame, WebRtcConfig, WebRtcSession};
+    use super::{
+        frame_payload_to_nals, rtp_nal_pool_slots, RtpFrame, WebRtcConfig, WebRtcSession,
+        RTP_FRAME_QUEUE_CAPACITY,
+    };
     use crate::webrtc::decode::VideoCodec;
     use crate::webrtc::recycle::{RecycledBytes, VecPool};
     use std::sync::Arc;
+
+    #[test]
+    fn rtp_nal_pool_covers_queue_workers_and_blocked_sender() {
+        assert_eq!(rtp_nal_pool_slots(2), RTP_FRAME_QUEUE_CAPACITY + 2 + 1);
+        assert_eq!(rtp_nal_pool_slots(0), RTP_FRAME_QUEUE_CAPACITY + 1 + 1);
+    }
 
     #[test]
     fn rtp_frame_annex_b_layout_h264() {
@@ -536,6 +552,7 @@ mod tests {
             guided_json: Arc::new(arc_swap::ArcSwapOption::from(None::<Arc<Arc<str>>>)),
             max_output_tokens_per_second: 128,
             codec: VideoCodec::H264,
+            rtp_nal_pool_slots: super::rtp_nal_pool_slots(2),
         };
 
         session.update_prompt("describe safety events".to_string());

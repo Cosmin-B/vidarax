@@ -50,7 +50,27 @@ const DEFAULT_DECODE_WIDTH: u32 = 1920;
 const DEFAULT_DECODE_HEIGHT: u32 = 1080;
 const DEFAULT_LOOP_WINDOW: u32 = 6;
 const DEFAULT_LOOP_REPEAT_THRESHOLD: usize = 3;
-const DEFAULT_CROSS_THREAD_POOL_SLOTS: usize = 8;
+pub const STREAM_FRAME_QUEUE_CAPACITY: usize = 64;
+pub const VLM_WORK_QUEUE_CAPACITY: usize = 32;
+pub const CLIP_FRAME_QUEUE_CAPACITY: usize = STREAM_FRAME_QUEUE_CAPACITY;
+pub const CLIP_WORK_QUEUE_CAPACITY: usize = 32;
+pub const SINK_EVENT_QUEUE_CAPACITY: usize = 512;
+const DECODE_OUTPUT_POOL_SLOTS_PER_WORKER: usize = 3;
+const JPEG_SINK_EVENT_POOL_ALLOWANCE: usize = 128;
+
+pub fn decode_output_pool_slots(_analysis_workers: usize) -> usize {
+    DECODE_OUTPUT_POOL_SLOTS_PER_WORKER
+}
+
+pub fn jpeg_pool_slots(analysis_workers: usize, vlm_workers: usize) -> usize {
+    let analysis_workers = analysis_workers.max(1);
+    let vlm_workers = vlm_workers.max(1);
+    let decode_to_analysis = STREAM_FRAME_QUEUE_CAPACITY + analysis_workers + 1;
+    let normal_path =
+        VLM_WORK_QUEUE_CAPACITY + vlm_workers + JPEG_SINK_EVENT_POOL_ALLOWANCE + 1;
+
+    decode_to_analysis + normal_path
+}
 
 // ─── EventSink trait ──────────────────────────────────────────────────────────
 
@@ -166,6 +186,8 @@ pub fn spawn_decode_workers(
     rtp_rx: kanal::Receiver<RtpFrame>,
     frame_tx: kanal::Sender<StreamFrame>,
     gpu: bool,
+    output_pool_slots: usize,
+    jpeg_pool_slots: usize,
     metrics: Arc<PipelineMetrics>,
     session_span: tracing::Span,
 ) {
@@ -188,7 +210,7 @@ pub fn spawn_decode_workers(
                 let mut ycbcr_scratch: Vec<u8> = Vec::with_capacity(
                     DEFAULT_DECODE_WIDTH as usize * DEFAULT_DECODE_HEIGHT as usize * 3,
                 );
-                let jpeg_pool = VecPool::with_slots(DEFAULT_CROSS_THREAD_POOL_SLOTS);
+                let jpeg_pool = VecPool::with_slots(jpeg_pool_slots);
 
                 while let Ok(frame) = rtp_rx.recv() {
                     let _guard = session_span.enter();
@@ -202,6 +224,7 @@ pub fn spawn_decode_workers(
                             codec: frame.codec,
                             width: DEFAULT_DECODE_WIDTH,
                             height: DEFAULT_DECODE_HEIGHT,
+                            output_pool_slots,
                         };
                         decoder = Some(Decoder::new(&config));
                         active_codec = Some(frame.codec);
@@ -487,7 +510,7 @@ where
     let _training_store = training_store;
 
     // FIFO channel between VLM workers and the SpacetimeDB writer.
-    let (event_tx, event_rx) = kanal::bounded::<SinkEvent>(512);
+    let (event_tx, event_rx) = kanal::bounded::<SinkEvent>(SINK_EVENT_QUEUE_CAPACITY);
 
     // The writer thread needs its own Arc<PipelineMetrics> clone so it can
     // record HTTP POST latency without contending with VLM worker threads.
@@ -976,7 +999,10 @@ fn collect_training_pair(
 #[cfg(test)]
 mod tests {
     use super::{
-        token_budget_entry, EventSink, KeyframeWork, StreamFrame, VLM_TOKEN_BUDGET_MAX_SESSIONS,
+        decode_output_pool_slots, jpeg_pool_slots, token_budget_entry, EventSink, KeyframeWork,
+        StreamFrame, JPEG_SINK_EVENT_POOL_ALLOWANCE, SINK_EVENT_QUEUE_CAPACITY,
+        STREAM_FRAME_QUEUE_CAPACITY,
+        VLM_TOKEN_BUDGET_MAX_SESSIONS, VLM_WORK_QUEUE_CAPACITY,
     };
     use crate::gate::FrameSignal;
     use std::collections::HashMap;
@@ -1086,6 +1112,27 @@ mod tests {
         }
 
         assert_eq!(budget.len(), VLM_TOKEN_BUDGET_MAX_SESSIONS);
+    }
+
+    #[test]
+    fn decode_output_pool_is_sized_to_local_decode_in_flight() {
+        assert_eq!(decode_output_pool_slots(1), 3);
+        assert_eq!(decode_output_pool_slots(8), 3);
+    }
+
+    #[test]
+    fn jpeg_pool_covers_normal_streaming_path_without_clip_worst_case() {
+        let vlm_workers = 2;
+        let decode_to_analysis = STREAM_FRAME_QUEUE_CAPACITY + 1 + 1;
+        let normal_path =
+            VLM_WORK_QUEUE_CAPACITY + vlm_workers + JPEG_SINK_EVENT_POOL_ALLOWANCE + 1;
+
+        assert_eq!(
+            jpeg_pool_slots(1, vlm_workers),
+            decode_to_analysis + normal_path
+        );
+        assert!(jpeg_pool_slots(1, vlm_workers) < SINK_EVENT_QUEUE_CAPACITY);
+        assert!(jpeg_pool_slots(1, vlm_workers) < 1024);
     }
 
     #[test]

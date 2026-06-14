@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use serde_json::Value;
 use vidarax_contracts::models::normalize_model_id;
 
@@ -183,11 +184,16 @@ impl Transport for HttpTransport {
 pub struct OpenAiCompatProvider<T: Transport> {
     transport: T,
     kind: ProviderKind,
+    model_cache: ArcSwap<Arc<str>>,
 }
 
 impl<T: Transport> OpenAiCompatProvider<T> {
     pub fn new(transport: T, kind: ProviderKind) -> Self {
-        Self { transport, kind }
+        Self {
+            transport,
+            kind,
+            model_cache: ArcSwap::from(Arc::new(Arc::from(""))),
+        }
     }
 }
 
@@ -208,7 +214,7 @@ impl<T: Transport> InferenceProvider for OpenAiCompatProvider<T> {
 
         Ok(InferenceResult {
             provider: self.kind,
-            model: Arc::from(model),
+            model: cached_arc_str(&self.model_cache, model),
             output_text,
             fallback_used: false,
             finish_reason,
@@ -289,6 +295,21 @@ pub fn infer_with_endpoints(
 
 fn canonical_model(model: &str) -> Result<&'static str, ProviderError> {
     normalize_model_id(model).ok_or_else(|| ProviderError::UnsupportedModel(model.to_string()))
+}
+
+pub(crate) fn new_arc_str_cache() -> ArcSwap<Arc<str>> {
+    ArcSwap::from(Arc::new(Arc::from("")))
+}
+
+pub(crate) fn cached_arc_str(cache: &ArcSwap<Arc<str>>, value: &str) -> Arc<str> {
+    let cached = cache.load_full();
+    if cached.as_ref().as_ref() == value {
+        return Arc::clone(&*cached);
+    }
+
+    let updated: Arc<str> = Arc::from(value);
+    cache.store(Arc::new(Arc::clone(&updated)));
+    updated
 }
 
 fn build_payload(model: &str, request: &InferenceRequest) -> String {
@@ -490,6 +511,17 @@ mod tests {
         let result = provider.infer(&request()).expect("inference");
         assert_eq!(&*result.model, "openbmb/MiniCPM-V-4_5");
         assert_eq!(result.output_text, "ok");
+    }
+
+    #[test]
+    fn repeated_same_model_results_reuse_cached_arc() {
+        let provider =
+            OpenAiCompatProvider::new(MockTransport::ok(&completion_json("ok")), ProviderKind::Vllm);
+
+        let first = provider.infer(&request()).expect("first inference");
+        let second = provider.infer(&request()).expect("second inference");
+
+        assert!(Arc::ptr_eq(&first.model, &second.model));
     }
 
     #[test]

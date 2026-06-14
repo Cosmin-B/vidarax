@@ -37,9 +37,11 @@ use vidarax_core::webrtc::clip::{
 };
 use vidarax_core::provider::{InferenceProvider, InferenceRequest, InferenceResult, ProviderError, ProviderKind};
 use vidarax_core::tiered_vlm::TieredVlmConfig;
-use vidarax_core::webrtc::session::WebRtcSession;
+use vidarax_core::webrtc::session::{RTP_FRAME_QUEUE_CAPACITY, WebRtcSession};
 use vidarax_core::webrtc::workers::{
-    EventSink, VlmWorkerParams, spawn_analysis_workers, spawn_decode_workers, spawn_vlm_workers,
+    decode_output_pool_slots, jpeg_pool_slots, EventSink, VlmWorkerParams,
+    CLIP_FRAME_QUEUE_CAPACITY, CLIP_WORK_QUEUE_CAPACITY, STREAM_FRAME_QUEUE_CAPACITY,
+    VLM_WORK_QUEUE_CAPACITY, spawn_analysis_workers, spawn_decode_workers, spawn_vlm_workers,
 };
 
 use crate::auth::principal_key_from_headers;
@@ -211,13 +213,13 @@ pub async fn whip_offer(
     );
 
     // ── Channel topology ───────────────────────────────────────────────────
-    // RTP frames (128) → decoded stream frames (64) → keyframe work (32).
+    // RTP frames → decoded stream frames → keyframe work.
     let (frame_tx, frame_rx) =
-        kanal::bounded::<vidarax_core::webrtc::session::RtpFrame>(128);
+        kanal::bounded::<vidarax_core::webrtc::session::RtpFrame>(RTP_FRAME_QUEUE_CAPACITY);
     let (stream_tx, stream_rx) =
-        kanal::bounded::<vidarax_core::webrtc::workers::StreamFrame>(64);
+        kanal::bounded::<vidarax_core::webrtc::workers::StreamFrame>(STREAM_FRAME_QUEUE_CAPACITY);
     let (vlm_tx, vlm_rx) =
-        kanal::bounded::<vidarax_core::webrtc::workers::KeyframeWork>(32);
+        kanal::bounded::<vidarax_core::webrtc::workers::KeyframeWork>(VLM_WORK_QUEUE_CAPACITY);
 
     // ── Media ingestion task ───────────────────────────────────────────────
     let run_future = session.run(frame_tx);
@@ -263,6 +265,11 @@ pub async fn whip_offer(
             frame_rx,
             stream_tx,
             false, // gpu_available — conservative default; no GPU assumed
+            decode_output_pool_slots(webrtc_config_for_workers.analysis_workers),
+            jpeg_pool_slots(
+                webrtc_config_for_workers.analysis_workers,
+                webrtc_config_for_workers.vlm_workers,
+            ),
             Arc::clone(&metrics_for_workers),
             session_span_for_workers.clone(),
         );
@@ -275,9 +282,11 @@ pub async fn whip_offer(
 
         if let Some(clip_config) = clip_config_for_workers {
             let (clip_frame_tx, clip_frame_rx) =
-                kanal::bounded::<vidarax_core::webrtc::workers::StreamFrame>(64);
+                kanal::bounded::<vidarax_core::webrtc::workers::StreamFrame>(
+                    CLIP_FRAME_QUEUE_CAPACITY,
+                );
             let (clip_tx, clip_rx) =
-                kanal::bounded::<vidarax_core::webrtc::clip::ClipWork>(32);
+                kanal::bounded::<vidarax_core::webrtc::clip::ClipWork>(CLIP_WORK_QUEUE_CAPACITY);
 
             spawn_analysis_workers(
                 webrtc_config_for_workers.analysis_workers,

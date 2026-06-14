@@ -7,6 +7,7 @@ fn software_decoder_creates_without_panic() {
         codec: VideoCodec::H264,
         width: 1280,
         height: 720,
+        output_pool_slots: 1,
     };
     let decoder = Decoder::new(&config);
     assert!(matches!(decoder, Decoder::Software { .. }));
@@ -19,6 +20,7 @@ fn ffmpeg_sw_decoder_selects_for_vp8_no_gpu() {
         codec: VideoCodec::Vp8,
         width: 1280,
         height: 720,
+        output_pool_slots: 1,
     };
     let decoder = Decoder::new(&config);
     assert!(matches!(decoder, Decoder::FfmpegSw { .. }));

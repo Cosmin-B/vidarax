@@ -22,6 +22,7 @@
 //!     codec: VideoCodec::H264,
 //!     width: 1280,
 //!     height: 720,
+//!     output_pool_slots: 1,
 //! };
 //! let mut decoder = Decoder::new(&config);
 //! // Feed raw NAL / VP8 bytes:
@@ -35,8 +36,6 @@ use std::sync::mpsc;
 use openh264::formats::YUVSource;
 
 use crate::webrtc::recycle::{RecycledBytes, VecPool};
-
-const CROSS_THREAD_POOL_SLOTS: usize = 8;
 
 /// Video codec carried by the WebRTC track.
 ///
@@ -128,15 +127,15 @@ pub struct YuvPlanePools {
 }
 
 impl YuvPlanePools {
-    fn new(width: u32, height: u32) -> Self {
+    fn new(width: u32, height: u32, slots: usize) -> Self {
         let w = width as usize;
         let h = height as usize;
         let y_size = w * h;
         let uv_size = (w / 2) * (h / 2);
         Self {
-            y: VecPool::with_capacity(CROSS_THREAD_POOL_SLOTS, y_size),
-            u: VecPool::with_capacity(CROSS_THREAD_POOL_SLOTS, uv_size),
-            v: VecPool::with_capacity(CROSS_THREAD_POOL_SLOTS, uv_size),
+            y: VecPool::with_capacity(slots, y_size),
+            u: VecPool::with_capacity(slots, uv_size),
+            v: VecPool::with_capacity(slots, uv_size),
         }
     }
 }
@@ -159,6 +158,8 @@ pub struct DecoderConfig {
     pub width: u32,
     /// Frame height passed to the NVDEC ffmpeg pipeline.  Ignored for openh264.
     pub height: u32,
+    /// Recycle slots for decoded YUV frames crossing into downstream queues.
+    pub output_pool_slots: usize,
 }
 
 impl DecoderConfig {
@@ -180,6 +181,7 @@ impl DecoderConfig {
             codec: VideoCodec::H264,
             width: 1920,
             height: 1080,
+            output_pool_slots: 1,
         }
     }
 }
@@ -271,9 +273,10 @@ fn spawn_frame_reader(
     mut stdout: BufReader<ChildStdout>,
     width: u32,
     height: u32,
+    output_pool_slots: usize,
 ) -> mpsc::Receiver<YuvFrame> {
     let (tx, rx) = mpsc::channel();
-    let pools = YuvPlanePools::new(width, height);
+    let pools = YuvPlanePools::new(width, height, output_pool_slots);
     std::thread::spawn(move || {
         let w = width as usize;
         let h = height as usize;
@@ -325,29 +328,41 @@ impl Decoder {
     /// for `NvDec`/`FfmpegSw`, or openh264 library init failure for `Software`).
     pub fn new(config: &DecoderConfig) -> Self {
         if config.gpu_available {
-            Self::new_nvdec(config.codec, config.width, config.height)
+            Self::new_nvdec(
+                config.codec,
+                config.width,
+                config.height,
+                config.output_pool_slots,
+            )
         } else {
             match config.codec {
-                VideoCodec::H264 => Self::new_software(config.width, config.height),
-                VideoCodec::Vp8 => Self::new_ffmpeg_sw(config.codec, config.width, config.height),
+                VideoCodec::H264 => {
+                    Self::new_software(config.width, config.height, config.output_pool_slots)
+                }
+                VideoCodec::Vp8 => Self::new_ffmpeg_sw(
+                    config.codec,
+                    config.width,
+                    config.height,
+                    config.output_pool_slots,
+                ),
             }
         }
     }
 
-    fn new_software(width: u32, height: u32) -> Self {
+    fn new_software(width: u32, height: u32, output_pool_slots: usize) -> Self {
         let decoder =
             openh264::decoder::Decoder::new().expect("openh264 decoder initialisation failed");
         Decoder::Software {
             decoder,
             scratch: SoftwareScratch::default(),
-            yuv_pools: YuvPlanePools::new(width, height),
+            yuv_pools: YuvPlanePools::new(width, height, output_pool_slots),
         }
     }
 
     /// Spawn an ffmpeg sidecar using `-hwaccel auto` so the same process
     /// handles both H.264 (NVDEC) and VP8 (GPU VP8 decode) without needing to
     /// hard-code the codec decoder name.
-    fn new_nvdec(codec: VideoCodec, width: u32, height: u32) -> Self {
+    fn new_nvdec(codec: VideoCodec, width: u32, height: u32, output_pool_slots: usize) -> Self {
         let input_fmt = codec.ffmpeg_input_format();
         let mut child = Command::new(crate::ingest::ffmpeg_path())
             .args([
@@ -373,7 +388,7 @@ impl Decoder {
 
         let stdin = child.stdin.take().expect("ffmpeg stdin missing");
         let stdout = BufReader::new(child.stdout.take().expect("ffmpeg stdout missing"));
-        let frame_rx = spawn_frame_reader(stdout, width, height);
+        let frame_rx = spawn_frame_reader(stdout, width, height, output_pool_slots);
 
         Decoder::NvDec {
             child,
@@ -389,7 +404,7 @@ impl Decoder {
     /// Uses ffmpeg's bundled `libvpx` decoder; no GPU or special codec flags
     /// required.  The `-s` scaling hint is not passed because VP8 streams carry
     /// their dimensions in-band; ffmpeg reads them from the bitstream headers.
-    fn new_ffmpeg_sw(codec: VideoCodec, width: u32, height: u32) -> Self {
+    fn new_ffmpeg_sw(codec: VideoCodec, width: u32, height: u32, output_pool_slots: usize) -> Self {
         let input_fmt = codec.ffmpeg_input_format();
         let mut child = Command::new(crate::ingest::ffmpeg_path())
             .args([
@@ -411,7 +426,7 @@ impl Decoder {
 
         let stdin = child.stdin.take().expect("ffmpeg stdin missing");
         let stdout = BufReader::new(child.stdout.take().expect("ffmpeg stdout missing"));
-        let frame_rx = spawn_frame_reader(stdout, width, height);
+        let frame_rx = spawn_frame_reader(stdout, width, height, output_pool_slots);
 
         Decoder::FfmpegSw {
             child,
