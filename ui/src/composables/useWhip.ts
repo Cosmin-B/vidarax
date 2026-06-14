@@ -51,7 +51,6 @@ export function useWhip() {
   const localStream = ref<MediaStream | null>(null)
   const pc = ref<RTCPeerConnection | null>(null)
   let metricsTimer: ReturnType<typeof setInterval> | null = null
-  let prevBytesSent = 0
   let prevFrames = 0
   let prevTs = 0
 
@@ -187,7 +186,6 @@ export function useWhip() {
         latencyMs: 0, // round-trip time available via candidate-pair stats if needed
       })
 
-      prevBytesSent = bytesSent
       prevFrames = framesEncoded
       prevTs = now
     } catch {
@@ -209,7 +207,6 @@ export function useWhip() {
       localStream.value.getTracks().forEach(t => t.stop())
       localStream.value = null
     }
-    prevBytesSent = 0
     prevFrames = 0
     prevTs = 0
   }

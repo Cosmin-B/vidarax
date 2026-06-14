@@ -23,6 +23,7 @@ export interface RunSummary {
   status: RunStatus
   mode: RunMode
   model: string
+  source_uri?: string
   created_at?: string
   event_count?: number
 }

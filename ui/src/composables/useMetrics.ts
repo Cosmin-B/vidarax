@@ -102,9 +102,9 @@ function parseHistograms(text: string): Map<string, RawHistogram> {
       /^([a-zA-Z_:][a-zA-Z0-9_:]*)_bucket\{[^}]*le="([^"]+)"[^}]*\}\s+([\d.e+\-]+)/,
     )
     if (bucketMatch) {
-      const base = bucketMatch[1]
-      const le = bucketMatch[2]
-      const count = parseFloat(bucketMatch[3])
+      const base = bucketMatch[1]!
+      const le = bucketMatch[2]!
+      const count = parseFloat(bucketMatch[3]!)
       if (!isNaN(count)) {
         if (!buckets.has(base)) buckets.set(base, new Map())
         buckets.get(base)!.set(le, count)
@@ -115,16 +115,16 @@ function parseHistograms(text: string): Map<string, RawHistogram> {
     // _sum value
     const sumMatch = line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)_sum\s+([\d.e+\-]+)/)
     if (sumMatch) {
-      const v = parseFloat(sumMatch[2])
-      if (!isNaN(v)) sums.set(sumMatch[1], v)
+      const v = parseFloat(sumMatch[2]!)
+      if (!isNaN(v)) sums.set(sumMatch[1]!, v)
       continue
     }
 
     // _count value
     const countMatch = line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)_count\s+([\d.e+\-]+)/)
     if (countMatch) {
-      const v = parseFloat(countMatch[2])
-      if (!isNaN(v)) counts.set(countMatch[1], v)
+      const v = parseFloat(countMatch[2]!)
+      if (!isNaN(v)) counts.set(countMatch[1]!, v)
       continue
     }
   }
@@ -148,7 +148,7 @@ function parseHistograms(text: string): Map<string, RawHistogram> {
     if (inf !== undefined) {
       totalCount = inf
     } else {
-      totalCount = counts.get(base) ?? (cumulativeCounts.at(-1) ?? 0)
+      totalCount = counts.get(base) ?? (cumulativeCounts[cumulativeCounts.length - 1] ?? 0)
     }
 
     result.set(base, {
@@ -178,21 +178,22 @@ function histogramQuantile(h: RawHistogram, q: number): number {
   let lowerCount = 0
 
   for (let i = 0; i < h.upperBounds.length; i++) {
-    const upperCount = h.cumulativeCounts[i]
+    const upper = h.upperBounds[i]!
+    const upperCount = h.cumulativeCounts[i]!
     if (upperCount >= target) {
       // Linear interpolation within this bucket.
       const countInBucket = upperCount - lowerCount
-      if (countInBucket === 0) return h.upperBounds[i]
+      if (countInBucket === 0) return upper
       const fraction = (target - lowerCount) / countInBucket
-      return lowerBound + fraction * (h.upperBounds[i] - lowerBound)
+      return lowerBound + fraction * (upper - lowerBound)
     }
-    lowerBound = h.upperBounds[i]
+    lowerBound = upper
     lowerCount = upperCount
   }
 
   // Quantile falls in the +Inf bucket — return the last finite upper bound as
   // a conservative estimate (we cannot interpolate to infinity).
-  return h.upperBounds.at(-1) ?? 0
+  return h.upperBounds[h.upperBounds.length - 1] ?? 0
 }
 
 /** Derive p50/p95/p99/mean from a RawHistogram. */
@@ -215,8 +216,8 @@ function parsePrometheus(text: string): Map<string, number> {
     // Strip labels: metric_name{...} value  →  metric_name value
     const match = line.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(?:\{[^}]*\})?\s+([\d.e+\-]+)/)
     if (match) {
-      const value = parseFloat(match[2])
-      if (!isNaN(value)) result.set(match[1], value)
+      const value = parseFloat(match[2]!)
+      if (!isNaN(value)) result.set(match[1]!, value)
     }
   }
   return result
