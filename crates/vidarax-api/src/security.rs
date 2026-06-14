@@ -141,9 +141,7 @@ pub async fn enforce_security(
     let policy = state.security_policy();
     let origin = header_value(&request, header::ORIGIN.as_str()).map(ToString::to_string);
 
-    // M-10: Apply global rate limiting BEFORE the health/preflight bypass so
-    // that unauthenticated endpoints cannot be used to exhaust the rate budget.
-    // Only the API key check is skipped for these paths, not the rate limit.
+    // Only the API key check is skipped for health/preflight, not the rate limit.
     if let Some(global) = &policy.global_limiter {
         let now_sec = epoch_seconds();
         if !global.allow(now_sec) {

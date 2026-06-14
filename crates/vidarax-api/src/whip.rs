@@ -49,12 +49,6 @@ use crate::wal_sink::WalEventSink;
 
 const ATTACH_CONFIG_HEADER: &str = "x-attach-config";
 
-// ---------------------------------------------------------------------------
-// NullInferenceProvider — used when no provider endpoints are configured
-// ---------------------------------------------------------------------------
-
-/// An [`InferenceProvider`] that always returns a placeholder response.
-///
 /// Used when no inference endpoints are configured so the pipeline can still
 /// run without VLM inference (frames are decoded and gated, but the VLM step
 /// is a no-op).

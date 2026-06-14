@@ -25,7 +25,6 @@ impl InputSource {
                 reqwest::Url::parse(trimmed).map_err(|err| format!("invalid source_uri: {err}"))?;
             return match url.scheme() {
                 "http" | "https" => {
-                    // HLS manifests served over HTTP/HTTPS: validate as HLS stream.
                     if url.path().to_ascii_lowercase().ends_with(".m3u8") {
                         validate_hls_url(url)
                     } else {
@@ -35,9 +34,7 @@ impl InputSource {
                 "hls" => validate_hls_url(url),
                 "rtsps" => validate_remote_url(url),
                 "rtsp" => {
-                    // M-12: Reject unencrypted RTSP by default. Operators can
-                    // opt in via VIDARAX_ALLOW_UNENCRYPTED_RTSP=true for legacy
-                    // cameras on trusted networks.
+                    // Operators can opt in for legacy cameras on trusted networks.
                     let allow_plain = std::env::var("VIDARAX_ALLOW_UNENCRYPTED_RTSP")
                         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
                         .unwrap_or(false);
@@ -66,9 +63,6 @@ impl InputSource {
             InputSource::FilePath(path) | InputSource::Url(path) | InputSource::HlsStream(path) => {
                 path
             }
-            // WebRTC streams are fed through the worker pool directly; the
-            // session ID is returned as a placeholder but should never be
-            // passed to ffmpeg.
             InputSource::WebRtcStream(session_id) => session_id.as_str(),
         }
     }
@@ -91,7 +85,7 @@ fn validate_remote_url(url: reqwest::Url) -> Result<InputSource, String> {
         }
     }
 
-    // H-1: Resolve DNS and validate ALL resolved IPs to prevent DNS rebinding.
+    // Resolve DNS and validate every address to prevent DNS rebinding.
     let port = url.port_or_known_default().unwrap_or(80);
     let resolve_target = format!("{host}:{port}");
     match resolve_target.to_socket_addrs() {

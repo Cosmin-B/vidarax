@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use vidarax_core::gate::{FrameSignal, GateConfig, GateEngine};
-use vidarax_core::lockfree::spsc::spsc_channel;
 
 struct CountingAllocator;
 
@@ -35,14 +34,12 @@ static GLOBAL: CountingAllocator = CountingAllocator;
 
 fn main() {
     let gate_stats = bench_gate_path(120_000);
-    let spsc_stats = bench_spsc(600_000);
     let alloc_stats = allocation_probe(60_000);
 
     println!(
-        "{{\"gate_process\":{{\"p50_ns\":{},\"p95_ns\":{}}},\"spsc\":{{\"throughput_ops_sec\":{}}},\"allocations\":{{\"total\":{},\"per_frame\":{:.6}}}}}",
+        "{{\"gate_process\":{{\"p50_ns\":{},\"p95_ns\":{}}},\"allocations\":{{\"total\":{},\"per_frame\":{:.6}}}}}",
         gate_stats.p50_ns,
         gate_stats.p95_ns,
-        spsc_stats.throughput_ops_sec,
         alloc_stats.total,
         alloc_stats.per_frame
     );
@@ -51,10 +48,6 @@ fn main() {
 struct GateStats {
     p50_ns: u64,
     p95_ns: u64,
-}
-
-struct SpscStats {
-    throughput_ops_sec: u64,
 }
 
 struct AllocStats {
@@ -85,38 +78,6 @@ fn bench_gate_path(samples: usize) -> GateStats {
     GateStats {
         p50_ns: percentile(&durations, 50),
         p95_ns: percentile(&durations, 95),
-    }
-}
-
-fn bench_spsc(iterations: usize) -> SpscStats {
-    let (producer, consumer) = spsc_channel::<u64, 65536>();
-
-    let start = Instant::now();
-    let producer_thread = std::thread::spawn(move || {
-        for i in 0..iterations as u64 {
-            while producer.push(i).is_err() {
-                std::hint::spin_loop();
-            }
-        }
-    });
-
-    let consumer_thread = std::thread::spawn(move || {
-        let mut received = 0usize;
-        while received < iterations {
-            if consumer.pop().is_some() {
-                received += 1;
-            } else {
-                std::hint::spin_loop();
-            }
-        }
-    });
-
-    producer_thread.join().expect("producer thread");
-    consumer_thread.join().expect("consumer thread");
-    let elapsed = start.elapsed().as_secs_f64();
-
-    SpscStats {
-        throughput_ops_sec: ((iterations as f64) / elapsed) as u64,
     }
 }
 

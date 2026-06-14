@@ -6,17 +6,7 @@
 //! 2. `fmt` console layer — human-readable to stdout (dev ergonomics)
 //! 3. `fmt` JSON layer  — structured JSON to stderr (VictoriaLogs sidecar ingest)
 //! 4. OpenTelemetry layer — span bridge; OTLP exporter wired when
-//!    `VIDARAX_TRACES_ENDPOINT` is set (Phase 3)
-//!
-//! # Usage
-//!
-//! ```no_run
-//! // At process start:
-//! vidarax_api::telemetry::init_telemetry();
-//!
-//! // On graceful shutdown — flushes any buffered spans:
-//! vidarax_api::telemetry::shutdown_telemetry();
-//! ```
+//!    `VIDARAX_TRACES_ENDPOINT` is set
 
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -31,32 +21,25 @@ static OTEL_PROVIDER: std::sync::OnceLock<SdkTracerProvider> = std::sync::OnceLo
 /// Environment variables:
 /// - `RUST_LOG` — tracing filter (default: `info`)
 /// - `VIDARAX_TRACES_ENDPOINT` — OTLP gRPC endpoint for trace export
-///   (e.g. `http://localhost:4317`).  When unset, spans are collected
-///   but immediately dropped (no-op Phase 1 provider).
+///   (e.g. `http://localhost:4317`). When unset, spans are dropped.
 pub fn init_telemetry() {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
-    // Human-readable output to stdout (dev / local runs).
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
         .with_writer(std::io::stdout);
 
-    // Structured JSON to stderr (consumed by VictoriaLogs log-shipper sidecar).
     let json_layer = tracing_subscriber::fmt::layer()
         .json()
         .with_current_span(true)
         .with_span_list(true)
         .with_writer(std::io::stderr);
 
-    // Build the OTel provider.  When VIDARAX_TRACES_ENDPOINT is set, wire the
-    // OTLP gRPC exporter (Phase 3).  Otherwise fall back to a no-op provider so
-    // the binary starts cleanly without external infra.
     let otel_provider = build_otel_provider();
     let tracer = opentelemetry::trace::TracerProvider::tracer(&otel_provider, "vidarax-api");
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
-    // Store a clone for shutdown_telemetry(); then publish globally.
     let _ = OTEL_PROVIDER.set(otel_provider.clone());
     opentelemetry::global::set_tracer_provider(otel_provider);
 
@@ -85,7 +68,7 @@ pub fn shutdown_telemetry() {
 /// Build the `SdkTracerProvider` appropriate for the current environment.
 ///
 /// - If `VIDARAX_TRACES_ENDPOINT` is set: wire an OTLP gRPC exporter.
-/// - Otherwise: return a no-op provider (Phase 1 default).
+/// - Otherwise: return a no-op provider.
 fn build_otel_provider() -> SdkTracerProvider {
     if let Ok(endpoint) = std::env::var("VIDARAX_TRACES_ENDPOINT") {
         match build_otlp_provider(&endpoint) {
@@ -103,7 +86,6 @@ fn build_otel_provider() -> SdkTracerProvider {
             }
         }
     }
-    // No endpoint configured — collect spans locally but discard them.
     SdkTracerProvider::builder().build()
 }
 
