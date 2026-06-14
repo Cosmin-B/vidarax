@@ -257,6 +257,7 @@ pub async fn whip_offer(
     // Share the session's guided_json handle with VLM workers so that
     // PATCH /prompt with output_schema takes effect on the next keyframe
     // without restarting the worker threads.
+    let prompt_for_workers = session.prompt_arc();
     let guided_json_for_workers = session.guided_json_arc();
 
     // Worker threads are long-running OS threads (not tokio tasks).
@@ -282,6 +283,7 @@ pub async fn whip_offer(
             Arc::clone(&event_sink_for_workers),
             Arc::clone(&run_id_for_workers),
             Arc::clone(&session_id_for_workers),
+            Arc::clone(&prompt_for_workers),
             Arc::clone(&metrics_for_workers),
             session_span_for_workers.clone(),
         );
