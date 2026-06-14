@@ -32,6 +32,9 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
+use vidarax_core::webrtc::clip::{
+    spawn_clip_accumulator, spawn_clip_vlm_workers, ClipConfig as CoreClipConfig,
+};
 use vidarax_core::provider::{InferenceProvider, InferenceRequest, InferenceResult, ProviderError, ProviderKind};
 use vidarax_core::tiered_vlm::TieredVlmConfig;
 use vidarax_core::webrtc::session::WebRtcSession;
@@ -40,8 +43,11 @@ use vidarax_core::webrtc::workers::{
 };
 
 use crate::auth::principal_key_from_headers;
+use crate::models::AttachStreamRequest;
 use crate::state::AppState;
 use crate::wal_sink::WalEventSink;
+
+const ATTACH_CONFIG_HEADER: &str = "x-attach-config";
 
 // ---------------------------------------------------------------------------
 // NullInferenceProvider — used when no provider endpoints are configured
@@ -146,8 +152,13 @@ pub async fn whip_offer(
         tracing::debug!("WHIP offer content-type: {:?}", ct);
     }
 
+    let attach_config = match parse_attach_config_header(&headers) {
+        Ok(config) => config,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+
     // Create the rustrtc PeerConnection and negotiate the SDP answer.
-    let (session, answer_sdp) =
+    let (mut session, answer_sdp) =
         match WebRtcSession::new(offer_sdp, state.webrtc_config()).await {
             Ok(pair) => pair,
             Err(e) => {
@@ -159,6 +170,11 @@ pub async fn whip_offer(
                     .into_response();
             }
         };
+
+    let clip_config = match apply_attach_config(&mut session, attach_config) {
+        Ok(config) => config,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
 
     let session = Arc::new(session);
     let sess_id = new_session_id();
@@ -226,6 +242,7 @@ pub async fn whip_offer(
     let metrics_arc = Arc::clone(state.pipeline_metrics_arc());
     let vlm_config = TieredVlmConfig::default();
     let webrtc_config_for_workers = state.webrtc_config().clone();
+    let max_output_tokens_per_second = session.max_output_tokens_per_second;
 
     // Capture everything needed by the spawn_blocking closure.
     let run_id_for_workers = Arc::clone(&run_id);
@@ -235,6 +252,7 @@ pub async fn whip_offer(
     let metrics_for_workers = Arc::clone(&metrics_arc);
     let vlm_config_for_workers = vlm_config.clone();
     let provider = state.provider().cloned();
+    let clip_config_for_workers = clip_config;
     // Share the session's guided_json handle with VLM workers so that
     // PATCH /prompt with output_schema takes effect on the next keyframe
     // without restarting the worker threads.
@@ -255,39 +273,76 @@ pub async fn whip_offer(
             session_span_for_workers.clone(),
         );
 
-        // ── Analysis workers ───────────────────────────────────────────
-        spawn_analysis_workers(
-            webrtc_config_for_workers.analysis_workers,
-            stream_rx,
-            vlm_tx,
-            None, // clip_tx — normal keyframe mode, not clip mode
-            Arc::clone(&event_sink_for_workers),
-            Arc::clone(&run_id_for_workers),
-            Arc::clone(&session_id_for_workers),
-            Arc::clone(&prompt_for_workers),
-            Arc::clone(&metrics_for_workers),
-            session_span_for_workers.clone(),
-        );
-
-        // ── VLM workers ────────────────────────────────────────────────
-        let guided_json = guided_json_for_workers;
         let vlm_provider: Arc<dyn InferenceProvider + Send + Sync> = match provider {
             Some(p) => p,
             None => Arc::new(NullInferenceProvider),
         };
-        spawn_vlm_workers(VlmWorkerParams {
-            workers: webrtc_config_for_workers.vlm_workers,
-            vlm_rx,
-            provider: Arc::new(vlm_provider),
-            stdb: event_sink_for_workers,
-            config: vlm_config_for_workers,
-            metrics: metrics_for_workers,
-            session_span: session_span_for_workers,
-            max_output_tokens_per_second: webrtc_config_for_workers.max_output_tokens_per_second,
-            guided_json: Arc::clone(&guided_json),
-            training_store: None,
-            distillation: vidarax_core::tiered_vlm::DistillationConfig::default(),
-        });
+        let guided_json = guided_json_for_workers;
+
+        if let Some(clip_config) = clip_config_for_workers {
+            let (clip_frame_tx, clip_frame_rx) =
+                kanal::bounded::<vidarax_core::webrtc::workers::StreamFrame>(64);
+            let (clip_tx, clip_rx) =
+                kanal::bounded::<vidarax_core::webrtc::clip::ClipWork>(32);
+
+            spawn_analysis_workers(
+                webrtc_config_for_workers.analysis_workers,
+                stream_rx,
+                vlm_tx,
+                Some(clip_frame_tx),
+                Arc::clone(&event_sink_for_workers),
+                Arc::clone(&run_id_for_workers),
+                Arc::clone(&session_id_for_workers),
+                Arc::clone(&prompt_for_workers),
+                Arc::clone(&metrics_for_workers),
+                session_span_for_workers.clone(),
+            );
+            spawn_clip_accumulator(
+                clip_frame_rx,
+                clip_tx,
+                clip_config,
+                Arc::clone(&run_id_for_workers),
+                Arc::clone(&session_id_for_workers),
+                Arc::clone(&*prompt_for_workers.load_full()),
+                session_span_for_workers.clone(),
+            );
+            spawn_clip_vlm_workers(
+                webrtc_config_for_workers.vlm_workers,
+                clip_rx,
+                Arc::new(vlm_provider),
+                event_sink_for_workers,
+                vlm_config_for_workers,
+                metrics_for_workers,
+                session_span_for_workers,
+                Arc::clone(&guided_json),
+            );
+        } else {
+            spawn_analysis_workers(
+                webrtc_config_for_workers.analysis_workers,
+                stream_rx,
+                vlm_tx,
+                None,
+                Arc::clone(&event_sink_for_workers),
+                Arc::clone(&run_id_for_workers),
+                Arc::clone(&session_id_for_workers),
+                Arc::clone(&prompt_for_workers),
+                Arc::clone(&metrics_for_workers),
+                session_span_for_workers.clone(),
+            );
+            spawn_vlm_workers(VlmWorkerParams {
+                workers: webrtc_config_for_workers.vlm_workers,
+                vlm_rx,
+                provider: Arc::new(vlm_provider),
+                stdb: event_sink_for_workers,
+                config: vlm_config_for_workers,
+                metrics: metrics_for_workers,
+                session_span: session_span_for_workers,
+                max_output_tokens_per_second,
+                guided_json: Arc::clone(&guided_json),
+                training_store: None,
+                distillation: vidarax_core::tiered_vlm::DistillationConfig::default(),
+            });
+        }
     });
 
     // Build the 201 Created response with SDP answer.
@@ -306,6 +361,41 @@ pub async fn whip_offer(
         )
         .body(axum::body::Body::from(answer_sdp))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn parse_attach_config_header(headers: &HeaderMap) -> Result<Option<AttachStreamRequest>, String> {
+    let Some(value) = headers.get(ATTACH_CONFIG_HEADER) else {
+        return Ok(None);
+    };
+    let text = value
+        .to_str()
+        .map_err(|_| format!("{ATTACH_CONFIG_HEADER} must be valid UTF-8"))?;
+    serde_json::from_str::<AttachStreamRequest>(text)
+        .map(Some)
+        .map_err(|err| format!("invalid {ATTACH_CONFIG_HEADER}: {err}"))
+}
+
+fn apply_attach_config(
+    session: &mut WebRtcSession,
+    config: Option<AttachStreamRequest>,
+) -> Result<Option<CoreClipConfig>, String> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+
+    if let Some(prompt) = config.prompt {
+        session.update_prompt(prompt);
+    }
+    if let Some(max) = config.max_output_tokens_per_second {
+        session.max_output_tokens_per_second = max;
+    }
+    if let Some(clip) = config.clip_mode {
+        let clip = clip.into_core();
+        clip.validate()?;
+        return Ok(Some(clip));
+    }
+
+    Ok(None)
 }
 
 /// `PATCH /v1/stream/whip/{sess_id}`
@@ -478,7 +568,10 @@ pub async fn whip_update_prompt(
 
 #[cfg(test)]
 mod tests {
-    use super::{hex_char, new_session_id};
+    use super::{
+        hex_char, new_session_id, parse_attach_config_header, ATTACH_CONFIG_HEADER,
+    };
+    use axum::http::{HeaderMap, HeaderValue};
 
     #[test]
     fn session_id_has_sess_prefix() {
@@ -499,5 +592,25 @@ mod tests {
         assert_eq!(hex_char(9), '9');
         assert_eq!(hex_char(10), 'a');
         assert_eq!(hex_char(15), 'f');
+    }
+
+    #[test]
+    fn attach_config_header_reads_prompt_clip_mode_and_token_cap() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ATTACH_CONFIG_HEADER,
+            HeaderValue::from_static(
+                r#"{"prompt":"watch exits","token-cap":42,"clip_mode":{"target_fps":6,"clip_length_seconds":0.5,"delay_seconds":0.25}}"#,
+            ),
+        );
+        let config = parse_attach_config_header(&headers).unwrap().unwrap();
+        let clip = config.clip_mode.unwrap().into_core();
+
+        assert_eq!(config.prompt.as_deref(), Some("watch exits"));
+        assert_eq!(config.max_output_tokens_per_second, Some(42));
+        clip.validate().unwrap();
+        assert_eq!(clip.target_fps, 6);
+        assert_eq!(clip.clip_length_seconds, 0.5);
+        assert_eq!(clip.delay_seconds, 0.25);
     }
 }
