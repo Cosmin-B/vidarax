@@ -893,6 +893,7 @@ pub async fn analyze_run(
         TwoPassConfig {
             window_size,
             segment_ms,
+            confidence_weights: Default::default(),
         },
         GateConfig::default(),
     );
@@ -1487,6 +1488,7 @@ pub async fn reason_realtime_run(
         TwoPassConfig {
             window_size: payload.window_size.unwrap_or(16),
             segment_ms: payload.segment_ms.unwrap_or(250),
+            confidence_weights: Default::default(),
         },
         GateConfig::default(),
     );

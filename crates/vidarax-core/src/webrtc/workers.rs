@@ -440,6 +440,32 @@ where
 /// so inference latency is never stalled by SpacetimeDB HTTP round-trips.
 ///
 /// Threads exit when `params.vlm_rx` is closed.
+/// Upper bound on sessions tracked by the per-session token budget map.
+const VLM_TOKEN_BUDGET_MAX_SESSIONS: usize = 4096;
+
+/// Returns the token-budget window for `session`, inserting it if absent and
+/// keeping the map within `VLM_TOKEN_BUDGET_MAX_SESSIONS` (stale windows are
+/// dropped first, then an arbitrary entry) so a long-lived worker cannot grow
+/// the map unbounded.
+fn token_budget_entry<'a>(
+    budget: &'a mut std::collections::HashMap<Arc<str>, (std::time::Instant, u32)>,
+    session: &Arc<str>,
+    now: std::time::Instant,
+) -> &'a mut (std::time::Instant, u32) {
+    if !budget.contains_key(session.as_ref()) {
+        if budget.len() >= VLM_TOKEN_BUDGET_MAX_SESSIONS {
+            budget.retain(|_, (ts, _)| now.duration_since(*ts).as_secs() < 1);
+            if budget.len() >= VLM_TOKEN_BUDGET_MAX_SESSIONS {
+                if let Some(key) = budget.keys().next().cloned() {
+                    budget.remove(&key);
+                }
+            }
+        }
+        budget.insert(Arc::clone(session), (now, 0));
+    }
+    budget.get_mut(session.as_ref()).expect("entry inserted above")
+}
+
 pub fn spawn_vlm_workers<I>(params: VlmWorkerParams<I>)
 where
     I: InferenceProvider + 'static,
@@ -570,11 +596,7 @@ where
                     // already exceeded the per-second output token budget.
                     if max_output_tokens_per_second > 0 {
                         let now = std::time::Instant::now();
-                        // Avoid Arc clone on hit: check with &str borrow first.
-                        if !token_budget.contains_key(work.session_id.as_ref()) {
-                            token_budget.insert(Arc::clone(&work.session_id), (now, 0));
-                        }
-                        let entry = token_budget.get_mut(work.session_id.as_ref()).unwrap();
+                        let entry = token_budget_entry(&mut token_budget, &work.session_id, now);
                         if now.duration_since(entry.0).as_secs() >= 1 {
                             *entry = (now, 0); // reset 1-second window
                         }
@@ -953,9 +975,13 @@ fn collect_training_pair(
 
 #[cfg(test)]
 mod tests {
-    use super::{EventSink, KeyframeWork, StreamFrame};
+    use super::{
+        token_budget_entry, EventSink, KeyframeWork, StreamFrame, VLM_TOKEN_BUDGET_MAX_SESSIONS,
+    };
     use crate::gate::FrameSignal;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     struct MockSink {
         events: Mutex<Vec<String>>,
@@ -1047,6 +1073,19 @@ mod tests {
         sink.store_keyframe_sync("r", 0, 0, "scene_cut", "hello", b"").unwrap();
         assert_eq!(sink.events.lock().unwrap().as_slice(), ["vlm"]);
         assert_eq!(sink.keyframes.lock().unwrap().as_slice(), ["scene_cut"]);
+    }
+
+    #[test]
+    fn token_budget_entry_evicts_when_session_bound_is_reached() {
+        let mut budget: HashMap<Arc<str>, (Instant, u32)> = HashMap::new();
+        let now = Instant::now();
+
+        for i in 0..(VLM_TOKEN_BUDGET_MAX_SESSIONS + 4) {
+            let session: Arc<str> = Arc::from(format!("session-{i}"));
+            token_budget_entry(&mut budget, &session, now);
+        }
+
+        assert_eq!(budget.len(), VLM_TOKEN_BUDGET_MAX_SESSIONS);
     }
 
     #[test]

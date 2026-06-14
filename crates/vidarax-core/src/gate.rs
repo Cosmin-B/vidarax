@@ -1,3 +1,10 @@
+pub const GATE_KEEPALIVE_EVERY_FRAMES: u64 = 30;
+pub const GATE_SCENE_CUT_HAMMING_THRESHOLD: u32 = 18;
+pub const GATE_LUMA_SHIFT_THRESHOLD: f32 = 0.15;
+pub const GATE_FLICKER_THRESHOLD: f32 = 0.55;
+pub const GATE_GHOSTING_THRESHOLD: f32 = 0.55;
+pub const GATE_NOISE_VARIANCE_THRESHOLD: f32 = 0.55;
+
 #[derive(Debug, Clone)]
 pub struct GateConfig {
     pub keepalive_every_frames: u64,
@@ -11,12 +18,12 @@ pub struct GateConfig {
 impl Default for GateConfig {
     fn default() -> Self {
         Self {
-            keepalive_every_frames: 30,
-            scene_cut_hamming_threshold: 18,
-            luma_shift_threshold: 0.15,
-            flicker_threshold: 0.55,
-            ghosting_threshold: 0.55,
-            noise_variance_threshold: 0.55,
+            keepalive_every_frames: GATE_KEEPALIVE_EVERY_FRAMES,
+            scene_cut_hamming_threshold: GATE_SCENE_CUT_HAMMING_THRESHOLD,
+            luma_shift_threshold: GATE_LUMA_SHIFT_THRESHOLD,
+            flicker_threshold: GATE_FLICKER_THRESHOLD,
+            ghosting_threshold: GATE_GHOSTING_THRESHOLD,
+            noise_variance_threshold: GATE_NOISE_VARIANCE_THRESHOLD,
         }
     }
 }
