@@ -343,7 +343,16 @@ fn parse_distillation_config() -> Result<DistillationConfig, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use vidarax_core::webrtc::session::WebRtcConfig;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     // ─── TransportMode parsing ────────────────────────────────────────────────
 
@@ -387,6 +396,7 @@ mod tests {
 
     #[test]
     fn server_config_preserves_custom_decode_backend_name() {
+        let _guard = env_guard();
         std::env::set_var("VIDARAX_DECODE_BACKEND", "test-custom-backend");
         std::env::set_var("VIDARAX_REQUIRE_API_KEY", "false");
 
@@ -400,6 +410,7 @@ mod tests {
 
     #[test]
     fn server_config_clamps_webrtc_worker_counts() {
+        let _guard = env_guard();
         std::env::set_var("VIDARAX_REQUIRE_API_KEY", "false");
         std::env::set_var("VIDARAX_WEBRTC_DECODE_WORKERS", "999");
         std::env::set_var("VIDARAX_WEBRTC_ANALYSIS_WORKERS", "999");
@@ -419,6 +430,7 @@ mod tests {
 
     #[test]
     fn server_config_default_ingest_roots_are_empty() {
+        let _guard = env_guard();
         std::env::remove_var("VIDARAX_INGEST_FILE_ROOTS");
         std::env::set_var("VIDARAX_REQUIRE_API_KEY", "false");
 
@@ -445,6 +457,7 @@ mod tests {
 
     #[test]
     fn server_config_explicit_ingest_roots_are_canonicalized() {
+        let _guard = env_guard();
         let root = std::env::temp_dir().join(format!(
             "vidarax-explicit-root-{}",
             std::process::id()

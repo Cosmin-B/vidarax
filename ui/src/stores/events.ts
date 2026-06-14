@@ -33,6 +33,7 @@ export interface KeyframeEntry {
 }
 
 const MAX_EVENTS = 500
+export const MAX_KEYFRAMES = 256
 
 export const useEventsStore = defineStore('events', () => {
   const events = shallowRef<AgentEvent[]>([])
@@ -150,6 +151,17 @@ export const useEventsStore = defineStore('events', () => {
       keyframesByRunId.value.set(stored.run_id, runKeyframes)
     }
     binaryInsert(runKeyframes, stored, keyframeOrder)
+
+    if (keyframes.value.length > MAX_KEYFRAMES) {
+      const dropped = keyframes.value.splice(0, keyframes.value.length - MAX_KEYFRAMES)
+      for (const keyframe of dropped) {
+        const indexed = keyframesByRunId.value.get(keyframe.run_id)
+        if (indexed) {
+          removeByIdentity(indexed, keyframe)
+          if (indexed.length === 0) keyframesByRunId.value.delete(keyframe.run_id)
+        }
+      }
+    }
     touchKeyframes()
   }
 

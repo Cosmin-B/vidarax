@@ -1,33 +1,7 @@
-//! Video decode backends: GPU via ffmpeg NVDEC or CPU via openh264 / ffmpeg sidecar.
+//! WebRTC video decoders for H.264 and VP8.
 //!
-//! Supports H.264 and VP8 codecs.  The backend is selected at construction time
-//! based on [`DecoderConfig`]:
-//!
-//! - **GPU path (`NvDec`)**: spawns a long-lived ffmpeg sidecar with
-//!   `-hwaccel auto`, which handles both H.264 (NVDEC) and VP8 transparently.
-//!   Reads back planar YUV420 from stdout.
-//! - **Software H.264 path (`Software`)**: uses openh264 in-process.  Lower
-//!   latency on machines without CUDA; only valid for H.264 input.
-//! - **Software VP8 path (`FfmpegSw`)**: spawns a long-lived ffmpeg sidecar
-//!   without hardware acceleration for VP8 streams on machines without a GPU.
-//!   Uses `libvpx` inside ffmpeg, so no additional Rust crates are needed.
-//!
-//! # Example
-//!
-//! ```no_run
-//! use vidarax_core::webrtc::decode::{Decoder, DecoderConfig, VideoCodec};
-//!
-//! let config = DecoderConfig {
-//!     gpu_available: false,
-//!     codec: VideoCodec::H264,
-//!     width: 1280,
-//!     height: 720,
-//!     output_pool_slots: 1,
-//! };
-//! let mut decoder = Decoder::new(&config);
-//! // Feed raw NAL / VP8 bytes:
-//! // let yuv = decoder.decode(&payload_bytes).unwrap();
-//! ```
+//! GPU and VP8 paths use a long-lived ffmpeg sidecar; software H.264 uses
+//! openh264 in-process.
 
 use std::collections::VecDeque;
 use std::io::{BufReader, Read, Write};
@@ -71,10 +45,6 @@ pub const FFMPEG_YUV_READER_POOL_MIN_SLOTS: usize =
 pub const SOFTWARE_YUV_POOL_MIN_SLOTS: usize = 2;
 
 /// Video codec carried by the WebRTC track.
-///
-/// Detected from the SDP offer (presence of `"VP8"` or `"H264"` media attributes)
-/// before the peer connection is established and propagated through the pipeline
-/// so the correct decode backend is selected per-session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VideoCodec {
     /// ITU-T H.264 / AVC — default when the offer codec cannot be determined.
@@ -85,24 +55,7 @@ pub enum VideoCodec {
 }
 
 impl VideoCodec {
-    /// Parse the raw SDP offer string and return the first video codec found.
-    ///
-    /// Looks for `VP8` or `H264` (case-insensitive) in the `a=rtpmap:` lines of
-    /// the video media section.  Falls back to [`VideoCodec::H264`] when neither
-    /// is found so that existing sessions without explicit codec info continue to
-    /// work unchanged.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use vidarax_core::webrtc::decode::VideoCodec;
-    ///
-    /// let sdp = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP8/90000\r\n";
-    /// assert_eq!(VideoCodec::from_sdp(sdp), VideoCodec::Vp8);
-    ///
-    /// let sdp2 = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 H264/90000\r\n";
-    /// assert_eq!(VideoCodec::from_sdp(sdp2), VideoCodec::H264);
-    /// ```
+    /// Parse the first video codec from the SDP offer.
     pub fn from_sdp(sdp: &str) -> Self {
         // Walk the SDP looking for video m= sections, then scan rtpmap lines.
         let mut in_video = false;
@@ -126,7 +79,7 @@ impl VideoCodec {
                 }
             }
         }
-        // Default: assume H.264 so existing sessions without explicit codec info work.
+        // Compatibility fallback for sessions without explicit codec info.
         VideoCodec::H264
     }
 
@@ -314,7 +267,7 @@ impl std::error::Error for DecodeError {
 /// returns the freshest ready frame so downstream labels stay close to the
 /// current RTP timestamp. Encoded input is still always written.
 pub enum Decoder {
-    /// GPU: long-lived ffmpeg sidecar using `-hwaccel auto` (~0.5 ms/frame).
+    /// GPU ffmpeg sidecar using `-hwaccel auto`.
     NvDec {
         child: Child,
         stdin: ChildStdin,
@@ -326,7 +279,7 @@ pub enum Decoder {
         width: u32,
         height: u32,
     },
-    /// CPU: openh264 in-process decoder (~2–5 ms/frame on ARM).
+    /// In-process openh264 decoder.
     Software {
         decoder: openh264::decoder::Decoder,
         scratch: SoftwareScratch,
@@ -346,8 +299,7 @@ pub enum Decoder {
     },
 }
 
-/// Spawn a background thread that continuously reads YUV420 frames from
-/// ffmpeg stdout and sends them to the returned receiver.
+/// Spawn a reader thread for complete YUV420 frames from ffmpeg stdout.
 ///
 /// The handoff is lossless: the reader uses a bounded blocking send and never
 /// evicts decoded output. The decode side drains the bounded channel before

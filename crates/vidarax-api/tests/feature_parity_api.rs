@@ -265,12 +265,10 @@ fn test_attach_stream_accepts_token_rate() {
 /// Serialise env-var access so parallel tests don't clobber each other.
 static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
-/// Set VIDARAX_WEBRTC_STUN_SERVERS and verify it is parsed into ServerConfig.
 #[test]
 fn test_config_parses_stun_servers() {
     let _guard = ENV_MUTEX.lock().unwrap();
 
-    // Disable API-key requirement to avoid needing VIDARAX_API_KEYS.
     std::env::set_var("VIDARAX_REQUIRE_API_KEY", "false");
     std::env::set_var(
         "VIDARAX_WEBRTC_STUN_SERVERS",
@@ -293,7 +291,6 @@ fn test_config_parses_stun_servers() {
     );
 }
 
-/// Set VIDARAX_WEBRTC_TURN_URL (plus username / credential) and verify parsing.
 #[test]
 fn test_config_parses_turn_server() {
     let _guard = ENV_MUTEX.lock().unwrap();

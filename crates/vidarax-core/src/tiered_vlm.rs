@@ -6,8 +6,7 @@ use crate::provider::{
 
 /// Configuration for tiered VLM inference routing.
 ///
-/// First-pass: fast, cheap model (e.g. Qwen3-VL-2B, <200ms).
-/// Second-pass: accurate model (e.g. Qwen3-VL-8B, ~400ms) — only called
+/// First-pass model handles the common case. The second-pass model only runs
 /// when first-pass confidence is below `second_pass_threshold`.
 ///
 /// # Examples
@@ -28,14 +27,14 @@ use crate::provider::{
 /// ```
 #[derive(Debug, Clone)]
 pub struct TieredVlmConfig {
-    /// Model ID for the fast first-pass inference.
+    /// Model ID for first-pass inference.
     pub first_pass_model: Arc<str>,
-    /// Model ID for the accurate second-pass inference.
+    /// Model ID for second-pass inference.
     pub second_pass_model: Arc<str>,
     /// Confidence threshold: if first-pass confidence < this, run second-pass.
     /// Range: 0.0 to 1.0. Default: 0.7.
     pub second_pass_threshold: f32,
-    /// Max tokens for second-pass (can be higher than first-pass for detailed output).
+    /// Max tokens for second-pass output.
     pub second_pass_max_tokens: u32,
 }
 

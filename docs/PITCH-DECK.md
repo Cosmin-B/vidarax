@@ -4,10 +4,10 @@
 
 **Video is the last unstructured frontier.**
 
-- 3.5 trillion hours of video produced per year. Less than 1% is analyzed.
-- Cloud vision model: $2-4 per hour. At 24/7 across 100 cameras: $350K/year.
-- Current options: expensive cloud APIs or naive pixel-diff motion detection.
-- Nothing exists that is open-source, self-hosted, and intelligent.
+- Most video is still reviewed manually or reduced to coarse motion events.
+- Sending every frame to a cloud vision API gets expensive quickly.
+- Local motion detection is cheap, but it misses semantic context.
+- Open-source teams need a self-hosted path between raw video and VLMs.
 
 ## SLIDE 2: How It Works
 
@@ -22,7 +22,7 @@ frames rather than the full frame rate.
 
 ## SLIDE 3: Live Demo
 
-1. Upload a 10-second video. Processed in seconds.
+1. Upload a 10-second video and start analysis.
 2. Run detail: markers, keyframes, VLM descriptions on a scrubable timeline.
 3. Tracing: full pipeline observability with per-stage latency.
 4. Settings: tiered model routing, gate engine tuning.
@@ -52,7 +52,7 @@ frames rather than the full frame rate.
 Runs entirely on your hardware with open-source models. Only a sampled subset of frames reaches a model; the gate engine turns the rest into lightweight deterministic markers -- you pay for the moments that matter, not the frame rate.
 
 **"Why not send everything to a large model?"**
-Economics. 100 cameras at 24/7 is hundreds of thousands per year. Vidarax filters first, infers second, routes intelligently between model tiers.
+Economics. Continuous multi-camera inference is dominated by model calls. Vidarax filters first, infers second, and routes between model tiers.
 
 **"Business model?"**
 Open-source engine with commercial support. Managed cloud for teams that prefer not to self-host.

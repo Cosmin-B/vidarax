@@ -14,7 +14,6 @@ export const UI_DEFAULTS = {
   loopDetection: true,
   loopRepeatTrigger: 3,
   gpuDecode: 'auto',
-  vlmWorkers: 4,
   defaultModel: 'Qwen/Qwen3-VL-4B-Instruct',
   firstPassModel: 'Qwen/Qwen3-VL-2B-Instruct',
   secondPassModel: 'Qwen/Qwen3-VL-4B-Instruct',
@@ -40,7 +39,6 @@ export const STORAGE_KEYS = {
   loopDetection: 'vidarax_loop_detection',
   loopRepeatTrigger: 'vidarax_loop_repeat_trigger',
   gpuDecode: 'vidarax_gpu_decode',
-  vlmWorkers: 'vidarax_vlm_workers',
 } as const
 
 export const SPACETIME_MODULE_NAME = 'vidarax'

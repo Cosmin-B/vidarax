@@ -245,8 +245,15 @@ fn fold_into_router(
 mod tests {
     use super::*;
 
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn interpolate_replaces_set_variable() {
+        let _guard = env_guard();
         std::env::set_var("_VIDARAX_TEST_VAR", "hello");
         let result = interpolate_env_vars("prefix_${_VIDARAX_TEST_VAR}_suffix");
         assert_eq!(result, "prefix_hello_suffix");
@@ -255,6 +262,7 @@ mod tests {
 
     #[test]
     fn interpolate_leaves_unset_variable_literal() {
+        let _guard = env_guard();
         std::env::remove_var("_VIDARAX_MISSING_VAR_XYZ");
         let result = interpolate_env_vars("${_VIDARAX_MISSING_VAR_XYZ}");
         assert_eq!(result, "${_VIDARAX_MISSING_VAR_XYZ}");
@@ -268,6 +276,7 @@ mod tests {
 
     #[test]
     fn interpolate_multiple_placeholders() {
+        let _guard = env_guard();
         std::env::set_var("_VDX_A", "foo");
         std::env::set_var("_VDX_B", "bar");
         let result = interpolate_env_vars("${_VDX_A}/${_VDX_B}");
@@ -313,6 +322,7 @@ base_url = "http://localhost:8000"
 
     #[test]
     fn parse_config_interpolates_base_url() {
+        let _guard = env_guard();
         std::env::set_var("_VDX_TEST_URL", "http://myhost:1234");
         let toml = r#"
 [[backends]]
@@ -381,7 +391,7 @@ base_url = "${_VDX_TEST_URL}"
 
     #[test]
     fn build_chain_gemini_unresolved_env_var_api_key_returns_err() {
-        // Ensure the env var is not set so ${...} remains unresolved.
+        let _guard = env_guard();
         std::env::remove_var("_VDX_NONEXISTENT_GEMINI_KEY");
         let entry = BackendEntry {
             name: "gemini".into(),
@@ -410,7 +420,7 @@ base_url = "${_VDX_TEST_URL}"
 
     #[test]
     fn build_chain_openai_compat_unresolved_env_var_base_url_returns_err() {
-        // Ensure the env var is not set so ${...} remains unresolved.
+        let _guard = env_guard();
         std::env::remove_var("_VDX_NONEXISTENT_VLLM_URL");
         let entry = BackendEntry {
             name: "vllm".into(),

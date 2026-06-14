@@ -4,7 +4,7 @@ Audience: engineers, investors. Tone: direct, technical, no fluff.
 
 ## 0:00 -- 0:15 | The Problem
 
-> "Video agents are blind. They scrape screenshots and miss context. Vidarax is a real-time video intelligence engine -- any video in, semantic events out."
+> "Video agents often see isolated frames instead of video context. Vidarax is a real-time video intelligence engine -- video in, semantic events out."
 
 Screen: Dashboard page at `/`.
 
@@ -21,7 +21,7 @@ Navigate to Upload (`/upload`). Drag in a 10-second screen recording.
 Select model (Qwen3-VL 4B), leave semantic inference on. Click Start Analysis.
 Show the processing visualization: frame strip, chunk progress, live event feed.
 
-> "Done. Scene cuts detected at exactly the right transitions."
+> "Done. The gate engine marked scene cuts and keyframes."
 
 Click View Results to open Run Detail (`/runs/:runId`). Show:
 - Video player with timeline scrubbing
@@ -46,7 +46,7 @@ Navigate to Settings (`/settings`). Show:
 - Stream controls: FPS, chunk size, semantic frames per chunk
 - Gate engine tuning: Hamming threshold, luma shift, loop detection
 
-> "All models run on your GPU. Self-hosted. No data leaves your infrastructure."
+> "Point it at self-hosted models on your own hardware, and video stays inside your infrastructure."
 
 ## 2:45 -- 3:00 | Close
 
