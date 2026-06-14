@@ -27,9 +27,9 @@ fn ffmpeg_sw_decoder_selects_for_vp8_no_gpu() {
 #[test]
 fn yuv_frame_dimensions() {
     let frame = YuvFrame {
-        y: vec![128; 1920 * 1080],
-        u: vec![128; 960 * 540],
-        v: vec![128; 960 * 540],
+        y: vec![128; 1920 * 1080].into(),
+        u: vec![128; 960 * 540].into(),
+        v: vec![128; 960 * 540].into(),
         width: 1920,
         height: 1080,
     };

@@ -1,11 +1,12 @@
 use vidarax_core::webrtc::decode::YuvFrame;
+use vidarax_core::webrtc::recycle::VecPool;
 use vidarax_core::webrtc::signals::{yuv_to_frame_signal, yuv_to_jpeg};
 
 fn make_gray_frame(luma: u8, width: u32, height: u32) -> YuvFrame {
     YuvFrame {
-        y: vec![luma; (width * height) as usize],
-        u: vec![128; (width / 2 * height / 2) as usize],
-        v: vec![128; (width / 2 * height / 2) as usize],
+        y: vec![luma; (width * height) as usize].into(),
+        u: vec![128; (width / 2 * height / 2) as usize].into(),
+        v: vec![128; (width / 2 * height / 2) as usize].into(),
         width,
         height,
     }
@@ -58,7 +59,8 @@ fn different_frames_have_nonzero_flicker() {
 fn jpeg_encoding_produces_valid_jpeg() {
     let frame = make_gray_frame(128, 64, 64);
     let mut scratch = Vec::new();
-    let jpeg = yuv_to_jpeg(&frame, 80, &mut scratch);
+    let jpeg_pool = VecPool::with_slots(1);
+    let jpeg = yuv_to_jpeg(&frame, 80, &mut scratch, &jpeg_pool);
     assert!(jpeg.len() > 100, "JPEG too small: {} bytes", jpeg.len());
     assert_eq!(&jpeg[0..2], &[0xFF, 0xD8], "not a JPEG header");
 }

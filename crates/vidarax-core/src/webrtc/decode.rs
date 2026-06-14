@@ -34,6 +34,10 @@ use std::sync::mpsc;
 
 use openh264::formats::YUVSource;
 
+use crate::webrtc::recycle::{RecycledBytes, VecPool};
+
+const CROSS_THREAD_POOL_SLOTS: usize = 8;
+
 /// Video codec carried by the WebRTC track.
 ///
 /// Detected from the SDP offer (presence of `"VP8"` or `"H264"` media attributes)
@@ -109,11 +113,39 @@ impl VideoCodec {
 /// `u.len() == v.len() == (width / 2 * height / 2) as usize`
 #[derive(Debug, Clone)]
 pub struct YuvFrame {
-    pub y: Vec<u8>,
-    pub u: Vec<u8>,
-    pub v: Vec<u8>,
+    pub y: RecycledBytes,
+    pub u: RecycledBytes,
+    pub v: RecycledBytes,
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct YuvPlanePools {
+    y: VecPool,
+    u: VecPool,
+    v: VecPool,
+}
+
+impl YuvPlanePools {
+    fn new(width: u32, height: u32) -> Self {
+        let w = width as usize;
+        let h = height as usize;
+        let y_size = w * h;
+        let uv_size = (w / 2) * (h / 2);
+        Self {
+            y: VecPool::with_capacity(CROSS_THREAD_POOL_SLOTS, y_size),
+            u: VecPool::with_capacity(CROSS_THREAD_POOL_SLOTS, uv_size),
+            v: VecPool::with_capacity(CROSS_THREAD_POOL_SLOTS, uv_size),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct SoftwareScratch {
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
 }
 
 /// Controls which decode backend [`Decoder::new`] selects.
@@ -215,6 +247,8 @@ pub enum Decoder {
     /// CPU: openh264 in-process decoder (~2–5 ms/frame on ARM).
     Software {
         decoder: openh264::decoder::Decoder,
+        scratch: SoftwareScratch,
+        yuv_pools: YuvPlanePools,
     },
     /// CPU: long-lived ffmpeg sidecar without hardware acceleration.
     FfmpegSw {
@@ -239,6 +273,7 @@ fn spawn_frame_reader(
     height: u32,
 ) -> mpsc::Receiver<YuvFrame> {
     let (tx, rx) = mpsc::channel();
+    let pools = YuvPlanePools::new(width, height);
     std::thread::spawn(move || {
         let w = width as usize;
         let h = height as usize;
@@ -258,7 +293,13 @@ fn spawn_frame_reader(
             if stdout.read_exact(&mut v).is_err() {
                 break;
             }
-            let frame = YuvFrame { y: y.clone(), u: u.clone(), v: v.clone(), width, height };
+            let frame = YuvFrame {
+                y: pools.y.copy_from_slice(&y),
+                u: pools.u.copy_from_slice(&u),
+                v: pools.v.copy_from_slice(&v),
+                width,
+                height,
+            };
             if tx.send(frame).is_err() {
                 break; // receiver dropped
             }
@@ -287,16 +328,20 @@ impl Decoder {
             Self::new_nvdec(config.codec, config.width, config.height)
         } else {
             match config.codec {
-                VideoCodec::H264 => Self::new_software(),
+                VideoCodec::H264 => Self::new_software(config.width, config.height),
                 VideoCodec::Vp8 => Self::new_ffmpeg_sw(config.codec, config.width, config.height),
             }
         }
     }
 
-    fn new_software() -> Self {
+    fn new_software(width: u32, height: u32) -> Self {
         let decoder =
             openh264::decoder::Decoder::new().expect("openh264 decoder initialisation failed");
-        Decoder::Software { decoder }
+        Decoder::Software {
+            decoder,
+            scratch: SoftwareScratch::default(),
+            yuv_pools: YuvPlanePools::new(width, height),
+        }
     }
 
     /// Spawn an ffmpeg sidecar using `-hwaccel auto` so the same process
@@ -410,12 +455,18 @@ impl Decoder {
                     Err(mpsc::TryRecvError::Disconnected) => Err(DecodeError::ReaderExited),
                 }
             }
-            Decoder::Software { decoder } => Self::decode_software(decoder, payload),
+            Decoder::Software {
+                decoder,
+                scratch,
+                yuv_pools,
+            } => Self::decode_software(decoder, scratch, yuv_pools, payload),
         }
     }
 
     fn decode_software(
         decoder: &mut openh264::decoder::Decoder,
+        scratch: &mut SoftwareScratch,
+        yuv_pools: &YuvPlanePools,
         nals: &[u8],
     ) -> Result<YuvFrame, DecodeError> {
         let maybe_yuv = decoder
@@ -436,28 +487,31 @@ impl Decoder {
         let uv_width = width / 2;
         let uv_height = height / 2;
 
-        let mut y_packed = Vec::with_capacity(width * height);
+        scratch.y.clear();
+        scratch.y.reserve(width * height);
         for row in 0..height {
             let start = row * y_stride;
-            y_packed.extend_from_slice(&yuv.y()[start..start + width]);
+            scratch.y.extend_from_slice(&yuv.y()[start..start + width]);
         }
 
-        let mut u_packed = Vec::with_capacity(uv_width * uv_height);
+        scratch.u.clear();
+        scratch.u.reserve(uv_width * uv_height);
         for row in 0..uv_height {
             let start = row * u_stride;
-            u_packed.extend_from_slice(&yuv.u()[start..start + uv_width]);
+            scratch.u.extend_from_slice(&yuv.u()[start..start + uv_width]);
         }
 
-        let mut v_packed = Vec::with_capacity(uv_width * uv_height);
+        scratch.v.clear();
+        scratch.v.reserve(uv_width * uv_height);
         for row in 0..uv_height {
             let start = row * v_stride;
-            v_packed.extend_from_slice(&yuv.v()[start..start + uv_width]);
+            scratch.v.extend_from_slice(&yuv.v()[start..start + uv_width]);
         }
 
         Ok(YuvFrame {
-            y: y_packed,
-            u: u_packed,
-            v: v_packed,
+            y: yuv_pools.y.copy_from_slice(&scratch.y),
+            u: yuv_pools.u.copy_from_slice(&scratch.u),
+            v: yuv_pools.v.copy_from_slice(&scratch.v),
             width: width as u32,
             height: height as u32,
         })

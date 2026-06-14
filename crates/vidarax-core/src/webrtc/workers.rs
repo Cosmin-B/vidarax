@@ -41,6 +41,7 @@ use crate::training_data::TrainingStore;
 #[allow(dead_code)]
 pub struct TrainingStore;
 use crate::webrtc::decode::{Decoder, DecoderConfig};
+use crate::webrtc::recycle::{RecycledBytes, VecPool};
 use crate::webrtc::session::RtpFrame;
 use crate::webrtc::signals::{yuv_to_frame_signal, yuv_to_jpeg};
 
@@ -48,6 +49,7 @@ const DEFAULT_DECODE_WIDTH: u32 = 1920;
 const DEFAULT_DECODE_HEIGHT: u32 = 1080;
 const DEFAULT_LOOP_WINDOW: u32 = 6;
 const DEFAULT_LOOP_REPEAT_THRESHOLD: usize = 3;
+const DEFAULT_CROSS_THREAD_POOL_SLOTS: usize = 8;
 
 // ─── EventSink trait ──────────────────────────────────────────────────────────
 
@@ -95,9 +97,9 @@ pub struct StreamFrame {
     pub signal: crate::gate::FrameSignal,
     /// JPEG thumbnail of the decoded frame (`Some` after successful decode).
     ///
-    /// Stored as a reference-counted slice so downstream consumers can clone
-    /// the pointer (16 bytes) rather than copying the full JPEG payload.
-    pub jpeg: Option<Arc<[u8]>>,
+    /// Stored as a recycled buffer so downstream workers can move ownership
+    /// without copying the JPEG payload.
+    pub jpeg: Option<RecycledBytes>,
     /// Presentation timestamp in milliseconds.
     pub pts_ms: u64,
     /// Per-session monotonically increasing frame index (== `signal.frame_index`).
@@ -123,8 +125,8 @@ pub struct KeyframeWork {
     pub motion_score: f32,
     /// Raw JPEG bytes — base64-encoded on-demand for VLM, stored raw in SpacetimeDB.
     ///
-    /// Shared via `Arc<[u8]>` so cloning this work item copies only a pointer.
-    pub jpeg_bytes: Arc<[u8]>,
+    /// Recycled buffer moved through VLM and storage without copying the payload.
+    pub jpeg_bytes: RecycledBytes,
     /// Semantic prompt to pass to the VLM.
     pub prompt: Arc<str>,
     /// When `true` the analysis worker detected an active visual loop at the
@@ -185,6 +187,7 @@ pub fn spawn_decode_workers(
                 let mut ycbcr_scratch: Vec<u8> = Vec::with_capacity(
                     DEFAULT_DECODE_WIDTH as usize * DEFAULT_DECODE_HEIGHT as usize * 3,
                 );
+                let jpeg_pool = VecPool::with_slots(DEFAULT_CROSS_THREAD_POOL_SLOTS);
 
                 while let Ok(frame) = rtp_rx.recv() {
                     let _guard = session_span.enter();
@@ -218,7 +221,7 @@ pub fn spawn_decode_workers(
                         prev_signal.as_ref(),
                     );
                     // Encode JPEG; scratch buffer reused per-worker to avoid allocation.
-                    let jpeg: Arc<[u8]> = yuv_to_jpeg(&yuv, 75, &mut ycbcr_scratch);
+                    let jpeg = yuv_to_jpeg(&yuv, 75, &mut ycbcr_scratch, &jpeg_pool);
                     prev_signal = Some(signal);
 
                     // Record decode latency (decode + signal + JPEG encoding).
@@ -291,7 +294,7 @@ pub fn spawn_analysis_workers(
                 // Cleared when the detector stops firing for a full window.
                 let mut loop_active = false;
 
-                while let Ok(sf) = frame_rx.recv() {
+                while let Ok(mut sf) = frame_rx.recv() {
                     let _guard = session_span.enter();
 
                     // ── Loop detection (always active) ───────────────────
@@ -334,11 +337,7 @@ pub fn spawn_analysis_workers(
                         };
 
                         if meta.gate_event == GateEventType::KeepKeyframe {
-                            // Clone the Arc pointer (16 bytes), not the JPEG payload.
-                            let jpeg_bytes: Arc<[u8]> = sf
-                                .jpeg
-                                .clone()
-                                .unwrap_or_else(|| Arc::from([] as [u8; 0]));
+                            let jpeg_bytes = sf.jpeg.take().unwrap_or_default();
 
                             let event_type: &'static str = if meta.scene_cut {
                                 "scene_cut"
@@ -394,7 +393,7 @@ enum SinkEvent {
         pts_ms: u64,
         event_type: &'static str,
         description: Arc<str>,
-        jpeg_bytes: Arc<[u8]>,
+        jpeg_bytes: RecycledBytes,
     },
 }
 
@@ -791,15 +790,6 @@ where
                             description: Arc::from(transition_desc),
                         });
                     }
-                    let _ = event_tx.send(SinkEvent::StoreKeyframe {
-                        run_id: Arc::clone(&work.run_id),
-                        frame_index: work.frame_index,
-                        pts_ms: work.pts_ms,
-                        event_type: work.event_type,
-                        description,
-                        jpeg_bytes: Arc::clone(&work.jpeg_bytes),
-                    });
-
                     // ── Training pair collection ─────────────────────────────────────
                     #[cfg(feature = "training")]
                     if distillation.enabled {
@@ -816,6 +806,15 @@ where
                             }
                         }
                     }
+
+                    let _ = event_tx.send(SinkEvent::StoreKeyframe {
+                        run_id: Arc::clone(&work.run_id),
+                        frame_index: work.frame_index,
+                        pts_ms: work.pts_ms,
+                        event_type: work.event_type,
+                        description,
+                        jpeg_bytes: work.jpeg_bytes,
+                    });
                 }
                 // event_tx clone is dropped here; once all worker clones drop,
                 // the outer event_tx also drops, closing the writer channel.
@@ -1001,7 +1000,7 @@ mod tests {
                 ghosting_score: 0.0,
                 noise_variance_score: 0.0,
             },
-            jpeg: Some(Arc::from([0xff_u8, 0xd8, 0xff, 0xd9] as [u8; 4])), // minimal JPEG markers
+            jpeg: Some([0xff_u8, 0xd8, 0xff, 0xd9].into()), // minimal JPEG markers
             pts_ms: seq * 33,
             seq,
         }
@@ -1022,7 +1021,7 @@ mod tests {
             confidence: 0.9,
             novelty_score: 0.8,
             motion_score: 0.5,
-            jpeg_bytes: Arc::from([0xFF_u8, 0xD8, 0xFF, 0xD9] as [u8; 4]),
+            jpeg_bytes: [0xFF_u8, 0xD8, 0xFF, 0xD9].into(),
             prompt: Arc::from(""),
             loop_active: false,
         };
@@ -1070,7 +1069,7 @@ mod tests {
                 ghosting_score: 0.0,
                 noise_variance_score: 0.0,
             },
-            jpeg: Some(Arc::from([0xff_u8, 0xd8, 0xff, 0xd9] as [u8; 4])),
+            jpeg: Some([0xff_u8, 0xd8, 0xff, 0xd9].into()),
             pts_ms: 0,
             seq: 0,
         };

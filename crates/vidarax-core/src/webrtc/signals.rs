@@ -4,10 +4,9 @@
 //! to the gate engine's [`crate::gate::FrameSignal`] type, and provides JPEG
 //! thumbnail encoding for downstream consumers.
 
-use std::sync::Arc;
-
 use crate::gate::FrameSignal;
 use crate::webrtc::decode::YuvFrame;
+use crate::webrtc::recycle::{RecycledBytes, VecPool};
 
 /// Compute a 64-bit perceptual hash from the Y (luma) plane.
 ///
@@ -152,7 +151,12 @@ pub fn yuv_to_frame_signal(
 ///
 /// Panics only if the frame dimensions are inconsistent with the plane buffers
 /// (i.e. a bug in the caller, not a user error).
-pub fn yuv_to_jpeg(yuv: &YuvFrame, quality: u8, scratch: &mut Vec<u8>) -> Arc<[u8]> {
+pub fn yuv_to_jpeg(
+    yuv: &YuvFrame,
+    quality: u8,
+    scratch: &mut Vec<u8>,
+    output_pool: &VecPool,
+) -> RecycledBytes {
     let w = yuv.width as usize;
     let h = yuv.height as usize;
     let half_w = w / 2;
@@ -170,10 +174,10 @@ pub fn yuv_to_jpeg(yuv: &YuvFrame, quality: u8, scratch: &mut Vec<u8>) -> Arc<[u
         }
     }
 
-    let mut buf = Vec::new();
+    let mut buf = output_pool.acquire();
     let encoder = jpeg_encoder::Encoder::new(&mut buf, quality);
     encoder
         .encode(scratch, yuv.width as u16, yuv.height as u16, jpeg_encoder::ColorType::Ycbcr)
         .expect("JPEG encoding failed");
-    Arc::from(buf.into_boxed_slice())
+    output_pool.recycle(buf)
 }

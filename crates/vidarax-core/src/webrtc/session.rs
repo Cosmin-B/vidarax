@@ -48,6 +48,7 @@ use rustrtc::{
 };
 
 use crate::webrtc::decode::VideoCodec;
+use crate::webrtc::recycle::{RecycledBytes, VecPool};
 
 /// Annex B start code prepended to every H.264 NAL unit.
 ///
@@ -55,6 +56,7 @@ use crate::webrtc::decode::VideoCodec;
 /// ffmpeg expect them prepended.  VP8 payloads are passed through unchanged
 /// (no start code wrapping).
 const ANNEX_B_START: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+const RTP_NAL_POOL_SLOTS: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -75,7 +77,7 @@ pub struct RtpFrame {
     ///
     /// - H.264: Annex B encoded (starts with `00 00 00 01`).
     /// - VP8: raw bitstream payload.
-    pub nals: Arc<[u8]>,
+    pub nals: RecycledBytes,
     /// Presentation timestamp derived from the 90 kHz RTP clock (in ms).
     pub pts_ms: u64,
     /// Per-session monotonically increasing sequence number.
@@ -314,38 +316,19 @@ impl WebRtcSession {
                         let seq = Arc::clone(&seq_counter);
 
                         tokio::spawn(async move {
-                            // Reusable scratch buffer — capacity is retained across frames
-                            // so reserve() is a no-op after the first frame.
-                            let mut nals_buf: Vec<u8> = Vec::new();
+                            let nals_pool = VecPool::with_slots(RTP_NAL_POOL_SLOTS);
                             loop {
                                 match track.recv().await {
                                     Ok(MediaSample::Video(frame)) => {
                                         let nal_seq = seq.fetch_add(1, Ordering::Relaxed);
 
-                                        nals_buf.clear();
-
-                                        match codec {
-                                            VideoCodec::H264 => {
-                                                // rustrtc delivers H.264 NAL payload WITHOUT
-                                                // Annex B start codes.  Prepend 0x00 0x00 0x00 0x01
-                                                // so both openh264 and ffmpeg accept the bytes.
-                                                nals_buf.reserve(4 + frame.data.len());
-                                                nals_buf.extend_from_slice(&ANNEX_B_START);
-                                                nals_buf.extend_from_slice(&frame.data);
-                                            }
-                                            VideoCodec::Vp8 => {
-                                                // VP8 payloads are passed through as-is.
-                                                // No start code framing is needed or expected.
-                                                nals_buf.reserve(frame.data.len());
-                                                nals_buf.extend_from_slice(&frame.data);
-                                            }
-                                        }
+                                        let nals = frame_payload_to_nals(codec, &frame.data, &nals_pool);
 
                                         // RTP timestamp is on a 90 kHz clock → ms.
                                         let pts_ms = frame.rtp_timestamp as u64 / 90;
 
                                         let rtp_frame = RtpFrame {
-                                            nals: Arc::from(nals_buf.as_slice()),
+                                            nals,
                                             pts_ms,
                                             seq: nal_seq,
                                             codec,
@@ -424,24 +407,39 @@ impl WebRtcSession {
     }
 }
 
+fn frame_payload_to_nals(codec: VideoCodec, payload: &[u8], pool: &VecPool) -> RecycledBytes {
+    let mut nals = pool.acquire();
+    match codec {
+        VideoCodec::H264 => {
+            // rustrtc delivers H.264 NAL payload without Annex B start codes.
+            nals.reserve(ANNEX_B_START.len() + payload.len());
+            nals.extend_from_slice(&ANNEX_B_START);
+            nals.extend_from_slice(payload);
+        }
+        VideoCodec::Vp8 => {
+            nals.reserve(payload.len());
+            nals.extend_from_slice(payload);
+        }
+    }
+    pool.recycle(nals)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use super::{RtpFrame, WebRtcConfig};
+    use super::{frame_payload_to_nals, RtpFrame, WebRtcConfig};
     use crate::webrtc::decode::VideoCodec;
+    use crate::webrtc::recycle::{RecycledBytes, VecPool};
 
     #[test]
     fn rtp_frame_annex_b_layout_h264() {
         // Simulate what run() produces for H.264: start code + payload.
         let payload = vec![0x65, 0xB8, 0x00]; // IDR NAL header byte
-        let mut nals = Vec::with_capacity(4 + payload.len());
-        nals.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-        nals.extend_from_slice(&payload);
+        let pool = VecPool::with_slots(1);
+        let nals = frame_payload_to_nals(VideoCodec::H264, &payload, &pool);
 
         assert_eq!(&nals[..4], &[0x00, 0x00, 0x00, 0x01]);
         assert_eq!(&nals[4..], &payload[..]);
@@ -450,16 +448,16 @@ mod tests {
     #[test]
     fn rtp_frame_vp8_no_annex_b() {
         // VP8 payloads should be forwarded without Annex B start codes.
-        let payload: Arc<[u8]> = vec![0x30, 0x01, 0x02, 0x03].into(); // synthetic VP8 bytes
+        let payload = RecycledBytes::from(vec![0x30, 0x01, 0x02, 0x03]); // synthetic VP8 bytes
         let frame = RtpFrame {
-            nals: Arc::clone(&payload),
+            nals: payload.clone(),
             pts_ms: 0,
             seq: 0,
             codec: VideoCodec::Vp8,
         };
         // No Annex B prefix — first byte should be the raw VP8 payload byte.
         assert_eq!(frame.nals[0], 0x30);
-        assert_eq!(*frame.nals, *payload);
+        assert_eq!(&frame.nals[..], &payload[..]);
     }
 
     #[test]
