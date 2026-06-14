@@ -297,25 +297,6 @@ function uploadFileWithProgress(file: File): Promise<string> {
   })
 }
 
-/** Poll GET /v1/runs/:id every 3s until status is completed/failed/stopped. */
-async function pollRunStatus(runId: string): Promise<void> {
-  const TERMINAL = new Set(['completed', 'failed', 'stopped'])
-  while (true) {
-    await new Promise(r => setTimeout(r, 3000))
-    try {
-      const data = await api.runs.get(runId)
-      runStatus.value = data.status as RunStatus
-      runsStore.updateRunStatus(runId, data.status as RunStatus)
-      if (TERMINAL.has(data.status)) {
-        uploadState.value = 'done'
-        return
-      }
-    } catch {
-      // transient errors — keep polling
-    }
-  }
-}
-
 function reset(): void {
   disconnectEvents()
   stopVizPolling()
