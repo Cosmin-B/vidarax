@@ -9,7 +9,7 @@
 //!   ↓ kanal::Sender<StreamFrame>
 //! analysis_workers — TwoPassPipeline + LoopDetector
 //!   ↓ kanal::Sender<KeyframeWork>  (non-blocking; drops if full)
-//! vlm_workers      — N threads; VLM inference → SpacetimeDB events + keyframes
+//! vlm_workers      — one stateful thread; VLM inference → SpacetimeDB events + keyframes
 //! ```
 //!
 //! All worker threads are `std::thread::spawn`ed (long-running, no async).
@@ -24,6 +24,7 @@
 //! indefinitely; they are called from worker threads that must keep up with
 //! the frame rate.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -41,7 +42,10 @@ use crate::training_data::TrainingStore;
 #[cfg(not(feature = "training"))]
 #[allow(dead_code)]
 pub struct TrainingStore;
-use crate::webrtc::decode::{Decoder, DecoderConfig};
+use crate::webrtc::decode::{
+    Decoder, DecoderBackend, DecoderConfig, VideoCodec, YuvFrame,
+    FFMPEG_YUV_PENDING_POOL_ALLOWANCE, FFMPEG_YUV_READER_QUEUE_CAPACITY,
+};
 use crate::webrtc::recycle::{RecycledBytes, VecPool};
 use crate::webrtc::session::RtpFrame;
 use crate::webrtc::signals::{yuv_to_frame_signal, yuv_to_jpeg};
@@ -53,23 +57,61 @@ const DEFAULT_LOOP_REPEAT_THRESHOLD: usize = 3;
 pub const STREAM_FRAME_QUEUE_CAPACITY: usize = 64;
 pub const VLM_WORK_QUEUE_CAPACITY: usize = 32;
 pub const CLIP_FRAME_QUEUE_CAPACITY: usize = STREAM_FRAME_QUEUE_CAPACITY;
-pub const CLIP_WORK_QUEUE_CAPACITY: usize = 32;
+/// Clip VLM backlog is intentionally backpressured with no queued clip work:
+/// 1 active worker plus 1 accumulator-owned request that may block in send.
+/// That keeps the full JPEG pool worst case at 484 slots: 66 decode→analysis
+/// + 162 normal VLM/sink + 64 clip-frame queue + 64 accumulator + 128
+/// active/blocked clip work.
+pub const CLIP_WORK_QUEUE_CAPACITY: usize = 0;
 pub const SINK_EVENT_QUEUE_CAPACITY: usize = 512;
-const DECODE_OUTPUT_POOL_SLOTS_PER_WORKER: usize = 3;
+pub const JPEG_POOL_SLOT_CEILING: usize = 512;
+const FFMPEG_READER_CONSTRUCTING_YUV_FRAMES: usize = 1;
+const FFMPEG_DECODER_PENDING_YUV_FRAMES: usize = FFMPEG_YUV_PENDING_POOL_ALLOWANCE;
+const DECODE_CONSUMER_YUV_FRAMES: usize = 1;
+const DECODE_OUTPUT_POOL_SLOTS_PER_WORKER: usize = FFMPEG_READER_CONSTRUCTING_YUV_FRAMES
+    + FFMPEG_YUV_READER_QUEUE_CAPACITY
+    + FFMPEG_DECODER_PENDING_YUV_FRAMES
+    + DECODE_CONSUMER_YUV_FRAMES;
 const JPEG_SINK_EVENT_POOL_ALLOWANCE: usize = 128;
 
-pub fn decode_output_pool_slots(_analysis_workers: usize) -> usize {
-    DECODE_OUTPUT_POOL_SLOTS_PER_WORKER
+pub fn jpeg_sink_event_backlog_capacity() -> usize {
+    JPEG_SINK_EVENT_POOL_ALLOWANCE
+}
+
+pub fn per_stream_decode_workers(_configured: usize) -> usize {
+    1
+}
+
+pub fn per_stream_vlm_workers(_configured: usize) -> usize {
+    1
+}
+
+pub fn decode_output_pool_slots(gpu_available: bool, codec: VideoCodec) -> usize {
+    let backend = DecoderBackend::select(gpu_available, codec);
+    match backend {
+        DecoderBackend::NvDec | DecoderBackend::FfmpegSw => {
+            // Full bounded ffmpeg reader queue, steady-state decoder pending
+            // FIFO, one reader-constructed frame, and one decode-consumer frame.
+            DECODE_OUTPUT_POOL_SLOTS_PER_WORKER
+        }
+        DecoderBackend::Software => backend.min_yuv_pool_slots(),
+    }
 }
 
 pub fn jpeg_pool_slots(analysis_workers: usize, vlm_workers: usize) -> usize {
     let analysis_workers = analysis_workers.max(1);
-    let vlm_workers = vlm_workers.max(1);
+    let vlm_workers = per_stream_vlm_workers(vlm_workers);
     let decode_to_analysis = STREAM_FRAME_QUEUE_CAPACITY + analysis_workers + 1;
     let normal_path =
         VLM_WORK_QUEUE_CAPACITY + vlm_workers + JPEG_SINK_EVENT_POOL_ALLOWANCE + 1;
+    let active_clip_workers = vlm_workers;
+    let blocked_clip_sender = 1;
+    let clip_path = CLIP_FRAME_QUEUE_CAPACITY
+        + crate::webrtc::clip::MAX_CLIP_FRAMES_PER_REQUEST
+        + (CLIP_WORK_QUEUE_CAPACITY + active_clip_workers + blocked_clip_sender)
+            * crate::webrtc::clip::MAX_CLIP_FRAMES_PER_REQUEST;
 
-    decode_to_analysis + normal_path
+    decode_to_analysis + normal_path + clip_path
 }
 
 // ─── EventSink trait ──────────────────────────────────────────────────────────
@@ -157,9 +199,29 @@ pub struct KeyframeWork {
     pub loop_active: bool,
 }
 
+fn build_stream_frame_from_yuv(
+    yuv: &YuvFrame,
+    seq: u64,
+    pts_ms: u64,
+    prev_signal: &mut Option<crate::gate::FrameSignal>,
+    ycbcr_scratch: &mut Vec<u8>,
+    jpeg_pool: &VecPool,
+) -> StreamFrame {
+    let signal = yuv_to_frame_signal(yuv, seq, pts_ms, prev_signal.as_ref());
+    let jpeg = yuv_to_jpeg(yuv, 75, ycbcr_scratch, jpeg_pool);
+    *prev_signal = Some(signal);
+
+    StreamFrame {
+        signal,
+        jpeg: Some(jpeg),
+        pts_ms,
+        seq,
+    }
+}
+
 // ─── Decode workers ───────────────────────────────────────────────────────────
 
-/// Spawn `cores` video decode worker threads.
+/// Spawn video decode worker threads for one ordered media stream.
 ///
 /// Each thread:
 /// 1. Waits for the first [`RtpFrame`] to determine the stream codec, then
@@ -175,8 +237,11 @@ pub struct KeyframeWork {
 /// the decoder the first time they see a frame whose codec differs from the
 /// previous one.
 ///
-/// Threads exit when `rtp_rx` is closed (all senders dropped).
-/// `rtp_rx` is cloned so all `cores` workers share the same channel (MPMC).
+/// Threads exit when `rtp_rx` is closed (all senders dropped).  Although the
+/// API keeps the `cores` parameter for compatibility, a single H.264/VP8 stream
+/// is stateful and ordered, so it is always decoded by exactly one decoder.
+/// Decode parallelism is across sessions, never by racing decoders on one
+/// stream.
 ///
 /// `metrics` counters are incremented for each received / decoded frame.
 /// `session_span` is entered inside each thread so all log events are
@@ -191,7 +256,7 @@ pub fn spawn_decode_workers(
     metrics: Arc<PipelineMetrics>,
     session_span: tracing::Span,
 ) {
-    for i in 0..cores.max(1) {
+    for i in 0..per_stream_decode_workers(cores) {
         let rtp_rx = rtp_rx.clone();
         let frame_tx = frame_tx.clone();
         let metrics = Arc::clone(&metrics);
@@ -212,7 +277,7 @@ pub fn spawn_decode_workers(
                 );
                 let jpeg_pool = VecPool::with_slots(jpeg_pool_slots);
 
-                while let Ok(frame) = rtp_rx.recv() {
+                'rtp_frames: while let Ok(frame) = rtp_rx.recv() {
                     let _guard = session_span.enter();
                     metrics.inc_rtp_received();
 
@@ -226,7 +291,7 @@ pub fn spawn_decode_workers(
                             height: DEFAULT_DECODE_HEIGHT,
                             output_pool_slots,
                         };
-                        decoder = Some(Decoder::new(&config));
+                        decoder = Some(Decoder::new_with_metrics(&config, Arc::clone(&metrics)));
                         active_codec = Some(frame.codec);
                     }
 
@@ -234,34 +299,26 @@ pub fn spawn_decode_workers(
 
                     let decode_start = std::time::Instant::now();
                     let yuv = match dec.decode(&frame.nals) {
-                        Ok(y) => y,
-                        Err(_) => continue, // SPS/PPS, incomplete NAL, or VP8 header — skip
+                        Ok(yuv) => yuv,
+                        Err(_) => continue 'rtp_frames,
                     };
 
-                    let signal = yuv_to_frame_signal(
+                    let sf = build_stream_frame_from_yuv(
                         &yuv,
                         frame.seq,
                         frame.pts_ms,
-                        prev_signal.as_ref(),
+                        &mut prev_signal,
+                        &mut ycbcr_scratch,
+                        &jpeg_pool,
                     );
-                    // Encode JPEG; scratch buffer reused per-worker to avoid allocation.
-                    let jpeg = yuv_to_jpeg(&yuv, 75, &mut ycbcr_scratch, &jpeg_pool);
-                    prev_signal = Some(signal);
 
                     // Record decode latency (decode + signal + JPEG encoding).
                     let decode_us = decode_start.elapsed().as_micros() as u64;
                     metrics.decode_latency_us.record(decode_us);
 
                     metrics.inc_frames_decoded();
-                    let sf = StreamFrame {
-                        signal,
-                        jpeg: Some(jpeg),
-                        pts_ms: frame.pts_ms,
-                        seq: frame.seq,
-                    };
-
                     if frame_tx.send(sf).is_err() {
-                        break; // downstream dropped — shut down
+                        return; // downstream dropped — shut down
                     }
                 }
             })
@@ -402,6 +459,80 @@ pub fn spawn_analysis_workers(
 
 // ─── VLM workers ──────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
+struct JpegSinkBacklog {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl JpegSinkBacklog {
+    fn new() -> Self {
+        Self {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn try_acquire(&self) -> Option<SinkJpegPermit> {
+        let mut current = self.in_flight.load(Ordering::Relaxed);
+        loop {
+            if current >= JPEG_SINK_EVENT_POOL_ALLOWANCE {
+                return None;
+            }
+            match self.in_flight.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(SinkJpegPermit {
+                        in_flight: Arc::clone(&self.in_flight),
+                    });
+                }
+                Err(next) => current = next,
+            }
+        }
+    }
+}
+
+struct SinkJpegPermit {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for SinkJpegPermit {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::Release);
+    }
+}
+
+fn store_keyframe_event_with_backlog(
+    backlog: &JpegSinkBacklog,
+    metrics: &PipelineMetrics,
+    run_id: Arc<str>,
+    frame_index: u64,
+    pts_ms: u64,
+    event_type: &'static str,
+    description: Arc<str>,
+    jpeg_bytes: RecycledBytes,
+) -> Option<SinkEvent> {
+    let jpeg_permit = match backlog.try_acquire() {
+        Some(permit) => permit,
+        None => {
+            metrics.inc_sink_keyframes_dropped();
+            return None;
+        }
+    };
+
+    Some(SinkEvent::StoreKeyframe {
+        run_id,
+        frame_index,
+        pts_ms,
+        event_type,
+        description,
+        jpeg_bytes,
+        _jpeg_permit: jpeg_permit,
+    })
+}
+
 /// Event routed from VLM worker threads to the dedicated SpacetimeDB writer.
 enum SinkEvent {
     Emit {
@@ -420,6 +551,7 @@ enum SinkEvent {
         event_type: &'static str,
         description: Arc<str>,
         jpeg_bytes: RecycledBytes,
+        _jpeg_permit: SinkJpegPermit,
     },
 }
 
@@ -488,7 +620,11 @@ pub(super) fn token_budget_entry<'a>(
 /// a bounded kanal channel; a dedicated writer thread drains it sequentially,
 /// so inference latency is never stalled by SpacetimeDB HTTP round-trips.
 ///
-/// Threads exit when `params.vlm_rx` is closed.
+/// Threads exit when `params.vlm_rx` is closed.  Keyframe analysis is stateful:
+/// dedup, previous description, and previous timestamp must advance in stream
+/// order.  The worker count is therefore clamped to one per stream.  Future VLM
+/// parallelism must be stateless or explicitly batched, not racing workers with
+/// independent temporal context.
 pub fn spawn_vlm_workers<I>(params: VlmWorkerParams<I>)
 where
     I: InferenceProvider + 'static,
@@ -533,7 +669,7 @@ where
                         );
                     }
                     SinkEvent::StoreKeyframe {
-                        run_id, frame_index, pts_ms, event_type, description, jpeg_bytes,
+                        run_id, frame_index, pts_ms, event_type, description, jpeg_bytes, ..
                     } => {
                         let _ = stdb.store_keyframe_sync(
                             &run_id, frame_index, pts_ms, &event_type, &description, &jpeg_bytes,
@@ -546,10 +682,13 @@ where
         })
         .expect("stdb writer thread spawn failed");
 
-    for i in 0..workers.max(1) {
+    let jpeg_sink_backlog = JpegSinkBacklog::new();
+
+    for i in 0..per_stream_vlm_workers(workers) {
         let vlm_rx = vlm_rx.clone();
         let provider = Arc::clone(&provider);
         let event_tx = event_tx.clone();
+        let jpeg_sink_backlog = jpeg_sink_backlog.clone();
         let config = config.clone();
         let metrics = Arc::clone(&metrics);
         let session_span = session_span.clone();
@@ -856,14 +995,18 @@ where
                         }
                     }
 
-                    let _ = event_tx.send(SinkEvent::StoreKeyframe {
-                        run_id: Arc::clone(&work.run_id),
-                        frame_index: work.frame_index,
-                        pts_ms: work.pts_ms,
-                        event_type: work.event_type,
+                    if let Some(event) = store_keyframe_event_with_backlog(
+                        &jpeg_sink_backlog,
+                        &metrics,
+                        Arc::clone(&work.run_id),
+                        work.frame_index,
+                        work.pts_ms,
+                        work.event_type,
                         description,
-                        jpeg_bytes: work.jpeg_bytes,
-                    });
+                        work.jpeg_bytes,
+                    ) {
+                        let _ = event_tx.send(event);
+                    }
                 }
                 // event_tx clone is dropped here; once all worker clones drop,
                 // the outer event_tx also drops, closing the writer channel.
@@ -999,11 +1142,19 @@ fn collect_training_pair(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_output_pool_slots, jpeg_pool_slots, token_budget_entry, EventSink, KeyframeWork,
-        StreamFrame, JPEG_SINK_EVENT_POOL_ALLOWANCE, SINK_EVENT_QUEUE_CAPACITY,
-        STREAM_FRAME_QUEUE_CAPACITY,
-        VLM_TOKEN_BUDGET_MAX_SESSIONS, VLM_WORK_QUEUE_CAPACITY,
+        build_stream_frame_from_yuv, decode_output_pool_slots, jpeg_pool_slots,
+        token_budget_entry, EventSink, KeyframeWork, StreamFrame, CLIP_FRAME_QUEUE_CAPACITY,
+        CLIP_WORK_QUEUE_CAPACITY,
+        FFMPEG_YUV_READER_QUEUE_CAPACITY, JPEG_POOL_SLOT_CEILING, JPEG_SINK_EVENT_POOL_ALLOWANCE,
+        SINK_EVENT_QUEUE_CAPACITY, STREAM_FRAME_QUEUE_CAPACITY, VLM_TOKEN_BUDGET_MAX_SESSIONS,
+        VLM_WORK_QUEUE_CAPACITY,
     };
+    use crate::webrtc::clip::MAX_CLIP_FRAMES_PER_REQUEST;
+    use crate::webrtc::decode::{
+        VideoCodec, YuvFrame, FFMPEG_YUV_PENDING_POOL_ALLOWANCE,
+        FFMPEG_YUV_READER_POOL_MIN_SLOTS, SOFTWARE_YUV_POOL_MIN_SLOTS,
+    };
+    use crate::webrtc::recycle::VecPool;
     use crate::gate::FrameSignal;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -1069,6 +1220,16 @@ mod tests {
         }
     }
 
+    fn tiny_yuv_frame(width: u32, height: u32, luma: u8) -> YuvFrame {
+        YuvFrame {
+            y: vec![luma; (width * height) as usize].into(),
+            u: vec![128; (width / 2 * height / 2) as usize].into(),
+            v: vec![128; (width / 2 * height / 2) as usize].into(),
+            width,
+            height,
+        }
+    }
+
     #[test]
     fn stream_frame_and_keyframe_work_are_clone_debug() {
         let sf = make_stream_frame(0);
@@ -1115,24 +1276,140 @@ mod tests {
     }
 
     #[test]
-    fn decode_output_pool_is_sized_to_local_decode_in_flight() {
-        assert_eq!(decode_output_pool_slots(1), 3);
-        assert_eq!(decode_output_pool_slots(8), 3);
+    fn decode_output_pool_is_sized_to_ffmpeg_pipe_in_flight() {
+        let expected = super::FFMPEG_READER_CONSTRUCTING_YUV_FRAMES
+            + FFMPEG_YUV_READER_QUEUE_CAPACITY
+            + FFMPEG_YUV_PENDING_POOL_ALLOWANCE
+            + super::DECODE_CONSUMER_YUV_FRAMES;
+        assert_eq!(expected, FFMPEG_YUV_READER_POOL_MIN_SLOTS);
+        assert_eq!(
+            expected,
+            FFMPEG_YUV_READER_QUEUE_CAPACITY + FFMPEG_YUV_PENDING_POOL_ALLOWANCE + 2
+        );
+        assert_eq!(decode_output_pool_slots(true, VideoCodec::H264), expected);
+        assert_eq!(decode_output_pool_slots(true, VideoCodec::Vp8), expected);
+        assert_eq!(decode_output_pool_slots(false, VideoCodec::Vp8), expected);
     }
 
     #[test]
-    fn jpeg_pool_covers_normal_streaming_path_without_clip_worst_case() {
+    fn decode_output_pool_is_small_for_synchronous_openh264() {
+        assert_eq!(
+            decode_output_pool_slots(false, VideoCodec::H264),
+            SOFTWARE_YUV_POOL_MIN_SLOTS
+        );
+        assert!(SOFTWARE_YUV_POOL_MIN_SLOTS < FFMPEG_YUV_READER_POOL_MIN_SLOTS);
+    }
+
+    #[test]
+    fn decoded_stream_frames_use_current_rtp_label_once_per_frame() {
+        let yuv = tiny_yuv_frame(64, 64, 128);
+        let mut prev_signal = None;
+        let mut ycbcr_scratch = Vec::with_capacity(64 * 64 * 3);
+        let jpeg_pool = VecPool::with_slots(3);
+        let labels = [(10, 330), (11, 363), (12, 396)];
+
+        let emitted: Vec<_> = labels
+            .iter()
+            .map(|&(seq, pts_ms)| {
+                build_stream_frame_from_yuv(
+                    &yuv,
+                    seq,
+                    pts_ms,
+                    &mut prev_signal,
+                    &mut ycbcr_scratch,
+                    &jpeg_pool,
+                )
+            })
+            .collect();
+
+        let emitted_labels: Vec<_> = emitted.iter().map(|sf| (sf.seq, sf.pts_ms)).collect();
+        let signal_labels: Vec<_> = emitted
+            .iter()
+            .map(|sf| (sf.signal.frame_index, sf.signal.pts_ms))
+            .collect();
+        assert_eq!(emitted_labels, labels);
+        assert_eq!(signal_labels, labels);
+        assert!(emitted_labels.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn jpeg_pool_covers_full_clip_path_and_bounded_sink_backlog_without_heap_growth() {
         let vlm_workers = 2;
         let decode_to_analysis = STREAM_FRAME_QUEUE_CAPACITY + 1 + 1;
-        let normal_path =
-            VLM_WORK_QUEUE_CAPACITY + vlm_workers + JPEG_SINK_EVENT_POOL_ALLOWANCE + 1;
+        let normal_path = VLM_WORK_QUEUE_CAPACITY
+            + super::per_stream_vlm_workers(vlm_workers)
+            + JPEG_SINK_EVENT_POOL_ALLOWANCE
+            + 1;
+        let active_clip_workers = super::per_stream_vlm_workers(vlm_workers);
+        assert_eq!(CLIP_WORK_QUEUE_CAPACITY, 0);
+        let blocked_clip_sender = 1;
+        let clip_path = CLIP_FRAME_QUEUE_CAPACITY
+            + MAX_CLIP_FRAMES_PER_REQUEST
+            + (CLIP_WORK_QUEUE_CAPACITY + active_clip_workers + blocked_clip_sender)
+                * MAX_CLIP_FRAMES_PER_REQUEST;
+        let expected = decode_to_analysis + normal_path + clip_path;
 
-        assert_eq!(
-            jpeg_pool_slots(1, vlm_workers),
-            decode_to_analysis + normal_path
+        assert_eq!(expected, 484);
+        assert_eq!(super::jpeg_sink_event_backlog_capacity(), JPEG_SINK_EVENT_POOL_ALLOWANCE);
+        assert!(JPEG_SINK_EVENT_POOL_ALLOWANCE < SINK_EVENT_QUEUE_CAPACITY);
+        assert_eq!(jpeg_pool_slots(1, vlm_workers), expected);
+        assert!(expected <= JPEG_POOL_SLOT_CEILING);
+    }
+
+    #[test]
+    fn sink_jpeg_backlog_drops_store_events_past_pool_allowance() {
+        let backlog = super::JpegSinkBacklog::new();
+        let metrics = crate::metrics::PipelineMetrics::new();
+        let mut retained = Vec::with_capacity(JPEG_SINK_EVENT_POOL_ALLOWANCE);
+
+        for frame_index in 0..JPEG_SINK_EVENT_POOL_ALLOWANCE {
+            let event = super::store_keyframe_event_with_backlog(
+                &backlog,
+                &metrics,
+                Arc::from("run"),
+                frame_index as u64,
+                0,
+                "scene_cut",
+                Arc::from("description"),
+                [0xff_u8, 0xd8, 0xff, 0xd9].into(),
+            );
+            assert!(event.is_some(), "permit {frame_index} should be admitted");
+            retained.push(event.unwrap());
+        }
+
+        let dropped = super::store_keyframe_event_with_backlog(
+            &backlog,
+            &metrics,
+            Arc::from("run"),
+            JPEG_SINK_EVENT_POOL_ALLOWANCE as u64,
+            0,
+            "scene_cut",
+            Arc::from("description"),
+            [0xff_u8, 0xd8, 0xff, 0xd9].into(),
         );
-        assert!(jpeg_pool_slots(1, vlm_workers) < SINK_EVENT_QUEUE_CAPACITY);
-        assert!(jpeg_pool_slots(1, vlm_workers) < 1024);
+
+        assert!(dropped.is_none());
+        assert_eq!(metrics.sink_keyframes_dropped_total(), 1);
+        drop(retained.pop());
+        assert!(super::store_keyframe_event_with_backlog(
+            &backlog,
+            &metrics,
+            Arc::from("run"),
+            999,
+            0,
+            "scene_cut",
+            Arc::from("description"),
+            [0xff_u8, 0xd8, 0xff, 0xd9].into(),
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn per_stream_stateful_worker_counts_are_clamped_to_one() {
+        assert_eq!(super::per_stream_decode_workers(0), 1);
+        assert_eq!(super::per_stream_decode_workers(8), 1);
+        assert_eq!(super::per_stream_vlm_workers(0), 1);
+        assert_eq!(super::per_stream_vlm_workers(8), 1);
     }
 
     #[test]

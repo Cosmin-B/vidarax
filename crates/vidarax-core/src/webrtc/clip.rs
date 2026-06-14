@@ -37,12 +37,20 @@ use crate::metrics::PipelineMetrics;
 use crate::provider::{InferenceImage, InferenceProvider, InferenceRequest};
 use crate::tiered_vlm::{run_tiered, TieredVlmConfig};
 use crate::webrtc::recycle::RecycledBytes;
-use crate::webrtc::workers::{token_budget_entry, EventSink, StreamFrame};
+use crate::webrtc::workers::{
+    per_stream_vlm_workers, token_budget_entry, EventSink, StreamFrame,
+};
 
 // ─── ClipConfig ───────────────────────────────────────────────────────────────
 
 pub const MAX_CLIP_TARGET_FPS: u32 = 30;
 pub const MAX_CLIP_LENGTH_SECONDS: u32 = 60;
+/// Maximum JPEG frames retained and sent in one multi-image VLM clip request.
+///
+/// At typical JPEG sizes this keeps a clip payload bounded while preserving
+/// enough temporal coverage for short interaction analysis. Longer windows keep
+/// a uniformly downsampled set across the configured clip duration.
+pub const MAX_CLIP_FRAMES_PER_REQUEST: usize = 64;
 
 /// Parameters controlling clip-mode temporal batching.
 ///
@@ -161,6 +169,8 @@ pub struct ClipAccumulator {
     sample_interval_ms: u64,
     /// PTS of the last frame accepted into the buffer (for rate limiting).
     last_accepted_pts: Option<u64>,
+    /// PTS of the first accepted frame in the current logical clip window.
+    window_start_pts: Option<u64>,
     /// Wall-clock instant of the last emission (for delay enforcement).
     last_emit: Option<Instant>,
 }
@@ -183,6 +193,7 @@ impl ClipAccumulator {
             buffer: VecDeque::new(),
             sample_interval_ms,
             last_accepted_pts: None,
+            window_start_pts: None,
             last_emit: None,
         }
     }
@@ -210,14 +221,17 @@ impl ClipAccumulator {
         };
 
         self.last_accepted_pts = Some(sf.pts_ms);
+        if self.window_start_pts.is_none() {
+            self.window_start_pts = Some(sf.pts_ms);
+        }
         self.buffer.push_back((sf.signal, jpeg_bytes));
 
         // ── Check window duration ──────────────────────────────────────────
-        let window_start_pts = match self.buffer.front() {
-            Some((sig, _)) => sig.pts_ms,
-            None => return None,
-        };
+        let window_start_pts = self.window_start_pts.unwrap_or(sf.pts_ms);
         let window_ms = (self.config.clip_length_seconds * 1000.0) as u64;
+        if self.buffer.len() > MAX_CLIP_FRAMES_PER_REQUEST {
+            downsample_clip_buffer(&mut self.buffer, window_start_pts, window_ms);
+        }
         let elapsed_pts_ms = sf.pts_ms.saturating_sub(window_start_pts);
 
         if elapsed_pts_ms < window_ms {
@@ -231,6 +245,7 @@ impl ClipAccumulator {
             if delay_ms > 0 && last.elapsed().as_millis() < delay_ms as u128 {
                 // Slide the window forward by dropping the oldest frame — O(1) with VecDeque.
                 self.buffer.pop_front();
+                self.window_start_pts = self.buffer.front().map(|(sig, _)| sig.pts_ms);
                 return None;
             }
         }
@@ -238,8 +253,9 @@ impl ClipAccumulator {
         // ── Emit ───────────────────────────────────────────────────────────
         let deque = std::mem::take(&mut self.buffer);
         let pts_start = deque.front().map(|(s, _)| s.pts_ms).unwrap_or(0);
-        let pts_end = sf.pts_ms;
+        let pts_end = deque.back().map(|(s, _)| s.pts_ms).unwrap_or(pts_start);
         self.last_emit = Some(now);
+        self.window_start_pts = None;
         // Collect into Vec for ClipWork (O(n) but done once per clip emission).
         let frames: Vec<(FrameSignal, RecycledBytes)> = deque.into_iter().collect();
 
@@ -314,7 +330,7 @@ pub fn spawn_clip_vlm_workers<I>(
 ) where
     I: InferenceProvider + 'static,
 {
-    for i in 0..n.max(1) {
+    for i in 0..clip_vlm_worker_count(n) {
         let clip_rx = clip_rx.clone();
         let provider = Arc::clone(&provider);
         let stdb = Arc::clone(&stdb);
@@ -438,6 +454,57 @@ pub fn spawn_clip_vlm_workers<I>(
     }
 }
 
+fn clip_vlm_worker_count(configured: usize) -> usize {
+    per_stream_vlm_workers(configured)
+}
+
+fn downsample_clip_buffer(
+    buffer: &mut VecDeque<(FrameSignal, RecycledBytes)>,
+    window_start_pts: u64,
+    window_ms: u64,
+) {
+    if buffer.len() <= MAX_CLIP_FRAMES_PER_REQUEST {
+        return;
+    }
+
+    let last_slot = (MAX_CLIP_FRAMES_PER_REQUEST - 1) as u64;
+    let mut slots: [Option<(FrameSignal, RecycledBytes)>; MAX_CLIP_FRAMES_PER_REQUEST] =
+        std::array::from_fn(|_| None);
+
+    let original_len = buffer.len();
+    for (idx, frame) in buffer.drain(..).enumerate() {
+        if idx == 0 {
+            slots[0] = Some(frame);
+            continue;
+        }
+        if idx + 1 == original_len {
+            slots[MAX_CLIP_FRAMES_PER_REQUEST - 1] = Some(frame);
+            continue;
+        }
+
+        let elapsed = frame.0.pts_ms.saturating_sub(window_start_pts).min(window_ms);
+        let mut slot = if window_ms == 0 {
+            0
+        } else {
+            ((elapsed * last_slot + window_ms / 2) / window_ms) as usize
+        };
+        slot = slot.clamp(1, MAX_CLIP_FRAMES_PER_REQUEST - 2);
+        let target_pts = if last_slot == 0 {
+            window_start_pts
+        } else {
+            window_start_pts + ((slot as u64 * window_ms + last_slot / 2) / last_slot)
+        };
+        let new_distance = frame.0.pts_ms.abs_diff(target_pts);
+
+        match &slots[slot] {
+            Some((existing, _)) if existing.pts_ms.abs_diff(target_pts) <= new_distance => {}
+            _ => slots[slot] = Some(frame),
+        }
+    }
+
+    buffer.extend(slots.into_iter().flatten());
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -461,6 +528,66 @@ mod tests {
             pts_ms,
             seq,
         }
+    }
+
+    #[test]
+    fn clip_accumulator_caps_retained_frames_across_full_window() {
+        let cfg = ClipConfig {
+            target_fps: 30,
+            clip_length_seconds: MAX_CLIP_LENGTH_SECONDS as f32,
+            delay_seconds: 0.0,
+        };
+        let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into(), "".into());
+        let mut clip = None;
+
+        for i in 0..=1800_u64 {
+            clip = acc.push(make_frame(i, i * 34)).or(clip);
+            if clip.is_some() {
+                break;
+            }
+        }
+
+        let clip = clip.expect("long clip should emit");
+        assert_eq!(clip.frames.len(), MAX_CLIP_FRAMES_PER_REQUEST);
+        assert!(
+            clip.frames.first().unwrap().0.pts_ms <= 100,
+            "first retained frame should stay near the window start, got {}ms",
+            clip.frames.first().unwrap().0.pts_ms
+        );
+        assert_eq!(clip.frames.last().unwrap().0.pts_ms, clip.pts_end);
+    }
+
+    #[test]
+    fn clip_timestamps_match_retained_first_and_last_frames_after_downsample() {
+        let mut buffer = VecDeque::new();
+        for i in 0..63_u64 {
+            let mut frame = make_frame(i, i * 900);
+            buffer.push_back((frame.signal, frame.jpeg.take().unwrap()));
+        }
+        let mut near_window_end = make_frame(63, 60_000);
+        buffer.push_back((
+            near_window_end.signal,
+            near_window_end.jpeg.take().unwrap(),
+        ));
+        let mut triggering = make_frame(64, 60_900);
+        buffer.push_back((triggering.signal, triggering.jpeg.take().unwrap()));
+
+        downsample_clip_buffer(&mut buffer, 0, 60_000);
+
+        let pts_start = buffer.front().map(|(s, _)| s.pts_ms).unwrap();
+        let pts_end = buffer.back().map(|(s, _)| s.pts_ms).unwrap();
+
+        assert_eq!(pts_start, 0);
+        assert_eq!(pts_end, 60_900);
+        assert_eq!(buffer.front().unwrap().0.pts_ms, pts_start);
+        assert_eq!(buffer.back().unwrap().0.pts_ms, pts_end);
+    }
+
+    #[test]
+    fn clip_vlm_workers_are_clamped_to_one_per_stream() {
+        assert_eq!(clip_vlm_worker_count(0), 1);
+        assert_eq!(clip_vlm_worker_count(1), 1);
+        assert_eq!(clip_vlm_worker_count(8), 1);
     }
 
     // ── ClipConfig validation ──────────────────────────────────────────────

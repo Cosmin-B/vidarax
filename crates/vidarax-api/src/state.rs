@@ -1,10 +1,10 @@
 use arc_swap::ArcSwap;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 use serde_json::Value;
 use vidarax_contracts::lifecycle::StreamState;
@@ -29,8 +29,92 @@ const MAX_WEBRTC_SESSIONS: usize = 100;
 const DEFAULT_STREAM_ID: &str = "stream-0";
 
 /// In-memory store for active WebRTC sessions, keyed by session ID.
-/// Each entry stores the owning principal alongside the session.
-type SessionMap = Arc<RwLock<HashMap<String, (String, Arc<WebRtcSession>)>>>;
+/// Each entry stores the owning principal, run ID, and live session.
+type SessionEntry = (String, Arc<str>, Arc<WebRtcSession>);
+type SessionMap = Arc<RwLock<HashMap<String, SessionEntry>>>;
+type ReclaimedSessionEntry = (String, Arc<str>);
+type ReclaimedSessionMap = Arc<RwLock<ReclaimedSessions>>;
+
+/// WHIP DELETE remains idempotent for watcher-reclaimed sessions within this
+/// window. Older random session IDs are tombstones only; retaining them forever
+/// would make memory grow with all historical disconnects.
+const RECLAIMED_SESSION_TTL_MS: u64 = 10 * 60 * 1000;
+const RECLAIMED_SESSION_MAX_ENTRIES: usize = 1024;
+
+const RUN_DELETE_LIVE: u8 = 0;
+const RUN_DELETE_APPEND_IN_FLIGHT: u8 = 1;
+const RUN_DELETE_DELETED: u8 = 2;
+
+#[derive(Default)]
+struct ReclaimedSessions {
+    entries: HashMap<String, ReclaimedSessionRecord>,
+    order: VecDeque<String>,
+}
+
+struct ReclaimedSessionRecord {
+    principal: String,
+    run_id: Arc<str>,
+    reclaimed_at_ms: u64,
+}
+
+impl ReclaimedSessions {
+    fn insert(&mut self, sess_id: String, principal: String, run_id: Arc<str>, now_ms: u64) {
+        self.prune_expired(now_ms);
+        if self.entries.contains_key(&sess_id) {
+            self.order.retain(|existing| existing != &sess_id);
+        }
+        self.order.push_back(sess_id.clone());
+        self.entries.insert(
+            sess_id,
+            ReclaimedSessionRecord {
+                principal,
+                run_id,
+                reclaimed_at_ms: now_ms,
+            },
+        );
+        self.enforce_cap();
+    }
+
+    fn get(&mut self, sess_id: &str, now_ms: u64) -> Option<ReclaimedSessionEntry> {
+        self.prune_expired(now_ms);
+        self.entries
+            .get(sess_id)
+            .map(|entry| (entry.principal.clone(), Arc::clone(&entry.run_id)))
+    }
+
+    fn remove(&mut self, sess_id: &str) {
+        self.entries.remove(sess_id);
+        self.order.retain(|existing| existing != sess_id);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn prune_expired(&mut self, now_ms: u64) {
+        while let Some(sess_id) = self.order.front() {
+            let Some(entry) = self.entries.get(sess_id) else {
+                self.order.pop_front();
+                continue;
+            };
+            if now_ms.saturating_sub(entry.reclaimed_at_ms) <= RECLAIMED_SESSION_TTL_MS {
+                break;
+            }
+            let sess_id = self.order.pop_front().expect("front checked above");
+            self.entries.remove(&sess_id);
+        }
+    }
+
+    fn enforce_cap(&mut self) {
+        while self.entries.len() > RECLAIMED_SESSION_MAX_ENTRIES {
+            let Some(sess_id) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&sess_id);
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -52,6 +136,9 @@ pub struct AppState {
     spacetime_client: Option<SpacetimeClient>,
     /// Active WebRTC peer connections indexed by session ID.
     sessions: SessionMap,
+    /// Recently reclaimed WHIP sessions, retained so DELETE remains idempotent
+    /// after a peer-state watcher has already removed the live session entry.
+    reclaimed_sessions: ReclaimedSessionMap,
     /// WebRTC configuration (STUN/TURN servers, token rate limit).
     webrtc_config: WebRtcConfig,
 }
@@ -94,6 +181,7 @@ impl AppStateConfig {
             active_stream_limit: self.active_stream_limit.max(1),
             spacetime_client: None,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            reclaimed_sessions: Arc::new(RwLock::new(ReclaimedSessions::default())),
             webrtc_config: WebRtcConfig::default(),
         }
     }
@@ -146,6 +234,7 @@ impl AppState {
             active_stream_limit: active_stream_limit.max(1),
             spacetime_client: None,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            reclaimed_sessions: Arc::new(RwLock::new(ReclaimedSessions::default())),
             webrtc_config,
         })
     }
@@ -246,6 +335,7 @@ impl AppState {
         &self,
         sess_id: String,
         principal: String,
+        run_id: Arc<str>,
         session: Arc<WebRtcSession>,
     ) -> bool {
         let mut map = self.sessions.write().await;
@@ -255,19 +345,55 @@ impl AppState {
         if map.contains_key(&sess_id) {
             return false;
         }
-        map.insert(sess_id, (principal, session));
+        map.insert(sess_id.clone(), (principal, run_id, session));
+        drop(map);
+        self.reclaimed_sessions.write().await.remove(&sess_id);
         true
     }
 
     /// Look up a WebRTC session by ID.  Returns `None` if not found.
-    pub async fn get_session(&self, sess_id: &str) -> Option<(String, Arc<WebRtcSession>)> {
+    pub async fn get_session(&self, sess_id: &str) -> Option<SessionEntry> {
         self.sessions.read().await.get(sess_id).cloned()
     }
 
-    /// Remove and return a WebRTC session.  Dropping the returned `Arc`
-    /// (or ignoring the return value) triggers peer connection cleanup.
-    pub async fn remove_session(&self, sess_id: &str) -> Option<(String, Arc<WebRtcSession>)> {
-        self.sessions.write().await.remove(sess_id)
+    /// Remove and return a WebRTC session only if it still belongs to `run_id`.
+    ///
+    /// The write lock makes session removal the atomic ownership transfer for
+    /// reclaim paths: exactly one caller can win cleanup for a given session.
+    pub(crate) async fn remove_session_for_run(
+        &self,
+        sess_id: &str,
+        run_id: &str,
+    ) -> Option<SessionEntry> {
+        let mut map = self.sessions.write().await;
+        let Some((principal, existing_run_id, _session)) = map.get(sess_id) else {
+            return None;
+        };
+        if &**existing_run_id != run_id {
+            return None;
+        }
+        self.reclaimed_sessions.write().await.insert(
+            sess_id.to_string(),
+            principal.clone(),
+            Arc::clone(existing_run_id),
+            now_epoch_ms(),
+        );
+        map.remove(sess_id)
+    }
+
+    pub(crate) async fn get_reclaimed_session(
+        &self,
+        sess_id: &str,
+    ) -> Option<ReclaimedSessionEntry> {
+        self.reclaimed_sessions
+            .write()
+            .await
+            .get(sess_id, now_epoch_ms())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_reclaimed_sessions_write_for_tests(&self) -> impl Drop {
+        Arc::clone(&self.reclaimed_sessions).write_owned().await
     }
 
     /// Number of active WebRTC sessions.
@@ -302,6 +428,12 @@ impl AppState {
         kind: &str,
         payload: Value,
     ) -> Result<TimelineEvent, String> {
+        if kind == "run_deleted" {
+            return self
+                .append_run_deleted_for_stream_idempotent(run_id, stream_id, payload)
+                .map(|result| result.event);
+        }
+
         let seq = self.event_seq.fetch_add(1, Ordering::AcqRel) + 1;
         let event = TimelineEvent {
             seq,
@@ -333,6 +465,13 @@ impl AppState {
         kind: &str,
         payload: Value,
     ) -> Result<TimelineEvent, String> {
+        if kind == "run_deleted" {
+            return self
+                .append_run_deleted_for_stream_idempotent_async(run_id, stream_id, payload)
+                .await
+                .map(|result| result.event);
+        }
+
         let seq = self.event_seq.fetch_add(1, Ordering::AcqRel) + 1;
         let event = TimelineEvent {
             seq,
@@ -350,6 +489,173 @@ impl AppState {
             .map_err(|err| err.to_string())?;
         self.apply_event_to_registry(&event);
         Ok(event)
+    }
+
+    pub(crate) async fn append_run_deleted_idempotent_async(
+        &self,
+        run_id: &str,
+        payload: Value,
+    ) -> Result<bool, String> {
+        self.append_run_deleted_for_stream_idempotent_async(run_id, DEFAULT_STREAM_ID, payload)
+            .await
+            .map(|result| result.appended)
+    }
+
+    fn append_run_deleted_for_stream_idempotent(
+        &self,
+        run_id: &str,
+        stream_id: &str,
+        payload: Value,
+    ) -> Result<RunDeletedAppend, String> {
+        loop {
+            match self.begin_run_deleted_append(run_id) {
+                RunDeleteClaim::Claimed(run) => {
+                    let guard = RunDeleteAppendGuard::new(run);
+                    let event =
+                        self.new_timeline_event(run_id, stream_id, "run_deleted", &payload);
+                    if let Err(err) = append_event(self.wal_path.as_ref(), &event) {
+                        return Err(err.to_string());
+                    }
+                    self.apply_event_to_registry(&event);
+                    guard.commit();
+                    return Ok(RunDeletedAppend {
+                        event,
+                        appended: true,
+                    });
+                }
+                RunDeleteClaim::AlreadyDeleted => {
+                    return Ok(RunDeletedAppend {
+                        event: self.synthetic_run_deleted_event(run_id, stream_id, &payload),
+                        appended: false,
+                    });
+                }
+                RunDeleteClaim::InFlight(run) => run.wait_delete_append_blocking(),
+                RunDeleteClaim::Missing => {
+                    let event =
+                        self.new_timeline_event(run_id, stream_id, "run_deleted", &payload);
+                    append_event(self.wal_path.as_ref(), &event)
+                        .map_err(|err| err.to_string())?;
+                    self.apply_event_to_registry(&event);
+                    return Ok(RunDeletedAppend {
+                        event,
+                        appended: true,
+                    });
+                }
+            }
+        }
+    }
+
+    async fn append_run_deleted_for_stream_idempotent_async(
+        &self,
+        run_id: &str,
+        stream_id: &str,
+        payload: Value,
+    ) -> Result<RunDeletedAppend, String> {
+        loop {
+            match self.begin_run_deleted_append(run_id) {
+                RunDeleteClaim::Claimed(run) => {
+                    let event =
+                        self.new_timeline_event(run_id, stream_id, "run_deleted", &payload);
+                    let state = self.clone();
+                    let append_task = tokio::spawn(async move {
+                        let guard = RunDeleteAppendGuard::new(run);
+                        let wal_path = Arc::clone(&state.wal_path);
+                        let event_for_write = event.clone();
+                        let write_result = tokio::task::spawn_blocking(move || {
+                            append_event(wal_path.as_ref(), &event_for_write)
+                        })
+                        .await
+                        .map_err(|err| format!("timeline append worker join failure: {err}"))?
+                        .map_err(|err| err.to_string());
+
+                        if let Err(err) = write_result {
+                            return Err(err);
+                        }
+
+                        state.apply_event_to_registry(&event);
+                        guard.commit();
+                        Ok(RunDeletedAppend {
+                            event,
+                            appended: true,
+                        })
+                    });
+
+                    return append_task
+                        .await
+                        .map_err(|err| format!("timeline append coordinator join failure: {err}"))?;
+                }
+                RunDeleteClaim::AlreadyDeleted => {
+                    return Ok(RunDeletedAppend {
+                        event: self.synthetic_run_deleted_event(run_id, stream_id, &payload),
+                        appended: false,
+                    });
+                }
+                RunDeleteClaim::InFlight(run) => run.wait_delete_append().await,
+                RunDeleteClaim::Missing => {
+                    let event =
+                        self.new_timeline_event(run_id, stream_id, "run_deleted", &payload);
+                    let wal_path = Arc::clone(&self.wal_path);
+                    let event_for_write = event.clone();
+                    tokio::task::spawn_blocking(move || {
+                        append_event(wal_path.as_ref(), &event_for_write)
+                    })
+                    .await
+                    .map_err(|err| format!("timeline append worker join failure: {err}"))?
+                    .map_err(|err| err.to_string())?;
+                    self.apply_event_to_registry(&event);
+                    return Ok(RunDeletedAppend {
+                        event,
+                        appended: true,
+                    });
+                }
+            }
+        }
+    }
+
+    fn begin_run_deleted_append(&self, run_id: &str) -> RunDeleteClaim {
+        let registry = self.run_registry.load();
+        let Some(run) = registry.runs.get(run_id).cloned() else {
+            return RunDeleteClaim::Missing;
+        };
+        match run.begin_delete_append() {
+            RunDeleteState::Claimed => RunDeleteClaim::Claimed(run),
+            RunDeleteState::AlreadyDeleted => RunDeleteClaim::AlreadyDeleted,
+            RunDeleteState::InFlight => RunDeleteClaim::InFlight(run),
+        }
+    }
+
+    fn new_timeline_event(
+        &self,
+        run_id: &str,
+        stream_id: &str,
+        kind: &str,
+        payload: &Value,
+    ) -> TimelineEvent {
+        let seq = self.event_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        TimelineEvent {
+            seq,
+            run_id: run_id.to_owned(),
+            stream_id: stream_id.to_owned(),
+            pts_ms: now_epoch_ms(),
+            kind: kind.to_owned(),
+            payload: payload.to_string(),
+        }
+    }
+
+    fn synthetic_run_deleted_event(
+        &self,
+        run_id: &str,
+        stream_id: &str,
+        payload: &Value,
+    ) -> TimelineEvent {
+        TimelineEvent {
+            seq: self.event_seq.load(Ordering::Acquire),
+            run_id: run_id.to_owned(),
+            stream_id: stream_id.to_owned(),
+            pts_ms: now_epoch_ms(),
+            kind: "run_deleted".to_owned(),
+            payload: payload.to_string(),
+        }
     }
 
     pub fn read_run_events(&self, run_id: &str) -> Result<Vec<TimelineEvent>, String> {
@@ -454,6 +760,15 @@ impl AppState {
             state: apply_expiry(summary.state, summary.last_activity_ms, now_ms, ttl_ms),
             last_activity_ms: summary.last_activity_ms,
         })
+    }
+
+    pub(crate) fn run_is_deleted(&self, run_id: &str) -> bool {
+        let registry = self.run_registry.load();
+        registry
+            .runs
+            .get(run_id)
+            .map(|summary| summary.snapshot().deleted)
+            .unwrap_or(false)
     }
 
     pub fn count_active_runs_for_principal(&self, principal_key: &str, now_ms: u64) -> usize {
@@ -572,9 +887,55 @@ impl RunRegistry {
     }
 }
 
+struct RunDeletedAppend {
+    event: TimelineEvent,
+    appended: bool,
+}
+
+enum RunDeleteClaim {
+    Claimed(Arc<RunState>),
+    AlreadyDeleted,
+    InFlight(Arc<RunState>),
+    Missing,
+}
+
+enum RunDeleteState {
+    Claimed,
+    AlreadyDeleted,
+    InFlight,
+}
+
+struct RunDeleteAppendGuard {
+    run: Arc<RunState>,
+    committed: bool,
+}
+
+impl RunDeleteAppendGuard {
+    fn new(run: Arc<RunState>) -> Self {
+        Self {
+            run,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) {
+        self.run.commit_delete_append();
+        self.committed = true;
+    }
+}
+
+impl Drop for RunDeleteAppendGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.run.rollback_delete_append();
+        }
+    }
+}
+
 struct RunState {
     created: AtomicBool,
-    deleted: AtomicBool,
+    delete_state: AtomicU8,
+    delete_notify: Notify,
     principal_key: ArcSwap<Arc<str>>,
     state: AtomicU8,
     last_activity_ms: AtomicU64,
@@ -584,7 +945,12 @@ impl RunState {
     fn from_summary(summary: RunSummary) -> Self {
         Self {
             created: AtomicBool::new(summary.created),
-            deleted: AtomicBool::new(summary.deleted),
+            delete_state: AtomicU8::new(if summary.deleted {
+                RUN_DELETE_DELETED
+            } else {
+                RUN_DELETE_LIVE
+            }),
+            delete_notify: Notify::new(),
             principal_key: ArcSwap::from(Arc::new(summary.principal_key)),
             state: AtomicU8::new(encode_stream_state(summary.state)),
             last_activity_ms: AtomicU64::new(summary.last_activity_ms),
@@ -593,7 +959,7 @@ impl RunState {
 
     fn apply_event(&self, event: &TimelineEvent) {
         if event.kind == "run_deleted" {
-            self.deleted.store(true, Ordering::Release);
+            self.commit_delete_append();
         }
         if let Some(next) = transition_state(event.kind.as_str()) {
             self.state
@@ -603,10 +969,56 @@ impl RunState {
             .fetch_max(event.pts_ms, Ordering::AcqRel);
     }
 
+    fn begin_delete_append(&self) -> RunDeleteState {
+        match self.delete_state.compare_exchange(
+            RUN_DELETE_LIVE,
+            RUN_DELETE_APPEND_IN_FLIGHT,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => RunDeleteState::Claimed,
+            Err(RUN_DELETE_DELETED) => RunDeleteState::AlreadyDeleted,
+            Err(RUN_DELETE_APPEND_IN_FLIGHT) => RunDeleteState::InFlight,
+            Err(_) => RunDeleteState::InFlight,
+        }
+    }
+
+    fn commit_delete_append(&self) {
+        self.delete_state
+            .store(RUN_DELETE_DELETED, Ordering::Release);
+        self.delete_notify.notify_waiters();
+    }
+
+    fn rollback_delete_append(&self) {
+        let _ = self.delete_state.compare_exchange(
+            RUN_DELETE_APPEND_IN_FLIGHT,
+            RUN_DELETE_LIVE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.delete_notify.notify_waiters();
+    }
+
+    async fn wait_delete_append(&self) {
+        loop {
+            let notified = self.delete_notify.notified();
+            if self.delete_state.load(Ordering::Acquire) != RUN_DELETE_APPEND_IN_FLIGHT {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn wait_delete_append_blocking(&self) {
+        while self.delete_state.load(Ordering::Acquire) == RUN_DELETE_APPEND_IN_FLIGHT {
+            std::thread::yield_now();
+        }
+    }
+
     fn snapshot(&self) -> RunSummary {
         RunSummary {
             created: self.created.load(Ordering::Acquire),
-            deleted: self.deleted.load(Ordering::Acquire),
+            deleted: self.delete_state.load(Ordering::Acquire) == RUN_DELETE_DELETED,
             principal_key: Arc::clone(&*self.principal_key.load_full()),
             state: decode_stream_state(self.state.load(Ordering::Acquire)),
             last_activity_ms: self.last_activity_ms.load(Ordering::Acquire),
@@ -777,6 +1189,166 @@ mod tests {
         let events = state.read_run_events("run-1").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stream_id, "camera-west");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_run_deleted_appends_are_idempotent() {
+        let state = AppState::with_wal_for_tests(std::env::temp_dir().join(format!(
+            "vidarax-state-delete-idempotent-{}.wal",
+            std::process::id()
+        )));
+        let principal = "tenant-a";
+
+        state
+            .append_run_event(
+                "run-1",
+                "run_created",
+                json!({ "principal_key": principal }),
+            )
+            .unwrap();
+        assert_eq!(state.count_active_runs_for_principal(principal, now_epoch_ms()), 1);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = Vec::new();
+        for worker in 0..8 {
+            let state = state.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                state
+                    .append_run_deleted_idempotent_async(
+                        "run-1",
+                        json!({ "worker": worker }),
+                    )
+                    .await
+            }));
+        }
+
+        let mut appended = 0;
+        for task in tasks {
+            if task.await.unwrap().unwrap() {
+                appended += 1;
+            }
+        }
+
+        let events = state.read_run_events("run-1").unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "run_deleted")
+                .count(),
+            1
+        );
+        assert_eq!(appended, 1);
+        assert_eq!(state.count_active_runs_for_principal(principal, now_epoch_ms()), 0);
+        assert!(state.run_runtime_snapshot("run-1", now_epoch_ms()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_run_deleted_append_releases_claim_for_retry() {
+        use std::io::Read;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vidarax-state-delete-cancel-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal_path = dir.join("timeline.wal");
+        let state = AppState::with_wal_for_tests(wal_path.clone());
+        state
+            .append_run_event(
+                "run-1",
+                "run_created",
+                json!({ "principal_key": "tenant-a" }),
+            )
+            .unwrap();
+
+        std::fs::remove_file(&wal_path).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(&wal_path)
+            .status()
+            .expect("mkfifo should run");
+        assert!(status.success(), "mkfifo failed: {status}");
+
+        let delete_state = state.clone();
+        let delete_task = tokio::spawn(async move {
+            delete_state
+                .append_run_deleted_idempotent_async("run-1", json!({ "reason": "cancelled" }))
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let registry = state.run_registry.load();
+                let run = registry.runs.get("run-1").expect("run exists");
+                if run.delete_state.load(Ordering::Acquire) == RUN_DELETE_APPEND_IN_FLIGHT {
+                    return;
+                }
+                drop(registry);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delete append should reach in-flight claim");
+
+        delete_task.abort();
+        let _ = delete_task.await;
+
+        let mut fifo_reader = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&wal_path)
+            .expect("open fifo reader");
+        let mut discarded = String::new();
+        fifo_reader
+            .read_to_string(&mut discarded)
+            .expect("read cancelled append");
+        drop(fifo_reader);
+        std::fs::remove_file(&wal_path).unwrap();
+
+        let appended = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.append_run_deleted_idempotent_async("run-1", json!({ "reason": "retry" })),
+        )
+        .await
+        .expect("retry after cancelled delete must not wait forever")
+        .expect("retry delete append should succeed");
+        assert!(!appended, "cancelled caller must not force a duplicate tombstone");
+        assert!(state.run_runtime_snapshot("run-1", now_epoch_ms()).is_none());
+    }
+
+    #[tokio::test]
+    async fn reclaimed_sessions_are_bounded_across_historical_disconnects() {
+        let state = AppState::with_wal_for_tests(std::env::temp_dir().join(format!(
+            "vidarax-state-reclaimed-bound-{}.wal",
+            std::process::id()
+        )));
+
+        for i in 0..(RECLAIMED_SESSION_MAX_ENTRIES + 16) {
+            let sess_id = format!("sess-reclaimed-{i:04}");
+            let run_id: Arc<str> = Arc::from(format!("run-reclaimed-{i:04}"));
+            assert!(
+                state
+                    .insert_session(
+                        sess_id.clone(),
+                        "tenant-a".to_string(),
+                        Arc::clone(&run_id),
+                        Arc::new(WebRtcSession::new_for_tests()),
+                    )
+                    .await
+            );
+            state
+                .remove_session_for_run(&sess_id, &run_id)
+                .await
+                .expect("session should be reclaimed");
+        }
+
+        assert_eq!(
+            state.reclaimed_sessions.read().await.len(),
+            RECLAIMED_SESSION_MAX_ENTRIES
+        );
+        assert!(state.get_reclaimed_session("sess-reclaimed-0000").await.is_none());
     }
 
     #[test]

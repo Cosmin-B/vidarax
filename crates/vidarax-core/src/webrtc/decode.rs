@@ -26,16 +26,49 @@
 //! };
 //! let mut decoder = Decoder::new(&config);
 //! // Feed raw NAL / VP8 bytes:
-//! // let frame = decoder.decode(&payload_bytes).unwrap();
+//! // let yuv = decoder.decode(&payload_bytes).unwrap();
 //! ```
 
+use std::collections::VecDeque;
 use std::io::{BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 
 use openh264::formats::YUVSource;
 
+use crate::metrics::PipelineMetrics;
 use crate::webrtc::recycle::{RecycledBytes, VecPool};
+
+/// Bounded ffmpeg stdout reader handoff depth.
+///
+/// Sixteen frames gives short scheduler stalls room to clear while bounding
+/// decoded output retained in the reader handoff. The reader uses blocking
+/// sends; `decode()` drains this queue before writing more encoded input so the
+/// handoff is lossless without deadlocking the ffmpeg pipes.
+pub const FFMPEG_YUV_READER_QUEUE_CAPACITY: usize = 16;
+
+/// Decoder-local pending FIFO allowance covered by the YUV output pool.
+pub const FFMPEG_YUV_PENDING_POOL_ALLOWANCE: usize = 4;
+
+const FFMPEG_YUV_PENDING_FIFO_CAPACITY: usize =
+    FFMPEG_YUV_READER_QUEUE_CAPACITY + FFMPEG_YUV_PENDING_POOL_ALLOWANCE;
+
+/// Generous diagnostic bound for the decoder-local pending FIFO.
+pub const FFMPEG_YUV_PENDING_SANITY_BOUND: usize = FFMPEG_YUV_READER_QUEUE_CAPACITY * 4;
+
+/// Minimum pooled YUV frame slots needed by the bounded ffmpeg reader path:
+/// full reader queue, steady-state decoder pending FIFO allowance, one frame
+/// currently being assembled by the reader, and one frame held by the decode
+/// consumer.
+pub const FFMPEG_YUV_READER_POOL_MIN_SLOTS: usize =
+    FFMPEG_YUV_READER_QUEUE_CAPACITY + FFMPEG_YUV_PENDING_POOL_ALLOWANCE + 2;
+
+/// Minimum pooled YUV slots for the synchronous openh264 path.
+///
+/// openh264 decodes one access unit at a time and has no reader handoff or
+/// pending FIFO. Two slots cover one caller-held output and the next decoded
+/// output without falling back to heap allocation in the normal decode loop.
+pub const SOFTWARE_YUV_POOL_MIN_SLOTS: usize = 2;
 
 /// Video codec carried by the WebRTC track.
 ///
@@ -106,6 +139,37 @@ impl VideoCodec {
     }
 }
 
+/// Concrete decoder backend selected from GPU availability and negotiated codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderBackend {
+    /// GPU ffmpeg pipe path.
+    NvDec,
+    /// In-process openh264 path.
+    Software,
+    /// CPU ffmpeg pipe path.
+    FfmpegSw,
+}
+
+impl DecoderBackend {
+    pub fn select(gpu_available: bool, codec: VideoCodec) -> Self {
+        if gpu_available {
+            DecoderBackend::NvDec
+        } else {
+            match codec {
+                VideoCodec::H264 => DecoderBackend::Software,
+                VideoCodec::Vp8 => DecoderBackend::FfmpegSw,
+            }
+        }
+    }
+
+    pub fn min_yuv_pool_slots(self) -> usize {
+        match self {
+            DecoderBackend::NvDec | DecoderBackend::FfmpegSw => FFMPEG_YUV_READER_POOL_MIN_SLOTS,
+            DecoderBackend::Software => SOFTWARE_YUV_POOL_MIN_SLOTS,
+        }
+    }
+}
+
 /// A planar YUV 4:2:0 frame with packed (non-strided) plane buffers.
 ///
 /// `y.len() == (width * height) as usize`
@@ -136,6 +200,20 @@ impl YuvPlanePools {
             y: VecPool::with_capacity(slots, y_size),
             u: VecPool::with_capacity(slots, uv_size),
             v: VecPool::with_capacity(slots, uv_size),
+        }
+    }
+}
+
+pub struct YuvFrameReceiver {
+    rx: mpsc::Receiver<YuvFrame>,
+}
+
+impl YuvFrameReceiver {
+    fn try_recv(&self) -> Result<Option<YuvFrame>, mpsc::TryRecvError> {
+        match self.rx.try_recv() {
+            Ok(frame) => Ok(Some(frame)),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(err @ mpsc::TryRecvError::Disconnected) => Err(err),
         }
     }
 }
@@ -188,15 +266,9 @@ impl DecoderConfig {
 
 /// Errors returned by [`Decoder::decode`].
 ///
-/// The common hot-path case is [`DecodeError::Buffered`] — the codec is still
-/// accumulating input (SPS/PPS NALs, incomplete VP8 frame).  It carries no
-/// heap allocation, so callers that pattern-match on `Err(_) => continue` pay
-/// zero allocation cost per buffered NAL.
 #[derive(Debug)]
 pub enum DecodeError {
-    /// The codec is buffering input; no frame is available yet.
-    /// This is normal for H.264 SPS/PPS/IDR sequences and VP8 headers.
-    /// Callers should feed the next NAL and retry.
+    /// The decoder accepted input but no output frame is available yet.
     Buffered,
     /// The ffmpeg reader thread has exited (process terminated or pipe closed).
     ReaderExited,
@@ -235,14 +307,22 @@ impl std::error::Error for DecodeError {
 /// The ffmpeg pipe paths (`NvDec`, `FfmpegSw`) use a dedicated reader thread
 /// to avoid deadlocks: H.264 commonly requires multiple NAL units (SPS, PPS,
 /// IDR) before ffmpeg can produce a frame, so writing and reading must happen
-/// concurrently.  The reader thread continuously reads complete YUV frames from
-/// ffmpeg stdout and sends them through an `mpsc` channel.
+/// concurrently. The reader thread continuously drains complete YUV frames from
+/// ffmpeg stdout into a bounded channel with blocking sends. `decode()` drains
+/// that channel into a decoder-local FIFO before writing more encoded input.
+/// Under real-time backlog, `decode()` sheds older decoded YUV output and
+/// returns the freshest ready frame so downstream labels stay close to the
+/// current RTP timestamp. Encoded input is still always written.
 pub enum Decoder {
     /// GPU: long-lived ffmpeg sidecar using `-hwaccel auto` (~0.5 ms/frame).
     NvDec {
         child: Child,
         stdin: ChildStdin,
-        frame_rx: mpsc::Receiver<YuvFrame>,
+        frame_rx: YuvFrameReceiver,
+        pending: VecDeque<YuvFrame>,
+        pending_warned: bool,
+        metrics: Option<Arc<PipelineMetrics>>,
+        codec: VideoCodec,
         width: u32,
         height: u32,
     },
@@ -256,7 +336,11 @@ pub enum Decoder {
     FfmpegSw {
         child: Child,
         stdin: ChildStdin,
-        frame_rx: mpsc::Receiver<YuvFrame>,
+        frame_rx: YuvFrameReceiver,
+        pending: VecDeque<YuvFrame>,
+        pending_warned: bool,
+        metrics: Option<Arc<PipelineMetrics>>,
+        codec: VideoCodec,
         width: u32,
         height: u32,
     },
@@ -265,17 +349,23 @@ pub enum Decoder {
 /// Spawn a background thread that continuously reads YUV420 frames from
 /// ffmpeg stdout and sends them to the returned receiver.
 ///
+/// The handoff is lossless: the reader uses a bounded blocking send and never
+/// evicts decoded output. The decode side drains the bounded channel before
+/// writing more input to ffmpeg, so a full handoff channel cannot remain the
+/// reason `decode()` is blocked while writing stdin.
+///
 /// Plane buffers (`y`, `u`, `v`) are allocated once before the loop and
-/// reused across frames, avoiding ~93 MB/s of repeated heap allocation at
-/// 1080p/30 fps.  Each [`YuvFrame`] sent on the channel owns a clone of the
-/// plane data so the scratch buffers can be refilled immediately.
+/// reused across frames, avoiding repeated heap allocation at 1080p/30 fps.
+/// The bounded output pools cover the full reader queue, a small steady-state
+/// pending FIFO allowance, one constructing frame, and one consumer-held frame.
 fn spawn_frame_reader(
     mut stdout: BufReader<ChildStdout>,
     width: u32,
     height: u32,
     output_pool_slots: usize,
-) -> mpsc::Receiver<YuvFrame> {
-    let (tx, rx) = mpsc::channel();
+) -> YuvFrameReceiver {
+    let (tx, rx) = mpsc::sync_channel(FFMPEG_YUV_READER_QUEUE_CAPACITY);
+    let output_pool_slots = output_pool_slots.max(FFMPEG_YUV_READER_POOL_MIN_SLOTS);
     let pools = YuvPlanePools::new(width, height, output_pool_slots);
     std::thread::spawn(move || {
         let w = width as usize;
@@ -303,12 +393,113 @@ fn spawn_frame_reader(
                 width,
                 height,
             };
-            if tx.send(frame).is_err() {
-                break; // receiver dropped
+            if !send_yuv_frame_lossless(&tx, frame) {
+                break;
             }
         }
     });
-    rx
+    YuvFrameReceiver { rx }
+}
+
+fn send_yuv_frame_lossless(tx: &mpsc::SyncSender<YuvFrame>, frame: YuvFrame) -> bool {
+    tx.send(frame).is_ok()
+}
+
+#[cfg(test)]
+fn try_receive_yuv_frame(frame_rx: &YuvFrameReceiver) -> Result<YuvFrame, DecodeError> {
+    match frame_rx.try_recv() {
+        Ok(Some(frame)) => Ok(frame),
+        Ok(None) => Err(DecodeError::Buffered),
+        Err(_) => Err(DecodeError::ReaderExited),
+    }
+}
+
+/// Feed one raw access unit into an ffmpeg pipe decoder and return at most one
+/// decoded YUV frame.
+///
+/// The ffmpeg raw pipe has no frame metadata channel, so callers label any
+/// returned frame with the current access unit as a best-effort approximation.
+/// The decode side first drains all currently-ready YUV frames into `pending`,
+/// then writes and flushes the next encoded payload, then returns the newest
+/// pending decoded frame. Older pending decoded frames are shed and counted so
+/// real-time analysis stays as close as possible to the current RTP label while
+/// still never dropping encoded input. The drain-before-write order keeps room
+/// in the bounded reader channel for the reader thread's blocking send.
+fn decode_ffmpeg_pipe(
+    stdin: &mut impl Write,
+    frame_rx: &YuvFrameReceiver,
+    pending: &mut VecDeque<YuvFrame>,
+    metrics: Option<&PipelineMetrics>,
+    pending_warned: &mut bool,
+    codec: VideoCodec,
+    width: u32,
+    height: u32,
+    payload: &[u8],
+) -> Result<YuvFrame, DecodeError> {
+    let reader_exited = drain_ready_yuv_frames(frame_rx, pending);
+    observe_pending_depth(pending.len(), metrics, pending_warned, codec, width, height);
+
+    stdin.write_all(payload).map_err(DecodeError::WriteError)?;
+    stdin.flush().map_err(DecodeError::FlushError)?;
+
+    if let Some(frame) = pending.pop_back() {
+        let shed = pending.len();
+        if shed != 0 {
+            if let Some(metrics) = metrics {
+                metrics.inc_frames_dropped_by(shed as u64);
+            }
+            pending.clear();
+        }
+        return Ok(frame);
+    }
+    if reader_exited {
+        return Err(DecodeError::ReaderExited);
+    }
+    Err(DecodeError::Buffered)
+}
+
+fn drain_ready_yuv_frames(frame_rx: &YuvFrameReceiver, pending: &mut VecDeque<YuvFrame>) -> bool {
+    loop {
+        match frame_rx.try_recv() {
+            Ok(Some(frame)) => pending.push_back(frame),
+            Ok(None) => return false,
+            Err(_) => return true,
+        }
+    }
+}
+
+fn observe_pending_depth(
+    pending_depth: usize,
+    metrics: Option<&PipelineMetrics>,
+    pending_warned: &mut bool,
+    codec: VideoCodec,
+    width: u32,
+    height: u32,
+) {
+    if pending_depth <= FFMPEG_YUV_PENDING_SANITY_BOUND {
+        return;
+    }
+
+    debug_assert!(
+        pending_depth <= FFMPEG_YUV_PENDING_SANITY_BOUND,
+        "ffmpeg YUV pending depth exceeded backpressure sanity bound"
+    );
+
+    if *pending_warned {
+        return;
+    }
+    *pending_warned = true;
+    if let Some(metrics) = metrics {
+        metrics.inc_decode_pending_sanity_violations();
+    }
+    tracing::warn!(
+        pending_depth,
+        sanity_bound = FFMPEG_YUV_PENDING_SANITY_BOUND,
+        ?codec,
+        width,
+        height,
+        "ffmpeg YUV pending FIFO exceeded sanity bound; preserving frames without eviction"
+    );
 }
 
 impl Decoder {
@@ -327,12 +518,21 @@ impl Decoder {
     /// Panics if the selected backend cannot be initialised (ffmpeg not found
     /// for `NvDec`/`FfmpegSw`, or openh264 library init failure for `Software`).
     pub fn new(config: &DecoderConfig) -> Self {
+        Self::new_inner(config, None)
+    }
+
+    pub(crate) fn new_with_metrics(config: &DecoderConfig, metrics: Arc<PipelineMetrics>) -> Self {
+        Self::new_inner(config, Some(metrics))
+    }
+
+    fn new_inner(config: &DecoderConfig, metrics: Option<Arc<PipelineMetrics>>) -> Self {
         if config.gpu_available {
             Self::new_nvdec(
                 config.codec,
                 config.width,
                 config.height,
                 config.output_pool_slots,
+                metrics,
             )
         } else {
             match config.codec {
@@ -344,6 +544,7 @@ impl Decoder {
                     config.width,
                     config.height,
                     config.output_pool_slots,
+                    metrics,
                 ),
             }
         }
@@ -352,6 +553,7 @@ impl Decoder {
     fn new_software(width: u32, height: u32, output_pool_slots: usize) -> Self {
         let decoder =
             openh264::decoder::Decoder::new().expect("openh264 decoder initialisation failed");
+        let output_pool_slots = output_pool_slots.max(SOFTWARE_YUV_POOL_MIN_SLOTS);
         Decoder::Software {
             decoder,
             scratch: SoftwareScratch::default(),
@@ -362,7 +564,13 @@ impl Decoder {
     /// Spawn an ffmpeg sidecar using `-hwaccel auto` so the same process
     /// handles both H.264 (NVDEC) and VP8 (GPU VP8 decode) without needing to
     /// hard-code the codec decoder name.
-    fn new_nvdec(codec: VideoCodec, width: u32, height: u32, output_pool_slots: usize) -> Self {
+    fn new_nvdec(
+        codec: VideoCodec,
+        width: u32,
+        height: u32,
+        output_pool_slots: usize,
+        metrics: Option<Arc<PipelineMetrics>>,
+    ) -> Self {
         let input_fmt = codec.ffmpeg_input_format();
         let mut child = Command::new(crate::ingest::ffmpeg_path())
             .args([
@@ -394,6 +602,10 @@ impl Decoder {
             child,
             stdin,
             frame_rx,
+            pending: VecDeque::with_capacity(FFMPEG_YUV_PENDING_FIFO_CAPACITY),
+            pending_warned: false,
+            metrics,
+            codec,
             width,
             height,
         }
@@ -404,7 +616,13 @@ impl Decoder {
     /// Uses ffmpeg's bundled `libvpx` decoder; no GPU or special codec flags
     /// required.  The `-s` scaling hint is not passed because VP8 streams carry
     /// their dimensions in-band; ffmpeg reads them from the bitstream headers.
-    fn new_ffmpeg_sw(codec: VideoCodec, width: u32, height: u32, output_pool_slots: usize) -> Self {
+    fn new_ffmpeg_sw(
+        codec: VideoCodec,
+        width: u32,
+        height: u32,
+        output_pool_slots: usize,
+        metrics: Option<Arc<PipelineMetrics>>,
+    ) -> Self {
         let input_fmt = codec.ffmpeg_input_format();
         let mut child = Command::new(crate::ingest::ffmpeg_path())
             .args([
@@ -432,6 +650,10 @@ impl Decoder {
             child,
             stdin,
             frame_rx,
+            pending: VecDeque::with_capacity(FFMPEG_YUV_PENDING_FIFO_CAPACITY),
+            pending_warned: false,
+            metrics,
+            codec,
             width,
             height,
         }
@@ -439,37 +661,48 @@ impl Decoder {
 
     /// Decode raw video payload bytes into a packed YUV420 frame.
     ///
-    /// - For `NvDec` and `FfmpegSw`: writes `payload` to the ffmpeg stdin pipe
-    ///   and then checks the reader thread's channel for a decoded frame.
-    ///   H.264 streams commonly need several NAL units (SPS, PPS, IDR) before
-    ///   ffmpeg produces a frame, so this returns `Err` (with a "buffered" msg)
-    ///   for NALs that don't yet produce output — callers should keep feeding
-    ///   NALs and ignore those errors (same contract as the openh264 path).
-    /// - For `Software` (H.264 only): passes `payload` directly to openh264.
-    ///   Returns `Err` if openh264 reports no frame (e.g. SPS/PPS only).
+    /// - For `NvDec` and `FfmpegSw`: drains the bounded stdout reader channel
+    ///   into the decoder-local FIFO, writes and flushes `payload` to ffmpeg
+    ///   stdin, then returns the freshest pending output frame and sheds older
+    ///   pending decoded frames. `Buffered` means
+    ///   ffmpeg accepted the input but has no output ready for this call.
+    /// - For `Software` (H.264 only): passes `payload` directly to openh264;
+    ///   `Buffered` covers SPS/PPS-only payloads or partial slices that do not
+    ///   produce an output frame.
     pub fn decode(&mut self, payload: &[u8]) -> Result<YuvFrame, DecodeError> {
         match self {
             Decoder::NvDec {
-                stdin, frame_rx, ..
+                stdin,
+                frame_rx,
+                pending,
+                pending_warned,
+                metrics,
+                codec,
+                width,
+                height,
+                ..
             }
             | Decoder::FfmpegSw {
-                stdin, frame_rx, ..
-            } => {
-                // Write the NAL/payload to ffmpeg.  The reader thread
-                // independently reads decoded frames from stdout.
-                stdin.write_all(payload).map_err(DecodeError::WriteError)?;
-                stdin.flush().map_err(DecodeError::FlushError)?;
-
-                // Try to receive a frame without blocking.  If ffmpeg hasn't
-                // produced one yet (e.g. still buffering SPS/PPS) we return
-                // `DecodeError::Buffered` — zero allocation — the caller feeds
-                // the next NAL and retries.
-                match frame_rx.try_recv() {
-                    Ok(frame) => Ok(frame),
-                    Err(mpsc::TryRecvError::Empty) => Err(DecodeError::Buffered),
-                    Err(mpsc::TryRecvError::Disconnected) => Err(DecodeError::ReaderExited),
-                }
-            }
+                stdin,
+                frame_rx,
+                pending,
+                pending_warned,
+                metrics,
+                codec,
+                width,
+                height,
+                ..
+            } => decode_ffmpeg_pipe(
+                stdin,
+                frame_rx,
+                pending,
+                metrics.as_deref(),
+                pending_warned,
+                *codec,
+                *width,
+                *height,
+                payload,
+            ),
             Decoder::Software {
                 decoder,
                 scratch,
@@ -551,7 +784,17 @@ impl Drop for Decoder {
 
 #[cfg(test)]
 mod tests {
-    use super::VideoCodec;
+    use std::collections::VecDeque;
+    use std::io::{self, Write};
+    use std::sync::mpsc;
+
+    use crate::metrics::PipelineMetrics;
+
+    use super::{
+        decode_ffmpeg_pipe, send_yuv_frame_lossless, try_receive_yuv_frame, DecodeError,
+        VideoCodec, YuvFrame, FFMPEG_YUV_PENDING_POOL_ALLOWANCE,
+        FFMPEG_YUV_READER_POOL_MIN_SLOTS, FFMPEG_YUV_READER_QUEUE_CAPACITY,
+    };
 
     #[test]
     fn detects_vp8_from_sdp_rtpmap() {
@@ -605,5 +848,283 @@ mod tests {
     #[test]
     fn video_codec_default_is_h264() {
         assert_eq!(VideoCodec::default(), VideoCodec::H264);
+    }
+
+    #[test]
+    fn ffmpeg_reader_handoff_is_lossless_for_bounded_burst() {
+        let (tx, rx) = test_frame_receiver();
+
+        for i in 0..FFMPEG_YUV_READER_QUEUE_CAPACITY {
+            assert!(tx.try_send(tiny_yuv_frame(i as u8)).is_ok());
+        }
+
+        for i in 0..FFMPEG_YUV_READER_QUEUE_CAPACITY {
+            let frame = try_receive_yuv_frame(&rx).unwrap();
+            assert_eq!(frame.y[0], i as u8);
+        }
+        assert!(matches!(
+            try_receive_yuv_frame(&rx),
+            Err(DecodeError::Buffered)
+        ));
+    }
+
+    #[test]
+    fn ffmpeg_reader_try_recv_semantics_are_preserved() {
+        let (tx, rx) = test_frame_receiver();
+
+        assert!(matches!(
+            try_receive_yuv_frame(&rx),
+            Err(DecodeError::Buffered)
+        ));
+
+        drop(tx);
+        assert!(matches!(
+            try_receive_yuv_frame(&rx),
+            Err(DecodeError::ReaderExited)
+        ));
+    }
+
+    #[test]
+    fn ffmpeg_decode_writes_input_then_returns_buffered_before_output() {
+        let (_tx, rx) = test_frame_receiver();
+        let mut stdin = CountingWrite { writes: 0, flushes: 0 };
+        let mut pending = test_pending_fifo();
+        let mut pending_warned = false;
+
+        let err =
+            decode_for_test(&mut stdin, &rx, &mut pending, &mut pending_warned, b"encoded")
+                .unwrap_err();
+
+        assert!(matches!(err, DecodeError::Buffered));
+        assert_eq!(stdin.writes, 1);
+        assert_eq!(stdin.flushes, 1);
+    }
+
+    #[test]
+    fn ffmpeg_decode_returns_freshest_ready_frame_and_sheds_older_backlog() {
+        let (tx, rx) = test_frame_receiver();
+        tx.try_send(tiny_yuv_frame(7)).unwrap();
+        tx.try_send(tiny_yuv_frame(8)).unwrap();
+        let mut stdin = CountingWrite { writes: 0, flushes: 0 };
+        let mut pending = test_pending_fifo();
+        let mut pending_warned = false;
+        let metrics = PipelineMetrics::new();
+
+        let first = decode_for_test_with_metrics(
+            &mut stdin,
+            &rx,
+            &mut pending,
+            Some(&metrics),
+            &mut pending_warned,
+            b"encoded-1",
+        )
+        .unwrap();
+        let second = decode_for_test_with_metrics(
+            &mut stdin,
+            &rx,
+            &mut pending,
+            Some(&metrics),
+            &mut pending_warned,
+            b"encoded-2",
+        )
+        .unwrap_err();
+
+        assert_eq!(first.y[0], 8);
+        assert!(matches!(second, DecodeError::Buffered));
+        assert_eq!(metrics.frames_dropped_total(), 1);
+        assert_eq!(stdin.writes, 2);
+        assert_eq!(stdin.flushes, 2);
+    }
+
+    #[test]
+    fn ffmpeg_decode_reports_reader_exited_after_writing_input() {
+        let (tx, rx) = test_frame_receiver();
+        drop(tx);
+        let mut stdin = CountingWrite { writes: 0, flushes: 0 };
+        let mut pending = test_pending_fifo();
+        let mut pending_warned = false;
+
+        let err =
+            decode_for_test(&mut stdin, &rx, &mut pending, &mut pending_warned, b"encoded")
+                .unwrap_err();
+
+        assert!(matches!(err, DecodeError::ReaderExited));
+        assert_eq!(stdin.writes, 1);
+        assert_eq!(stdin.flushes, 1);
+    }
+
+    #[test]
+    fn ffmpeg_decode_writes_encoded_input_even_when_output_queue_is_full() {
+        let (tx, rx) = test_frame_receiver();
+        for i in 0..FFMPEG_YUV_READER_QUEUE_CAPACITY {
+            tx.try_send(tiny_yuv_frame(i as u8)).unwrap();
+        }
+        let mut stdin = CountingWrite { writes: 0, flushes: 0 };
+        let mut pending = test_pending_fifo();
+        let mut pending_warned = false;
+        let metrics = PipelineMetrics::new();
+
+        let frame = decode_for_test_with_metrics(
+            &mut stdin,
+            &rx,
+            &mut pending,
+            Some(&metrics),
+            &mut pending_warned,
+            b"must-not-drop-input",
+        )
+        .unwrap();
+
+        assert_eq!(frame.y[0], (FFMPEG_YUV_READER_QUEUE_CAPACITY - 1) as u8);
+        assert_eq!(
+            metrics.frames_dropped_total(),
+            (FFMPEG_YUV_READER_QUEUE_CAPACITY - 1) as u64
+        );
+        assert_eq!(stdin.writes, 1);
+        assert_eq!(stdin.flushes, 1);
+    }
+
+    #[test]
+    fn ffmpeg_decode_drains_before_write_to_unblock_lossless_reader() {
+        let (tx, rx) = test_frame_receiver();
+        for i in 0..FFMPEG_YUV_READER_QUEUE_CAPACITY {
+            tx.try_send(tiny_yuv_frame(i as u8)).unwrap();
+        }
+        let mut stdin = QueueRoomAssertingWrite {
+            tx: tx.clone(),
+            injected: false,
+        };
+        let mut pending = test_pending_fifo();
+        let mut pending_warned = false;
+
+        let first =
+            decode_for_test(&mut stdin, &rx, &mut pending, &mut pending_warned, b"encoded")
+                .unwrap();
+
+        assert_eq!(first.y[0], (FFMPEG_YUV_READER_QUEUE_CAPACITY - 1) as u8);
+        assert!(stdin.injected);
+        let injected = decode_for_test(
+            &mut CountingWrite { writes: 0, flushes: 0 },
+            &rx,
+            &mut pending,
+            &mut pending_warned,
+            b"encoded",
+        )
+        .unwrap();
+        assert_eq!(injected.y[0], 200);
+    }
+
+    #[test]
+    fn ffmpeg_reader_lossless_send_blocks_for_backpressure_without_dropping() {
+        let (tx, rx) = test_frame_receiver();
+        for i in 0..FFMPEG_YUV_READER_QUEUE_CAPACITY {
+            tx.try_send(tiny_yuv_frame(i as u8)).unwrap();
+        }
+
+        let producer = std::thread::spawn(move || {
+            assert!(send_yuv_frame_lossless(&tx, tiny_yuv_frame(200)));
+        });
+
+        assert_eq!(try_receive_yuv_frame(&rx).unwrap().y[0], 0);
+        producer.join().unwrap();
+        for i in 1..FFMPEG_YUV_READER_QUEUE_CAPACITY {
+            assert_eq!(try_receive_yuv_frame(&rx).unwrap().y[0], i as u8);
+        }
+        assert_eq!(try_receive_yuv_frame(&rx).unwrap().y[0], 200);
+    }
+
+    #[test]
+    fn ffmpeg_reader_pool_slots_cover_queue_constructing_and_consumer_frames() {
+        assert_eq!(
+            FFMPEG_YUV_READER_POOL_MIN_SLOTS,
+            FFMPEG_YUV_READER_QUEUE_CAPACITY + FFMPEG_YUV_PENDING_POOL_ALLOWANCE + 2
+        );
+    }
+
+    fn decode_for_test(
+        stdin: &mut impl Write,
+        rx: &super::YuvFrameReceiver,
+        pending: &mut VecDeque<YuvFrame>,
+        pending_warned: &mut bool,
+        payload: &[u8],
+    ) -> Result<YuvFrame, DecodeError> {
+        decode_for_test_with_metrics(stdin, rx, pending, None, pending_warned, payload)
+    }
+
+    fn decode_for_test_with_metrics(
+        stdin: &mut impl Write,
+        rx: &super::YuvFrameReceiver,
+        pending: &mut VecDeque<YuvFrame>,
+        metrics: Option<&PipelineMetrics>,
+        pending_warned: &mut bool,
+        payload: &[u8],
+    ) -> Result<YuvFrame, DecodeError> {
+        decode_ffmpeg_pipe(
+            stdin,
+            rx,
+            pending,
+            metrics,
+            pending_warned,
+            VideoCodec::Vp8,
+            2,
+            2,
+            payload,
+        )
+    }
+
+    struct CountingWrite {
+        writes: usize,
+        flushes: usize,
+    }
+
+    impl Write for CountingWrite {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    struct QueueRoomAssertingWrite {
+        tx: mpsc::SyncSender<YuvFrame>,
+        injected: bool,
+    }
+
+    impl Write for QueueRoomAssertingWrite {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if !self.injected {
+                self.tx
+                    .try_send(tiny_yuv_frame(200))
+                    .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "queue still full"))?;
+                self.injected = true;
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn tiny_yuv_frame(seed: u8) -> YuvFrame {
+        YuvFrame {
+            y: vec![seed; 4].into(),
+            u: vec![seed; 1].into(),
+            v: vec![seed; 1].into(),
+            width: 2,
+            height: 2,
+        }
+    }
+
+    fn test_pending_fifo() -> VecDeque<YuvFrame> {
+        VecDeque::with_capacity(super::FFMPEG_YUV_PENDING_FIFO_CAPACITY)
+    }
+
+    fn test_frame_receiver() -> (mpsc::SyncSender<YuvFrame>, super::YuvFrameReceiver) {
+        let (tx, rx) = mpsc::sync_channel(FFMPEG_YUV_READER_QUEUE_CAPACITY);
+        (tx, super::YuvFrameReceiver { rx })
     }
 }
