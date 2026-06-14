@@ -1,9 +1,10 @@
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::task::JoinSet;
+use tokio::task::{Id as TaskId, JoinError, JoinSet};
 use vidarax_core::gate::{FrameSignal, GateEventType};
 use vidarax_core::ingest::{extract_video_clip, DecodedJpegFrame, InputSource};
 use vidarax_core::pipeline::{FrameMetadata, TwoPassPipeline};
@@ -19,6 +20,10 @@ use crate::models::{
 };
 use crate::semantic::{MarkerInput, SemanticMarker};
 use crate::state::AppState;
+
+#[cfg(test)]
+static SEMANTIC_TASK_PANIC_CHUNK_FOR_TESTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
 
 pub struct DecodedSignals {
     pub signals: Vec<FrameSignal>,
@@ -319,49 +324,165 @@ pub async fn run_semantic_dispatch(
             task_end_times[chunk_idx] = Instant::now();
         }
     } else {
-        let sem = Arc::new(tokio::sync::Semaphore::new(vlm_concurrency));
         let mut join_set: JoinSet<(usize, ChunkSemanticResult, Instant)> = JoinSet::new();
+        let max_in_flight = vlm_concurrency.max(1);
+        let mut task_chunks: HashMap<TaskId, usize> =
+            HashMap::with_capacity(max_in_flight.min(num_chunks));
+        let mut pending = chunk_preps.iter().enumerate();
 
-        for (chunk_idx, prep) in chunk_preps.iter().enumerate() {
-            let providers_c = providers.clone();
-            let prompt_c = semantic_prompt.to_string();
-            let chunk_jpegs_c = Arc::clone(&prep.chunk_jpegs);
-            let chunk_video_clip_c = prep.chunk_video_clip.as_ref().map(Arc::clone);
-            let sem_c = Arc::clone(&sem);
-            let frame_offset = prep.frame_offset as u64;
-            let pts_start_ms = prep.pts_start_ms;
-            let pts_end_ms = prep.pts_end_ms;
-            let tiered_config_c = tiered_config.clone();
-            let guided_json_c = guided_json_str.clone();
-            join_set.spawn(async move {
-                let _permit = sem_c.acquire().await.unwrap();
-                let overlay = infer_chunk_semantics(
-                    providers_c,
-                    true,
-                    &prompt_c,
-                    semantic_timeout_ms,
-                    semantic_frames_per_chunk,
-                    &chunk_jpegs_c,
-                    frame_offset,
-                    pts_start_ms,
-                    pts_end_ms,
-                    tiered_config_c,
-                    guided_json_c,
-                    None,
-                    chunk_video_clip_c,
-                )
-                .await;
-                (chunk_idx, overlay, Instant::now())
-            });
+        for _ in 0..max_in_flight.min(num_chunks) {
+            let (chunk_idx, task_id) = spawn_semantic_task(
+                &mut join_set,
+                pending.next().expect("bounded by num_chunks"),
+                providers.clone(),
+                semantic_prompt,
+                semantic_timeout_ms,
+                semantic_frames_per_chunk,
+                tiered_config.clone(),
+                guided_json_str.clone(),
+            );
+            task_chunks.insert(task_id, chunk_idx);
         }
 
-        while let Some(Ok((idx, result, finished))) = join_set.join_next().await {
-            semantic_results[idx] = Some(result);
-            task_end_times[idx] = finished;
+        while let Some(joined) = join_set.join_next_with_id().await {
+            match joined {
+                Ok((task_id, (idx, result, finished))) => {
+                    task_chunks.remove(&task_id);
+                    semantic_results[idx] = Some(result);
+                    task_end_times[idx] = finished;
+                }
+                Err(err) => {
+                    let finished = Instant::now();
+                    let task_id = err.id();
+                    if let Some(idx) = task_chunks.remove(&task_id) {
+                        semantic_results[idx] = Some(semantic_join_failure_result(err));
+                        task_end_times[idx] = finished;
+                    } else {
+                        tracing::warn!(
+                            task_id = ?task_id,
+                            error = %err,
+                            "semantic inference task failed without chunk mapping"
+                        );
+                    }
+                }
+            }
+
+            if let Some(next) = pending.next() {
+                let (chunk_idx, task_id) = spawn_semantic_task(
+                    &mut join_set,
+                    next,
+                    providers.clone(),
+                    semantic_prompt,
+                    semantic_timeout_ms,
+                    semantic_frames_per_chunk,
+                    tiered_config.clone(),
+                    guided_json_str.clone(),
+                );
+                task_chunks.insert(task_id, chunk_idx);
+            }
         }
     }
 
     (semantic_results, task_end_times)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_semantic_task(
+    join_set: &mut JoinSet<(usize, ChunkSemanticResult, Instant)>,
+    (chunk_idx, prep): (usize, &ChunkPrep),
+    providers: Option<Arc<dyn InferenceProvider + Send + Sync>>,
+    semantic_prompt: &str,
+    semantic_timeout_ms: u64,
+    semantic_frames_per_chunk: usize,
+    tiered_config: TieredVlmConfig,
+    guided_json_str: Option<String>,
+) -> (usize, TaskId) {
+    let providers_c = providers;
+    let prompt_c = semantic_prompt.to_string();
+    let chunk_jpegs_c = Arc::clone(&prep.chunk_jpegs);
+    let chunk_video_clip_c = prep.chunk_video_clip.as_ref().map(Arc::clone);
+    let frame_offset = prep.frame_offset as u64;
+    let pts_start_ms = prep.pts_start_ms;
+    let pts_end_ms = prep.pts_end_ms;
+    let tiered_config_c = tiered_config;
+    let guided_json_c = guided_json_str;
+    let handle = join_set.spawn(async move {
+        #[cfg(test)]
+        if chunk_idx
+            == SEMANTIC_TASK_PANIC_CHUNK_FOR_TESTS.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("injected semantic task panic for chunk {chunk_idx}");
+        }
+
+        let overlay = infer_chunk_semantics(
+            providers_c,
+            true,
+            &prompt_c,
+            semantic_timeout_ms,
+            semantic_frames_per_chunk,
+            &chunk_jpegs_c,
+            frame_offset,
+            pts_start_ms,
+            pts_end_ms,
+            tiered_config_c,
+            guided_json_c,
+            None,
+            chunk_video_clip_c,
+        )
+        .await;
+        (chunk_idx, overlay, Instant::now())
+    });
+    (chunk_idx, handle.id())
+}
+
+fn semantic_join_failure_result(err: JoinError) -> ChunkSemanticResult {
+    ChunkSemanticResult {
+        attempted: true,
+        used_fallback: true,
+        error: Some(format!("join_error:{err}")),
+        ..ChunkSemanticResult::default()
+    }
+}
+
+#[cfg(test)]
+async fn bounded_task_spawn_probe_for_tests(total: usize, limit: usize) -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_live = Arc::new(AtomicUsize::new(0));
+    let mut join_set = JoinSet::new();
+    let mut next = 0usize;
+    let max_in_flight = limit.max(1);
+
+    while next < total && join_set.len() < max_in_flight {
+        spawn_probe_task(&mut join_set, Arc::clone(&active), Arc::clone(&max_live));
+        next += 1;
+    }
+    while join_set.join_next().await.is_some() {
+        if next < total {
+            spawn_probe_task(&mut join_set, Arc::clone(&active), Arc::clone(&max_live));
+            next += 1;
+        }
+    }
+
+    max_live.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+fn spawn_probe_task(
+    join_set: &mut JoinSet<()>,
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    max_live: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    join_set.spawn(async move {
+        let live = active.fetch_add(1, Ordering::SeqCst) + 1;
+        max_live.fetch_max(live, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        active.fetch_sub(1, Ordering::SeqCst);
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -596,6 +717,26 @@ fn truncate_context(text: &str, max_chars: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vidarax_core::provider::{InferenceResult, ProviderKind};
+
+    struct SemanticTestProvider;
+
+    impl InferenceProvider for SemanticTestProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Vllm
+        }
+
+        fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+            Ok(InferenceResult {
+                provider: ProviderKind::Vllm,
+                model: Arc::clone(&request.model),
+                output_text: r#"{"event_type":"context_observation","object_label":"frame_context","summary":"ok","description":"chunk completed","confidence":0.95}"#.to_string(),
+                fallback_used: false,
+                finish_reason: Some("stop".to_string()),
+                inference_latency_ms: 1,
+            })
+        }
+    }
 
     #[test]
     fn semantic_context_truncation_is_utf8_safe() {
@@ -606,6 +747,76 @@ mod tests {
         let truncated = truncate_context(&longer, 200);
         assert_eq!(truncated.chars().count(), 200);
         assert!(longer.starts_with(truncated));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_semantic_dispatch_bounds_live_spawned_tasks() {
+        let max_live = super::bounded_task_spawn_probe_for_tests(100, 4).await;
+        assert_eq!(max_live, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_semantic_dispatch_continues_after_task_panic() {
+        SEMANTIC_TASK_PANIC_CHUNK_FOR_TESTS.store(1, std::sync::atomic::Ordering::SeqCst);
+
+        let chunk_preps: Vec<ChunkPrep> = (0..5).map(test_chunk_prep).collect();
+        let provider: Arc<dyn InferenceProvider + Send + Sync> = Arc::new(SemanticTestProvider);
+        let (results, _finished) = run_semantic_dispatch(
+            &chunk_preps,
+            Some(provider),
+            true,
+            "classify",
+            1_000,
+            1,
+            TieredVlmConfig::single_model("test-model"),
+            None,
+            false,
+            false,
+            2,
+        )
+        .await;
+
+        SEMANTIC_TASK_PANIC_CHUNK_FOR_TESTS
+            .store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(results.len(), 5);
+        for idx in [0usize, 2, 3, 4] {
+            let result = results[idx].as_ref().expect("chunk should complete");
+            assert!(result.attempted, "chunk {idx} should be attempted");
+            assert_eq!(result.error, None, "chunk {idx} should not inherit panic");
+            assert_eq!(
+                result.overlay.as_ref().map(|overlay| overlay.summary.as_str()),
+                Some("ok")
+            );
+        }
+
+        let failed = results[1].as_ref().expect("panic should be surfaced");
+        assert!(failed.attempted);
+        assert!(failed.used_fallback);
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|err| err.starts_with("join_error:") && err.contains("panicked")),
+            "expected chunk 1 join panic error, got {:?}",
+            failed.error
+        );
+    }
+
+    fn test_chunk_prep(idx: usize) -> ChunkPrep {
+        ChunkPrep {
+            analyzed: Vec::new(),
+            frame_offset: idx,
+            chunk_jpegs: Arc::from([DecodedJpegFrame {
+                frame_index: idx as u64,
+                jpeg_bytes: vec![0xff, 0xd8, 0xff, idx as u8],
+            }]),
+            chunk_video_clip: None,
+            pts_start_ms: idx as u64 * 33,
+            pts_end_ms: idx as u64 * 33,
+            chunk_len: 1,
+            started: Instant::now(),
+        }
     }
 }
 

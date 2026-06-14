@@ -159,15 +159,19 @@ impl ServerConfig {
         let webrtc_turn_credential = env::var("VIDARAX_WEBRTC_TURN_CREDENTIAL").ok();
         let webrtc_max_output_tokens_per_second =
             parse_usize_env("VIDARAX_WEBRTC_MAX_OUTPUT_TOKENS_PER_SECOND", 128)? as u32;
+        // One ordered stream is decoded by one stateful decoder. Keep the env
+        // knob for compatibility but clamp above 1 at config load.
         let webrtc_decode_workers =
-            parse_usize_env("VIDARAX_WEBRTC_DECODE_WORKERS", 2)?.clamp(1, 64);
+            parse_usize_env("VIDARAX_WEBRTC_DECODE_WORKERS", 1)?.clamp(1, 64).min(1);
         // Analysis owns stream-order gate/loop state; more workers make one
         // shared stream's decisions nondeterministic.
         let webrtc_analysis_workers = parse_usize_env("VIDARAX_WEBRTC_ANALYSIS_WORKERS", 1)?
             .clamp(1, 64)
             .min(1);
+        // VLM keyframe analysis carries temporal/dedup state; do not split one
+        // stream across racing workers.
         let webrtc_vlm_workers =
-            parse_usize_env("VIDARAX_WEBRTC_VLM_WORKERS", 2)?.clamp(1, 64);
+            parse_usize_env("VIDARAX_WEBRTC_VLM_WORKERS", 1)?.clamp(1, 64).min(1);
         let distillation = parse_distillation_config()?;
         Ok(Self {
             bind_addr,
@@ -408,9 +412,9 @@ mod tests {
         std::env::remove_var("VIDARAX_WEBRTC_ANALYSIS_WORKERS");
         std::env::remove_var("VIDARAX_WEBRTC_VLM_WORKERS");
 
-        assert_eq!(cfg.webrtc_decode_workers, 64);
+        assert_eq!(cfg.webrtc_decode_workers, 1);
         assert_eq!(cfg.webrtc_analysis_workers, 1);
-        assert_eq!(cfg.webrtc_vlm_workers, 64);
+        assert_eq!(cfg.webrtc_vlm_workers, 1);
     }
 
     #[test]

@@ -89,10 +89,16 @@ pub struct PipelineMetrics {
     rtp_frames_received_total: AtomicU64,
     /// Video frames decoded successfully.
     frames_decoded_total: AtomicU64,
+    /// Decoded video frames shed by real-time decode freshness policy.
+    frames_dropped_total: AtomicU64,
+    /// ffmpeg YUV pending FIFO exceeded the backpressure sanity bound.
+    decode_pending_sanity_violations_total: AtomicU64,
     /// Keyframes forwarded from analysis workers to VLM workers.
     keyframes_total: AtomicU64,
     /// Keyframes dropped because the VLM queue was full.
     keyframes_dropped_total: AtomicU64,
+    /// Keyframe storage payloads dropped because the sink JPEG backlog is full.
+    sink_keyframes_dropped_total: AtomicU64,
     /// VLM inference calls dispatched.
     vlm_inferences_total: AtomicU64,
     /// Loop detection events emitted by analysis workers.
@@ -118,8 +124,11 @@ impl PipelineMetrics {
         Self {
             rtp_frames_received_total: AtomicU64::new(0),
             frames_decoded_total: AtomicU64::new(0),
+            frames_dropped_total: AtomicU64::new(0),
+            decode_pending_sanity_violations_total: AtomicU64::new(0),
             keyframes_total: AtomicU64::new(0),
             keyframes_dropped_total: AtomicU64::new(0),
+            sink_keyframes_dropped_total: AtomicU64::new(0),
             vlm_inferences_total: AtomicU64::new(0),
             loop_detected_total: AtomicU64::new(0),
             sessions_created_total: AtomicU64::new(0),
@@ -144,6 +153,33 @@ impl PipelineMetrics {
     }
 
     #[inline]
+    pub fn inc_frames_dropped(&self) {
+        self.frames_dropped_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_frames_dropped_by(&self, count: u64) {
+        self.frames_dropped_total.fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn frames_dropped_total(&self) -> u64 {
+        self.frames_dropped_total.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn inc_decode_pending_sanity_violations(&self) {
+        self.decode_pending_sanity_violations_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn decode_pending_sanity_violations_total(&self) -> u64 {
+        self.decode_pending_sanity_violations_total
+            .load(Ordering::Relaxed)
+    }
+
+    #[inline]
     pub fn inc_keyframes(&self) {
         self.keyframes_total.fetch_add(1, Ordering::Relaxed);
     }
@@ -152,6 +188,17 @@ impl PipelineMetrics {
     pub fn inc_keyframes_dropped(&self) {
         self.keyframes_dropped_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_sink_keyframes_dropped(&self) {
+        self.sink_keyframes_dropped_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn sink_keyframes_dropped_total(&self) -> u64 {
+        self.sink_keyframes_dropped_total.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -180,8 +227,13 @@ impl PipelineMetrics {
             .rtp_frames_received_total
             .load(Ordering::Relaxed);
         let decoded = self.frames_decoded_total.load(Ordering::Relaxed);
+        let dropped = self.frames_dropped_total.load(Ordering::Relaxed);
+        let pending_sanity = self
+            .decode_pending_sanity_violations_total
+            .load(Ordering::Relaxed);
         let kf = self.keyframes_total.load(Ordering::Relaxed);
         let kf_drop = self.keyframes_dropped_total.load(Ordering::Relaxed);
+        let sink_kf_drop = self.sink_keyframes_dropped_total.load(Ordering::Relaxed);
         let vlm = self.vlm_inferences_total.load(Ordering::Relaxed);
         let loops = self.loop_detected_total.load(Ordering::Relaxed);
         let sess_created = self.sessions_created_total.load(Ordering::Relaxed);
@@ -190,8 +242,11 @@ impl PipelineMetrics {
         let mut out = format!(
             "vidarax_pipeline_rtp_frames_received_total {rtp}\n\
              vidarax_pipeline_frames_decoded_total {decoded}\n\
+             vidarax_pipeline_frames_dropped_total {dropped}\n\
+             vidarax_pipeline_decode_pending_sanity_violations_total {pending_sanity}\n\
              vidarax_pipeline_keyframes_total {kf}\n\
              vidarax_pipeline_keyframes_dropped_total {kf_drop}\n\
+             vidarax_pipeline_sink_keyframes_dropped_total {sink_kf_drop}\n\
              vidarax_pipeline_vlm_inferences_total {vlm}\n\
              vidarax_pipeline_loop_detected_total {loops}\n\
              vidarax_pipeline_sessions_created_total {sess_created}\n\
@@ -239,6 +294,7 @@ mod tests {
         m.inc_rtp_received();
         m.inc_rtp_received();
         m.inc_frames_decoded();
+        m.inc_frames_dropped();
         m.inc_keyframes();
         m.inc_vlm_inferences();
         m.inc_sessions_created();
@@ -246,10 +302,12 @@ mod tests {
         let text = m.render_prometheus();
         assert!(text.contains("vidarax_pipeline_rtp_frames_received_total 2"));
         assert!(text.contains("vidarax_pipeline_frames_decoded_total 1"));
+        assert!(text.contains("vidarax_pipeline_frames_dropped_total 1"));
         assert!(text.contains("vidarax_pipeline_keyframes_total 1"));
         assert!(text.contains("vidarax_pipeline_vlm_inferences_total 1"));
         assert!(text.contains("vidarax_pipeline_sessions_created_total 1"));
         assert!(text.contains("vidarax_pipeline_keyframes_dropped_total 0"));
+        assert!(text.contains("vidarax_pipeline_sink_keyframes_dropped_total 0"));
     }
 
     #[test]

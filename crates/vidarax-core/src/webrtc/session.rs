@@ -25,7 +25,8 @@
 //!         .unwrap();
 //!
 //!     let (frame_tx, frame_rx) = kanal::bounded(128);
-//!     tokio::spawn(async move { session.run(frame_tx).await });
+//!     let metrics = std::sync::Arc::new(vidarax_core::metrics::PipelineMetrics::new());
+//!     tokio::spawn(async move { session.run(frame_tx, metrics).await });
 //!
 //!     // consume frames on another thread:
 //!     std::thread::spawn(move || {
@@ -47,7 +48,9 @@ use rustrtc::{
     media::{MediaKind, MediaSample, MediaStreamTrack},
     peer_connection::{PeerConnection, PeerConnectionEvent},
 };
+pub use rustrtc::peer_connection::PeerConnectionState;
 
+use crate::metrics::PipelineMetrics;
 use crate::webrtc::decode::VideoCodec;
 use crate::webrtc::recycle::{RecycledBytes, VecPool};
 
@@ -60,7 +63,7 @@ const ANNEX_B_START: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
 pub const RTP_FRAME_QUEUE_CAPACITY: usize = 128;
 
 pub fn rtp_nal_pool_slots(decode_workers: usize) -> usize {
-    RTP_FRAME_QUEUE_CAPACITY + decode_workers.max(1) + 1
+    RTP_FRAME_QUEUE_CAPACITY + crate::webrtc::workers::per_stream_decode_workers(decode_workers) + 1
 }
 
 // ---------------------------------------------------------------------------
@@ -113,11 +116,18 @@ pub struct WebRtcConfig {
     pub turn_servers: Vec<TurnServer>,
     /// Maximum VLM output tokens per second for this session (backpressure).
     pub max_output_tokens_per_second: u32,
-    /// Number of decode worker threads per session.
+    /// Requested decode worker threads per session.
+    ///
+    /// One ordered media stream must be decoded by exactly one stateful decoder.
+    /// Values above 1 are accepted for API compatibility but clamped at worker
+    /// spawn time; decode parallelism is across sessions, not within a stream.
     pub decode_workers: usize,
     /// Number of analysis worker threads per session.
     pub analysis_workers: usize,
-    /// Number of VLM worker threads per session.
+    /// Requested VLM worker threads per session.
+    ///
+    /// Keyframe analysis carries sequential dedup and temporal context, so
+    /// values above 1 are accepted for API compatibility but clamped per stream.
     pub vlm_workers: usize,
 }
 
@@ -127,9 +137,9 @@ impl Default for WebRtcConfig {
             stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
             turn_servers: Vec::new(),
             max_output_tokens_per_second: 128,
-            decode_workers: 2,
+            decode_workers: 1,
             analysis_workers: 1,
-            vlm_workers: 2,
+            vlm_workers: 1,
         }
     }
 }
@@ -156,6 +166,8 @@ pub struct WebRtcSession {
     /// Video codec negotiated from the SDP offer (H.264 or VP8).
     pub codec: VideoCodec,
     rtp_nal_pool_slots: usize,
+    #[cfg(any(test, debug_assertions))]
+    close_calls: AtomicU64,
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +175,21 @@ pub struct WebRtcSession {
 // ---------------------------------------------------------------------------
 
 impl WebRtcSession {
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn new_for_tests() -> Self {
+        Self {
+            pc: PeerConnection::new(Default::default()),
+            prompt: Arc::new(ArcSwap::from(Arc::new(Arc::from("")))),
+            guided_json: Arc::new(ArcSwapOption::from(None::<Arc<Arc<str>>>)),
+            max_output_tokens_per_second: 128,
+            codec: VideoCodec::H264,
+            rtp_nal_pool_slots: rtp_nal_pool_slots(1),
+            #[cfg(any(test, debug_assertions))]
+            close_calls: AtomicU64::new(0),
+        }
+    }
+
     /// Create a new session from a browser SDP offer.
     ///
     /// 1. Parses `offer_sdp` and applies it as the remote description.
@@ -245,6 +272,8 @@ impl WebRtcSession {
                 max_output_tokens_per_second: config.max_output_tokens_per_second,
                 codec,
                 rtp_nal_pool_slots: rtp_nal_pool_slots(config.decode_workers),
+                #[cfg(any(test, debug_assertions))]
+                close_calls: AtomicU64::new(0),
             },
             answer_sdp,
         ))
@@ -285,19 +314,24 @@ impl WebRtcSession {
     ///
     /// # Notes on blocking
     ///
-    /// `kanal::Sender::send` is synchronous.  For a bounded channel that is
-    /// not full the call returns essentially instantly.  When the channel is
-    /// full the call blocks briefly — this provides natural backpressure.
+    /// RTP ingress feeds a bounded, lossless, ordered queue into the single
+    /// decoder. When decode/analysis is slower than ingress, the Tokio task
+    /// awaits channel capacity and yields the runtime worker; sustained
+    /// overload backpressures the WebRTC media layer, where jitter buffering,
+    /// NACKs, and keyframe requests can handle real-time RTP loss without
+    /// corrupting the stateful decoder.
     ///
     /// # Example
     ///
     /// ```ignore
     /// let (tx, rx) = kanal::bounded(128);
-    /// tokio::spawn(session.run(tx));
+    /// let metrics = std::sync::Arc::new(vidarax_core::metrics::PipelineMetrics::new());
+    /// tokio::spawn(session.run(tx, metrics));
     /// ```
     pub fn run(
         &self,
         frame_tx: kanal::Sender<RtpFrame>,
+        metrics: Arc<PipelineMetrics>,
     ) -> impl std::future::Future<Output = ()> + Send + 'static {
         // Clone the PeerConnection so the returned future owns everything it
         // needs and has no lifetime dependency on `self`.
@@ -322,6 +356,7 @@ impl WebRtcSession {
 
                         let tx = frame_tx.clone();
                         let seq = Arc::clone(&seq_counter);
+                        let metrics = Arc::clone(&metrics);
 
                         tokio::spawn(async move {
                             let nals_pool = VecPool::with_slots(rtp_nal_pool_slots);
@@ -342,8 +377,9 @@ impl WebRtcSession {
                                             codec,
                                         };
 
-                                        if tx.send(rtp_frame).is_err() {
-                                            // Receiver dropped — stop this track loop.
+                                        if !enqueue_rtp_frame_lossless(&tx, rtp_frame, &metrics)
+                                            .await
+                                        {
                                             break;
                                         }
                                     }
@@ -398,15 +434,40 @@ impl WebRtcSession {
         Arc::clone(&self.guided_json)
     }
 
+    /// Subscribe to rustrtc peer state changes for lifecycle cleanup.
+    pub fn subscribe_peer_state(&self) -> tokio::sync::watch::Receiver<PeerConnectionState> {
+        self.pc.subscribe_peer_state()
+    }
+
+    /// Close the peer connection while shared session handles may still exist.
+    pub fn close(&self) {
+        #[cfg(any(test, debug_assertions))]
+        self.close_calls.fetch_add(1, Ordering::Relaxed);
+        self.pc.close();
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn close_call_count_for_tests(&self) -> u64 {
+        self.close_calls.load(Ordering::Relaxed)
+    }
+
     /// Close the peer connection.
     ///
     /// After this call any active `run` task will exit on its next poll cycle
     /// as the underlying `PeerConnection` cleans up.
     pub fn terminate(self) {
-        // Dropping self drops our PeerConnection handle; rustrtc closes the
-        // connection when all handles are released.
+        self.close();
         drop(self);
     }
+}
+
+async fn enqueue_rtp_frame_lossless(
+    tx: &kanal::Sender<RtpFrame>,
+    frame: RtpFrame,
+    _metrics: &PipelineMetrics,
+) -> bool {
+    tx.as_async().send(frame).await.is_ok()
 }
 
 fn frame_payload_to_nals(codec: VideoCodec, payload: &[u8], pool: &VecPool) -> RecycledBytes {
@@ -433,8 +494,8 @@ fn frame_payload_to_nals(codec: VideoCodec, payload: &[u8], pool: &VecPool) -> R
 #[cfg(test)]
 mod tests {
     use super::{
-        frame_payload_to_nals, rtp_nal_pool_slots, RtpFrame, WebRtcConfig, WebRtcSession,
-        RTP_FRAME_QUEUE_CAPACITY,
+        enqueue_rtp_frame_lossless, frame_payload_to_nals, rtp_nal_pool_slots, RtpFrame,
+        WebRtcConfig, WebRtcSession, RTP_FRAME_QUEUE_CAPACITY,
     };
     use crate::webrtc::decode::VideoCodec;
     use crate::webrtc::recycle::{RecycledBytes, VecPool};
@@ -442,7 +503,7 @@ mod tests {
 
     #[test]
     fn rtp_nal_pool_covers_queue_workers_and_blocked_sender() {
-        assert_eq!(rtp_nal_pool_slots(2), RTP_FRAME_QUEUE_CAPACITY + 2 + 1);
+        assert_eq!(rtp_nal_pool_slots(2), RTP_FRAME_QUEUE_CAPACITY + 1 + 1);
         assert_eq!(rtp_nal_pool_slots(0), RTP_FRAME_QUEUE_CAPACITY + 1 + 1);
     }
 
@@ -490,9 +551,9 @@ mod tests {
         assert_eq!(cfg.stun_servers, vec!["stun:stun.l.google.com:19302"]);
         assert!(cfg.turn_servers.is_empty());
         assert_eq!(cfg.max_output_tokens_per_second, 128);
-        assert_eq!(cfg.decode_workers, 2);
+        assert_eq!(cfg.decode_workers, 1);
         assert_eq!(cfg.analysis_workers, 1);
-        assert_eq!(cfg.vlm_workers, 2);
+        assert_eq!(cfg.vlm_workers, 1);
     }
 
     #[test]
@@ -545,6 +606,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_rtp_queue_backpressures_without_dropping_or_blocking_tokio() {
+        let (tx, rx) = kanal::bounded::<RtpFrame>(1);
+        let metrics = Arc::new(crate::metrics::PipelineMetrics::new());
+
+        assert!(enqueue_rtp_frame_lossless(
+            &tx,
+            RtpFrame {
+                nals: vec![0x30].into(),
+                pts_ms: 0,
+                seq: 0,
+                codec: VideoCodec::Vp8,
+            },
+            &metrics,
+        )
+        .await);
+
+        let tx_for_task = tx.clone();
+        let metrics_for_task = Arc::clone(&metrics);
+        let mut blocked_send = tokio::spawn(async move {
+            enqueue_rtp_frame_lossless(
+                &tx_for_task,
+                RtpFrame {
+                    nals: vec![0x31].into(),
+                    pts_ms: 33,
+                    seq: 1,
+                    codec: VideoCodec::Vp8,
+                },
+                &metrics_for_task,
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut blocked_send)
+                .await
+                .is_err()
+        );
+        assert_eq!(metrics.frames_dropped_total(), 0);
+
+        let retained = rx.try_recv().unwrap().unwrap();
+        assert_eq!(retained.seq, 0);
+        let sent = blocked_send.await.unwrap();
+        assert!(sent);
+        let second = rx.try_recv().unwrap().unwrap();
+        assert_eq!(second.seq, 1);
+        assert!(rx.try_recv().unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn prompt_and_guided_json_read_latest_updates() {
         let session = WebRtcSession {
             pc: rustrtc::peer_connection::PeerConnection::new(Default::default()),
@@ -553,6 +664,7 @@ mod tests {
             max_output_tokens_per_second: 128,
             codec: VideoCodec::H264,
             rtp_nal_pool_slots: super::rtp_nal_pool_slots(2),
+            close_calls: std::sync::atomic::AtomicU64::new(0),
         };
 
         session.update_prompt("describe safety events".to_string());
