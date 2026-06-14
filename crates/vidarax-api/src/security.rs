@@ -560,7 +560,9 @@ mod tests {
 
         assert!(limiter.allow(&tenant_a));
         assert!(!limiter.allow(&tenant_b));
-        thread::sleep(Duration::from_millis(1100));
+        // Sleep well past IDLE_TENANT_RETENTION (1s) so the eviction is not
+        // racing the wall clock on a loaded CI machine.
+        thread::sleep(IDLE_TENANT_RETENTION + Duration::from_millis(500));
         assert!(limiter.allow(&tenant_b));
         assert_eq!(limiter.tracked_tenants(), 1);
     }
