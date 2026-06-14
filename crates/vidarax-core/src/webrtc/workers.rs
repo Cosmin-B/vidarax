@@ -24,8 +24,9 @@
 //! indefinitely; they are called from worker threads that must keep up with
 //! the frame rate.
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwapOption;
 use base64::Engine as _;
 
 use crate::dedup::DedupFilter;
@@ -409,7 +410,7 @@ where
     pub metrics: Arc<PipelineMetrics>,
     pub session_span: tracing::Span,
     pub max_output_tokens_per_second: u32,
-    pub guided_json: Arc<RwLock<Option<Arc<str>>>>,
+    pub guided_json: Arc<ArcSwapOption<Arc<str>>>,
     pub training_store: Option<Arc<Mutex<TrainingStore>>>,
     pub distillation: DistillationConfig,
 }
@@ -650,10 +651,8 @@ where
                         hit
                     } else {
                         // Snapshot the current guided_json schema once per inference.
-                        let current_guided_json: Option<Arc<str>> = guided_json
-                            .read()
-                            .ok()
-                            .and_then(|g| g.clone());
+                        let current_guided_json: Option<Arc<str>> =
+                            guided_json.load_full().map(|schema| Arc::clone(&*schema));
                         let first_max_tokens = if current_guided_json.is_some() { 1024 } else { 128 };
                         let prompt_arc: Arc<str> = Arc::from(prompt_str.as_str());
                         let first_request = InferenceRequest {

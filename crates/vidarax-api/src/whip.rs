@@ -61,7 +61,7 @@ impl InferenceProvider for NullInferenceProvider {
     fn infer(&self, _request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
         Ok(InferenceResult {
             provider: ProviderKind::Vllm,
-            model: "null",
+            model: std::sync::Arc::from("null"),
             output_text: "(no inference provider configured)".to_string(),
             fallback_used: false,
             finish_reason: Some("stop".to_string()),

@@ -26,9 +26,10 @@
 //! `delay_seconds` (wall-clock) prevents bursting.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
+use arc_swap::ArcSwapOption;
 use base64::Engine as _;
 
 use crate::gate::FrameSignal;
@@ -305,7 +306,7 @@ pub fn spawn_clip_vlm_workers<I>(
     // Shared guided-JSON schema handle.  When the inner `Option` is `Some`,
     // the schema is passed to the first-pass VLM request and `max_tokens`
     // is raised to 1024 to accommodate structured output.
-    guided_json: Arc<RwLock<Option<Arc<str>>>>,
+    guided_json: Arc<ArcSwapOption<Arc<str>>>,
 ) where
     I: InferenceProvider + 'static,
 {
@@ -342,10 +343,8 @@ pub fn spawn_clip_vlm_workers<I>(
                         .collect();
 
                     // Snapshot the current guided_json schema once per inference.
-                    let current_guided_json: Option<Arc<str>> = guided_json
-                        .read()
-                        .ok()
-                        .and_then(|g| g.clone());
+                    let current_guided_json: Option<Arc<str>> =
+                        guided_json.load_full().map(|schema| Arc::clone(&*schema));
                     let first_max_tokens = if current_guided_json.is_some() { 1024 } else { 256 };
 
                     let first_request = InferenceRequest {

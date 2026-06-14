@@ -89,7 +89,7 @@ pub struct InferenceVideo {
 #[derive(Debug, Clone)]
 pub struct InferenceResult {
     pub provider: ProviderKind,
-    pub model: &'static str,
+    pub model: Arc<str>,
     pub output_text: String,
     pub fallback_used: bool,
     pub finish_reason: Option<String>,
@@ -209,7 +209,7 @@ impl<T: Transport> InferenceProvider for OpenAiCompatProvider<T> {
 
         Ok(InferenceResult {
             provider: self.kind,
-            model,
+            model: Arc::from(model),
             output_text,
             fallback_used: false,
             finish_reason,
@@ -489,7 +489,7 @@ mod tests {
     fn normalizes_model_alias_before_call() {
         let provider = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("ok")), ProviderKind::Vllm);
         let result = provider.infer(&request()).expect("inference");
-        assert_eq!(result.model, "openbmb/MiniCPM-V-4_5");
+        assert_eq!(&*result.model, "openbmb/MiniCPM-V-4_5");
         assert_eq!(result.output_text, "ok");
     }
 
