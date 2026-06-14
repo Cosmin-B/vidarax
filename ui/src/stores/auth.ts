@@ -1,21 +1,22 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
+import { STORAGE_KEYS, UI_DEFAULTS } from '@/lib/config'
 
 export const useAuthStore = defineStore('auth', () => {
-  const apiKey = ref<string>(localStorage.getItem('vidarax_api_key') ?? '')
-  const spacetimeToken = ref<string>(localStorage.getItem('spacetime_token') ?? '')
+  const apiKey = ref<string>(localStorage.getItem(STORAGE_KEYS.apiKey) ?? '')
+  const spacetimeToken = ref<string>(localStorage.getItem(STORAGE_KEYS.spacetimeToken) ?? '')
   const apiEndpoint = ref<string>(
-    localStorage.getItem('vidarax_endpoint') ?? 'http://localhost:8080'
+    localStorage.getItem(STORAGE_KEYS.apiEndpoint) ?? UI_DEFAULTS.apiEndpoint
   )
   const spacetimeEndpoint = ref<string>(
-    localStorage.getItem('vidarax_spacetime_endpoint') ?? 'http://localhost:3000'
+    localStorage.getItem(STORAGE_KEYS.spacetimeEndpoint) ?? UI_DEFAULTS.spacetimeEndpoint
   )
 
   const isConfigured = computed(() => apiEndpoint.value.length > 0)
 
   function setApiKey(key: string) {
     apiKey.value = key
-    localStorage.setItem('vidarax_api_key', key)
+    localStorage.setItem(STORAGE_KEYS.apiKey, key)
   }
 
   function setApiEndpoint(url: string) {
@@ -24,7 +25,7 @@ export const useAuthStore = defineStore('auth', () => {
       throw new Error('Only http and https protocols are allowed')
     }
     apiEndpoint.value = url
-    localStorage.setItem('vidarax_endpoint', url)
+    localStorage.setItem(STORAGE_KEYS.apiEndpoint, url)
   }
 
   function setSpacetimeEndpoint(url: string) {
@@ -33,19 +34,19 @@ export const useAuthStore = defineStore('auth', () => {
       throw new Error('Only http and https protocols are allowed')
     }
     spacetimeEndpoint.value = url
-    localStorage.setItem('vidarax_spacetime_endpoint', url)
+    localStorage.setItem(STORAGE_KEYS.spacetimeEndpoint, url)
   }
 
   function setSpacetimeToken(token: string) {
     spacetimeToken.value = token
-    localStorage.setItem('spacetime_token', token)
+    localStorage.setItem(STORAGE_KEYS.spacetimeToken, token)
   }
 
   function clearAuth() {
     apiKey.value = ''
     spacetimeToken.value = ''
-    localStorage.removeItem('vidarax_api_key')
-    localStorage.removeItem('spacetime_token')
+    localStorage.removeItem(STORAGE_KEYS.apiKey)
+    localStorage.removeItem(STORAGE_KEYS.spacetimeToken)
   }
 
   function defaultHeaders(): Record<string, string> {

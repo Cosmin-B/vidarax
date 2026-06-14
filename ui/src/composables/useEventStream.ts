@@ -15,6 +15,7 @@
 import { ref, onUnmounted } from 'vue'
 import { useEventsStore } from '@/stores/events'
 import { useAuthStore } from '@/stores/auth'
+import { buildSpacetimeSubscribeUrl, SPACETIME_PROTOCOLS, UI_DEFAULTS } from '@/lib/config'
 import { logger } from '@/lib/logger'
 import type { AgentEvent, KeyframeEntry } from '@/stores/events'
 
@@ -57,21 +58,12 @@ type ServerMessage =
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Build the SpacetimeDB WebSocket URL. */
-function buildWsUrl(baseUrl: string, moduleName: string): string {
-  // Normalise trailing slash + http → ws scheme
-  const url = new URL(baseUrl.replace(/\/$/, ''))
-  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
-  // SpacetimeDB v1 subscribe endpoint
-  url.pathname = `/v1/database/${moduleName}/subscribe`
-  return url.toString()
-}
-
 /** Returns true when the endpoint is the default localhost value (not user-configured). */
 function isDefaultLocalhostEndpoint(endpoint: string): boolean {
   try {
     const url = new URL(endpoint)
-    return (url.hostname === 'localhost' || url.hostname === '127.0.0.1') && url.port === '3000'
+    const defaultUrl = new URL(UI_DEFAULTS.spacetimeEndpoint)
+    return (url.hostname === 'localhost' || url.hostname === '127.0.0.1') && url.port === defaultUrl.port
   } catch {
     return false
   }
@@ -122,9 +114,6 @@ function parseKeyframeEntry(row: unknown): KeyframeEntry | null {
     timestamp_ms: Number(r.timestamp_ms ?? 0),
   }
 }
-
-// ── Module name used in the SpacetimeDB module ────────────────────────────────
-const MODULE_NAME = 'vidarax'
 
 // ── Reconnect config ──────────────────────────────────────────────────────────
 const MAX_RECONNECT_ATTEMPTS = 3
@@ -257,8 +246,8 @@ export function useEventStream() {
       ws = null
     }
 
-    const wsUrl = buildWsUrl(authStore.spacetimeEndpoint, MODULE_NAME)
-    const protocols: string[] = ['v1.json.spacetimedb']
+    const wsUrl = buildSpacetimeSubscribeUrl(authStore.spacetimeEndpoint)
+    const protocols = [...SPACETIME_PROTOCOLS]
 
     try {
       ws = new WebSocket(wsUrl, protocols)

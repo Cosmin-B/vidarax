@@ -6,6 +6,7 @@ import { useEventsStore } from '@/stores/events'
 import { useEventStream } from '@/composables/useEventStream'
 import { useAuthStore } from '@/stores/auth'
 import { api, ApiError } from '@/lib/api'
+import { ls, lsBool, lsNum, STORAGE_KEYS, UI_DEFAULTS } from '@/lib/config'
 import type { RunStatus } from '@/stores/runs'
 import { ChevronLeft, UploadCloud, CheckCircle, AlertCircle, Upload, Zap } from 'lucide-vue-next'
 import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
@@ -28,9 +29,9 @@ const uploadError = ref<string | null>(null)
 const DEFAULT_ANALYSIS_PROMPT = 'Describe what is happening in this video frame.'
 
 // Config for the run
-const selectedModel = ref(localStorage.getItem('vidarax_default_model') ?? 'Qwen/Qwen3-VL-4B-Instruct')
+const selectedModel = ref(ls(STORAGE_KEYS.defaultModel, UI_DEFAULTS.defaultModel))
 const prompt = ref('')
-const semanticInference = ref(localStorage.getItem('vidarax_semantic_inference') !== 'false')
+const semanticInference = ref(lsBool(STORAGE_KEYS.semanticInference, UI_DEFAULTS.semanticInference))
 
 // Created run
 const createdRunId = ref<string | null>(null)
@@ -202,8 +203,8 @@ async function startUpload(): Promise<void> {
     uploadState.value = 'creating'
     uploadProgress.value = 0
 
-    const fps = Number(localStorage.getItem('vidarax_fps') ?? '5')
-    const chunkSize = Number(localStorage.getItem('vidarax_chunk_size') ?? '30')
+    const fps = lsNum(STORAGE_KEYS.fps, UI_DEFAULTS.fps)
+    const chunkSize = lsNum(STORAGE_KEYS.chunkSize, UI_DEFAULTS.chunkSize)
 
     const effectivePrompt = prompt.value.trim() || DEFAULT_ANALYSIS_PROMPT
 

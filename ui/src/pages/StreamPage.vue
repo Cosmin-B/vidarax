@@ -103,12 +103,12 @@ const streamVizTotal      = computed(() => Math.max(streamVizProcessed.value + s
 const streamVizChunkStart = computed(() => Math.max(0, streamVizProcessed.value - 30))
 const streamVizChunkEnd   = computed(() => streamVizProcessed.value)
 const streamVizEvents     = computed(() => eventsStore.activeEvents)
-const streamVizVlmFrames  = computed(() =>
-  streamVizEvents.value.filter(e => e.event_type === 'vlm_description').map(e => e.frame_index)
-)
-const streamVizKfIndices  = computed(() =>
-  streamVizEvents.value.filter(e => e.event_type === 'keyframe').map(e => e.frame_index)
-)
+const streamVizVlmFrames  = ref<number[]>([])
+const streamVizKfIndices  = ref<number[]>([])
+const seenVizVlmFrames = new Set<number>()
+const seenVizKfFrames = new Set<number>()
+const seenVlmResultEvents = new Set<string>()
+let processedEventCount = 0
 
 // ── Export code snippet ───────────────────────────────────────────────────────
 
@@ -160,6 +160,7 @@ async function handleStop() {
   vlmResults.value = []
   resultCounter.value = 0
   livePrompt.value = ''
+  resetEventDerivedState()
 }
 
 async function patchPrompt(value: string) {
@@ -208,37 +209,61 @@ async function fetchModels() {
   }
 }
 
-// ── Collect VLM results from events ──────────────────────────────────────────
+// ── Collect visualization frames + VLM results from events ───────────────────
+
+function resetEventDerivedState(): void {
+  streamVizVlmFrames.value = []
+  streamVizKfIndices.value = []
+  seenVizVlmFrames.clear()
+  seenVizKfFrames.clear()
+  seenVlmResultEvents.clear()
+  processedEventCount = 0
+}
+
+function eventResultKey(event: { frame_index: number; timestamp_ms: number; pts_ms: number; event_type: string }): string {
+  return `${event.event_type}:${event.frame_index}:${event.pts_ms}:${event.timestamp_ms}`
+}
+
+function eventLatencyMs(timestampMs: number): number {
+  return timestampMs > 1_577_836_800_000 ? Math.max(0, Date.now() - timestampMs) : 0
+}
 
 watch(
-  () => eventsStore.activeEvents.length,
+  () => [streamStore.activeSession?.runId, eventsStore.activeEvents.length] as const,
   () => {
     const events = eventsStore.activeEvents
-    if (events.length === 0) return
+    if (events.length < processedEventCount) resetEventDerivedState()
 
-    const latest = events[events.length - 1]
-    if (!latest || latest.event_type !== 'vlm_description') return
+    const nextEvents = events.slice(processedEventCount)
+    processedEventCount = events.length
 
-    // Avoid duplicates by checking frame_index + timestamp
-    const ts = formatTimestamp(latest.timestamp_ms)
-    const existing = vlmResults.value.find(
-      r => r.id === latest.frame_index && r.timestamp === ts
-    )
-    if (existing) return
+    for (const event of nextEvents) {
+      if (event.event_type === 'vlm_description' && !seenVizVlmFrames.has(event.frame_index)) {
+        seenVizVlmFrames.add(event.frame_index)
+        streamVizVlmFrames.value = [...streamVizVlmFrames.value, event.frame_index]
+      } else if (event.event_type === 'keyframe' && !seenVizKfFrames.has(event.frame_index)) {
+        seenVizKfFrames.add(event.frame_index)
+        streamVizKfIndices.value = [...streamVizKfIndices.value, event.frame_index]
+      }
 
-    const result: VlmResult = {
-      id: resultCounter.value++,
-      timestamp: ts,
-      latencyMs: Math.round(latest.pts_ms % 1000) + Math.floor(Math.random() * 80) + 100,
-      text: latest.description,
-      isJson: outputMode.value === 'json',
-    }
+      if (event.event_type !== 'vlm_description') continue
 
-    vlmResults.value.unshift(result) // newest first
+      const key = eventResultKey(event)
+      if (seenVlmResultEvents.has(key)) continue
+      seenVlmResultEvents.add(key)
 
-    // Cap at 200 results
-    if (vlmResults.value.length > 200) {
-      vlmResults.value = vlmResults.value.slice(0, 200)
+      const result: VlmResult = {
+        id: resultCounter.value++,
+        timestamp: formatTimestamp(event.timestamp_ms),
+        latencyMs: eventLatencyMs(event.timestamp_ms),
+        text: event.description,
+        isJson: outputMode.value === 'json',
+      }
+
+      vlmResults.value.unshift(result)
+      if (vlmResults.value.length > 200) {
+        vlmResults.value = vlmResults.value.slice(0, 200)
+      }
     }
   }
 )
@@ -257,6 +282,7 @@ watch(localStream, (stream) => {
 watch(
   () => streamStore.activeSession?.runId,
   (runId) => {
+    resetEventDerivedState()
     if (runId) connectEvents(runId)
     else disconnectEvents()
   },

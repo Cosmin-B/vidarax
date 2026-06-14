@@ -2,46 +2,11 @@
 import { ref, reactive, onMounted } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { api } from '@/lib/api'
+import { buildSpacetimeSubscribeUrl, ls, lsBool, lsNum, SPACETIME_PROTOCOLS, STORAGE_KEYS, UI_DEFAULTS } from '@/lib/config'
 import { Check, ChevronDown, RefreshCw } from 'lucide-vue-next'
 import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
 
 const authStore = useAuthStore()
-
-// ── Defaults ──────────────────────────────────────────────────────────────────
-
-const DEFAULTS = {
-  apiEndpoint: 'http://localhost:8080',
-  apiKey: '',
-  spacetimeEndpoint: 'http://localhost:3000',
-  turnUrl: '',
-  fps: 5,
-  chunkSize: 30,
-  tokenRateCap: 0,
-  clipMode: false,
-  semanticInference: true,
-  semanticFramesPerChunk: 4,
-  sceneCutHammingThreshold: 10,
-  lumaShiftThreshold: 0.15,
-  loopDetection: true,
-  loopRepeatTrigger: 3,
-  gpuDecode: 'auto',
-  vlmWorkers: 4,
-  defaultModel: 'Qwen/Qwen3-VL-4B-Instruct',
-  firstPassModel: 'Qwen/Qwen3-VL-2B-Instruct',
-  secondPassModel: 'Qwen/Qwen3-VL-4B-Instruct',
-} as const
-
-function ls(key: string, fallback: string): string {
-  return localStorage.getItem(key) ?? fallback
-}
-function lsNum(key: string, fallback: number): number {
-  const v = localStorage.getItem(key)
-  return v !== null ? Number(v) : fallback
-}
-function lsBool(key: string, fallback: boolean): boolean {
-  const v = localStorage.getItem(key)
-  return v !== null ? v !== 'false' : fallback
-}
 
 // ── Reactive form ─────────────────────────────────────────────────────────────
 
@@ -50,26 +15,26 @@ const form = reactive({
   apiEndpoint:       authStore.apiEndpoint,
   apiKey:            authStore.apiKey,
   spacetimeEndpoint: authStore.spacetimeEndpoint,
-  turnUrl:           ls('vidarax_turn_url', DEFAULTS.turnUrl),
+  turnUrl:           ls(STORAGE_KEYS.turnUrl, UI_DEFAULTS.turnUrl),
   // Models
-  defaultModel:      ls('vidarax_default_model',    DEFAULTS.defaultModel),
-  firstPassModel:    ls('vidarax_first_pass_model',  DEFAULTS.firstPassModel),
-  secondPassModel:   ls('vidarax_second_pass_model', DEFAULTS.secondPassModel),
+  defaultModel:      ls(STORAGE_KEYS.defaultModel,    UI_DEFAULTS.defaultModel),
+  firstPassModel:    ls(STORAGE_KEYS.firstPassModel,  UI_DEFAULTS.firstPassModel),
+  secondPassModel:   ls(STORAGE_KEYS.secondPassModel, UI_DEFAULTS.secondPassModel),
   // Stream
-  fps:                    lsNum('vidarax_fps', DEFAULTS.fps),
-  chunkSize:              lsNum('vidarax_chunk_size', DEFAULTS.chunkSize),
-  tokenRateCap:           lsNum('vidarax_token_rate_cap', DEFAULTS.tokenRateCap),
-  clipMode:               lsBool('vidarax_clip_mode', DEFAULTS.clipMode),
-  semanticInference:      lsBool('vidarax_semantic_inference', DEFAULTS.semanticInference),
-  semanticFramesPerChunk: lsNum('vidarax_semantic_frames_per_chunk', DEFAULTS.semanticFramesPerChunk),
+  fps:                    lsNum(STORAGE_KEYS.fps, UI_DEFAULTS.fps),
+  chunkSize:              lsNum(STORAGE_KEYS.chunkSize, UI_DEFAULTS.chunkSize),
+  tokenRateCap:           lsNum(STORAGE_KEYS.tokenRateCap, UI_DEFAULTS.tokenRateCap),
+  clipMode:               lsBool(STORAGE_KEYS.clipMode, UI_DEFAULTS.clipMode),
+  semanticInference:      lsBool(STORAGE_KEYS.semanticInference, UI_DEFAULTS.semanticInference),
+  semanticFramesPerChunk: lsNum(STORAGE_KEYS.semanticFramesPerChunk, UI_DEFAULTS.semanticFramesPerChunk),
   // Gate engine
-  sceneCutHammingThreshold: lsNum('vidarax_scene_cut_hamming_threshold', DEFAULTS.sceneCutHammingThreshold),
-  lumaShiftThreshold:       lsNum('vidarax_luma_shift_threshold', DEFAULTS.lumaShiftThreshold),
-  loopDetection:            lsBool('vidarax_loop_detection', DEFAULTS.loopDetection),
-  loopRepeatTrigger:        lsNum('vidarax_loop_repeat_trigger', DEFAULTS.loopRepeatTrigger),
+  sceneCutHammingThreshold: lsNum(STORAGE_KEYS.sceneCutHammingThreshold, UI_DEFAULTS.sceneCutHammingThreshold),
+  lumaShiftThreshold:       lsNum(STORAGE_KEYS.lumaShiftThreshold, UI_DEFAULTS.lumaShiftThreshold),
+  loopDetection:            lsBool(STORAGE_KEYS.loopDetection, UI_DEFAULTS.loopDetection),
+  loopRepeatTrigger:        lsNum(STORAGE_KEYS.loopRepeatTrigger, UI_DEFAULTS.loopRepeatTrigger),
   // Advanced
-  gpuDecode:  ls('vidarax_gpu_decode', DEFAULTS.gpuDecode),
-  vlmWorkers: lsNum('vidarax_vlm_workers', DEFAULTS.vlmWorkers),
+  gpuDecode:  ls(STORAGE_KEYS.gpuDecode, UI_DEFAULTS.gpuDecode),
+  vlmWorkers: lsNum(STORAGE_KEYS.vlmWorkers, UI_DEFAULTS.vlmWorkers),
 })
 
 // ── Models fetched from API ───────────────────────────────────────────────────
@@ -137,10 +102,7 @@ async function pingApi(): Promise<void> {
 
 function pingSpacetime(): Promise<void> {
   return new Promise((resolve, reject) => {
-    const url = new URL(form.spacetimeEndpoint.replace(/\/$/, ''))
-    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
-    url.pathname = '/v1/database/vidarax/subscribe'
-    const ws = new WebSocket(url.toString(), ['v1.json.spacetimedb'])
+    const ws = new WebSocket(buildSpacetimeSubscribeUrl(form.spacetimeEndpoint), [...SPACETIME_PROTOCOLS])
     const t = setTimeout(() => { ws.close(); reject(new Error('SpacetimeDB timeout')) }, 4000)
     ws.onopen = () => { clearTimeout(t); ws.close(1000); resolve() }
     ws.onerror = () => { clearTimeout(t); reject(new Error('SpacetimeDB unreachable')) }
@@ -156,30 +118,30 @@ function saveSettings(): void {
   authStore.setApiEndpoint(form.apiEndpoint)
   authStore.setApiKey(form.apiKey)
   authStore.setSpacetimeEndpoint(form.spacetimeEndpoint)
-  localStorage.setItem('vidarax_turn_url', form.turnUrl)
+  localStorage.setItem(STORAGE_KEYS.turnUrl, form.turnUrl)
 
   // Models
-  localStorage.setItem('vidarax_default_model',    form.defaultModel)
-  localStorage.setItem('vidarax_first_pass_model',  form.firstPassModel)
-  localStorage.setItem('vidarax_second_pass_model', form.secondPassModel)
+  localStorage.setItem(STORAGE_KEYS.defaultModel,    form.defaultModel)
+  localStorage.setItem(STORAGE_KEYS.firstPassModel,  form.firstPassModel)
+  localStorage.setItem(STORAGE_KEYS.secondPassModel, form.secondPassModel)
 
   // Stream
-  localStorage.setItem('vidarax_fps',                      String(form.fps))
-  localStorage.setItem('vidarax_chunk_size',               String(form.chunkSize))
-  localStorage.setItem('vidarax_token_rate_cap',           String(form.tokenRateCap))
-  localStorage.setItem('vidarax_clip_mode',                String(form.clipMode))
-  localStorage.setItem('vidarax_semantic_inference',       String(form.semanticInference))
-  localStorage.setItem('vidarax_semantic_frames_per_chunk', String(form.semanticFramesPerChunk))
+  localStorage.setItem(STORAGE_KEYS.fps,                      String(form.fps))
+  localStorage.setItem(STORAGE_KEYS.chunkSize,                String(form.chunkSize))
+  localStorage.setItem(STORAGE_KEYS.tokenRateCap,             String(form.tokenRateCap))
+  localStorage.setItem(STORAGE_KEYS.clipMode,                 String(form.clipMode))
+  localStorage.setItem(STORAGE_KEYS.semanticInference,        String(form.semanticInference))
+  localStorage.setItem(STORAGE_KEYS.semanticFramesPerChunk,   String(form.semanticFramesPerChunk))
 
   // Gate engine
-  localStorage.setItem('vidarax_scene_cut_hamming_threshold', String(form.sceneCutHammingThreshold))
-  localStorage.setItem('vidarax_luma_shift_threshold',        String(form.lumaShiftThreshold))
-  localStorage.setItem('vidarax_loop_detection',              String(form.loopDetection))
-  localStorage.setItem('vidarax_loop_repeat_trigger',         String(form.loopRepeatTrigger))
+  localStorage.setItem(STORAGE_KEYS.sceneCutHammingThreshold, String(form.sceneCutHammingThreshold))
+  localStorage.setItem(STORAGE_KEYS.lumaShiftThreshold,       String(form.lumaShiftThreshold))
+  localStorage.setItem(STORAGE_KEYS.loopDetection,            String(form.loopDetection))
+  localStorage.setItem(STORAGE_KEYS.loopRepeatTrigger,        String(form.loopRepeatTrigger))
 
   // Advanced
-  localStorage.setItem('vidarax_gpu_decode',   form.gpuDecode)
-  localStorage.setItem('vidarax_vlm_workers',  String(form.vlmWorkers))
+  localStorage.setItem(STORAGE_KEYS.gpuDecode,  form.gpuDecode)
+  localStorage.setItem(STORAGE_KEYS.vlmWorkers, String(form.vlmWorkers))
 
   saved.value = true
   setTimeout(() => { saved.value = false }, 2000)
@@ -187,25 +149,25 @@ function saveSettings(): void {
 
 function resetToDefaults(): void {
   Object.assign(form, {
-    apiEndpoint:               DEFAULTS.apiEndpoint,
-    apiKey:                    DEFAULTS.apiKey,
-    spacetimeEndpoint:         DEFAULTS.spacetimeEndpoint,
-    turnUrl:                   DEFAULTS.turnUrl,
-    defaultModel:              DEFAULTS.defaultModel,
-    firstPassModel:            DEFAULTS.firstPassModel,
-    secondPassModel:           DEFAULTS.secondPassModel,
-    fps:                       DEFAULTS.fps,
-    chunkSize:                 DEFAULTS.chunkSize,
-    tokenRateCap:              DEFAULTS.tokenRateCap,
-    clipMode:                  DEFAULTS.clipMode,
-    semanticInference:         DEFAULTS.semanticInference,
-    semanticFramesPerChunk:    DEFAULTS.semanticFramesPerChunk,
-    sceneCutHammingThreshold:  DEFAULTS.sceneCutHammingThreshold,
-    lumaShiftThreshold:        DEFAULTS.lumaShiftThreshold,
-    loopDetection:             DEFAULTS.loopDetection,
-    loopRepeatTrigger:         DEFAULTS.loopRepeatTrigger,
-    gpuDecode:                 DEFAULTS.gpuDecode,
-    vlmWorkers:                DEFAULTS.vlmWorkers,
+    apiEndpoint:               UI_DEFAULTS.apiEndpoint,
+    apiKey:                    UI_DEFAULTS.apiKey,
+    spacetimeEndpoint:         UI_DEFAULTS.spacetimeEndpoint,
+    turnUrl:                   UI_DEFAULTS.turnUrl,
+    defaultModel:              UI_DEFAULTS.defaultModel,
+    firstPassModel:            UI_DEFAULTS.firstPassModel,
+    secondPassModel:           UI_DEFAULTS.secondPassModel,
+    fps:                       UI_DEFAULTS.fps,
+    chunkSize:                 UI_DEFAULTS.chunkSize,
+    tokenRateCap:              UI_DEFAULTS.tokenRateCap,
+    clipMode:                  UI_DEFAULTS.clipMode,
+    semanticInference:         UI_DEFAULTS.semanticInference,
+    semanticFramesPerChunk:    UI_DEFAULTS.semanticFramesPerChunk,
+    sceneCutHammingThreshold:  UI_DEFAULTS.sceneCutHammingThreshold,
+    lumaShiftThreshold:        UI_DEFAULTS.lumaShiftThreshold,
+    loopDetection:             UI_DEFAULTS.loopDetection,
+    loopRepeatTrigger:         UI_DEFAULTS.loopRepeatTrigger,
+    gpuDecode:                 UI_DEFAULTS.gpuDecode,
+    vlmWorkers:                UI_DEFAULTS.vlmWorkers,
   })
 }
 
@@ -303,7 +265,7 @@ function toggle(section: SectionKey): void {
             v-model="form.apiEndpoint"
             data-testid="api-endpoint"
             type="url"
-            placeholder="http://localhost:8080"
+            :placeholder="UI_DEFAULTS.apiEndpoint"
             class="w-full px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] placeholder-[#475569] outline-none transition-colors duration-200 focus:border-[#2dd4bf44]"
             style="background: #050507; border: 1px solid #1e2633;"
           />
@@ -331,7 +293,7 @@ function toggle(section: SectionKey): void {
             v-model="form.spacetimeEndpoint"
             data-testid="spacetime-endpoint"
             type="url"
-            placeholder="http://localhost:3000"
+            :placeholder="UI_DEFAULTS.spacetimeEndpoint"
             class="w-full px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] placeholder-[#475569] outline-none transition-colors duration-200"
             style="background: #050507; border: 1px solid #1e2633;"
           />

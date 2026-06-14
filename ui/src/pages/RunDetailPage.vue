@@ -13,6 +13,7 @@ import { useEventsStore } from '@/stores/events'
 import { useEventStream } from '@/composables/useEventStream'
 import { api, ApiError } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth'
+import { lsNum, STORAGE_KEYS, UI_DEFAULTS } from '@/lib/config'
 import type { FeedbackRequest, RawRunEvent } from '@/lib/api'
 import type { RunStatus } from '@/stores/runs'
 import type { AgentEvent } from '@/stores/events'
@@ -82,10 +83,38 @@ function seekTo(ms: number) {
 
 // ── Timeline scrubber ─────────────────────────────────────────────────────────
 
-/** Events sorted by pts_ms for timeline rendering. */
-const timelineEvents = computed<AgentEvent[]>(() =>
-  [...eventsStore.eventsForRun(runId.value)].sort((a, b) => a.pts_ms - b.pts_ms)
-)
+interface TimelineMarkerStyle {
+  left: string
+  background: string
+  boxShadow: string
+}
+
+interface TimelineModel {
+  events: AgentEvent[]
+  maxFrame: number
+  vlmFrames: number[]
+  keyframeIndices: number[]
+}
+
+const events = computed(() => eventsStore.eventsForRun(runId.value))
+const keyframes = computed(() => eventsStore.keyframesForRun(runId.value))
+
+const timelineModel = computed<TimelineModel>(() => {
+  const sorted = [...events.value].sort((a, b) => a.pts_ms - b.pts_ms)
+  let maxFrame = 0
+  const vlmFrames: number[] = []
+  const keyframeIndices: number[] = []
+
+  for (const evt of sorted) {
+    maxFrame = Math.max(maxFrame, evt.frame_index)
+    if (evt.event_type === 'vlm_description') vlmFrames.push(evt.frame_index)
+    if (evt.event_type === 'keyframe') keyframeIndices.push(evt.frame_index)
+  }
+
+  return { events: sorted, maxFrame, vlmFrames, keyframeIndices }
+})
+
+const timelineEvents = computed<AgentEvent[]>(() => timelineModel.value.events)
 
 /**
  * Effective duration used for the scrubber.
@@ -107,6 +136,8 @@ function playheadLeftPct(): number {
   return markerLeftPct(videoCurrentTime.value)
 }
 
+const playheadStyle = computed(() => ({ left: `${playheadLeftPct()}%` }))
+
 /** Clicking on the timeline scrubber bar seeks proportionally. */
 function onTimelineClick(evt: MouseEvent) {
   if (!timelineEl.value) return
@@ -118,23 +149,49 @@ function onTimelineClick(evt: MouseEvent) {
 
 // ── Event highlighting sync ───────────────────────────────────────────────────
 
-/** The event closest to the current video time (within 2 s tolerance). */
-const activeEventIndex = computed<number>(() => {
-  const t = videoCurrentTime.value
+function nearestEventIndexByPts(items: AgentEvent[], ptsMs: number): number {
+  if (items.length === 0) return -1
+  let lo = 0
+  let hi = items.length
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1
+    if (items[mid]!.pts_ms < ptsMs) lo = mid + 1
+    else hi = mid
+  }
+
+  const candidates = [lo - 1, lo]
   let bestIdx = -1
   let bestDiff = Infinity
-  timelineEvents.value.forEach((evt, i) => {
-    const diff = Math.abs(evt.pts_ms - t)
+  for (const idx of candidates) {
+    const evt = items[idx]
+    if (!evt) continue
+    const diff = Math.abs(evt.pts_ms - ptsMs)
     if (diff < bestDiff && diff < 5000) {
       bestDiff = diff
-      bestIdx = i
+      bestIdx = idx
     }
-  })
+  }
   return bestIdx
+}
+
+/** The event closest to the current video time within the active tolerance. */
+const activeEventIndex = computed<number>(() => {
+  return nearestEventIndexByPts(timelineEvents.value, videoCurrentTime.value)
 })
 
 const activeEvent = computed<AgentEvent | null>(() =>
-  activeEventIndex.value >= 0 ? timelineEvents.value[activeEventIndex.value] : null
+  activeEventIndex.value >= 0 ? (timelineEvents.value[activeEventIndex.value] ?? null) : null
+)
+
+const timelineMarkerStyles = computed<TimelineMarkerStyle[]>(() =>
+  timelineEvents.value.map((evt) => {
+    const color = eventColor(evt.event_type)
+    return {
+      left: `${markerLeftPct(evt.pts_ms)}%`,
+      background: color,
+      boxShadow: `0 0 4px ${color}66`,
+    }
+  })
 )
 
 // Auto-scroll the event list to keep the active event visible.
@@ -226,8 +283,6 @@ async function extractKeyframes(): Promise<void> {
 const run = computed(() =>
   runsStore.activeRun ?? runsStore.runs.find(r => r.run_id === runId.value)
 )
-const events = computed(() => eventsStore.eventsForRun(runId.value))
-const keyframes = computed(() => eventsStore.keyframesForRun(runId.value))
 
 const isProcessing = computed(() =>
   run.value?.status === 'processing' || run.value?.status === 'pending'
@@ -236,8 +291,8 @@ const isProcessing = computed(() =>
 // ── Visualization props derived from run + event data ─────────────────────
 
 const vizFps = computed(() => {
-  const stored = Number(localStorage.getItem('vidarax_fps') ?? '5')
-  return stored > 0 ? stored : 5
+  const stored = lsNum(STORAGE_KEYS.fps, UI_DEFAULTS.fps)
+  return stored > 0 ? stored : UI_DEFAULTS.fps
 })
 
 const vizTotalFrames = computed(() => {
@@ -245,40 +300,29 @@ const vizTotalFrames = computed(() => {
   const fc = runsStore.activeRun?.frame_count
   if (fc && fc > 0) return fc
   if (events.value.length === 0) return 0
-  const maxFrame = Math.max(...events.value.map(e => e.frame_index))
-  return maxFrame + 1
+  return timelineModel.value.maxFrame + 1
 })
 
 const vizProcessedFrames = computed(() => {
   if (!isProcessing.value && events.value.length > 0) return vizTotalFrames.value
   if (events.value.length === 0) return 0
-  return Math.max(...events.value.map(e => e.frame_index))
+  return timelineModel.value.maxFrame
 })
 
 const vizChunkStart = computed(() => {
   if (events.value.length === 0) return 0
-  const sorted = [...events.value].sort((a, b) => a.frame_index - b.frame_index)
-  const last = sorted[sorted.length - 1]
-  const chunkSize = Number(localStorage.getItem('vidarax_chunk_size') ?? '30')
-  return Math.max(0, (last?.frame_index ?? 0) - chunkSize)
+  const chunkSize = lsNum(STORAGE_KEYS.chunkSize, UI_DEFAULTS.chunkSize)
+  return Math.max(0, timelineModel.value.maxFrame - chunkSize)
 })
 
 const vizChunkEnd = computed(() => {
   if (events.value.length === 0) return 0
-  return Math.max(...events.value.map(e => e.frame_index))
+  return timelineModel.value.maxFrame
 })
 
-const vizVlmFrames = computed(() =>
-  events.value
-    .filter(e => e.event_type === 'vlm_description')
-    .map(e => e.frame_index)
-)
+const vizVlmFrames = computed(() => timelineModel.value.vlmFrames)
 
-const vizKfIndices = computed(() =>
-  events.value
-    .filter(e => e.event_type === 'keyframe')
-    .map(e => e.frame_index)
-)
+const vizKfIndices = computed(() => timelineModel.value.keyframeIndices)
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
@@ -700,7 +744,7 @@ function formatTime(ms: number): string {
                 <div
                   class="absolute left-0 top-1/2 -translate-y-1/2 rounded-full"
                   style="height: 4px; background: rgba(45,212,191,0.3); transition: width 0.1s linear;"
-                  :style="{ width: `${playheadLeftPct()}%` }"
+                  :style="{ width: playheadStyle.left }"
                 />
 
                 <!-- Marker dots -->
@@ -710,11 +754,10 @@ function formatTime(ms: number): string {
                   class="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 rounded-full transition-all duration-100 focus:outline-none"
                   :class="activeEventIndex === i ? 'w-3.5 h-3.5 z-20' : 'w-2 h-2 z-10 hover:w-3 hover:h-3'"
                   :style="{
-                    left: `${markerLeftPct(evt.pts_ms)}%`,
-                    background: eventColor(evt.event_type),
+                    ...timelineMarkerStyles[i],
                     boxShadow: activeEventIndex === i
                       ? `0 0 8px ${eventColor(evt.event_type)}`
-                      : `0 0 4px ${eventColor(evt.event_type)}66`,
+                      : timelineMarkerStyles[i]?.boxShadow,
                     border: activeEventIndex === i ? `2px solid #e2e8f0` : 'none',
                   }"
                   :title="`${evt.event_type.replace(/_/g, ' ')} @ ${formatPts(evt.pts_ms)}`"
@@ -727,7 +770,7 @@ function formatTime(ms: number): string {
                   v-if="videoReady"
                   class="absolute top-0 bottom-0 w-px pointer-events-none z-30"
                   style="background: #2dd4bf; box-shadow: 0 0 6px #2dd4bf;"
-                  :style="{ left: `${playheadLeftPct()}%` }"
+                  :style="playheadStyle"
                 >
                   <div
                     class="absolute -top-1 left-1/2 -translate-x-1/2 w-2 h-2 rounded-full"
