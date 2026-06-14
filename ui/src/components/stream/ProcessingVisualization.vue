@@ -20,7 +20,7 @@
  *   />
  */
 
-import { computed, ref, watch, onUnmounted } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 
 // ── Props ──────────────────────────────────────────────────────────────────────
 
@@ -61,6 +61,10 @@ const effectiveTotal = computed(() => Math.max(props.totalFrames, 1))
 
 /** Strip total width in px */
 const stripWidthPx = computed(() => effectiveTotal.value * BAR_STRIDE)
+const visibleWidthPx = ref(0)
+const scrollLeftPx = ref(0)
+const canvasEl = ref<HTMLCanvasElement | null>(null)
+const canvasLeft = computed(() => scrollLeftPx.value)
 
 /** Convert a frame index to a pixel offset (left edge of that bar) */
 function frameToX(frame: number): number {
@@ -86,10 +90,13 @@ const secondMarkers = computed<{ label: string; x: number }[]>(() => {
   const fpsSafe = Math.max(props.fps, 1)
   const durationSec = Math.ceil(effectiveTotal.value / fpsSafe)
   const markers: { label: string; x: number }[] = []
-  for (let s = 0; s <= durationSec; s++) {
+  const startSec = Math.max(0, Math.floor(scrollLeftPx.value / BAR_STRIDE / fpsSafe) - 1)
+  const endFrame = (scrollLeftPx.value + visibleWidthPx.value) / BAR_STRIDE
+  const endSec = Math.min(durationSec, Math.ceil(endFrame / fpsSafe) + 1)
+  for (let s = startSec; s <= endSec; s++) {
     const frame = s * fpsSafe
     if (frame <= effectiveTotal.value) {
-      markers.push({ label: `${s}s`, x: frameToX(frame) })
+      markers.push({ label: `${s}s`, x: frameToX(frame) - scrollLeftPx.value })
     }
   }
   return markers
@@ -98,6 +105,15 @@ const secondMarkers = computed<{ label: string; x: number }[]>(() => {
 // ── Auto-scroll the strip to keep the cursor visible ─────────────────────────
 
 const scrollEl = ref<HTMLDivElement | null>(null)
+let resizeObserver: ResizeObserver | null = null
+let drawRafId: number | null = null
+
+function updateViewport() {
+  if (!scrollEl.value) return
+  visibleWidthPx.value = scrollEl.value.clientWidth
+  scrollLeftPx.value = scrollEl.value.scrollLeft
+  scheduleDraw()
+}
 
 watch(
   () => props.processedFrames,
@@ -117,6 +133,10 @@ watch(
   },
 )
 
+function onScroll() {
+  updateViewport()
+}
+
 // ── Animation tick for subtle shimmer on the active window ────────────────────
 
 const shimmerOffset = ref(0)
@@ -124,7 +144,7 @@ let rafId: number | null = null
 
 function tick() {
   shimmerOffset.value = (shimmerOffset.value + 0.5) % 100
-  if (props.isProcessing) rafId = requestAnimationFrame(tick)
+  rafId = props.isProcessing ? requestAnimationFrame(tick) : null
 }
 
 watch(
@@ -141,28 +161,82 @@ watch(
 
 onUnmounted(() => {
   if (rafId !== null) cancelAnimationFrame(rafId)
+  if (drawRafId !== null) cancelAnimationFrame(drawRafId)
+  resizeObserver?.disconnect()
 })
 
-// ── Bar color logic ───────────────────────────────────────────────────────────
+// ── Canvas filmstrip ──────────────────────────────────────────────────────────
 
 const vlmSet = computed(() => new Set(props.vlmFrames ?? []))
 const kfSet  = computed(() => new Set(props.keyframeIndices ?? []))
 
-function barColor(index: number): string {
-  if (vlmSet.value.has(index)) return COLOR_VLM
-  if (index < props.processedFrames) return COLOR_PROCESSED
-  return COLOR_PENDING
+function scheduleDraw() {
+  if (drawRafId !== null) return
+  drawRafId = requestAnimationFrame(() => {
+    drawRafId = null
+    drawFilmstrip()
+  })
 }
 
-function barHeight(index: number): number {
-  return kfSet.value.has(index) ? 32 : 24
+function drawFilmstrip() {
+  const canvas = canvasEl.value
+  const scroll = scrollEl.value
+  if (!canvas || !scroll) return
+
+  const cssWidth = Math.max(1, scroll.clientWidth)
+  const cssHeight = 48
+  const dpr = window.devicePixelRatio || 1
+  const pixelWidth = Math.floor(cssWidth * dpr)
+  const pixelHeight = Math.floor(cssHeight * dpr)
+
+  if (canvas.width !== pixelWidth) canvas.width = pixelWidth
+  if (canvas.height !== pixelHeight) canvas.height = pixelHeight
+  canvas.style.width = `${cssWidth}px`
+  canvas.style.height = `${cssHeight}px`
+
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  ctx.clearRect(0, 0, cssWidth, cssHeight)
+
+  const viewLeft = scroll.scrollLeft
+  const startFrame = Math.max(0, Math.floor(viewLeft / BAR_STRIDE) - 1)
+  const endFrame = Math.min(
+    effectiveTotal.value,
+    Math.ceil((viewLeft + cssWidth) / BAR_STRIDE) + 1,
+  )
+  const processedLimit = props.processedFrames
+  const vlm = vlmSet.value
+  const keyframes = kfSet.value
+
+  for (let frame = startFrame; frame < endFrame; frame++) {
+    const x = frameToX(frame) - viewLeft
+    const isVlm = vlm.has(frame)
+    const height = keyframes.has(frame) ? 32 : 24
+    ctx.fillStyle = isVlm ? COLOR_VLM : frame < processedLimit ? COLOR_PROCESSED : COLOR_PENDING
+    ctx.fillRect(x, cssHeight - 8 - height, BAR_W, height)
+  }
 }
 
-function barGlow(index: number): string {
-  if (vlmSet.value.has(index)) return `0 0 4px ${COLOR_VLM}88`
-  if (index < props.processedFrames) return `0 0 3px ${COLOR_PROCESSED}55`
-  return 'none'
-}
+watch(
+  () => [
+    props.totalFrames,
+    props.processedFrames,
+    props.vlmFrames,
+    props.keyframeIndices,
+  ],
+  () => scheduleDraw(),
+)
+
+onMounted(() => {
+  nextTick(() => {
+    updateViewport()
+    if (scrollEl.value) {
+      resizeObserver = new ResizeObserver(updateViewport)
+      resizeObserver.observe(scrollEl.value)
+    }
+  })
+})
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
@@ -236,6 +310,7 @@ const durationLabel = computed(() => {
       ref="scrollEl"
       class="pv-scroll"
       aria-hidden="true"
+      @scroll="onScroll"
     >
       <!-- Inner strip — actual pixel-exact width -->
       <div
@@ -261,20 +336,11 @@ const durationLabel = computed(() => {
           />
         </div>
 
-        <!-- Frame bars ──────────────────────────────────────────────────── -->
-        <div class="pv-bar-row" aria-hidden="true">
-          <div
-            v-for="i in effectiveTotal"
-            :key="i - 1"
-            class="pv-bar"
-            :style="`
-              background: ${barColor(i - 1)};
-              height: ${barHeight(i - 1)}px;
-              box-shadow: ${barGlow(i - 1)};
-            `"
-            :title="`Frame ${i - 1}`"
-          />
-        </div>
+        <canvas
+          ref="canvasEl"
+          class="pv-bar-canvas"
+          :style="`left: ${canvasLeft}px;`"
+        />
 
         <!-- Live cursor (teal triangle) ─────────────────────────────────── -->
         <div
@@ -299,7 +365,7 @@ const durationLabel = computed(() => {
     >
       <div
         class="relative"
-        :style="`width: ${stripWidthPx}px; height: 20px; min-width: 100%;`"
+        :style="`width: ${visibleWidthPx}px; height: 20px; min-width: 100%;`"
       >
         <span
           v-for="m in secondMarkers"
@@ -373,21 +439,12 @@ const durationLabel = computed(() => {
   border-radius: 2px;
 }
 
-/* ── Bar row ───────────────────────────────────────────────────────────────── */
-.pv-bar-row {
+/* ── Canvas bar row ────────────────────────────────────────────────────────── */
+.pv-bar-canvas {
   position: absolute;
   bottom: 8px;
-  left: 0;
-  display: flex;
-  align-items: flex-end;
-  gap: 1px;
-}
-
-.pv-bar {
-  width: 2px;
-  border-radius: 1px 1px 0 0;
-  flex-shrink: 0;
-  transition: background 120ms ease, height 120ms ease, box-shadow 120ms ease;
+  height: 48px;
+  pointer-events: none;
 }
 
 /* ── Processing window ─────────────────────────────────────────────────────── */

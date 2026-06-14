@@ -15,16 +15,9 @@
 
 import { ref, onUnmounted } from 'vue'
 import { api } from '@/lib/api'
+import { ICE_SERVERS } from '@/lib/config'
 import { useStreamStore } from '@/stores/stream'
 import type { StreamSourceType } from '@/stores/stream'
-
-const ICE_SERVERS: RTCIceServer[] = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  // TODO(security): Add TURN server(s) for production. STUN-only fails behind
-  // symmetric NATs. Use authenticated TURN credentials via a short-lived token
-  // endpoint rather than hardcoding long-lived secrets here.
-]
 
 /** Wait for ICE gathering to complete, with a 3 s timeout fallback. */
 function waitForIceComplete(pc: RTCPeerConnection): Promise<string> {
