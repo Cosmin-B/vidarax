@@ -111,6 +111,9 @@ fn build_webrtc_config(config: &ServerConfig) -> WebRtcConfig {
         stun_servers: config.webrtc_stun_servers.clone(),
         turn_servers,
         max_output_tokens_per_second: config.webrtc_max_output_tokens_per_second,
+        decode_workers: config.webrtc_decode_workers,
+        analysis_workers: config.webrtc_analysis_workers,
+        vlm_workers: config.webrtc_vlm_workers,
     }
 }
 
@@ -1438,6 +1441,9 @@ mod tests {
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
             webrtc_max_output_tokens_per_second: 128,
+            webrtc_decode_workers: 2,
+            webrtc_analysis_workers: 1,
+            webrtc_vlm_workers: 2,
             distillation: DistillationConfig::default(),
         })
         .unwrap();
@@ -1490,6 +1496,9 @@ mod tests {
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
             webrtc_max_output_tokens_per_second: 128,
+            webrtc_decode_workers: 2,
+            webrtc_analysis_workers: 1,
+            webrtc_vlm_workers: 2,
             distillation: DistillationConfig::default(),
         })
         .unwrap();
@@ -1539,6 +1548,9 @@ mod tests {
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
             webrtc_max_output_tokens_per_second: 128,
+            webrtc_decode_workers: 2,
+            webrtc_analysis_workers: 1,
+            webrtc_vlm_workers: 2,
             distillation: DistillationConfig::default(),
         })
         .unwrap();
@@ -1592,6 +1604,9 @@ mod tests {
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
             webrtc_max_output_tokens_per_second: 128,
+            webrtc_decode_workers: 2,
+            webrtc_analysis_workers: 1,
+            webrtc_vlm_workers: 2,
             distillation: DistillationConfig::default(),
         })
         .unwrap();
@@ -1745,6 +1760,9 @@ mod tests {
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
             webrtc_max_output_tokens_per_second: 128,
+            webrtc_decode_workers: 2,
+            webrtc_analysis_workers: 1,
+            webrtc_vlm_workers: 2,
             distillation: DistillationConfig::default(),
         };
 
@@ -1874,6 +1892,9 @@ mod tests {
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
             webrtc_max_output_tokens_per_second: 128,
+            webrtc_decode_workers: 2,
+            webrtc_analysis_workers: 1,
+            webrtc_vlm_workers: 2,
             distillation: DistillationConfig::default(),
         };
 

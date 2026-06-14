@@ -106,6 +106,12 @@ pub struct WebRtcConfig {
     pub turn_servers: Vec<TurnServer>,
     /// Maximum VLM output tokens per second for this session (backpressure).
     pub max_output_tokens_per_second: u32,
+    /// Number of decode worker threads per session.
+    pub decode_workers: usize,
+    /// Number of analysis worker threads per session.
+    pub analysis_workers: usize,
+    /// Number of VLM worker threads per session.
+    pub vlm_workers: usize,
 }
 
 impl Default for WebRtcConfig {
@@ -114,6 +120,9 @@ impl Default for WebRtcConfig {
             stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
             turn_servers: Vec::new(),
             max_output_tokens_per_second: 128,
+            decode_workers: 2,
+            analysis_workers: 1,
+            vlm_workers: 2,
         }
     }
 }
@@ -471,6 +480,9 @@ mod tests {
         assert_eq!(cfg.stun_servers, vec!["stun:stun.l.google.com:19302"]);
         assert!(cfg.turn_servers.is_empty());
         assert_eq!(cfg.max_output_tokens_per_second, 128);
+        assert_eq!(cfg.decode_workers, 2);
+        assert_eq!(cfg.analysis_workers, 1);
+        assert_eq!(cfg.vlm_workers, 2);
     }
 
     #[test]
@@ -483,10 +495,16 @@ mod tests {
                 credential: "pass".to_string(),
             }],
             max_output_tokens_per_second: 64,
+            decode_workers: 3,
+            analysis_workers: 2,
+            vlm_workers: 4,
         };
         assert_eq!(cfg.stun_servers.len(), 1);
         assert_eq!(cfg.turn_servers.len(), 1);
         assert_eq!(cfg.max_output_tokens_per_second, 64);
+        assert_eq!(cfg.decode_workers, 3);
+        assert_eq!(cfg.analysis_workers, 2);
+        assert_eq!(cfg.vlm_workers, 4);
     }
 
     #[test]
