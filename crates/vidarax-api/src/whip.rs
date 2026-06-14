@@ -308,6 +308,7 @@ pub async fn whip_offer(
                 vlm_config_for_workers,
                 metrics_for_workers,
                 session_span_for_workers,
+                max_output_tokens_per_second,
                 Arc::clone(&guided_json),
             );
         } else {

@@ -37,7 +37,7 @@ use crate::metrics::PipelineMetrics;
 use crate::provider::{InferenceImage, InferenceProvider, InferenceRequest};
 use crate::tiered_vlm::{run_tiered, TieredVlmConfig};
 use crate::webrtc::recycle::RecycledBytes;
-use crate::webrtc::workers::{EventSink, StreamFrame};
+use crate::webrtc::workers::{token_budget_entry, EventSink, StreamFrame};
 
 // ─── ClipConfig ───────────────────────────────────────────────────────────────
 
@@ -303,6 +303,7 @@ pub fn spawn_clip_vlm_workers<I>(
     config: TieredVlmConfig,
     metrics: Arc<PipelineMetrics>,
     session_span: tracing::Span,
+    max_output_tokens_per_second: u32,
     // Shared guided-JSON schema handle.  When the inner `Option` is `Some`,
     // the schema is passed to the first-pass VLM request and `max_tokens`
     // is raised to 1024 to accommodate structured output.
@@ -318,12 +319,24 @@ pub fn spawn_clip_vlm_workers<I>(
         let metrics = Arc::clone(&metrics);
         let session_span = session_span.clone();
         let guided_json = Arc::clone(&guided_json);
+        let mut token_budget = std::collections::HashMap::new();
 
         std::thread::Builder::new()
             .name(format!("vx-clip-vlm-{i}"))
             .spawn(move || {
                 while let Ok(work) = clip_rx.recv() {
                     let _guard = session_span.enter();
+                    if max_output_tokens_per_second > 0 {
+                        let now = std::time::Instant::now();
+                        let entry = token_budget_entry(&mut token_budget, &work.session_id, now);
+                        if now.duration_since(entry.0).as_secs() >= 1 {
+                            *entry = (now, 0);
+                        }
+                        if entry.1 >= max_output_tokens_per_second {
+                            metrics.inc_keyframes_dropped();
+                            continue;
+                        }
+                    }
                     metrics.inc_vlm_inferences();
 
                     let prompt: Arc<str> = if work.prompt.is_empty() {
@@ -369,6 +382,13 @@ pub fn spawn_clip_vlm_workers<I>(
                         Ok(output) => (output.result.output_text, output.used_second_pass),
                         Err(err) => (format!("clip_vlm_error: {:?}", err.error), false),
                     };
+
+                    if max_output_tokens_per_second > 0 {
+                        let token_count = (description.len() / 4).max(1) as u32;
+                        if let Some(entry) = token_budget.get_mut(work.session_id.as_ref()) {
+                            entry.1 = entry.1.saturating_add(token_count);
+                        }
+                    }
 
                     let event_type = if used_second_pass {
                         "clip_vlm_tiered"

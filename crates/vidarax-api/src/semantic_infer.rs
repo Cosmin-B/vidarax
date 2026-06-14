@@ -274,7 +274,7 @@ pub async fn run_semantic_dispatch(
             } else {
                 format!(
                     "{semantic_prompt}\n[previous_state ({last_pts_ms}ms): {}]",
-                    &last_description[..last_description.len().min(200)]
+                    truncate_context(&last_description, 200)
                 )
             };
 
@@ -306,12 +306,12 @@ pub async fn run_semantic_dispatch(
                 let s = raw.to_string();
                 if s.len() > 4 {
                     last_description.clear();
-                    last_description.push_str(&s[..s.len().min(200)]);
+                    last_description.push_str(truncate_context(&s, 200));
                     last_pts_ms = prep.pts_end_ms;
                 }
             } else if let Some(ref overlay) = result.overlay {
                 last_description.clear();
-                last_description.push_str(&overlay.description[..overlay.description.len().min(200)]);
+                last_description.push_str(truncate_context(&overlay.description, 200));
                 last_pts_ms = prep.pts_end_ms;
             }
 
@@ -581,6 +581,32 @@ fn parse_semantic_overlay(raw: &str) -> Option<SemanticOverlay> {
         description,
         confidence,
     })
+}
+
+fn truncate_context(text: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
+    match text.char_indices().nth(max_chars) {
+        Some((idx, _)) => &text[..idx],
+        None => text,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semantic_context_truncation_is_utf8_safe() {
+        let text = "a".repeat(199) + "étail";
+        assert_eq!(truncate_context(&text, 200), "a".repeat(199) + "é");
+
+        let longer = "é".repeat(201);
+        let truncated = truncate_context(&longer, 200);
+        assert_eq!(truncated.chars().count(), 200);
+        assert!(longer.starts_with(truncated));
+    }
 }
 
 fn normalize_semantic_event(raw: &str) -> String {

@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::provider::{InferenceProvider, InferenceRequest, InferenceResult, ProviderError};
+use crate::provider::{
+    teacher_label_schema, InferenceProvider, InferenceRequest, InferenceResult, ProviderError,
+};
 
 /// Configuration for tiered VLM inference routing.
 ///
@@ -110,6 +112,7 @@ where
         request.model = Arc::clone(&config.second_pass_model);
         request.max_tokens = config.second_pass_max_tokens;
         request.timeout_ms = second_pass_timeout_ms;
+        request.guided_json = Some(Arc::from(teacher_label_schema()));
         match provider.infer(&request) {
             Ok(result) => {
                 return Ok(TieredVlmRun {
@@ -148,7 +151,8 @@ pub fn parse_confidence_from_output(text: &str) -> f32 {
 mod tests {
     use super::*;
     use crate::provider::{
-        InferenceProvider, InferenceRequest, InferenceResult, ProviderError, ProviderKind,
+        teacher_label_schema, InferenceProvider, InferenceRequest, InferenceResult, ProviderError,
+        ProviderKind,
     };
     use std::sync::Mutex;
 
@@ -187,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn tiered_run_preserves_guided_json_on_second_pass() {
+    fn tiered_run_forces_teacher_schema_on_second_pass() {
         let provider = RecordingProvider {
             requests: Mutex::new(Vec::new()),
         };
@@ -197,7 +201,7 @@ mod tests {
             second_pass_threshold: 0.7,
             second_pass_max_tokens: 512,
         };
-        let schema: Arc<str> = Arc::from(r#"{"type":"object"}"#);
+        let schema: Arc<str> = Arc::from(r#"{"type":"object","properties":{"custom":{}}}"#);
         let request = InferenceRequest {
             model: Arc::from("placeholder"),
             prompt: Arc::from("prompt"),
@@ -219,7 +223,8 @@ mod tests {
         assert_eq!(&*requests[0].model, "small");
         assert_eq!(&*requests[1].model, "teacher");
         assert_eq!(requests[1].max_tokens, 512);
-        assert_eq!(requests[1].guided_json.as_deref(), Some(&*schema));
+        assert_eq!(requests[0].guided_json.as_deref(), Some(&*schema));
+        assert_eq!(requests[1].guided_json.as_deref(), Some(teacher_label_schema()));
     }
 }
 

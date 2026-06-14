@@ -1,5 +1,4 @@
 /target
-/.beads
 /.smoke-data
 /.vidarax-data
 /.vidarax-models
@@ -25,3 +24,11 @@ ui/node_modules/
 ui/dist/
 __pycache__/
 *.pyc
+
+.dolt/
+*.db
+
+# Local agent/dev tooling (not part of the project)
+.agents/
+.mlx-venv/
+.serena/
