@@ -21,6 +21,7 @@ use vidarax_core::provider::{
 };
 use vidarax_core::timeline::TimelineEvent;
 
+use crate::auth::{header_value, principal_key_from_headers, HEADER_TENANT_ID};
 use crate::ids::validate_run_id;
 use crate::models::{
     AnalyzeFrameMetadata, AnalyzeFramesRequest, AnalyzeFramesResponse, AnalyzeMarker,
@@ -40,9 +41,6 @@ use crate::semantic_infer::{
 };
 use crate::state::AppState;
 use crate::validation::{normalize_mode, normalize_model};
-
-const HEADER_API_KEY: &str = "x-api-key";
-const HEADER_TENANT_ID: &str = "x-tenant-id";
 
 #[derive(Debug, serde::Deserialize)]
 pub struct MarkerQueryParams {
@@ -2663,29 +2661,6 @@ fn load_run_snapshot(
 
 fn parse_payload(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| json!({ "raw": raw }))
-}
-
-fn header_value<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
-    headers.get(key).and_then(|value| value.to_str().ok())
-}
-
-fn principal_key_from_headers(headers: &HeaderMap) -> String {
-    if let Some(tenant_id) = header_value(headers, HEADER_TENANT_ID) {
-        return format!("tenant:{tenant_id}");
-    }
-    if let Some(api_key) = header_value(headers, HEADER_API_KEY) {
-        return format!("api-key:{:016x}", stable_hash(api_key));
-    }
-    "public".to_string()
-}
-
-fn stable_hash(value: &str) -> u64 {
-    let mut hash = 1469598103934665603u64;
-    for b in value.bytes() {
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(1099511628211);
-    }
-    hash
 }
 
 struct RuntimeAvailability {

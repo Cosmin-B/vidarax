@@ -3,6 +3,7 @@
 use std::{io, sync::Arc};
 
 pub mod config;
+mod auth;
 mod handlers;
 mod ids;
 mod inference_metrics;

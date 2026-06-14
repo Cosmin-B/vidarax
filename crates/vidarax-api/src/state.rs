@@ -53,6 +53,49 @@ pub struct AppState {
     webrtc_config: WebRtcConfig,
 }
 
+struct AppStateConfig {
+    wal_path: PathBuf,
+    provider: Option<Arc<dyn InferenceProvider + Send + Sync>>,
+    security_policy: SecurityPolicy,
+    stream_ttl_secs: u64,
+    active_stream_limit: usize,
+}
+
+impl AppStateConfig {
+    fn for_tests(wal_path: PathBuf) -> Self {
+        Self {
+            wal_path,
+            provider: None,
+            security_policy: SecurityPolicy::from_config_for_tests(),
+            stream_ttl_secs: 3600,
+            active_stream_limit: 5,
+        }
+    }
+
+    fn build(self) -> AppState {
+        AppState {
+            run_seq: Arc::new(AtomicU64::new(0)),
+            request_seq: Arc::new(AtomicU64::new(0)),
+            event_seq: Arc::new(AtomicU64::new(0)),
+            wal_path: Arc::new(self.wal_path),
+            ingest_file_roots: Arc::new(default_test_ingest_roots()),
+            provider: self.provider,
+            decode_pipeline: default_test_decode_pipeline(),
+            security_policy: Arc::new(self.security_policy),
+            inference_metrics: Arc::new(InferenceMetrics::new()),
+            pipeline_metrics: Arc::new(PipelineMetrics::new()),
+            distillation_config: Arc::new(DistillationConfig::default()),
+            run_registry: Arc::new(ArcSwap::from_pointee(RunRegistry::default())),
+            tenant_label_maps: Arc::new(TenantLabelMaps::default()),
+            stream_ttl_secs: self.stream_ttl_secs.max(1),
+            active_stream_limit: self.active_stream_limit.max(1),
+            spacetime_client: None,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            webrtc_config: WebRtcConfig::default(),
+        }
+    }
+}
+
 impl AppState {
     pub fn from_wal(
         wal_path: PathBuf,
@@ -105,26 +148,7 @@ impl AppState {
     }
 
     pub fn with_wal_for_tests(wal_path: PathBuf) -> Self {
-        Self {
-            run_seq: Arc::new(AtomicU64::new(0)),
-            request_seq: Arc::new(AtomicU64::new(0)),
-            event_seq: Arc::new(AtomicU64::new(0)),
-            wal_path: Arc::new(wal_path),
-            ingest_file_roots: Arc::new(default_test_ingest_roots()),
-            provider: None,
-            decode_pipeline: default_test_decode_pipeline(),
-            security_policy: Arc::new(SecurityPolicy::from_config_for_tests()),
-            inference_metrics: Arc::new(InferenceMetrics::new()),
-            pipeline_metrics: Arc::new(PipelineMetrics::new()),
-            distillation_config: Arc::new(DistillationConfig::default()),
-            run_registry: Arc::new(ArcSwap::from_pointee(RunRegistry::default())),
-            tenant_label_maps: Arc::new(TenantLabelMaps::default()),
-            stream_ttl_secs: 3600,
-            active_stream_limit: 5,
-            spacetime_client: None,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            webrtc_config: WebRtcConfig::default(),
-        }
+        AppStateConfig::for_tests(wal_path).build()
     }
 
     pub fn with_wal_for_tests_and_endpoints(
@@ -143,26 +167,12 @@ impl AppState {
         provider: Option<Arc<dyn InferenceProvider + Send + Sync>>,
         security_policy: SecurityPolicy,
     ) -> Self {
-        Self {
-            run_seq: Arc::new(AtomicU64::new(0)),
-            request_seq: Arc::new(AtomicU64::new(0)),
-            event_seq: Arc::new(AtomicU64::new(0)),
-            wal_path: Arc::new(wal_path),
-            ingest_file_roots: Arc::new(default_test_ingest_roots()),
+        AppStateConfig {
             provider,
-            decode_pipeline: default_test_decode_pipeline(),
-            security_policy: Arc::new(security_policy),
-            inference_metrics: Arc::new(InferenceMetrics::new()),
-            pipeline_metrics: Arc::new(PipelineMetrics::new()),
-            distillation_config: Arc::new(DistillationConfig::default()),
-            run_registry: Arc::new(ArcSwap::from_pointee(RunRegistry::default())),
-            tenant_label_maps: Arc::new(TenantLabelMaps::default()),
-            stream_ttl_secs: 3600,
-            active_stream_limit: 5,
-            spacetime_client: None,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            webrtc_config: WebRtcConfig::default(),
+            security_policy,
+            ..AppStateConfig::for_tests(wal_path)
         }
+        .build()
     }
 
     pub fn with_wal_for_tests_runtime(
@@ -172,26 +182,14 @@ impl AppState {
         stream_ttl_secs: u64,
         active_stream_limit: usize,
     ) -> Self {
-        Self {
-            run_seq: Arc::new(AtomicU64::new(0)),
-            request_seq: Arc::new(AtomicU64::new(0)),
-            event_seq: Arc::new(AtomicU64::new(0)),
-            wal_path: Arc::new(wal_path),
-            ingest_file_roots: Arc::new(default_test_ingest_roots()),
+        AppStateConfig {
             provider,
-            decode_pipeline: default_test_decode_pipeline(),
-            security_policy: Arc::new(security_policy),
-            inference_metrics: Arc::new(InferenceMetrics::new()),
-            pipeline_metrics: Arc::new(PipelineMetrics::new()),
-            distillation_config: Arc::new(DistillationConfig::default()),
-            run_registry: Arc::new(ArcSwap::from_pointee(RunRegistry::default())),
-            tenant_label_maps: Arc::new(TenantLabelMaps::default()),
-            stream_ttl_secs: stream_ttl_secs.max(1),
-            active_stream_limit: active_stream_limit.max(1),
-            spacetime_client: None,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            webrtc_config: WebRtcConfig::default(),
+            security_policy,
+            stream_ttl_secs,
+            active_stream_limit,
+            ..AppStateConfig::for_tests(wal_path)
         }
+        .build()
     }
 
     /// Attach a `SpacetimeClient` to this state (builder pattern).
