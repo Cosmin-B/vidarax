@@ -37,10 +37,11 @@
 //! ```
 
 use std::sync::{
-    Arc, RwLock,
     atomic::{AtomicU64, Ordering},
+    Arc,
 };
 
+use arc_swap::{ArcSwap, ArcSwapOption};
 use rustrtc::{
     IceServer, RtcConfiguration, SdpType, SessionDescription,
     media::{MediaKind, MediaSample, MediaStreamTrack},
@@ -139,13 +140,13 @@ impl Default for WebRtcConfig {
 pub struct WebRtcSession {
     pc: PeerConnection,
     /// Dynamic VLM prompt; updated via `PATCH /v1/stream/whip/{sess_id}/prompt`.
-    pub prompt: Arc<RwLock<Arc<str>>>,
+    pub prompt: Arc<ArcSwap<Arc<str>>>,
     /// Optional JSON schema string for guided/structured VLM output.
     ///
     /// When `Some`, passed as `guided_json` to the VLM inference request and
     /// `max_tokens` is bumped to 1024 to accommodate structured output.
     /// Updated via `PATCH /v1/stream/whip/{sess_id}/prompt` with `output_schema`.
-    pub guided_json: Arc<RwLock<Option<Arc<str>>>>,
+    pub guided_json: Arc<ArcSwapOption<Arc<str>>>,
     /// Token output rate cap (tokens/s) for backpressure in VLM workers.
     pub max_output_tokens_per_second: u32,
     /// Video codec negotiated from the SDP offer (H.264 or VP8).
@@ -234,8 +235,8 @@ impl WebRtcSession {
         Ok((
             Self {
                 pc,
-                prompt: Arc::new(RwLock::new(Arc::from(""))),
-                guided_json: Arc::new(RwLock::new(None)),
+                prompt: Arc::new(ArcSwap::from(Arc::new(Arc::from("")))),
+                guided_json: Arc::new(ArcSwapOption::from(None::<Arc<Arc<str>>>)),
                 max_output_tokens_per_second: config.max_output_tokens_per_second,
                 codec,
             },
@@ -360,23 +361,18 @@ impl WebRtcSession {
     /// Called by `PATCH /v1/stream/whip/{sess_id}/prompt`.  The new prompt is
     /// picked up by analysis workers on the next keyframe decision.
     pub fn update_prompt(&self, text: String) {
-        if let Ok(mut guard) = self.prompt.write() {
-            *guard = Arc::from(text);
-        }
+        self.prompt.store(Arc::new(Arc::from(text)));
     }
 
     /// Read the current VLM prompt (empty string means use the default).
     ///
     /// Clones only the `Arc<str>` pointer (pointer-width), not the string data.
     pub fn read_prompt(&self) -> Arc<str> {
-        self.prompt
-            .read()
-            .map(|g| Arc::clone(&*g))
-            .unwrap_or_default()
+        Arc::clone(&*self.prompt.load_full())
     }
 
     /// Clone the prompt handle for sharing with analysis workers.
-    pub fn prompt_arc(&self) -> Arc<RwLock<Arc<str>>> {
+    pub fn prompt_arc(&self) -> Arc<ArcSwap<Arc<str>>> {
         Arc::clone(&self.prompt)
     }
 
@@ -386,13 +382,12 @@ impl WebRtcSession {
     /// Called by `PATCH /v1/stream/whip/{sess_id}/prompt` when `output_schema`
     /// is present in the request body.
     pub fn update_guided_json(&self, schema: Option<String>) {
-        if let Ok(mut guard) = self.guided_json.write() {
-            *guard = schema.map(Arc::from);
-        }
+        self.guided_json
+            .store(schema.map(|schema| Arc::new(Arc::from(schema))));
     }
 
     /// Clone the guided-JSON handle for sharing with VLM worker threads.
-    pub fn guided_json_arc(&self) -> Arc<RwLock<Option<Arc<str>>>> {
+    pub fn guided_json_arc(&self) -> Arc<ArcSwapOption<Arc<str>>> {
         Arc::clone(&self.guided_json)
     }
 
@@ -430,9 +425,10 @@ fn frame_payload_to_nals(codec: VideoCodec, payload: &[u8], pool: &VecPool) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{frame_payload_to_nals, RtpFrame, WebRtcConfig};
+    use super::{frame_payload_to_nals, RtpFrame, WebRtcConfig, WebRtcSession};
     use crate::webrtc::decode::VideoCodec;
     use crate::webrtc::recycle::{RecycledBytes, VecPool};
+    use std::sync::Arc;
 
     #[test]
     fn rtp_frame_annex_b_layout_h264() {
@@ -530,5 +526,29 @@ mod tests {
         let cloned = frame.clone();
         assert_eq!(cloned.codec, VideoCodec::Vp8);
         let _ = format!("{:?}", cloned);
+    }
+
+    #[tokio::test]
+    async fn prompt_and_guided_json_read_latest_updates() {
+        let session = WebRtcSession {
+            pc: rustrtc::peer_connection::PeerConnection::new(Default::default()),
+            prompt: Arc::new(arc_swap::ArcSwap::from(Arc::new(Arc::from("")))),
+            guided_json: Arc::new(arc_swap::ArcSwapOption::from(None::<Arc<Arc<str>>>)),
+            max_output_tokens_per_second: 128,
+            codec: VideoCodec::H264,
+        };
+
+        session.update_prompt("describe safety events".to_string());
+        session.update_guided_json(Some(r#"{"type":"object"}"#.to_string()));
+
+        assert_eq!(&*session.read_prompt(), "describe safety events");
+        assert_eq!(
+            session
+                .guided_json_arc()
+                .load_full()
+                .as_ref()
+                .map(|schema| schema.as_ref().as_ref()),
+            Some(r#"{"type":"object"}"#)
+        );
     }
 }

@@ -1,7 +1,7 @@
 use arc_swap::ArcSwap;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -403,7 +403,7 @@ impl AppState {
 
     pub fn run_runtime_snapshot(&self, run_id: &str, now_ms: u64) -> Option<RunRuntimeSnapshot> {
         let registry = self.run_registry.load();
-        let summary = registry.runs.get(run_id)?;
+        let summary = registry.runs.get(run_id)?.snapshot();
         if !summary.created {
             return None;
         }
@@ -425,6 +425,7 @@ impl AppState {
             .iter()
             .filter_map(|run_id| registry.runs.get(run_id))
             .filter(|summary| {
+                let summary = summary.snapshot();
                 !apply_expiry(summary.state, summary.last_activity_ms, now_ms, ttl_ms).is_terminal()
             })
             .count()
@@ -439,11 +440,21 @@ impl AppState {
     }
 
     fn apply_event_to_registry(&self, event: &TimelineEvent) {
-        self.run_registry.rcu(|current| {
-            let mut next = (**current).clone();
-            next.apply_event(event);
-            Arc::new(next)
-        });
+        if event.kind == "run_created" {
+            self.run_registry
+                .rcu(|current| Arc::new(current.with_structural_event(event)));
+            return;
+        }
+
+        let registry = self.run_registry.load();
+        if let Some(summary) = registry.runs.get(&event.run_id) {
+            summary.apply_event(event);
+            return;
+        }
+        drop(registry);
+
+        self.run_registry
+            .rcu(|current| Arc::new(current.with_structural_event(event)));
     }
 }
 
@@ -472,45 +483,82 @@ pub struct RunRuntimeSnapshot {
 
 #[derive(Clone, Default)]
 struct RunRegistry {
-    runs: HashMap<String, RunSummary>,
+    runs: HashMap<String, Arc<RunState>>,
     by_principal: HashMap<Arc<str>, HashSet<String>>,
 }
 
 impl RunRegistry {
-    fn apply_event(&mut self, event: &TimelineEvent) {
-        let entry = self
+    fn with_structural_event(&self, event: &TimelineEvent) -> Self {
+        let mut next = self.clone();
+        next.apply_structural_event(event);
+        next
+    }
+
+    fn apply_structural_event(&mut self, event: &TimelineEvent) {
+        let before = self
             .runs
-            .entry(event.run_id.clone())
-            .or_insert_with(RunSummary::default_public);
-        let was_created = entry.created;
-        let previous_principal = entry.principal_key.clone();
+            .get(&event.run_id)
+            .map(|entry| entry.snapshot())
+            .unwrap_or_else(RunSummary::default_public);
+        let mut after = before.clone();
+        after.apply_event(event);
 
-        if event.kind == "run_created" {
-            entry.created = true;
-            if let Some(principal) = principal_key_from_payload(&event.payload) {
-                entry.principal_key = principal;
-            }
-        }
-
-        entry.state = transition_state(entry.state, event.kind.as_str());
-        entry.last_activity_ms = entry.last_activity_ms.max(event.pts_ms);
-
-        if !entry.created {
+        if !after.created {
+            self.runs
+                .insert(event.run_id.clone(), Arc::new(RunState::from_summary(after)));
             return;
         }
 
-        if was_created && previous_principal != entry.principal_key {
-            if let Some(set) = self.by_principal.get_mut(&*previous_principal) {
+        if before.created && before.principal_key != after.principal_key {
+            if let Some(set) = self.by_principal.get_mut(&*before.principal_key) {
                 set.remove(&event.run_id);
                 if set.is_empty() {
-                    self.by_principal.remove(&*previous_principal);
+                    self.by_principal.remove(&*before.principal_key);
                 }
             }
         }
         self.by_principal
-            .entry(entry.principal_key.clone())
+            .entry(after.principal_key.clone())
             .or_default()
             .insert(event.run_id.clone());
+        self.runs
+            .insert(event.run_id.clone(), Arc::new(RunState::from_summary(after)));
+    }
+}
+
+struct RunState {
+    created: AtomicBool,
+    principal_key: ArcSwap<Arc<str>>,
+    state: AtomicU8,
+    last_activity_ms: AtomicU64,
+}
+
+impl RunState {
+    fn from_summary(summary: RunSummary) -> Self {
+        Self {
+            created: AtomicBool::new(summary.created),
+            principal_key: ArcSwap::from(Arc::new(summary.principal_key)),
+            state: AtomicU8::new(encode_stream_state(summary.state)),
+            last_activity_ms: AtomicU64::new(summary.last_activity_ms),
+        }
+    }
+
+    fn apply_event(&self, event: &TimelineEvent) {
+        if let Some(next) = transition_state(event.kind.as_str()) {
+            self.state
+                .store(encode_stream_state(next), Ordering::Release);
+        }
+        self.last_activity_ms
+            .fetch_max(event.pts_ms, Ordering::AcqRel);
+    }
+
+    fn snapshot(&self) -> RunSummary {
+        RunSummary {
+            created: self.created.load(Ordering::Acquire),
+            principal_key: Arc::clone(&*self.principal_key.load_full()),
+            state: decode_stream_state(self.state.load(Ordering::Acquire)),
+            last_activity_ms: self.last_activity_ms.load(Ordering::Acquire),
+        }
     }
 }
 
@@ -531,12 +579,25 @@ impl RunSummary {
             last_activity_ms: 0,
         }
     }
+
+    fn apply_event(&mut self, event: &TimelineEvent) {
+        if event.kind == "run_created" {
+            self.created = true;
+            if let Some(principal) = principal_key_from_payload(&event.payload) {
+                self.principal_key = principal;
+            }
+        }
+        if let Some(next) = transition_state(event.kind.as_str()) {
+            self.state = next;
+        }
+        self.last_activity_ms = self.last_activity_ms.max(event.pts_ms);
+    }
 }
 
 fn build_run_registry(events: &[TimelineEvent]) -> Arc<RunRegistry> {
     let mut registry = RunRegistry::default();
     for event in events {
-        registry.apply_event(event);
+        registry.apply_structural_event(event);
     }
     Arc::new(registry)
 }
@@ -550,17 +611,39 @@ fn principal_key_from_payload(raw: &str) -> Option<Arc<str>> {
     })
 }
 
-fn transition_state(current: StreamState, event_kind: &str) -> StreamState {
+fn transition_state(event_kind: &str) -> Option<StreamState> {
     match event_kind {
-        "run_created" => StreamState::Pending,
+        "run_created" => Some(StreamState::Pending),
         "ingest_received"
         | "analysis_generated"
         | "inference_completed"
-        | "keepalive_refreshed" => StreamState::Processing,
-        "run_completed" => StreamState::Completed,
-        "run_failed" => StreamState::Failed,
-        "stop_requested" => StreamState::Cancelled,
-        _ => current,
+        | "keepalive_refreshed" => Some(StreamState::Processing),
+        "run_completed" => Some(StreamState::Completed),
+        "run_failed" => Some(StreamState::Failed),
+        "stop_requested" => Some(StreamState::Cancelled),
+        _ => None,
+    }
+}
+
+fn encode_stream_state(state: StreamState) -> u8 {
+    match state {
+        StreamState::Pending => 0,
+        StreamState::Processing => 1,
+        StreamState::Completed => 2,
+        StreamState::Failed => 3,
+        StreamState::Cancelled => 4,
+        StreamState::Expired => 5,
+    }
+}
+
+fn decode_stream_state(raw: u8) -> StreamState {
+    match raw {
+        1 => StreamState::Processing,
+        2 => StreamState::Completed,
+        3 => StreamState::Failed,
+        4 => StreamState::Cancelled,
+        5 => StreamState::Expired,
+        _ => StreamState::Pending,
     }
 }
 
@@ -577,5 +660,108 @@ fn apply_expiry(
         StreamState::Expired
     } else {
         state
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+    use std::thread;
+
+    fn event(seq: u64, kind: &str, pts_ms: u64, payload: Value) -> TimelineEvent {
+        TimelineEvent {
+            seq,
+            run_id: "run-1".to_string(),
+            stream_id: "stream-0".to_string(),
+            pts_ms,
+            kind: kind.to_string(),
+            payload: payload.to_string(),
+        }
+    }
+
+    #[test]
+    fn registry_keeps_same_map_snapshot_for_existing_run_event() {
+        let state = AppState::with_wal_for_tests(std::env::temp_dir().join(
+            format!("vidarax-state-test-{}.wal", std::process::id()),
+        ));
+        state.apply_event_to_registry(&event(
+            1,
+            "run_created",
+            100,
+            json!({"principal_key": "tenant-a"}),
+        ));
+        let before = state.run_registry.load_full();
+
+        state.apply_event_to_registry(&event(2, "analysis_generated", 150, json!({})));
+        let after = state.run_registry.load_full();
+
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "existing-run events must update run atomics without replacing the registry map"
+        );
+        let snapshot = state.run_runtime_snapshot("run-1", 150).unwrap();
+        assert_eq!(snapshot.principal_key, "tenant-a");
+        assert_eq!(snapshot.state, StreamState::Processing);
+        assert_eq!(snapshot.last_activity_ms, 150);
+    }
+
+    #[test]
+    fn concurrent_keyframes_do_not_clobber_completed_state() {
+        const KEYFRAME_THREADS: usize = 16;
+        const KEYFRAMES_PER_THREAD: usize = 10_000;
+
+        let run = Arc::new(RunState::from_summary(RunSummary {
+            created: true,
+            principal_key: Arc::from("tenant-a"),
+            state: StreamState::Processing,
+            last_activity_ms: 100,
+        }));
+        let start = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::with_capacity(KEYFRAME_THREADS + 1);
+
+        for worker in 0..KEYFRAME_THREADS {
+            let run = Arc::clone(&run);
+            let start = Arc::clone(&start);
+            let ready = Arc::clone(&ready);
+            threads.push(thread::spawn(move || {
+                ready.fetch_add(1, AtomicOrdering::AcqRel);
+                while !start.load(AtomicOrdering::Acquire) {
+                    thread::yield_now();
+                }
+                for i in 0..KEYFRAMES_PER_THREAD {
+                    run.apply_event(&event(
+                        1_000 + (worker * KEYFRAMES_PER_THREAD + i) as u64,
+                        "keyframe_stored",
+                        200 + i as u64,
+                        json!({}),
+                    ));
+                }
+            }));
+        }
+
+        let completed_run = Arc::clone(&run);
+        let completed_start = Arc::clone(&start);
+        let completed_ready = Arc::clone(&ready);
+        threads.push(thread::spawn(move || {
+            completed_ready.fetch_add(1, AtomicOrdering::AcqRel);
+            while !completed_start.load(AtomicOrdering::Acquire) {
+                thread::yield_now();
+            }
+            completed_run.apply_event(&event(2, "run_completed", 500, json!({})));
+        }));
+
+        while ready.load(AtomicOrdering::Acquire) != KEYFRAME_THREADS + 1 {
+            thread::yield_now();
+        }
+        start.store(true, AtomicOrdering::Release);
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(run.snapshot().state, StreamState::Completed);
     }
 }

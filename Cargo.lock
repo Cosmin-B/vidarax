@@ -4514,6 +4514,7 @@ version = "0.1.0"
 name = "vidarax-core"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "axum",
  "base64",
  "jpeg-encoder",

@@ -16,8 +16,7 @@
 //! assert_eq!(provider.kind(), ProviderKind::Gemini);
 //! ```
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -30,30 +29,6 @@ use crate::provider::{
 
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
 const INLINE_SIZE_LIMIT: usize = 20 * 1024 * 1024; // 20 MB
-
-// ── Static model-string interning cache ──────────────────────────────────────
-
-/// Thread-safe string interning cache.  Leaks exactly once per unique string
-/// so that callsites requiring `&'static str` don't leak on every call.
-/// Bounded by the number of distinct strings the process ever sees.
-static STRING_CACHE: Mutex<Option<HashMap<String, &'static str>>> = Mutex::new(None);
-
-/// Intern an arbitrary string, returning a `&'static str`.
-fn intern_str(s: &str) -> &'static str {
-    let mut guard = STRING_CACHE.lock().expect("string cache lock poisoned");
-    let map = guard.get_or_insert_with(HashMap::new);
-    if let Some(&cached) = map.get(s) {
-        return cached;
-    }
-    let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
-    map.insert(s.to_string(), leaked);
-    leaked
-}
-
-/// Intern a model name string.  Thin wrapper over [`intern_str`].
-pub(crate) fn intern_model(s: &str) -> &'static str {
-    intern_str(s)
-}
 
 // ── Provider ─────────────────────────────────────────────────────────────────
 
@@ -299,11 +274,11 @@ impl GeminiProvider {
         let finish_reason = json
             .pointer("/candidates/0/finishReason")
             .and_then(|v| v.as_str())
-            .map(|r| map_finish_reason(r).to_string());
+            .map(map_finish_reason);
 
         Ok(InferenceResult {
             provider: ProviderKind::Gemini,
-            model: intern_model(model),
+            model: Arc::from(model),
             output_text: text,
             fallback_used: false,
             finish_reason,
@@ -355,15 +330,12 @@ impl InferenceProvider for GeminiProvider {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn map_finish_reason(raw: &str) -> &'static str {
+fn map_finish_reason(raw: &str) -> String {
     match raw {
-        "STOP" => "stop",
-        "MAX_TOKENS" => "length",
-        "SAFETY" => "content_filter",
-        other => {
-            // For unknown variants we intern a lowercase copy.
-            intern_str(&other.to_ascii_lowercase())
-        }
+        "STOP" => "stop".to_string(),
+        "MAX_TOKENS" => "length".to_string(),
+        "SAFETY" => "content_filter".to_string(),
+        other => other.to_ascii_lowercase(),
     }
 }
 
@@ -563,17 +535,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_response_model_is_interned() {
+    fn parse_response_model_is_owned_arc() {
         let p = provider();
         let raw = make_gemini_response("hi", "STOP");
-        let r1 = p
-            .parse_response(&raw, "gemini-2.5-flash-preview-05-20", Instant::now())
+        let result = p
+            .parse_response(&raw, "gemini-3.0-custom", Instant::now())
             .unwrap();
-        let r2 = p
-            .parse_response(&raw, "gemini-2.5-flash-preview-05-20", Instant::now())
-            .unwrap();
-        // Same &'static str pointer for the same model name.
-        assert!(std::ptr::eq(r1.model, r2.model));
+        let _: Arc<str> = result.model.clone();
+        assert_eq!(&*result.model, "gemini-3.0-custom");
     }
 
     #[test]
@@ -587,22 +556,6 @@ mod tests {
         let p = provider();
         let raw = r#"{"candidates":[]}"#;
         assert!(p.parse_response(raw, "gemini-2.0-flash", Instant::now()).is_err());
-    }
-
-    // ── intern_model ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn intern_model_returns_same_pointer_for_same_string() {
-        let a = intern_model("gemini-test-model");
-        let b = intern_model("gemini-test-model");
-        assert!(std::ptr::eq(a, b));
-    }
-
-    #[test]
-    fn intern_model_distinct_strings_distinct_pointers() {
-        let a = intern_model("model-alpha");
-        let b = intern_model("model-beta");
-        assert!(!std::ptr::eq(a, b));
     }
 
     // ── Live integration tests (require GEMINI_API_KEY) ─────────────────────

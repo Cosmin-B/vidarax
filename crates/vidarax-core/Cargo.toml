@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+arc-swap = "1.8"
 libc = "0.2"
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 serde = { version = "1", features = ["derive", "rc"] }

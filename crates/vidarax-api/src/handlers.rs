@@ -2214,7 +2214,7 @@ async fn execute_infer_request(
         let event_payload = json!({
             "request_id": request_id,
             "provider": provider_name(result.provider),
-            "model": result.model,
+            "model": &*result.model,
             "fallback_used": result.fallback_used,
             "prompt_bytes": prepared.request.prompt.len(),
             "output_bytes": result.output_text.len()

@@ -19,8 +19,9 @@
 //! `Authorization: Bearer <token>` on subsequent calls so all reducer invocations
 //! share the same persistent identity.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
 use serde_json::Value;
 
 // ─── Error ────────────────────────────────────────────────────────────────────
@@ -138,7 +139,7 @@ struct Inner {
     async_client: reqwest::Client,
     sync_client: reqwest::blocking::Client,
     /// JWT issued by SpacetimeDB — persisted across calls for identity continuity.
-    token: RwLock<Option<String>>,
+    token: ArcSwapOption<Arc<str>>,
 }
 
 /// Cheap-to-clone (Arc-backed) HTTP client for the Vidarax SpacetimeDB module.
@@ -162,7 +163,7 @@ impl SpacetimeClient {
                 database: database.into(),
                 async_client: reqwest::Client::new(),
                 sync_client: reqwest::blocking::Client::new(),
-                token: RwLock::new(None),
+                token: ArcSwapOption::from(None::<Arc<Arc<str>>>),
             }),
         }
     }
@@ -183,16 +184,14 @@ impl SpacetimeClient {
         )
     }
 
-    fn read_token(&self) -> Option<String> {
-        self.inner.token.read().ok()?.clone()
+    fn read_token(&self) -> Option<Arc<str>> {
+        self.inner.token.load_full().map(|token| Arc::clone(&*token))
     }
 
     fn store_token_from_headers(&self, headers: &reqwest::header::HeaderMap) {
         if let Some(val) = headers.get("spacetime-identity-token") {
             if let Ok(tok) = val.to_str() {
-                if let Ok(mut guard) = self.inner.token.write() {
-                    *guard = Some(tok.to_string());
-                }
+                self.inner.token.store(Some(Arc::new(Arc::from(tok))));
             }
         }
     }
@@ -686,4 +685,23 @@ fn parse_feedback(row: Value) -> Result<FeedbackRow, SpacetimeError> {
         feedback: col_str(&row, 6)?,
         timestamp_micros: col_timestamp(&row, 7)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn token_reader_observes_latest_stored_header_value() {
+        let client = SpacetimeClient::new("http://localhost:3000", "vidarax");
+        let mut headers = HeaderMap::new();
+        headers.insert("spacetime-identity-token", HeaderValue::from_static("tok-a"));
+        client.store_token_from_headers(&headers);
+        assert_eq!(client.auth_header().as_deref(), Some("Bearer tok-a"));
+
+        headers.insert("spacetime-identity-token", HeaderValue::from_static("tok-b"));
+        client.store_token_from_headers(&headers);
+        assert_eq!(client.auth_header().as_deref(), Some("Bearer tok-b"));
+    }
 }

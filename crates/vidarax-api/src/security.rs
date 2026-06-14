@@ -411,42 +411,22 @@ fn epoch_seconds() -> u64 {
 
 struct FixedWindowLimiter {
     limit_per_sec: u64,
-    state: AtomicU64,
+    window: AtomicU64,
+    count: AtomicU64,
 }
 
 impl FixedWindowLimiter {
     fn new(limit_per_sec: u64) -> Self {
         Self {
             limit_per_sec: limit_per_sec.max(1),
-            state: AtomicU64::new(0),
+            window: AtomicU64::new(0),
+            count: AtomicU64::new(0),
         }
     }
 
     fn allow(&self, now_sec: u64) -> bool {
-        let window = pack_window(now_sec, 0);
-        let limit = self.limit_per_sec.min(u32::MAX as u64) as u32;
-        loop {
-            let observed = self.state.load(Ordering::Acquire);
-            let observed_window = unpack_window(observed);
-            let observed_count = unpack_count(observed);
-            let (next, allowed) = if observed_window != unpack_window(window) {
-                (pack_window(now_sec, 1), true)
-            } else if observed_count >= limit {
-                (observed, false)
-            } else {
-                (pack_window(now_sec, observed_count + 1), true)
-            };
-            if self
-                .state
-                .compare_exchange(observed, next, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                if !allowed {
-                    return false;
-                }
-                return unpack_count(next) <= limit;
-            }
-        }
+        reset_counter_if_window_changed(&self.window, &self.count, bounded_window(now_sec));
+        self.count.fetch_add(1, Ordering::AcqRel) + 1 <= self.limit_per_sec
     }
 }
 
@@ -469,8 +449,8 @@ impl TenantWindowLimiter {
 
     fn allow(&self, tenant_id: &str, now_sec: u64) -> bool {
         let target = stable_hash(tenant_id);
-        let now_window = bounded_window(now_sec);
-        let mut stale_candidate: Option<(usize, u64)> = None;
+        let now_window = bounded_window(now_sec) as u64;
+        let mut stale_candidate: Option<usize> = None;
 
         for probe in 0..self.slots.len() {
             let idx = ((target as usize).wrapping_add(probe)) % self.slots.len();
@@ -479,36 +459,21 @@ impl TenantWindowLimiter {
             if key == target {
                 return slot.allow(now_sec, self.limit_per_sec);
             }
-            if key == 0
-                && slot
-                    .hash
-                    .compare_exchange(0, target, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                slot.state.store(pack_window(now_sec, 0), Ordering::Release);
-                return slot.allow(now_sec, self.limit_per_sec);
-            }
 
             if stale_candidate.is_none() {
-                let observed_window = unpack_window(slot.state.load(Ordering::Acquire));
-                if observed_window != now_window {
-                    stale_candidate = Some((idx, key));
+                let observed_window = slot.window.load(Ordering::Acquire);
+                if key == 0 || observed_window != now_window {
+                    stale_candidate = Some(idx);
                 }
             }
         }
 
-        if let Some((idx, key)) = stale_candidate {
+        if let Some(idx) = stale_candidate {
             let slot = &self.slots[idx];
-            if slot
-                .hash
-                .compare_exchange(key, target, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                slot.state.store(pack_window(now_sec, 0), Ordering::Release);
-                return slot.allow(now_sec, self.limit_per_sec);
-            }
-            // If replacement lost the race, fail closed instead of reusing a slot whose state may
-            // still correspond to a different tenant window.
+            slot.count.store(0, Ordering::Release);
+            slot.window.store(now_window, Ordering::Release);
+            slot.hash.store(target, Ordering::Release);
+            return slot.allow(now_sec, self.limit_per_sec);
         }
 
         false
@@ -518,34 +483,14 @@ impl TenantWindowLimiter {
 #[derive(Default)]
 struct TenantSlot {
     hash: AtomicU64,
-    state: AtomicU64,
+    window: AtomicU64,
+    count: AtomicU64,
 }
 
 impl TenantSlot {
     fn allow(&self, now_sec: u64, limit_per_sec: u64) -> bool {
-        let limit = limit_per_sec.min(u32::MAX as u64) as u32;
-        loop {
-            let observed = self.state.load(Ordering::Acquire);
-            let observed_window = unpack_window(observed);
-            let observed_count = unpack_count(observed);
-            let (next, allowed) = if observed_window != bounded_window(now_sec) {
-                (pack_window(now_sec, 1), true)
-            } else if observed_count >= limit {
-                (observed, false)
-            } else {
-                (pack_window(now_sec, observed_count + 1), true)
-            };
-            if self
-                .state
-                .compare_exchange(observed, next, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                if !allowed {
-                    return false;
-                }
-                return unpack_count(next) <= limit;
-            }
-        }
+        reset_counter_if_window_changed(&self.window, &self.count, bounded_window(now_sec));
+        self.count.fetch_add(1, Ordering::AcqRel) + 1 <= limit_per_sec
     }
 }
 
@@ -559,23 +504,17 @@ fn stable_hash(value: &str) -> u64 {
 }
 
 #[inline]
-fn pack_window(now_sec: u64, count: u32) -> u64 {
-    ((bounded_window(now_sec) as u64) << 32) | count as u64
-}
-
-#[inline]
 fn bounded_window(now_sec: u64) -> u32 {
     now_sec.min(u32::MAX as u64) as u32
 }
 
 #[inline]
-fn unpack_window(state: u64) -> u32 {
-    (state >> 32) as u32
-}
-
-#[inline]
-fn unpack_count(state: u64) -> u32 {
-    (state & 0xffff_ffff) as u32
+fn reset_counter_if_window_changed(window: &AtomicU64, count: &AtomicU64, now_window: u32) {
+    let now_window = now_window as u64;
+    if window.load(Ordering::Acquire) != now_window {
+        count.store(0, Ordering::Release);
+        window.store(now_window, Ordering::Release);
+    }
 }
 
 fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
@@ -591,7 +530,16 @@ fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, SecurityPolicy, TenantWindowLimiter};
+    use super::{constant_time_eq, FixedWindowLimiter, SecurityPolicy, TenantWindowLimiter};
+
+    #[test]
+    fn fixed_window_enforces_limit_and_resets_on_next_second() {
+        let limiter = FixedWindowLimiter::new(2);
+        assert!(limiter.allow(10));
+        assert!(limiter.allow(10));
+        assert!(!limiter.allow(10));
+        assert!(limiter.allow(11));
+    }
 
     #[test]
     fn tenant_window_isolated_by_tenant_id() {
