@@ -94,11 +94,7 @@ impl PipelineBackend {
     }
 }
 
-/// What a backend can actually do today.
-///
-/// Stub backends report `hardware_decode = false` and fall back to the CPU path,
-/// so a caller that selects an unimplemented backend gets a warning instead of
-/// silent degradation.
+/// Backend capability flags used by fallback warnings.
 #[derive(Debug, Clone, Copy)]
 pub struct BackendCapabilities {
     pub hardware_decode: bool,
@@ -108,14 +104,12 @@ pub struct BackendCapabilities {
 /// A decode backend. Implementations run the two-phase flow: frame signals for
 /// the gate engine, then selective JPEG extraction for the frames it keeps.
 pub trait DecodePipeline: Send + Sync {
-    /// Phase 1: per-frame signals (hashes, luma) for the gate engine.
     fn decode_signals(
         &self,
         source: &InputSource,
         config: Mp4DecodeConfig,
     ) -> Result<DecodedMp4Batch, String>;
 
-    /// Phase 2: JPEG frames at `frame_indices` (computed from the gate output).
     /// An empty `frame_indices` returns no frames without invoking ffmpeg.
     fn decode_jpegs(
         &self,
@@ -189,7 +183,7 @@ impl DecodePipeline for NvdecCudaPipeline {
         source: &InputSource,
         config: Mp4DecodeConfig,
     ) -> Result<DecodedMp4Batch, String> {
-        // framemd5 is text output with no GPU benefit, so phase 1 stays on CPU.
+        // framemd5 is text output with no GPU benefit.
         decode_mp4_to_frame_signals(source, config)
     }
 
@@ -284,8 +278,6 @@ fn decode_selective_jpeg_frames_nvdec(
 // MLX backend (Apple Silicon)
 // ---------------------------------------------------------------------------
 
-/// MLX is not yet implemented. Both phases fall back to the CPU ffmpeg path, and
-/// [`BackendCapabilities`] reports the fallback so callers are not misled.
 pub struct MlxPipeline;
 
 impl DecodePipeline for MlxPipeline {
@@ -370,8 +362,7 @@ pub fn build_decode_pipeline(name: &str) -> Result<Arc<dyn DecodePipeline>, Stri
         .ok_or_else(|| format!("unknown decode backend '{name}'"))
 }
 
-/// Build the decode pipeline for `backend`. A backend that selects no hardware
-/// acceleration (an unimplemented stub) logs a warning so the fallback is visible.
+/// Build the decode pipeline for `backend`.
 pub fn create_pipeline(backend: PipelineBackend) -> Arc<dyn DecodePipeline> {
     let pipeline = build_decode_pipeline(backend.label()).expect("built-in decode backend missing");
 

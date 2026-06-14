@@ -9,25 +9,15 @@
 //! bucket arrays, one `AtomicU64` per bucket.  The `render_prometheus`
 //! method emits cumulative bucket counts compatible with the Prometheus
 //! histogram exposition format.
-//!
-//! # Example
-//!
-//! ```rust
-//! use std::sync::Arc;
-//! use vidarax_core::metrics::PipelineMetrics;
-//!
-//! let m = Arc::new(PipelineMetrics::new());
-//! m.inc_rtp_received();
-//! m.inc_frames_decoded();
-//! m.decode_latency_us.record(420);
-//! let text = m.render_prometheus();
-//! assert!(text.contains("vidarax_pipeline_rtp_frames_received_total 1"));
-//! assert!(text.contains("vidarax_pipeline_decode_latency_us_count 1"));
-//! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// ─── LatencyHistogram ─────────────────────────────────────────────────────────
+pub const DECODE_LATENCY_US_BUCKETS: [u64; 8] =
+    [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 50_000];
+pub const GATE_LATENCY_US_BUCKETS: [u64; 8] = [1, 5, 10, 50, 100, 500, 1_000, 5_000];
+pub const VLM_LATENCY_MS_BUCKETS: [u64; 8] =
+    [50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000];
+pub const STDB_EMIT_LATENCY_MS_BUCKETS: [u64; 8] = [1, 5, 10, 25, 50, 100, 250, 1_000];
 
 /// Zero-alloc histogram with 8 fixed upper-bound buckets.
 ///
@@ -39,13 +29,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// bucket whose bound is `>= value`), mirroring how `InferenceMetrics`
 /// handles its own latency buckets.
 pub struct LatencyHistogram {
-    /// Upper bounds for the 8 buckets (values in the same unit as observations).
     bounds: [u64; 8],
-    /// Per-bucket non-cumulative observation counts.
     buckets: [AtomicU64; 8],
-    /// Running sum of all observed values.
     sum: AtomicU64,
-    /// Total number of observations.
     count: AtomicU64,
 }
 
@@ -67,9 +53,6 @@ impl LatencyHistogram {
     }
 
     /// Record a single observation.
-    ///
-    /// Finds the first bucket whose upper bound is `>= value` and increments
-    /// it; also increments `sum` and `count`.  O(8) — branchless inner loop.
     #[inline]
     pub fn record(&self, value: u64) {
         self.sum.fetch_add(value, Ordering::Relaxed);
@@ -80,14 +63,8 @@ impl LatencyHistogram {
                 return;
             }
         }
-        // Value exceeds the largest explicit bound — counts only in +Inf.
     }
 
-    /// Emit Prometheus histogram lines for this histogram.
-    ///
-    /// `metric_name` is the base name (e.g. `"vidarax_pipeline_decode_latency_us"`).
-    /// `unit` is the label suffix used in `le` values (the bounds are raw
-    /// numbers, so the caller controls how they are presented).
     pub fn render_prometheus(&self, metric_name: &str, _unit: &str) -> String {
         let count = self.count.load(Ordering::Relaxed);
         let sum = self.sum.load(Ordering::Relaxed);
@@ -106,19 +83,7 @@ impl LatencyHistogram {
     }
 }
 
-// ─── PipelineMetrics ──────────────────────────────────────────────────────────
-
-/// Zero-alloc pipeline metrics backed by `AtomicU64` counters and latency
-/// histograms.
-///
-/// Histogram bucket boundaries per stage:
-///
-/// | Histogram            | Bounds (µs)                                     |
-/// |----------------------|-------------------------------------------------|
-/// | `decode_latency_us`  | 100, 250, 500, 1000, 2000, 5000, 10000, 50000  |
-/// | `gate_latency_us`    | 1, 5, 10, 50, 100, 500, 1000, 5000             |
-/// | `vlm_latency_ms`     | 50, 100, 250, 500, 1000, 2500, 5000, 10000     |
-/// | `stdb_emit_latency_ms` | 1, 5, 10, 25, 50, 100, 250, 1000            |
+/// Zero-alloc pipeline metrics backed by `AtomicU64` counters and latency histograms.
 pub struct PipelineMetrics {
     /// RTP frames received by decode workers.
     rtp_frames_received_total: AtomicU64,
@@ -137,22 +102,13 @@ pub struct PipelineMetrics {
     /// WHIP sessions removed (terminated).
     sessions_removed_total: AtomicU64,
 
-    // ── Latency histograms ────────────────────────────────────────────────
     /// Per-frame H.264 decode latency in microseconds.
-    ///
-    /// Bounds: [100, 250, 500, 1000, 2000, 5000, 10000, 50000] µs
     pub decode_latency_us: LatencyHistogram,
     /// Gate engine processing latency in microseconds.
-    ///
-    /// Bounds: [1, 5, 10, 50, 100, 500, 1000, 5000] µs
     pub gate_latency_us: LatencyHistogram,
     /// VLM inference round-trip latency in milliseconds.
-    ///
-    /// Bounds: [50, 100, 250, 500, 1000, 2500, 5000, 10000] ms
     pub vlm_latency_ms: LatencyHistogram,
     /// SpacetimeDB HTTP POST latency in milliseconds.
-    ///
-    /// Bounds: [1, 5, 10, 25, 50, 100, 250, 1000] ms
     pub stdb_emit_latency_ms: LatencyHistogram,
 }
 
@@ -169,14 +125,10 @@ impl PipelineMetrics {
             sessions_created_total: AtomicU64::new(0),
             sessions_removed_total: AtomicU64::new(0),
 
-            decode_latency_us: LatencyHistogram::new([
-                100, 250, 500, 1_000, 2_000, 5_000, 10_000, 50_000,
-            ]),
-            gate_latency_us: LatencyHistogram::new([1, 5, 10, 50, 100, 500, 1_000, 5_000]),
-            vlm_latency_ms: LatencyHistogram::new([
-                50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000,
-            ]),
-            stdb_emit_latency_ms: LatencyHistogram::new([1, 5, 10, 25, 50, 100, 250, 1_000]),
+            decode_latency_us: LatencyHistogram::new(DECODE_LATENCY_US_BUCKETS),
+            gate_latency_us: LatencyHistogram::new(GATE_LATENCY_US_BUCKETS),
+            vlm_latency_ms: LatencyHistogram::new(VLM_LATENCY_MS_BUCKETS),
+            stdb_emit_latency_ms: LatencyHistogram::new(STDB_EMIT_LATENCY_MS_BUCKETS),
         }
     }
 

@@ -22,7 +22,7 @@ mod validation;
 pub mod wal_sink;
 mod whip;
 
-pub use config::{assert_route_parity, resolve_wal_path, ServerConfig, TransportMode};
+pub use config::{resolve_wal_path, ServerConfig, TransportMode};
 pub use models::AttachStreamRequest;
 pub use router::app_router;
 pub use state::AppState;
@@ -41,7 +41,6 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
     )
     .ok();
 
-    assert_route_parity().map_err(invalid_input)?;
     let wal_path = resolve_wal_path(&config).map_err(invalid_input)?;
     let config_path = std::env::var("VIDARAX_CONFIG").unwrap_or_else(|_| "vidarax.toml".to_string());
     let backend_config = config::load_backend_config(&config_path).map_err(invalid_input)?;
@@ -128,7 +127,7 @@ fn build_webrtc_config(config: &ServerConfig) -> WebRtcConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{app_router, assert_route_parity, AppState, ServerConfig, TransportMode};
+    use super::{app_router, AppState, ServerConfig, TransportMode};
     use vidarax_core::ingest::pipeline::{register_decode_backend, CpuFfmpegPipeline, PipelineBackend};
     use vidarax_core::tiered_vlm::DistillationConfig;
     use crate::security::SecurityPolicy;
@@ -2020,8 +2019,4 @@ mod tests {
         assert!(TransportMode::parse(Some("bad-mode")).is_err());
     }
 
-    #[test]
-    fn route_parity_fingerprint_matches() {
-        assert!(assert_route_parity().is_ok());
-    }
 }

@@ -128,7 +128,6 @@ pub fn interpolate_env_vars(s: &str) -> String {
 /// - `entries` is empty.
 /// - Any entry has an unrecognised `type`.
 /// - A required field (e.g. `base_url` for `openai_compat`) is missing.
-/// - `"gemini"` is requested — Task 2 adds the implementation.
 pub fn build_provider_chain(
     entries: &[BackendEntry],
 ) -> Result<Arc<dyn InferenceProvider + Send + Sync>, String> {
@@ -136,11 +135,9 @@ pub fn build_provider_chain(
         return Err("no backends configured".to_string());
     }
 
-    // Sort a copy by priority (stable, ascending).
     let mut sorted = entries.to_vec();
     sorted.sort_by_key(|e| e.priority);
 
-    // Build each entry into a boxed InferenceProvider.
     let providers: Vec<Box<dyn InferenceProvider + Send + Sync>> = sorted
         .iter()
         .map(build_single_provider)
@@ -149,7 +146,6 @@ pub fn build_provider_chain(
     // Fold from the back so that the first entry becomes the outermost primary.
     // With a single provider we skip wrapping entirely.
     let chain: Arc<dyn InferenceProvider + Send + Sync> = if providers.len() == 1 {
-        // SAFETY: we just checked len() == 1.
         let only = providers.into_iter().next().unwrap();
         Arc::from(only)
     } else {
@@ -158,8 +154,6 @@ pub fn build_provider_chain(
 
     Ok(chain)
 }
-
-// ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn build_single_provider(
     entry: &BackendEntry,
@@ -247,13 +241,9 @@ fn fold_into_router(
     chain
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── interpolate_env_vars ──────────────────────────────────────────────────
 
     #[test]
     fn interpolate_replaces_set_variable() {

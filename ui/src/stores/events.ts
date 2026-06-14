@@ -79,6 +79,12 @@ export const useEventsStore = defineStore('events', () => {
   }
 
   function binaryInsert<T>(arr: T[], item: T, compare: (a: T, b: T) => number): void {
+    // SSE events arrive in order almost always, so the tail append is the
+    // common case and stays O(1); only an out-of-order event pays the O(n) splice.
+    if (arr.length === 0 || compare(arr[arr.length - 1]!, item) <= 0) {
+      arr.push(item)
+      return
+    }
     let lo = 0
     let hi = arr.length
     while (lo < hi) {

@@ -456,11 +456,6 @@ impl TrainingStore {
     /// they do not call `evict_oldest` from multiple threads simultaneously.
     pub fn evict_oldest(&self, tenant_id: &str, max_pairs: usize) -> Result<usize> {
         validate_tenant_id(tenant_id)?;
-        // Phase 1: collect the candidate rows *and* perform the DELETE atomically
-        // inside an IMMEDIATE transaction.  Rows are captured before the DELETE
-        // so we still have their ids and frame paths for zvec + fs cleanup after
-        // the transaction commits.
-
         // Quick pre-check outside a transaction to avoid opening one when there
         // is nothing to do.  The real count check is repeated inside the
         // transaction to guard against a concurrent insert.
@@ -469,19 +464,16 @@ impl TrainingStore {
             return Ok(0);
         }
 
-        // Phase 1 — collect candidates and DELETE inside a single transaction.
         let rows: Vec<(i64, String)> = {
             self.conn.execute_batch("BEGIN IMMEDIATE")?;
 
             let inner_result = (|| -> Result<Vec<(i64, String)>> {
-                // Re-read count inside the transaction.
                 let current = self.pair_count(tenant_id)?;
                 if current <= max_pairs {
                     return Ok(Vec::new());
                 }
                 let to_evict = current - max_pairs;
 
-                // Collect IDs + frame paths of the rows to be deleted.
                 let mut stmt = self.conn.prepare(
                     "SELECT id, frame_path FROM training_pairs
                      WHERE tenant_id = ?1
@@ -500,7 +492,6 @@ impl TrainingStore {
                     return Ok(Vec::new());
                 }
 
-                // Delete from SQLite while the transaction is still open.
                 self.conn.execute(
                     "DELETE FROM training_pairs
                      WHERE tenant_id = ?1
@@ -535,7 +526,6 @@ impl TrainingStore {
             return Ok(0);
         }
 
-        // Phase 2 — best-effort cleanup outside the transaction.
         // SQLite records are already gone; zvec and fs failures are logged but
         // not propagated so a transient error here does not interrupt the pipeline.
         let id_strings: Vec<String> = rows.iter().map(|(id, _)| id.to_string()).collect();

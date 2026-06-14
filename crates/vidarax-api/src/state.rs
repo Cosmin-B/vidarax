@@ -256,8 +256,7 @@ impl AppState {
     }
 
     pub fn next_run_id(&self) -> String {
-        // Sequence counter is still incremented for monotonic ordering; it is
-        // no longer used as an ID fallback (M-11).
+        // Sequence counter is still incremented for monotonic ordering.
         self.run_seq.fetch_add(1, Ordering::AcqRel);
         random_run_id()
     }

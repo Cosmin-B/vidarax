@@ -97,7 +97,6 @@ impl Transport for DelayTransport {
     }
 }
 
-/// Build a minimal `StreamFrame` with a valid JPEG stub.
 fn make_stream_frame(seq: u64, pts_ms: u64) -> StreamFrame {
     StreamFrame {
         signal: FrameSignal {

@@ -1409,23 +1409,20 @@ pub async fn reason_realtime_run(
             // Pass 1: frame signals (cheap, no encoding)
             let decoded = decode_pipeline.decode_signals(&decode_source, decode_config)?;
 
-            // Pre-compute which frames go to VLM (pure math, zero I/O).
             // In video_clip_mode, JPEG decoding is skipped here; clips are
-            // extracted per-chunk during Phase 1 below.
+            // extracted per chunk below.
             let decoded_jpegs = if semantic_decode_enabled && !video_clip_mode {
                 let indices = compute_semantic_frame_indices(
                     decoded.frame_signals.len(),
                     chunk_size,
                     semantic_frames_per_chunk,
                 );
-                // Pass 2: selective JPEG — only the ~4% of frames needed
                 let jpegs = decode_pipeline.decode_jpegs(
                     &decode_source,
                     sample_fps,
                     &indices,
                     max_frames as usize,
                 )?;
-                // Build lookup by frame_index for O(1) access during chunking
                 let lookup: std::collections::HashMap<u64, DecodedJpegFrame> =
                     jpegs.into_iter().map(|f| (f.frame_index, f)).collect();
                 Some(lookup)
@@ -1709,8 +1706,7 @@ pub async fn health() -> impl IntoResponse {
 /// `description` field matching the query string (case-insensitive).  When
 /// `run_id` is supplied only events belonging to that run are scanned.
 ///
-/// This is an MVP implementation: no embedding model is required.  Exact
-/// substring matching is O(n) in the number of stored events but is fast
+/// Exact substring matching is O(n) in the number of stored events but is fast
 /// enough for the typical WAL sizes encountered in development and staging.
 /// A vector-embedding upgrade path is available by storing description
 /// embeddings at write time and replacing this scan with a k-NN query.
@@ -1719,7 +1715,6 @@ pub async fn search(
     State(state): State<AppState>,
     Json(payload): Json<SearchRequest>,
 ) -> impl IntoResponse {
-    // Validate query string.
     let query = payload.query.trim();
     if query.is_empty() {
         return validation_error(
