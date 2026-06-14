@@ -46,8 +46,14 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
     let provider = if backend_config.backends.is_empty() {
         None
     } else {
+        let backends = backend_config.backends;
         Some(
-            vidarax_core::backends::build_provider_chain(&backend_config.backends)
+            tokio::task::spawn_blocking(move || {
+                // reqwest::blocking builds and drops an internal runtime.
+                vidarax_core::backends::build_provider_chain(&backends)
+            })
+            .await
+            .map_err(|e| invalid_input(format!("failed to build provider chain: {e}")))?
                 .map_err(|e| invalid_input(format!("failed to build provider chain: {e}")))?,
         )
     };
