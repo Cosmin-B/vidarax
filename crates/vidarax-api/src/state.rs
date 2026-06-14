@@ -154,6 +154,17 @@ impl AppState {
         AppStateConfig::for_tests(wal_path).build()
     }
 
+    pub fn with_wal_for_tests_requiring_api_keys(
+        wal_path: PathBuf,
+        api_keys: Vec<String>,
+    ) -> Self {
+        Self::with_wal_for_tests_full(
+            wal_path,
+            None,
+            SecurityPolicy::from_test_policy(true, api_keys, false, false, vec![]),
+        )
+    }
+
     pub fn with_wal_for_tests_and_endpoints(
         wal_path: PathBuf,
         provider: Option<Arc<dyn InferenceProvider + Send + Sync>>,
@@ -206,6 +217,15 @@ impl AppState {
     /// ```
     pub fn with_spacetime_client(mut self, client: SpacetimeClient) -> Self {
         self.spacetime_client = Some(client);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_tenant_label_maps_for_tests(
+        mut self,
+        maps: crate::tenant_labels::TenantLabelMaps,
+    ) -> Self {
+        self.tenant_label_maps = Arc::new(maps);
         self
     }
 
@@ -425,7 +445,7 @@ impl AppState {
     pub fn run_runtime_snapshot(&self, run_id: &str, now_ms: u64) -> Option<RunRuntimeSnapshot> {
         let registry = self.run_registry.load();
         let summary = registry.runs.get(run_id)?.snapshot();
-        if !summary.created {
+        if !summary.created || summary.deleted {
             return None;
         }
         let ttl_ms = self.stream_ttl_secs.saturating_mul(1000);
@@ -447,7 +467,9 @@ impl AppState {
             .filter_map(|run_id| registry.runs.get(run_id))
             .filter(|summary| {
                 let summary = summary.snapshot();
-                !apply_expiry(summary.state, summary.last_activity_ms, now_ms, ttl_ms).is_terminal()
+                !summary.deleted
+                    && !apply_expiry(summary.state, summary.last_activity_ms, now_ms, ttl_ms)
+                        .is_terminal()
             })
             .count()
     }
@@ -461,7 +483,7 @@ impl AppState {
     }
 
     fn apply_event_to_registry(&self, event: &TimelineEvent) {
-        if event.kind == "run_created" {
+        if matches!(event.kind.as_str(), "run_created" | "run_deleted") {
             self.run_registry
                 .rcu(|current| Arc::new(current.with_structural_event(event)));
             return;
@@ -524,13 +546,9 @@ impl RunRegistry {
         let mut after = before.clone();
         after.apply_event(event);
 
-        if !after.created {
-            self.runs
-                .insert(event.run_id.clone(), Arc::new(RunState::from_summary(after)));
-            return;
-        }
-
-        if before.created && before.principal_key != after.principal_key {
+        if before.created
+            && (!after.created || after.deleted || before.principal_key != after.principal_key)
+        {
             if let Some(set) = self.by_principal.get_mut(&*before.principal_key) {
                 set.remove(&event.run_id);
                 if set.is_empty() {
@@ -538,6 +556,13 @@ impl RunRegistry {
                 }
             }
         }
+
+        if !after.created || after.deleted {
+            self.runs
+                .insert(event.run_id.clone(), Arc::new(RunState::from_summary(after)));
+            return;
+        }
+
         self.by_principal
             .entry(after.principal_key.clone())
             .or_default()
@@ -549,6 +574,7 @@ impl RunRegistry {
 
 struct RunState {
     created: AtomicBool,
+    deleted: AtomicBool,
     principal_key: ArcSwap<Arc<str>>,
     state: AtomicU8,
     last_activity_ms: AtomicU64,
@@ -558,6 +584,7 @@ impl RunState {
     fn from_summary(summary: RunSummary) -> Self {
         Self {
             created: AtomicBool::new(summary.created),
+            deleted: AtomicBool::new(summary.deleted),
             principal_key: ArcSwap::from(Arc::new(summary.principal_key)),
             state: AtomicU8::new(encode_stream_state(summary.state)),
             last_activity_ms: AtomicU64::new(summary.last_activity_ms),
@@ -565,6 +592,9 @@ impl RunState {
     }
 
     fn apply_event(&self, event: &TimelineEvent) {
+        if event.kind == "run_deleted" {
+            self.deleted.store(true, Ordering::Release);
+        }
         if let Some(next) = transition_state(event.kind.as_str()) {
             self.state
                 .store(encode_stream_state(next), Ordering::Release);
@@ -576,6 +606,7 @@ impl RunState {
     fn snapshot(&self) -> RunSummary {
         RunSummary {
             created: self.created.load(Ordering::Acquire),
+            deleted: self.deleted.load(Ordering::Acquire),
             principal_key: Arc::clone(&*self.principal_key.load_full()),
             state: decode_stream_state(self.state.load(Ordering::Acquire)),
             last_activity_ms: self.last_activity_ms.load(Ordering::Acquire),
@@ -586,6 +617,7 @@ impl RunState {
 #[derive(Clone)]
 struct RunSummary {
     created: bool,
+    deleted: bool,
     principal_key: Arc<str>,
     state: StreamState,
     last_activity_ms: u64,
@@ -595,6 +627,7 @@ impl RunSummary {
     fn default_public() -> Self {
         Self {
             created: false,
+            deleted: false,
             principal_key: Arc::from("public"),
             state: StreamState::Pending,
             last_activity_ms: 0,
@@ -607,6 +640,9 @@ impl RunSummary {
             if let Some(principal) = principal_key_from_payload(&event.payload) {
                 self.principal_key = principal;
             }
+        }
+        if event.kind == "run_deleted" {
+            self.deleted = true;
         }
         if let Some(next) = transition_state(event.kind.as_str()) {
             self.state = next;
@@ -750,6 +786,7 @@ mod tests {
 
         let run = Arc::new(RunState::from_summary(RunSummary {
             created: true,
+            deleted: false,
             principal_key: Arc::from("tenant-a"),
             state: StreamState::Processing,
             last_activity_ms: 100,

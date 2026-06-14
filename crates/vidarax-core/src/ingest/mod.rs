@@ -1,5 +1,6 @@
 pub mod pipeline;
 
+mod fetch;
 mod ffmpeg;
 mod validate;
 
@@ -9,5 +10,8 @@ pub use ffmpeg::{
     ffprobe_path, nvidia_smi_path, probe_source_fps, DecodedJpegFrame, DecodedMp4Batch,
     FramePacket, FramePacketInput, Mp4DecodeConfig, TimestampNormalizer, make_frame_packet,
 };
-pub(crate) use ffmpeg::{parse_jpeg_stream_to_frames, FFMPEG_PROTOCOL_WHITELIST};
+pub(crate) use ffmpeg::{
+    ffmpeg_input_options_for_source, ffmpeg_protocol_whitelist_for_source,
+    parse_jpeg_stream_to_frames,
+};
 pub use validate::InputSource;

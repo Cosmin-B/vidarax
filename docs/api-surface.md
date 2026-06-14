@@ -151,8 +151,20 @@ All errors follow a consistent shape:
 ## Security
 
 - Optional API key enforcement via `x-api-key` header.
-- Optional tenant isolation via `x-tenant-id` header.
-- Lock-free fixed-window rate limiting (global and per-tenant).
+- Data ownership is based on the authenticated API-key principal. `x-tenant-id`
+  is not a security or authorization boundary unless a trusted upstream auth
+  layer enforces that mapping before requests reach Vidarax.
+- Open/no-key mode uses a shared `public` principal with no isolation and is
+  intended for development only.
+- Rate limiting is global and per authenticated principal. `x-tenant-id` is not
+  used as the quota identity.
+- Uploaded files are private to the uploader principal via the stored filename
+  prefix. Operator-configured non-upload ingest roots are admin-trusted shared
+  media roots. Legacy unprefixed files in the upload temp root are not
+  auto-claimed by authenticated callers.
+- Remote ingest has application-level SSRF mitigations, but untrusted-source
+  deployments should enforce network-level egress controls; see
+  `docs/security.md`.
 - CORS allowlist via `VIDARAX_CORS_ALLOWED_ORIGINS`.
 - Security headers on all responses: `x-content-type-options`, `x-frame-options`, `referrer-policy`, `cache-control`.
 

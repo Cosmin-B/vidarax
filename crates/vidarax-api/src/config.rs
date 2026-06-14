@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use vidarax_core::tiered_vlm::DistillationConfig;
 
+pub(crate) const UPLOAD_DIR_NAME: &str = "vidarax-uploads";
+
 /// Load the backend config from a TOML file, falling back to legacy env vars.
 ///
 /// Reads `config_path` (default: `"vidarax.toml"`).  If the file is absent or
@@ -138,6 +140,7 @@ impl ServerConfig {
                     .to_string(),
             );
         }
+        validate_tenant_auth_config(security_require_api_key, security_require_tenant_id)?;
         let stream_ttl_secs = parse_u64_env_with_default("VIDARAX_STREAM_TTL_SECS", 3600)?;
         if !(60..=86_400).contains(&stream_ttl_secs) {
             return Err("VIDARAX_STREAM_TTL_SECS must be in [60, 86400]".to_string());
@@ -213,14 +216,7 @@ fn parse_ingest_roots_env(var: &str) -> Result<Vec<PathBuf>, String> {
         .unwrap_or_default();
 
     if values.is_empty() {
-        let cwd = std::env::current_dir().map_err(|err| format!("failed to resolve cwd: {err}"))?;
-        let tmp = std::env::temp_dir();
-        return Ok(vec![
-            cwd.canonicalize()
-                .map_err(|err| format!("failed to canonicalize cwd ingest root: {err}"))?,
-            tmp.canonicalize()
-                .map_err(|err| format!("failed to canonicalize temp ingest root: {err}"))?,
-        ]);
+        return Ok(Vec::new());
     }
 
     let mut out = Vec::with_capacity(values.len());
@@ -238,6 +234,19 @@ pub fn resolve_wal_path(config: &ServerConfig) -> Result<PathBuf, String> {
     let data_dir = PathBuf::from(&config.data_dir);
     std::fs::create_dir_all(&data_dir).map_err(|err| err.to_string())?;
     Ok(data_dir.join("timeline.wal"))
+}
+
+fn validate_tenant_auth_config(
+    security_require_api_key: bool,
+    security_require_tenant_id: bool,
+) -> Result<(), String> {
+    if security_require_tenant_id && !security_require_api_key {
+        return Err(
+            "VIDARAX_REQUIRE_TENANT_ID requires VIDARAX_REQUIRE_API_KEY=true: tenant isolation is derived from authenticated API keys"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn parse_bool_env(var: &str, default: bool) -> Result<bool, String> {
@@ -402,6 +411,51 @@ mod tests {
         assert_eq!(cfg.webrtc_decode_workers, 64);
         assert_eq!(cfg.webrtc_analysis_workers, 1);
         assert_eq!(cfg.webrtc_vlm_workers, 64);
+    }
+
+    #[test]
+    fn server_config_default_ingest_roots_are_empty() {
+        std::env::remove_var("VIDARAX_INGEST_FILE_ROOTS");
+        std::env::set_var("VIDARAX_REQUIRE_API_KEY", "false");
+
+        let cfg = ServerConfig::from_env().expect("default config should parse");
+
+        std::env::remove_var("VIDARAX_REQUIRE_API_KEY");
+
+        assert!(
+            cfg.ingest_file_roots.is_empty(),
+            "shared ingest roots must be operator-configured; temp_dir is not a default root"
+        );
+    }
+
+    #[test]
+    fn server_config_rejects_required_tenant_without_required_api_key() {
+        let err = validate_tenant_auth_config(false, true)
+            .expect_err("required tenant IDs without required API-key auth should be rejected");
+
+        assert!(
+            err.contains("VIDARAX_REQUIRE_TENANT_ID requires VIDARAX_REQUIRE_API_KEY=true"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn server_config_explicit_ingest_roots_are_canonicalized() {
+        let root = std::env::temp_dir().join(format!(
+            "vidarax-explicit-root-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_var("VIDARAX_INGEST_FILE_ROOTS", root.to_string_lossy().to_string());
+        std::env::set_var("VIDARAX_REQUIRE_API_KEY", "false");
+
+        let cfg = ServerConfig::from_env().expect("explicit ingest root should parse");
+
+        std::env::remove_var("VIDARAX_INGEST_FILE_ROOTS");
+        std::env::remove_var("VIDARAX_REQUIRE_API_KEY");
+
+        assert_eq!(cfg.ingest_file_roots, vec![root.canonicalize().unwrap()]);
+        let _ = std::fs::remove_dir(root);
     }
 
     // ─── WebRtcConfig defaults (STUN / token-rate) ───────────────────────────

@@ -13,7 +13,7 @@ use axum::Json;
 use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota, RateLimiter};
 use serde_json::json;
 
-use crate::auth::{HEADER_API_KEY, HEADER_TENANT_ID};
+use crate::auth::{principal_key_from_headers, HEADER_API_KEY, HEADER_TENANT_ID};
 use crate::config::ServerConfig;
 use crate::state::AppState;
 
@@ -36,6 +36,12 @@ impl SecurityPolicy {
         if config.security_require_api_key && config.security_api_keys.is_empty() {
             return Err(
                 "VIDARAX_REQUIRE_API_KEY=true requires at least one VIDARAX_API_KEYS value"
+                    .to_string(),
+            );
+        }
+        if config.security_require_tenant_id && !config.security_require_api_key {
+            return Err(
+                "VIDARAX_REQUIRE_TENANT_ID requires VIDARAX_REQUIRE_API_KEY=true: tenant isolation is derived from authenticated API keys"
                     .to_string(),
             );
         }
@@ -75,8 +81,7 @@ impl SecurityPolicy {
         }
     }
 
-    #[cfg(test)]
-    pub fn from_test_policy(
+    pub(crate) fn from_test_policy(
         require_api_key: bool,
         api_keys: Vec<String>,
         require_tenant_id: bool,
@@ -99,6 +104,16 @@ impl SecurityPolicy {
             && !self.require_tenant_id
             && self.global_limiter.is_none()
             && self.tenant_limiter.is_none()
+    }
+
+    pub(crate) fn principal_key_from_headers(&self, headers: &HeaderMap) -> String {
+        let api_key_authenticated = self.require_api_key
+            && headers
+                .get(HEADER_API_KEY)
+                .and_then(|value| value.to_str().ok())
+                .map(|api_key| self.api_key_matches(api_key))
+                .unwrap_or(false);
+        principal_key_from_headers(headers, api_key_authenticated)
     }
 
     fn metrics_requires_api_key(&self) -> bool {
@@ -230,7 +245,7 @@ pub async fn enforce_security(
         }
     }
 
-    let tenant_id = header_value(&request, HEADER_TENANT_ID).map(ToString::to_string);
+    let tenant_id = header_value(&request, HEADER_TENANT_ID);
     if policy.require_tenant_id && tenant_id.is_none() {
         let response = error_response(
             StatusCode::UNAUTHORIZED,
@@ -245,20 +260,12 @@ pub async fn enforce_security(
     // (before the preflight/health bypass) so it is not duplicated here.
 
     if let Some(tenant_limiter) = &policy.tenant_limiter {
-        let Some(tenant_id) = tenant_id.as_ref() else {
-            let response = error_response(
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                "x-tenant-id header is required when tenant rate limiting is enabled",
-                request_id,
-            );
-            return finalize_response(policy, origin.as_deref(), response);
-        };
-        if !tenant_limiter.allow(tenant_id) {
+        let principal = policy.principal_key_from_headers(request.headers());
+        if !tenant_limiter.allow(&principal) {
             let response = error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limited",
-                "tenant request rate exceeded",
+                "principal request rate exceeded",
                 request_id,
             );
             return finalize_response(policy, origin.as_deref(), response);
@@ -512,7 +519,10 @@ fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, GlobalRateLimiter, SecurityPolicy, TenantRateLimiter};
+    use super::{
+        constant_time_eq, GlobalRateLimiter, SecurityPolicy, TenantRateLimiter,
+        IDLE_TENANT_RETENTION,
+    };
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Barrier,
@@ -536,6 +546,23 @@ mod tests {
         assert!(limiter.allow(&tenant_a));
         assert!(!limiter.allow(&tenant_a));
         assert!(limiter.allow(&tenant_b));
+    }
+
+    #[test]
+    fn keyed_governor_limiter_isolated_by_authenticated_principal() {
+        let limiter = TenantRateLimiter::new(1, 8);
+        let principal_a = "api-key:a".to_string();
+        let principal_b = "api-key:b".to_string();
+
+        assert!(limiter.allow(&principal_a));
+        assert!(
+            !limiter.allow(&principal_a),
+            "same authenticated principal must not escape its bucket"
+        );
+        assert!(
+            limiter.allow(&principal_b),
+            "different authenticated principals get independent buckets"
+        );
     }
 
     #[test]
