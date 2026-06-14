@@ -988,6 +988,8 @@ struct RealtimeReasonParams {
     sampling_policy: SamplingPolicy,
     max_frames: u64,
     chunk_size: usize,
+    window_size: usize,
+    segment_ms: u64,
     semantic_inference: bool,
     semantic_frames_per_chunk: usize,
     semantic_timeout_ms: u64,
@@ -1046,6 +1048,28 @@ fn validate_realtime_reason_params(
             vec![field_error(
                 "chunk_size",
                 "chunk_size must be in [5, 500]".to_string(),
+            )],
+        ));
+    }
+    let window_size = payload.window_size.unwrap_or(16);
+    if !(2..=256).contains(&window_size) {
+        return Err(validation_error(
+            state,
+            "invalid realtime reason request",
+            vec![field_error(
+                "window_size",
+                "window_size must be in [2, 256]".to_string(),
+            )],
+        ));
+    }
+    let segment_ms = payload.segment_ms.unwrap_or(250);
+    if segment_ms == 0 {
+        return Err(validation_error(
+            state,
+            "invalid realtime reason request",
+            vec![field_error(
+                "segment_ms",
+                "segment_ms must be >= 1".to_string(),
             )],
         ));
     }
@@ -1146,6 +1170,8 @@ fn validate_realtime_reason_params(
         sampling_policy,
         max_frames,
         chunk_size,
+        window_size,
+        segment_ms,
         semantic_inference,
         semantic_frames_per_chunk,
         semantic_timeout_ms,
@@ -1381,6 +1407,8 @@ pub async fn reason_realtime_run(
     let sampling_policy = params.sampling_policy;
     let max_frames = params.max_frames;
     let chunk_size = params.chunk_size;
+    let window_size = params.window_size;
+    let segment_ms = params.segment_ms;
     let semantic_inference = params.semantic_inference;
     let semantic_frames_per_chunk = params.semantic_frames_per_chunk;
     let semantic_timeout_ms = params.semantic_timeout_ms;
@@ -1483,8 +1511,8 @@ pub async fn reason_realtime_run(
     };
     let mut pipeline = TwoPassPipeline::new(
         TwoPassConfig {
-            window_size: payload.window_size.unwrap_or(16),
-            segment_ms: payload.segment_ms.unwrap_or(250),
+            window_size,
+            segment_ms,
             confidence_weights: Default::default(),
         },
         GateConfig::default(),
@@ -1492,7 +1520,7 @@ pub async fn reason_realtime_run(
 
     let providers = state.provider().cloned();
     let semantic_available = semantic_inference && providers.is_some();
-    let semantic_segment_ms = payload.segment_ms.unwrap_or(250);
+    let semantic_segment_ms = segment_ms;
     if semantic_inference && !semantic_available {
         if let Err(err) = state
             .append_run_event_async(

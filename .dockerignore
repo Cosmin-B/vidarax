@@ -1,6 +1,5 @@
 .git
 .github
-.beads
 target
 *.log
 .env

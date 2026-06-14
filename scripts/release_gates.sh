@@ -29,7 +29,7 @@ if (( api_size > max_api_size )); then
   exit 1
 fi
 
-probe_json="$(cargo run -q -p vidarax-core --release --bin perf_probe)"
+probe_json="$(cargo run -q -p vidarax-core --release --features perf-probe --bin perf_probe)"
 gate_p95_ns="$(jq -r '.gate_process.p95_ns' <<<"$probe_json")"
 
 echo "[gate] gate p95 ns=${gate_p95_ns}"

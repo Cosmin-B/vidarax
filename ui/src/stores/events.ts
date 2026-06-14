@@ -198,6 +198,7 @@ export const useEventsStore = defineStore('events', () => {
     isConnected,
     connectionError,
     activeRunId,
+    eventVersion,
     eventsByRunId,
     keyframesByRunId,
     activeEvents,

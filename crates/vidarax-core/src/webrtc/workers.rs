@@ -417,6 +417,32 @@ where
     pub distillation: DistillationConfig,
 }
 
+/// Upper bound on sessions tracked by the per-session token budget map.
+pub(super) const VLM_TOKEN_BUDGET_MAX_SESSIONS: usize = 4096;
+
+/// Returns the token-budget window for `session`, inserting it if absent and
+/// keeping the map within `VLM_TOKEN_BUDGET_MAX_SESSIONS` (stale windows are
+/// dropped first, then an arbitrary entry) so a long-lived worker cannot grow
+/// the map unbounded.
+pub(super) fn token_budget_entry<'a>(
+    budget: &'a mut std::collections::HashMap<Arc<str>, (std::time::Instant, u32)>,
+    session: &Arc<str>,
+    now: std::time::Instant,
+) -> &'a mut (std::time::Instant, u32) {
+    if !budget.contains_key(session.as_ref()) {
+        if budget.len() >= VLM_TOKEN_BUDGET_MAX_SESSIONS {
+            budget.retain(|_, (ts, _)| now.duration_since(*ts).as_secs() < 1);
+            if budget.len() >= VLM_TOKEN_BUDGET_MAX_SESSIONS {
+                if let Some(key) = budget.keys().next().cloned() {
+                    budget.remove(&key);
+                }
+            }
+        }
+        budget.insert(Arc::clone(session), (now, 0));
+    }
+    budget.get_mut(session.as_ref()).expect("entry inserted above")
+}
+
 /// Spawn VLM inference worker threads with 3-tier routing + training pair collection.
 ///
 /// **Tier 1 — KNN cache** (when `distillation.enabled` and embedding server is reachable):
@@ -440,32 +466,6 @@ where
 /// so inference latency is never stalled by SpacetimeDB HTTP round-trips.
 ///
 /// Threads exit when `params.vlm_rx` is closed.
-/// Upper bound on sessions tracked by the per-session token budget map.
-const VLM_TOKEN_BUDGET_MAX_SESSIONS: usize = 4096;
-
-/// Returns the token-budget window for `session`, inserting it if absent and
-/// keeping the map within `VLM_TOKEN_BUDGET_MAX_SESSIONS` (stale windows are
-/// dropped first, then an arbitrary entry) so a long-lived worker cannot grow
-/// the map unbounded.
-fn token_budget_entry<'a>(
-    budget: &'a mut std::collections::HashMap<Arc<str>, (std::time::Instant, u32)>,
-    session: &Arc<str>,
-    now: std::time::Instant,
-) -> &'a mut (std::time::Instant, u32) {
-    if !budget.contains_key(session.as_ref()) {
-        if budget.len() >= VLM_TOKEN_BUDGET_MAX_SESSIONS {
-            budget.retain(|_, (ts, _)| now.duration_since(*ts).as_secs() < 1);
-            if budget.len() >= VLM_TOKEN_BUDGET_MAX_SESSIONS {
-                if let Some(key) = budget.keys().next().cloned() {
-                    budget.remove(&key);
-                }
-            }
-        }
-        budget.insert(Arc::clone(session), (now, 0));
-    }
-    budget.get_mut(session.as_ref()).expect("entry inserted above")
-}
-
 pub fn spawn_vlm_workers<I>(params: VlmWorkerParams<I>)
 where
     I: InferenceProvider + 'static,

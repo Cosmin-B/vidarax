@@ -309,7 +309,7 @@ fn add_preflight_headers(policy: &SecurityPolicy, response: &mut Response, origi
     );
     response.headers_mut().insert(
         header::ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("content-type,x-api-key,x-tenant-id"),
+        HeaderValue::from_static("content-type,x-api-key,x-tenant-id,x-attach-config"),
     );
     response.headers_mut().insert(
         header::ACCESS_CONTROL_MAX_AGE,

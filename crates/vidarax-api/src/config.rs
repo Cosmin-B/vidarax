@@ -156,10 +156,15 @@ impl ServerConfig {
         let webrtc_turn_credential = env::var("VIDARAX_WEBRTC_TURN_CREDENTIAL").ok();
         let webrtc_max_output_tokens_per_second =
             parse_usize_env("VIDARAX_WEBRTC_MAX_OUTPUT_TOKENS_PER_SECOND", 128)? as u32;
-        let webrtc_decode_workers = parse_usize_env("VIDARAX_WEBRTC_DECODE_WORKERS", 2)?.max(1);
-        let webrtc_analysis_workers =
-            parse_usize_env("VIDARAX_WEBRTC_ANALYSIS_WORKERS", 1)?.max(1);
-        let webrtc_vlm_workers = parse_usize_env("VIDARAX_WEBRTC_VLM_WORKERS", 2)?.max(1);
+        let webrtc_decode_workers =
+            parse_usize_env("VIDARAX_WEBRTC_DECODE_WORKERS", 2)?.clamp(1, 64);
+        // Analysis owns stream-order gate/loop state; more workers make one
+        // shared stream's decisions nondeterministic.
+        let webrtc_analysis_workers = parse_usize_env("VIDARAX_WEBRTC_ANALYSIS_WORKERS", 1)?
+            .clamp(1, 64)
+            .min(1);
+        let webrtc_vlm_workers =
+            parse_usize_env("VIDARAX_WEBRTC_VLM_WORKERS", 2)?.clamp(1, 64);
         let distillation = parse_distillation_config()?;
         Ok(Self {
             bind_addr,
@@ -378,6 +383,25 @@ mod tests {
         std::env::remove_var("VIDARAX_REQUIRE_API_KEY");
 
         assert_eq!(cfg.decode_backend, "test-custom-backend");
+    }
+
+    #[test]
+    fn server_config_clamps_webrtc_worker_counts() {
+        std::env::set_var("VIDARAX_REQUIRE_API_KEY", "false");
+        std::env::set_var("VIDARAX_WEBRTC_DECODE_WORKERS", "999");
+        std::env::set_var("VIDARAX_WEBRTC_ANALYSIS_WORKERS", "999");
+        std::env::set_var("VIDARAX_WEBRTC_VLM_WORKERS", "999");
+
+        let cfg = ServerConfig::from_env().expect("worker counts should parse");
+
+        std::env::remove_var("VIDARAX_REQUIRE_API_KEY");
+        std::env::remove_var("VIDARAX_WEBRTC_DECODE_WORKERS");
+        std::env::remove_var("VIDARAX_WEBRTC_ANALYSIS_WORKERS");
+        std::env::remove_var("VIDARAX_WEBRTC_VLM_WORKERS");
+
+        assert_eq!(cfg.webrtc_decode_workers, 64);
+        assert_eq!(cfg.webrtc_analysis_workers, 1);
+        assert_eq!(cfg.webrtc_vlm_workers, 64);
     }
 
     // ─── WebRtcConfig defaults (STUN / token-rate) ───────────────────────────

@@ -8,6 +8,7 @@ import { useWhip } from '@/composables/useWhip'
 import { useEventStream } from '@/composables/useEventStream'
 import { api } from '@/lib/api'
 import type { StreamSourceType } from '@/stores/stream'
+import type { AgentEvent } from '@/stores/events'
 import type { ModelInfo } from '@/lib/api'
 import {
   Monitor, Camera, Radio, Square, Code2, ChevronDown,
@@ -108,7 +109,7 @@ const streamVizKfIndices  = ref<number[]>([])
 const seenVizVlmFrames = new Set<number>()
 const seenVizKfFrames = new Set<number>()
 const seenVlmResultEvents = new Set<string>()
-let processedEventCount = 0
+const seenStreamEvents = new Set<string>()
 
 // ── Export code snippet ───────────────────────────────────────────────────────
 
@@ -217,11 +218,15 @@ function resetEventDerivedState(): void {
   seenVizVlmFrames.clear()
   seenVizKfFrames.clear()
   seenVlmResultEvents.clear()
-  processedEventCount = 0
+  seenStreamEvents.clear()
 }
 
 function eventResultKey(event: { frame_index: number; timestamp_ms: number; pts_ms: number; event_type: string }): string {
   return `${event.event_type}:${event.frame_index}:${event.pts_ms}:${event.timestamp_ms}`
+}
+
+function streamEventKey(event: AgentEvent): string {
+  return `${event.run_id}:${event.session_id}:${event.event_type}:${event.frame_index}:${event.pts_ms}:${event.timestamp_ms}:${event.description}`
 }
 
 function eventLatencyMs(timestampMs: number): number {
@@ -229,15 +234,15 @@ function eventLatencyMs(timestampMs: number): number {
 }
 
 watch(
-  () => [streamStore.activeSession?.runId, eventsStore.activeEvents.length] as const,
+  () => [streamStore.activeSession?.runId, eventsStore.eventVersion] as const,
   () => {
     const events = eventsStore.activeEvents
-    if (events.length < processedEventCount) resetEventDerivedState()
 
-    const nextEvents = events.slice(processedEventCount)
-    processedEventCount = events.length
+    for (const event of events) {
+      const processedKey = streamEventKey(event)
+      if (seenStreamEvents.has(processedKey)) continue
+      seenStreamEvents.add(processedKey)
 
-    for (const event of nextEvents) {
       if (event.event_type === 'vlm_description' && !seenVizVlmFrames.has(event.frame_index)) {
         seenVizVlmFrames.add(event.frame_index)
         streamVizVlmFrames.value = [...streamVizVlmFrames.value, event.frame_index]
