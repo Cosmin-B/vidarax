@@ -34,7 +34,6 @@ const form = reactive({
   loopRepeatTrigger:        lsNum(STORAGE_KEYS.loopRepeatTrigger, UI_DEFAULTS.loopRepeatTrigger),
   // Advanced
   gpuDecode:  ls(STORAGE_KEYS.gpuDecode, UI_DEFAULTS.gpuDecode),
-  vlmWorkers: lsNum(STORAGE_KEYS.vlmWorkers, UI_DEFAULTS.vlmWorkers),
 })
 
 // ── Models fetched from API ───────────────────────────────────────────────────
@@ -141,7 +140,6 @@ function saveSettings(): void {
 
   // Advanced
   localStorage.setItem(STORAGE_KEYS.gpuDecode,  form.gpuDecode)
-  localStorage.setItem(STORAGE_KEYS.vlmWorkers, String(form.vlmWorkers))
 
   saved.value = true
   setTimeout(() => { saved.value = false }, 2000)
@@ -167,7 +165,6 @@ function resetToDefaults(): void {
     loopDetection:             UI_DEFAULTS.loopDetection,
     loopRepeatTrigger:         UI_DEFAULTS.loopRepeatTrigger,
     gpuDecode:                 UI_DEFAULTS.gpuDecode,
-    vlmWorkers:                UI_DEFAULTS.vlmWorkers,
   })
 }
 
@@ -709,22 +706,14 @@ function toggle(section: SectionKey): void {
           </select>
         </div>
 
-        <!-- VLM workers -->
+        <!-- Stream workers -->
         <div class="space-y-2">
           <div class="flex items-center justify-between">
             <div>
-              <label class="text-[#94a3b8] text-xs font-medium">VLM Workers</label>
-              <div class="text-[#475569] text-xs mt-0.5">Saturate vLLM continuous batching — N=4 recommended</div>
+              <label class="text-[#94a3b8] text-xs font-medium">Stream Workers</label>
+              <div class="text-[#475569] text-xs mt-0.5">Decode, analysis, and VLM are fixed at 1 per stream</div>
             </div>
-            <span class="mono text-[#f59e0b] text-sm">{{ form.vlmWorkers }}</span>
-          </div>
-          <input
-            v-model.number="form.vlmWorkers"
-            type="range" min="1" max="8" step="1"
-            class="w-full accent-[#2dd4bf] cursor-pointer"
-          />
-          <div class="flex justify-between text-xs text-[#475569] mono">
-            <span>1</span><span>8</span>
+            <span class="mono text-[#94a3b8] text-sm">1</span>
           </div>
         </div>
       </div>
