@@ -25,6 +25,9 @@ use vidarax_core::webrtc::session::WebRtcConfig;
 /// Maximum number of concurrent WebRTC sessions to prevent memory exhaustion.
 const MAX_WEBRTC_SESSIONS: usize = 100;
 
+/// Stream id used for single-stream runs when no explicit stream is attached.
+const DEFAULT_STREAM_ID: &str = "stream-0";
+
 /// In-memory store for active WebRTC sessions, keyed by session ID.
 /// Each entry stores the owning principal alongside the session.
 type SessionMap = Arc<RwLock<HashMap<String, (String, Arc<WebRtcSession>)>>>;
@@ -270,11 +273,21 @@ impl AppState {
         kind: &str,
         payload: Value,
     ) -> Result<TimelineEvent, String> {
+        self.append_run_event_for_stream(run_id, DEFAULT_STREAM_ID, kind, payload)
+    }
+
+    pub fn append_run_event_for_stream(
+        &self,
+        run_id: &str,
+        stream_id: &str,
+        kind: &str,
+        payload: Value,
+    ) -> Result<TimelineEvent, String> {
         let seq = self.event_seq.fetch_add(1, Ordering::AcqRel) + 1;
         let event = TimelineEvent {
             seq,
             run_id: run_id.to_owned(),
-            stream_id: "stream-0".to_owned(),
+            stream_id: stream_id.to_owned(),
             pts_ms: now_epoch_ms(),
             kind: kind.to_owned(),
             payload: payload.to_string(),
@@ -290,11 +303,22 @@ impl AppState {
         kind: &str,
         payload: Value,
     ) -> Result<TimelineEvent, String> {
+        self.append_run_event_for_stream_async(run_id, DEFAULT_STREAM_ID, kind, payload)
+            .await
+    }
+
+    pub async fn append_run_event_for_stream_async(
+        &self,
+        run_id: &str,
+        stream_id: &str,
+        kind: &str,
+        payload: Value,
+    ) -> Result<TimelineEvent, String> {
         let seq = self.event_seq.fetch_add(1, Ordering::AcqRel) + 1;
         let event = TimelineEvent {
             seq,
             run_id: run_id.to_owned(),
-            stream_id: "stream-0".to_owned(),
+            stream_id: stream_id.to_owned(),
             pts_ms: now_epoch_ms(),
             kind: kind.to_owned(),
             payload: payload.to_string(),
@@ -703,6 +727,21 @@ mod tests {
         assert_eq!(snapshot.principal_key, "tenant-a");
         assert_eq!(snapshot.state, StreamState::Processing);
         assert_eq!(snapshot.last_activity_ms, 150);
+    }
+
+    #[test]
+    fn append_run_event_for_stream_persists_stream_id() {
+        let state = AppState::with_wal_for_tests(std::env::temp_dir().join(
+            format!("vidarax-state-stream-test-{}.wal", std::process::id()),
+        ));
+
+        state
+            .append_run_event_for_stream("run-1", "camera-west", "analysis_generated", json!({}))
+            .unwrap();
+
+        let events = state.read_run_events("run-1").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].stream_id, "camera-west");
     }
 
     #[test]

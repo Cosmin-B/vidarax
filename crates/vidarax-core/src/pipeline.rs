@@ -1,9 +1,31 @@
 use crate::gate::{FrameSignal, GateConfig, GateEngine, GateEvent, GateEventType, GateReasonCode};
 
+pub const TWO_PASS_CONFIDENCE_NOVELTY_WEIGHT: f32 = 0.45;
+pub const TWO_PASS_CONFIDENCE_INSTABILITY_WEIGHT: f32 = 0.35;
+pub const TWO_PASS_CONFIDENCE_MOTION_WEIGHT: f32 = 0.20;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TwoPassWeights {
+    pub novelty: f32,
+    pub instability: f32,
+    pub motion: f32,
+}
+
+impl Default for TwoPassWeights {
+    fn default() -> Self {
+        Self {
+            novelty: TWO_PASS_CONFIDENCE_NOVELTY_WEIGHT,
+            instability: TWO_PASS_CONFIDENCE_INSTABILITY_WEIGHT,
+            motion: TWO_PASS_CONFIDENCE_MOTION_WEIGHT,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TwoPassConfig {
     pub window_size: usize,
     pub segment_ms: u64,
+    pub confidence_weights: TwoPassWeights,
 }
 
 impl Default for TwoPassConfig {
@@ -11,6 +33,7 @@ impl Default for TwoPassConfig {
         Self {
             window_size: 16,
             segment_ms: 250,
+            confidence_weights: TwoPassWeights::default(),
         }
     }
 }
@@ -49,6 +72,7 @@ impl TwoPassPipeline {
             config: TwoPassConfig {
                 window_size,
                 segment_ms: config.segment_ms.max(1),
+                confidence_weights: config.confidence_weights,
             },
             window: vec![WindowSample::default(); window_size],
             window_len: 0,
@@ -78,7 +102,11 @@ impl TwoPassPipeline {
 
             let (novelty, stability) = self.window_metrics(frame.perceptual_hash, frame.luma_mean);
             let motion = self.motion_score(frame.perceptual_hash);
-            let confidence = (0.45 * novelty + 0.35 * (1.0 - stability) + 0.20 * motion).clamp(0.0, 1.0);
+            let weights = self.config.confidence_weights;
+            let confidence = (weights.novelty * novelty
+                + weights.instability * (1.0 - stability)
+                + weights.motion * motion)
+                .clamp(0.0, 1.0);
 
             let segment_start_ms = (frame.pts_ms / self.config.segment_ms) * self.config.segment_ms;
             let segment_end_ms = segment_start_ms + self.config.segment_ms;
@@ -150,7 +178,11 @@ fn hamming_similarity(a: u64, b: u64) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{TwoPassConfig, TwoPassPipeline};
+    use super::{
+        TwoPassConfig, TwoPassPipeline, TwoPassWeights,
+        TWO_PASS_CONFIDENCE_INSTABILITY_WEIGHT, TWO_PASS_CONFIDENCE_MOTION_WEIGHT,
+        TWO_PASS_CONFIDENCE_NOVELTY_WEIGHT,
+    };
     use crate::gate::{FrameSignal, GateConfig, GateEventType};
 
     fn frame(frame_index: u64, hash: u64, luma: f32) -> FrameSignal {
@@ -171,6 +203,7 @@ mod tests {
             TwoPassConfig {
                 window_size: 4,
                 segment_ms: 250,
+                confidence_weights: Default::default(),
             },
             GateConfig::default(),
         );
@@ -205,5 +238,37 @@ mod tests {
             assert!((0.0..=1.0).contains(&m.motion_score));
             assert!((0.0..=1.0).contains(&m.confidence));
         }
+    }
+
+    #[test]
+    fn default_confidence_weights_are_named_and_preserved() {
+        let weights = TwoPassWeights::default();
+
+        assert_eq!(weights.novelty, TWO_PASS_CONFIDENCE_NOVELTY_WEIGHT);
+        assert_eq!(weights.instability, TWO_PASS_CONFIDENCE_INSTABILITY_WEIGHT);
+        assert_eq!(weights.motion, TWO_PASS_CONFIDENCE_MOTION_WEIGHT);
+        assert_eq!(weights.novelty, 0.45);
+        assert_eq!(weights.instability, 0.35);
+        assert_eq!(weights.motion, 0.20);
+    }
+
+    #[test]
+    fn confidence_weights_are_configurable() {
+        let mut p = TwoPassPipeline::new(
+            TwoPassConfig {
+                window_size: 4,
+                segment_ms: 250,
+                confidence_weights: TwoPassWeights {
+                    novelty: 0.0,
+                    instability: 0.0,
+                    motion: 1.0,
+                },
+            },
+            GateConfig::default(),
+        );
+
+        let out = p.analyze_batch(&[frame(0, 0, 0.2), frame(1, u64::MAX, 0.2)]);
+
+        assert_eq!(out[1].confidence, out[1].motion_score);
     }
 }
