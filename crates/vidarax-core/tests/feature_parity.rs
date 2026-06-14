@@ -109,7 +109,7 @@ fn make_stream_frame(seq: u64, pts_ms: u64) -> StreamFrame {
             ghosting_score: 0.0,
             noise_variance_score: 0.0,
         },
-        jpeg: Some(Arc::from([0xff_u8, 0xd8, 0xaa, 0xbb, 0xff, 0xd9] as [u8; 6])),
+        jpeg: Some([0xff_u8, 0xd8, 0xaa, 0xbb, 0xff, 0xd9].into()),
         pts_ms,
         seq,
     }
@@ -338,7 +338,7 @@ fn accumulator_emits_clip_after_window_fills() {
     // Feed frames at 100ms intervals; 500ms window requires 6 frames (pts 0..500).
     let mut emitted = None;
     for i in 0..8u64 {
-        emitted = acc.push(&make_stream_frame(i, i * 100));
+        emitted = acc.push(make_stream_frame(i, i * 100));
         if emitted.is_some() {
             break;
         }
@@ -363,7 +363,7 @@ fn accumulator_does_not_emit_before_window_is_full() {
 
     // Send 10 frames at 100ms each — only 1 second elapsed, below 2s window.
     for i in 0..10u64 {
-        let result = acc.push(&make_stream_frame(i, i * 100));
+        let result = acc.push(make_stream_frame(i, i * 100));
         assert!(result.is_none(), "frame {i}: should not emit before window fills");
     }
 }
@@ -382,7 +382,7 @@ fn accumulator_rate_limits_to_target_fps() {
     // At 500ms interval only frames at 0, 500, 1000, 1500, 2000ms are accepted.
     let mut clip = None;
     for i in 0..25u64 {
-        clip = acc.push(&make_stream_frame(i, i * 100));
+        clip = acc.push(make_stream_frame(i, i * 100));
         if clip.is_some() {
             break;
         }
@@ -409,7 +409,7 @@ fn accumulator_drops_frames_with_no_jpeg() {
 
     let mut no_jpeg = make_stream_frame(0, 0);
     no_jpeg.jpeg = None;
-    let result = acc.push(&no_jpeg);
+    let result = acc.push(no_jpeg);
     assert!(result.is_none(), "frames without JPEG data must be dropped");
 }
 
@@ -453,7 +453,7 @@ fn clip_accumulator_delay_suppresses_rapid_second_emission() {
     // Fill first window (pts 0–600ms) and trigger emission.
     let mut first = None;
     for i in 0..8u64 {
-        first = acc.push(&make_stream_frame(i, i * 100));
+        first = acc.push(make_stream_frame(i, i * 100));
         if first.is_some() {
             break;
         }
@@ -464,7 +464,7 @@ fn clip_accumulator_delay_suppresses_rapid_second_emission() {
     // The delay guard should prevent a second emission.
     let mut second = None;
     for i in 8..16u64 {
-        second = acc.push(&make_stream_frame(i, i * 100));
+        second = acc.push(make_stream_frame(i, i * 100));
         if second.is_some() {
             break;
         }
@@ -487,7 +487,7 @@ fn accumulator_buffer_cleared_after_emission() {
     // Trigger first emission.
     let mut first_clip = None;
     for i in 0..8u64 {
-        first_clip = acc.push(&make_stream_frame(i, i * 100));
+        first_clip = acc.push(make_stream_frame(i, i * 100));
         if first_clip.is_some() {
             break;
         }
@@ -496,7 +496,7 @@ fn accumulator_buffer_cleared_after_emission() {
 
     // After emission the buffer is cleared. Sending a single frame should NOT
     // emit immediately — the window must fill again.
-    let result = acc.push(&make_stream_frame(99, 9999));
+    let result = acc.push(make_stream_frame(99, 9999));
     assert!(
         result.is_none(),
         "single frame after emission should not trigger another clip"
@@ -514,7 +514,7 @@ fn clip_work_pts_span_covers_window() {
 
     let mut clip = None;
     for i in 0..8u64 {
-        clip = acc.push(&make_stream_frame(i, i * 100));
+        clip = acc.push(make_stream_frame(i, i * 100));
         if clip.is_some() {
             break;
         }

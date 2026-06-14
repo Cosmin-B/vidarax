@@ -35,6 +35,7 @@ use crate::gate::FrameSignal;
 use crate::metrics::PipelineMetrics;
 use crate::provider::{InferenceImage, InferenceProvider, InferenceRequest};
 use crate::tiered_vlm::TieredVlmConfig;
+use crate::webrtc::recycle::RecycledBytes;
 use crate::webrtc::workers::{EventSink, StreamFrame};
 
 // ─── ClipConfig ───────────────────────────────────────────────────────────────
@@ -125,9 +126,9 @@ pub struct ClipWork {
     pub session_id: Arc<str>,
     /// Frames in this clip: `(signal, JPEG bytes)`.
     ///
-    /// JPEG buffers are `Arc<[u8]>` so cloning `ClipWork` copies only the
-    /// signal (32 bytes) and an Arc pointer (16 bytes) per frame.
-    pub frames: Vec<(FrameSignal, Arc<[u8]>)>,
+    /// JPEG buffers are recycled byte handles moved into clip work without
+    /// copying the payload on the runtime path.
+    pub frames: Vec<(FrameSignal, RecycledBytes)>,
     /// PTS of the first frame in the batch (milliseconds).
     pub pts_start: u64,
     /// PTS of the last frame in the batch (milliseconds).
@@ -151,7 +152,7 @@ pub struct ClipAccumulator {
     session_id: Arc<str>,
     prompt: Arc<str>,
     /// Buffered frames for the current window.
-    buffer: VecDeque<(FrameSignal, Arc<[u8]>)>,
+    buffer: VecDeque<(FrameSignal, RecycledBytes)>,
     /// Minimum inter-sample distance in ms (1000 / target_fps).
     sample_interval_ms: u64,
     /// PTS of the last frame accepted into the buffer (for rate limiting).
@@ -189,7 +190,7 @@ impl ClipAccumulator {
     /// - The frame has no JPEG data.
     /// - The window is not yet full.
     /// - The inter-emission delay has not elapsed.
-    pub fn push(&mut self, sf: &StreamFrame) -> Option<ClipWork> {
+    pub fn push(&mut self, mut sf: StreamFrame) -> Option<ClipWork> {
         // ── Rate-limit to target_fps ───────────────────────────────────────
         if let Some(last_pts) = self.last_accepted_pts {
             let gap = sf.pts_ms.saturating_sub(last_pts);
@@ -199,8 +200,7 @@ impl ClipAccumulator {
         }
 
         // ── Accept JPEG ────────────────────────────────────────────────────
-        // Clone the Arc pointer (16 bytes), not the JPEG payload.
-        let jpeg_bytes: Arc<[u8]> = match sf.jpeg.clone() {
+        let jpeg_bytes = match sf.jpeg.take() {
             Some(arc) if !arc.is_empty() => arc,
             _ => return None, // no image data
         };
@@ -237,7 +237,7 @@ impl ClipAccumulator {
         let pts_end = sf.pts_ms;
         self.last_emit = Some(now);
         // Collect into Vec for ClipWork (O(n) but done once per clip emission).
-        let frames: Vec<(FrameSignal, Arc<[u8]>)> = deque.into_iter().collect();
+        let frames: Vec<(FrameSignal, RecycledBytes)> = deque.into_iter().collect();
 
         Some(ClipWork {
             run_id: Arc::clone(&self.run_id),
@@ -275,7 +275,7 @@ pub fn spawn_clip_accumulator(
             let mut acc = ClipAccumulator::new(config, run_id, session_id, prompt);
             while let Ok(sf) = frame_rx.recv() {
                 let _guard = session_span.enter();
-                if let Some(clip) = acc.push(&sf) {
+                if let Some(clip) = acc.push(sf) {
                     if clip_tx.send(clip).is_err() {
                         break; // downstream dropped — shut down
                     }
@@ -405,7 +405,7 @@ pub fn spawn_clip_vlm_workers<I>(
                                 ghosting_score: 0.0,
                                 noise_variance_score: 0.0,
                             },
-                            Arc::from([] as [u8; 0]),
+                            RecycledBytes::default(),
                         )
                     });
 
@@ -424,7 +424,7 @@ pub fn spawn_clip_vlm_workers<I>(
                         work.pts_end,
                         event_type,
                         &description,
-                        &*last_jpeg,
+                        &last_jpeg,
                     );
                 }
             })
@@ -460,7 +460,7 @@ mod tests {
                 ghosting_score: 0.0,
                 noise_variance_score: 0.0,
             },
-            jpeg: Some(Arc::from([0xff_u8, 0xd8, 0xaa, 0xbb, 0xff, 0xd9] as [u8; 6])),
+            jpeg: Some([0xff_u8, 0xd8, 0xaa, 0xbb, 0xff, 0xd9].into()),
             pts_ms,
             seq,
         }
@@ -540,7 +540,7 @@ mod tests {
         // Window requires 500ms elapsed since first frame.
         let mut result = None;
         for i in 0..7u64 {
-            result = acc.push(&make_frame(i, i * 100));
+            result = acc.push(make_frame(i, i * 100));
             if result.is_some() {
                 break;
             }
@@ -565,7 +565,7 @@ mod tests {
 
         // Send 10 frames at 500ms apart — only every other one should be accepted.
         for i in 0..10u64 {
-            acc.push(&make_frame(i, i * 500));
+            acc.push(make_frame(i, i * 500));
         }
         // At 500ms spacing with 1000ms interval, only frames at 0, 1000, 2000, 3000, 4000ms
         // get accepted (5 frames). Window = 5s, but pts_end at 4000ms < 5000ms, so no emit.
@@ -574,7 +574,7 @@ mod tests {
         // 4500 - 0 = 4500 < 5000. No emit yet.
 
         // Send frame at 5100ms: accepted (5100-4000=1100 >= 1000), window elapsed = 5100-0 = 5100 >= 5000
-        let result = acc.push(&make_frame(10, 5100));
+        let result = acc.push(make_frame(10, 5100));
         assert!(result.is_some(), "should emit after 5s of window at 1fps");
         let clip = result.unwrap();
         // Should have exactly the accepted frames: 0, 1000, 2000, 3000, 4000, 5100 → 6 frames
@@ -592,7 +592,7 @@ mod tests {
 
         let mut no_jpeg = make_frame(0, 0);
         no_jpeg.jpeg = None;
-        let result = acc.push(&no_jpeg);
+        let result = acc.push(no_jpeg);
         assert!(result.is_none());
     }
 
@@ -607,7 +607,7 @@ mod tests {
 
         // Send 10 frames at 100ms each → 1 second elapsed, below 2s window
         for i in 0..10u64 {
-            let r = acc.push(&make_frame(i, i * 100));
+            let r = acc.push(make_frame(i, i * 100));
             assert!(r.is_none(), "should not emit before window fills");
         }
     }
@@ -628,7 +628,7 @@ mod tests {
 
         let mut clip = None;
         for i in 0..10u64 {
-            clip = acc.push(&make_frame(i, i * 100));
+            clip = acc.push(make_frame(i, i * 100));
             if clip.is_some() {
                 break;
             }

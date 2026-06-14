@@ -57,7 +57,7 @@ fn keyframe_work_has_prompt_field() {
         confidence: 0.9,
         novelty_score: 0.0,
         motion_score: 0.0,
-        jpeg_bytes: Arc::from([] as [u8; 0]),
+        jpeg_bytes: Vec::new().into(),
         prompt: "Describe this frame.".into(),
         loop_active: false,
     };
