@@ -7,14 +7,14 @@ use vidarax_core::tiered_vlm::DistillationConfig;
 
 #[tokio::test]
 async fn staging_live_provider_e2e_opt_in() {
-    let vllm = std::env::var("VIDARAX_STAGING_VLLM_BASE_URL").ok();
-    let sglang = std::env::var("VIDARAX_STAGING_SGLANG_BASE_URL").ok();
-    if vllm.is_none() || sglang.is_none() {
-        eprintln!(
-            "skipping staging live provider e2e: set VIDARAX_STAGING_VLLM_BASE_URL and VIDARAX_STAGING_SGLANG_BASE_URL"
-        );
-        return;
-    }
+    let vllm = Some(
+        std::env::var("VIDARAX_STAGING_VLLM_BASE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8081".to_string()),
+    );
+    let sglang = Some(
+        std::env::var("VIDARAX_STAGING_SGLANG_BASE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8081".to_string()),
+    );
 
     let bind_port = reserve_tcp_port();
     let data_dir = std::env::temp_dir().join(format!("vidarax-staging-e2e-{bind_port}"));

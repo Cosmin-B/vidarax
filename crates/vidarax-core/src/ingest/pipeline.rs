@@ -218,7 +218,20 @@ fn decode_selective_jpeg_frames_nvdec(
     frame_indices: &[u64],
     max_frames: usize,
 ) -> Result<Vec<DecodedJpegFrame>, String> {
-    use crate::ingest::{build_select_expr, FFMPEG_PROTOCOL_WHITELIST};
+    super::fetch::with_prefetched_downloadable_source(source, |source| {
+        decode_selective_jpeg_frames_nvdec_inner(source, sample_fps, frame_indices, max_frames)
+    })?
+}
+
+fn decode_selective_jpeg_frames_nvdec_inner(
+    source: &InputSource,
+    sample_fps: f32,
+    frame_indices: &[u64],
+    max_frames: usize,
+) -> Result<Vec<DecodedJpegFrame>, String> {
+    use crate::ingest::{
+        build_select_expr, ffmpeg_input_options_for_source, ffmpeg_protocol_whitelist_for_source,
+    };
     use std::process::Command;
 
     let select_expr = build_select_expr(frame_indices);
@@ -235,7 +248,10 @@ fn decode_selective_jpeg_frames_nvdec(
             "-v",
             "error",
             "-protocol_whitelist",
-            FFMPEG_PROTOCOL_WHITELIST,
+            ffmpeg_protocol_whitelist_for_source(source),
+        ])
+        .args(ffmpeg_input_options_for_source(source))
+        .args([
             "-i",
             source.as_ffmpeg_input(),
             "-an",

@@ -42,8 +42,13 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
     .ok();
 
     let wal_path = resolve_wal_path(&config).map_err(invalid_input)?;
-    let config_path = std::env::var("VIDARAX_CONFIG").unwrap_or_else(|_| "vidarax.toml".to_string());
-    let backend_config = config::load_backend_config(&config_path).map_err(invalid_input)?;
+    let backend_config = if let Some(backends) = backend_entries_from_explicit_urls(&config) {
+        vidarax_core::backends::VidaraxConfig { backends }
+    } else {
+        let config_path =
+            std::env::var("VIDARAX_CONFIG").unwrap_or_else(|_| "vidarax.toml".to_string());
+        config::load_backend_config(&config_path).map_err(invalid_input)?
+    };
     let provider = if backend_config.backends.is_empty() {
         None
     } else {
@@ -85,6 +90,33 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
 
 pub fn invalid_input(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+fn backend_entries_from_explicit_urls(
+    config: &ServerConfig,
+) -> Option<Vec<vidarax_core::backends::BackendEntry>> {
+    let mut backends = Vec::new();
+    if let Some(base_url) = &config.inference_vllm_base_url {
+        backends.push(vidarax_core::backends::BackendEntry {
+            name: "vllm".to_string(),
+            backend_type: "openai_compat".to_string(),
+            base_url: Some(base_url.clone()),
+            api_key: None,
+            model: None,
+            priority: 1,
+        });
+    }
+    if let Some(base_url) = &config.inference_sglang_base_url {
+        backends.push(vidarax_core::backends::BackendEntry {
+            name: "sglang".to_string(),
+            backend_type: "openai_compat".to_string(),
+            base_url: Some(base_url.clone()),
+            api_key: None,
+            model: None,
+            priority: 2,
+        });
+    }
+    (!backends.is_empty()).then_some(backends)
 }
 
 fn build_configured_decode_pipeline(
@@ -135,6 +167,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -144,6 +177,7 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
     use vidarax_core::backends::BackendEntry;
+    use vidarax_core::webrtc::session::WebRtcConfig;
     #[cfg(feature = "h3-experimental")]
     use {
         tokio_quiche::http3::driver::{ClientH3Event, H3Event, InboundFrame, NewClientRequest},
@@ -302,6 +336,53 @@ mod tests {
         assert!(matches!(pipeline.backend(), PipelineBackend::CpuFfmpeg));
     }
 
+    #[test]
+    fn explicit_inference_urls_build_provider_backend_entries() {
+        let config = ServerConfig {
+            bind_addr: "127.0.0.1:8080".to_string(),
+            h3_bind_addr: "127.0.0.1:8443".to_string(),
+            h3_tls_cert_path: "deploy/certs/dev.crt".to_string(),
+            h3_tls_key_path: "deploy/certs/dev.key".to_string(),
+            data_dir: ".vidarax-data".to_string(),
+            ingest_file_roots: vec![std::env::temp_dir()],
+            inference_vllm_base_url: Some("http://127.0.0.1:8081/v1".to_string()),
+            inference_sglang_base_url: Some("http://127.0.0.1:8082/v1".to_string()),
+            security_require_api_key: false,
+            security_api_keys: vec![],
+            security_require_tenant_id: false,
+            security_global_rps: None,
+            security_tenant_rps: None,
+            security_tenant_slots: 16,
+            security_metrics_require_api_key: false,
+            cors_allowed_origins: vec![],
+            stream_ttl_secs: 3600,
+            active_stream_limit: 5,
+            transport: TransportMode::H1H2,
+            decode_backend: "cpu-ffmpeg".to_string(),
+            webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+            webrtc_turn_url: None,
+            webrtc_turn_username: None,
+            webrtc_turn_credential: None,
+            webrtc_max_output_tokens_per_second: 128,
+            webrtc_decode_workers: 2,
+            webrtc_analysis_workers: 1,
+            webrtc_vlm_workers: 2,
+            distillation: DistillationConfig::default(),
+        };
+
+        let entries = super::backend_entries_from_explicit_urls(&config).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "vllm");
+        assert_eq!(entries[0].backend_type, "openai_compat");
+        assert_eq!(entries[0].base_url.as_deref(), Some("http://127.0.0.1:8081/v1"));
+        assert_eq!(entries[0].priority, 1);
+        assert_eq!(entries[1].name, "sglang");
+        assert_eq!(entries[1].backend_type, "openai_compat");
+        assert_eq!(entries[1].base_url.as_deref(), Some("http://127.0.0.1:8082/v1"));
+        assert_eq!(entries[1].priority, 2);
+    }
+
     fn ffmpeg_available() -> bool {
         Command::new(vidarax_core::ingest::ffmpeg_path())
             .arg("-version")
@@ -416,11 +497,19 @@ mod tests {
 
     #[tokio::test]
     async fn run_scoped_endpoint_enforces_principal_ownership() {
-        let app = app_router(test_state());
+        let policy = SecurityPolicy::from_test_policy(
+            true,
+            vec!["key-a".to_string(), "key-b".to_string()],
+            false,
+            false,
+            vec![],
+        );
+        let app = app_router(test_state_with_provider_and_policy(None, policy));
         let create = Request::builder()
             .uri("/v1/runs")
             .method("POST")
             .header("content-type", "application/json")
+            .header("x-api-key", "key-a")
             .header("x-tenant-id", "tenant-a")
             .body(Body::from(r#"{"mode":"balanced"}"#))
             .unwrap();
@@ -430,23 +519,571 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let run_id = json.get("run_id").and_then(|v| v.as_str()).unwrap();
 
-        let denied = Request::builder()
+        let allowed_with_forged_tenant = Request::builder()
             .uri(format!("/v1/runs/{run_id}/state"))
             .method("GET")
+            .header("x-api-key", "key-a")
             .header("x-tenant-id", "tenant-b")
             .body(Body::empty())
             .unwrap();
-        let denied_resp = app.clone().oneshot(denied).await.unwrap();
-        assert_eq!(denied_resp.status(), StatusCode::NOT_FOUND);
+        let allowed_with_forged_tenant_resp =
+            app.clone().oneshot(allowed_with_forged_tenant).await.unwrap();
+        assert_eq!(allowed_with_forged_tenant_resp.status(), StatusCode::OK);
+
+        let denied_other_key = Request::builder()
+            .uri(format!("/v1/runs/{run_id}/state"))
+            .method("GET")
+            .header("x-api-key", "key-b")
+            .header("x-tenant-id", "tenant-a")
+            .body(Body::empty())
+            .unwrap();
+        let denied_other_key_resp = app.clone().oneshot(denied_other_key).await.unwrap();
+        assert_eq!(denied_other_key_resp.status(), StatusCode::NOT_FOUND);
 
         let allowed = Request::builder()
             .uri(format!("/v1/runs/{run_id}/state"))
             .method("GET")
+            .header("x-api-key", "key-a")
             .header("x-tenant-id", "tenant-a")
             .body(Body::empty())
             .unwrap();
         let allowed_resp = app.oneshot(allowed).await.unwrap();
         assert_eq!(allowed_resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn open_mode_uses_shared_public_principal_without_tenant_isolation() {
+        let app = app_router(test_state());
+        let create = Request::builder()
+            .uri("/v1/runs")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-api-key", "unvalidated-key")
+            .header("x-tenant-id", "tenant-a")
+            .body(Body::from(r#"{"mode":"balanced"}"#))
+            .unwrap();
+        let create_resp = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let body = create_resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let run_id = json.get("run_id").and_then(|v| v.as_str()).unwrap();
+
+        let read_from_other_tenant_header = Request::builder()
+            .uri(format!("/v1/runs/{run_id}/state"))
+            .method("GET")
+            .header("x-api-key", "other-unvalidated-key")
+            .header("x-tenant-id", "tenant-b")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(read_from_other_tenant_header).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn forged_tenant_id_cannot_cross_api_key_principals() {
+        let policy = SecurityPolicy::from_test_policy(
+            true,
+            vec!["key-a".to_string(), "key-b".to_string()],
+            false,
+            false,
+            vec![],
+        );
+        let app = app_router(test_state_with_provider_and_policy(None, policy));
+        let create = Request::builder()
+            .uri("/v1/runs")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-api-key", "key-a")
+            .header("x-tenant-id", "tenant-shared")
+            .body(Body::from(r#"{"mode":"balanced"}"#))
+            .unwrap();
+        let create_resp = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let body = create_resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let run_id = json.get("run_id").and_then(|v| v.as_str()).unwrap();
+
+        let forged = Request::builder()
+            .uri(format!("/v1/runs/{run_id}/state"))
+            .method("GET")
+            .header("x-api-key", "key-b")
+            .header("x-tenant-id", "tenant-shared")
+            .body(Body::empty())
+            .unwrap();
+        let forged_resp = app.clone().oneshot(forged).await.unwrap();
+        assert_eq!(forged_resp.status(), StatusCode::NOT_FOUND);
+
+        let allowed = Request::builder()
+            .uri(format!("/v1/runs/{run_id}/state"))
+            .method("GET")
+            .header("x-api-key", "key-a")
+            .header("x-tenant-id", "tenant-shared")
+            .body(Body::empty())
+            .unwrap();
+        let allowed_resp = app.oneshot(allowed).await.unwrap();
+        assert_eq!(allowed_resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn file_endpoint_requires_owner_prefix_and_video_extension() {
+        let policy = SecurityPolicy::from_test_policy(
+            true,
+            vec!["key-a".to_string(), "key-b".to_string()],
+            false,
+            false,
+            vec![],
+        );
+        let app = app_router(test_state_with_provider_and_policy(None, policy));
+        let principal = format!("api-key:{}", crate::auth::strong_hash_hex("key-a"));
+        let prefix = format!("{}__", crate::auth::strong_hash_hex(&principal));
+        let upload_root = std::env::temp_dir().join(crate::config::UPLOAD_DIR_NAME);
+        fs::create_dir_all(&upload_root).unwrap();
+        let filename = format!("{prefix}owned.mp4");
+        let path = upload_root.join(&filename);
+        fs::write(&path, b"video").unwrap();
+
+        let forged = Request::builder()
+            .uri(format!("/v1/files/{filename}"))
+            .method("GET")
+            .header("x-api-key", "key-b")
+            .body(Body::empty())
+            .unwrap();
+        let forged_resp = app.clone().oneshot(forged).await.unwrap();
+        assert_eq!(forged_resp.status(), StatusCode::NOT_FOUND);
+
+        let allowed = Request::builder()
+            .uri(format!("/v1/files/{filename}"))
+            .method("GET")
+            .header("x-api-key", "key-a")
+            .body(Body::empty())
+            .unwrap();
+        let allowed_resp = app.clone().oneshot(allowed).await.unwrap();
+        assert_eq!(allowed_resp.status(), StatusCode::OK);
+
+        let bad_ext = format!("{prefix}owned.txt");
+        fs::write(upload_root.join(&bad_ext), b"text").unwrap();
+        let rejected = Request::builder()
+            .uri(format!("/v1/files/{bad_ext}"))
+            .method("GET")
+            .header("x-api-key", "key-a")
+            .body(Body::empty())
+            .unwrap();
+        let rejected_resp = app.oneshot(rejected).await.unwrap();
+        assert_eq!(rejected_resp.status(), StatusCode::BAD_REQUEST);
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(upload_root.join(bad_ext));
+    }
+
+    #[tokio::test]
+    async fn legacy_temp_dir_file_is_not_shared_by_default() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let filename = format!("vidarax-legacy-temp-{nanos}.mp4");
+        let legacy_path = std::env::temp_dir().join(&filename);
+        fs::write(&legacy_path, b"legacy-temp-video").unwrap();
+
+        let state = AppState::from_wal(
+            std::env::temp_dir().join(format!("vidarax-legacy-temp-{nanos}.wal")),
+            vec![],
+            None,
+            super::build_configured_decode_pipeline("cpu-ffmpeg").unwrap(),
+            SecurityPolicy::from_config_for_tests(),
+            3600,
+            5,
+            WebRtcConfig::default(),
+            DistillationConfig::default(),
+        )
+        .unwrap();
+        let app = app_router(state);
+
+        let served = Request::builder()
+            .uri(format!("/v1/files/{filename}"))
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let served_resp = app.clone().oneshot(served).await.unwrap();
+        assert_eq!(
+            served_resp.status(),
+            StatusCode::NOT_FOUND,
+            "temp_dir files must not be served unless an operator configures temp_dir as a shared root"
+        );
+
+        let create = Request::builder()
+            .uri("/v1/runs")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"mode":"balanced"}"#))
+            .unwrap();
+        let create_resp = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let body = create_resp.into_body().collect().await.unwrap().to_bytes();
+        let create_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let run_id = create_json.get("run_id").and_then(|v| v.as_str()).unwrap();
+
+        let ingest = Request::builder()
+            .uri(format!("/v1/runs/{run_id}/ingest"))
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "source_uri": legacy_path,
+                    "sampling_policy": "fixed",
+                    "fixed_fps": 1.0,
+                    "max_frames": 1
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let ingest_resp = app.oneshot(ingest).await.unwrap();
+        assert_eq!(ingest_resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let _ = fs::remove_file(legacy_path);
+    }
+
+    #[tokio::test]
+    async fn operator_root_file_is_shared_while_uploaded_owner_prefix_stays_private() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let operator_root = std::env::temp_dir().join(format!("vidarax-operator-root-{nanos}"));
+        fs::create_dir_all(&operator_root).unwrap();
+        let operator_root = operator_root.canonicalize().unwrap();
+        let shared_name = "operator-shared.mp4";
+        fs::write(operator_root.join(shared_name), b"operator-video").unwrap();
+
+        let policy = SecurityPolicy::from_test_policy(
+            true,
+            vec!["key-a".to_string(), "key-b".to_string()],
+            false,
+            false,
+            vec![],
+        );
+        let state = AppState::from_wal(
+            std::env::temp_dir().join(format!("vidarax-operator-root-{nanos}.wal")),
+            vec![operator_root.clone(), std::env::temp_dir()],
+            None,
+            super::build_configured_decode_pipeline("cpu-ffmpeg").unwrap(),
+            policy,
+            3600,
+            5,
+            WebRtcConfig::default(),
+            DistillationConfig::default(),
+        )
+        .unwrap();
+        let app = app_router(state);
+
+        let shared = Request::builder()
+            .uri(format!("/v1/files/{shared_name}"))
+            .method("GET")
+            .header("x-api-key", "key-b")
+            .body(Body::empty())
+            .unwrap();
+        let shared_resp = app.clone().oneshot(shared).await.unwrap();
+        assert_eq!(
+            shared_resp.status(),
+            StatusCode::OK,
+            "operator-configured roots are shared for authenticated callers"
+        );
+
+        let principal = format!("api-key:{}", crate::auth::strong_hash_hex("key-a"));
+        let owner_prefix = format!("{}__", crate::auth::strong_hash_hex(&principal));
+        let uploaded_name = format!("{owner_prefix}private.mp4");
+        let upload_root = std::env::temp_dir().join(crate::config::UPLOAD_DIR_NAME);
+        fs::create_dir_all(&upload_root).unwrap();
+        fs::write(upload_root.join(&uploaded_name), b"uploaded-video").unwrap();
+        let forged = Request::builder()
+            .uri(format!("/v1/files/{uploaded_name}"))
+            .method("GET")
+            .header("x-api-key", "key-b")
+            .body(Body::empty())
+            .unwrap();
+        let forged_resp = app.oneshot(forged).await.unwrap();
+        assert_eq!(
+            forged_resp.status(),
+            StatusCode::NOT_FOUND,
+            "another principal's uploaded temp-root file remains private"
+        );
+
+        let _ = fs::remove_file(operator_root.join(shared_name));
+        let _ = fs::remove_dir(operator_root);
+        let _ = fs::remove_file(upload_root.join(uploaded_name));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_root_symlink_alias_is_not_served_or_ingested() {
+        use std::os::unix::fs::symlink;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let policy = SecurityPolicy::from_test_policy(
+            true,
+            vec!["key-a".to_string(), "key-b".to_string()],
+            false,
+            false,
+            vec![],
+        );
+        let state = AppState::from_wal(
+            std::env::temp_dir().join(format!("vidarax-upload-alias-{nanos}.wal")),
+            vec![std::env::temp_dir()],
+            None,
+            super::build_configured_decode_pipeline("cpu-ffmpeg").unwrap(),
+            policy,
+            3600,
+            5,
+            WebRtcConfig::default(),
+            DistillationConfig::default(),
+        )
+        .unwrap();
+        let app = app_router(state);
+
+        let principal_a = format!("api-key:{}", crate::auth::strong_hash_hex("key-a"));
+        let owner_prefix_a = format!("{}__", crate::auth::strong_hash_hex(&principal_a));
+        let principal_b = format!("api-key:{}", crate::auth::strong_hash_hex("key-b"));
+        let owner_prefix_b = format!("{}__", crate::auth::strong_hash_hex(&principal_b));
+        let upload_root = std::env::temp_dir().join(crate::config::UPLOAD_DIR_NAME);
+        fs::create_dir_all(&upload_root).unwrap();
+
+        let victim_name = format!("{owner_prefix_b}victim-{nanos}.mp4");
+        let victim_path = upload_root.join(&victim_name);
+        fs::write(&victim_path, b"victim-video").unwrap();
+        let alias_to_victim = format!("{owner_prefix_a}alias-to-victim-{nanos}.mp4");
+        let alias_to_victim_path = upload_root.join(&alias_to_victim);
+        let _ = fs::remove_file(&alias_to_victim_path);
+        symlink(&victim_path, &alias_to_victim_path).unwrap();
+
+        let forged_serve = Request::builder()
+            .uri(format!("/v1/files/{alias_to_victim}"))
+            .method("GET")
+            .header("x-api-key", "key-a")
+            .body(Body::empty())
+            .unwrap();
+        let forged_serve_resp = app.clone().oneshot(forged_serve).await.unwrap();
+        assert_eq!(
+            forged_serve_resp.status(),
+            StatusCode::NOT_FOUND,
+            "serve_file must authorize the resolved upload target, not the symlink basename"
+        );
+
+        let owned_name = format!("{owner_prefix_a}owned-{nanos}.mp4");
+        let owned_path = upload_root.join(&owned_name);
+        let fixture = create_test_mp4().expect("ffmpeg should generate an upload fixture");
+        fs::copy(&fixture, &owned_path).unwrap();
+        let owned_alias = format!("{owner_prefix_a}owned-alias-{nanos}.mp4");
+        let owned_alias_path = upload_root.join(&owned_alias);
+        let _ = fs::remove_file(&owned_alias_path);
+        symlink(&owned_path, &owned_alias_path).unwrap();
+
+        let create = Request::builder()
+            .uri("/v1/runs")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-api-key", "key-a")
+            .body(Body::from(r#"{"mode":"balanced"}"#))
+            .unwrap();
+        let create_resp = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let body = create_resp.into_body().collect().await.unwrap().to_bytes();
+        let create_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let run_id = create_json.get("run_id").and_then(|v| v.as_str()).unwrap();
+
+        let ingest = Request::builder()
+            .uri(format!("/v1/runs/{run_id}/ingest"))
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-api-key", "key-a")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "source_uri": owned_alias_path,
+                    "sampling_policy": "fixed",
+                    "fixed_fps": 1.0,
+                    "max_frames": 1
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let ingest_resp = app.oneshot(ingest).await.unwrap();
+        assert_eq!(
+            ingest_resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "upload-root symlinks must not be ingestable even when they point at an owned upload"
+        );
+        let ingest_body = ingest_resp.into_body().collect().await.unwrap().to_bytes();
+        let ingest_json: serde_json::Value = serde_json::from_slice(&ingest_body).unwrap();
+        let details = ingest_json["error"]["details"].as_array().unwrap();
+        assert!(
+            details.iter().any(|d| {
+                d["field"].as_str() == Some("source_uri")
+                    && d["message"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("not visible")
+            }),
+            "expected upload alias visibility rejection, got: {details:?}"
+        );
+
+        let _ = fs::remove_file(alias_to_victim_path);
+        let _ = fs::remove_file(owned_alias_path);
+        let _ = fs::remove_file(victim_path);
+        let _ = fs::remove_file(owned_path);
+        let _ = fs::remove_file(fixture);
+    }
+
+    #[tokio::test]
+    async fn file_prefixes_ignore_caller_controlled_tenant_header() {
+        let policy = SecurityPolicy::from_test_policy(
+            true,
+            vec!["shared-key".to_string()],
+            false,
+            false,
+            vec![],
+        );
+        let app = app_router(test_state_with_provider_and_policy(None, policy));
+        let principal = format!("api-key:{}", crate::auth::strong_hash_hex("shared-key"));
+        let owner_prefix = format!("{}__", crate::auth::strong_hash_hex(&principal));
+        let video_path = create_test_mp4().expect("ffmpeg should generate an upload fixture");
+        let video = fs::read(&video_path).expect("upload fixture should be readable");
+
+        let upload_for_tenant = |tenant: &'static str, filename: &'static str| {
+            let boundary = format!("vidarax-{tenant}-{filename}");
+            let mut body = Vec::new();
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!(
+                    "content-disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
+                     content-type: video/mp4\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(&video);
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            Request::builder()
+                .uri("/v1/upload")
+                .method("POST")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header("x-api-key", "shared-key")
+                .header("x-tenant-id", tenant)
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let upload_a = app
+            .clone()
+            .oneshot(upload_for_tenant("tenant-a", "a.mp4"))
+            .await
+            .unwrap();
+        assert_eq!(upload_a.status(), StatusCode::OK);
+        let body_a = upload_a.into_body().collect().await.unwrap().to_bytes();
+        let json_a: serde_json::Value = serde_json::from_slice(&body_a).unwrap();
+        let path_a = json_a["file_path"].as_str().unwrap().to_string();
+        let filename = std::path::Path::new(&path_a)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(filename.starts_with(&owner_prefix));
+
+        let upload_b = app
+            .clone()
+            .oneshot(upload_for_tenant("tenant-b", "b.mp4"))
+            .await
+            .unwrap();
+        assert_eq!(upload_b.status(), StatusCode::OK);
+        let body_b = upload_b.into_body().collect().await.unwrap().to_bytes();
+        let json_b: serde_json::Value = serde_json::from_slice(&body_b).unwrap();
+        let path_b = json_b["file_path"].as_str().unwrap().to_string();
+        let tenant_b_filename = std::path::Path::new(&path_b)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(tenant_b_filename.starts_with(&owner_prefix));
+
+        let allowed_with_different_tenant_header = Request::builder()
+            .uri(format!("/v1/files/{filename}"))
+            .method("GET")
+            .header("x-api-key", "shared-key")
+            .header("x-tenant-id", "tenant-b")
+            .body(Body::empty())
+            .unwrap();
+        let allowed_with_different_tenant_resp = app
+            .clone()
+            .oneshot(allowed_with_different_tenant_header)
+            .await
+            .unwrap();
+        assert_eq!(allowed_with_different_tenant_resp.status(), StatusCode::OK);
+
+        let allowed = Request::builder()
+            .uri(format!("/v1/files/{filename}"))
+            .method("GET")
+            .header("x-api-key", "shared-key")
+            .header("x-tenant-id", "tenant-a")
+            .body(Body::empty())
+            .unwrap();
+        let allowed_resp = app.oneshot(allowed).await.unwrap();
+        assert_eq!(allowed_resp.status(), StatusCode::OK);
+
+        let _ = fs::remove_file(path_a);
+        let _ = fs::remove_file(path_b);
+        let _ = fs::remove_file(video_path);
+    }
+
+    #[tokio::test]
+    async fn public_uploads_use_shared_public_namespace_and_can_be_served() {
+        let app = app_router(test_state());
+        let boundary = "vidarax-test-boundary";
+        let video_path = create_test_mp4().expect("ffmpeg should generate an upload fixture");
+        let video = fs::read(&video_path).expect("upload fixture should be readable");
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"content-disposition: form-data; name=\"file\"; filename=\"clip.mp4\"\r\ncontent-type: video/mp4\r\n\r\n",
+        );
+        body.extend_from_slice(&video);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let upload = Request::builder()
+            .uri("/v1/upload")
+            .method("POST")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .header("x-api-key", "unvalidated-key")
+            .header("x-tenant-id", "tenant-a")
+            .body(Body::from(body))
+            .unwrap();
+        let upload_resp = app.clone().oneshot(upload).await.unwrap();
+        assert_eq!(upload_resp.status(), StatusCode::OK);
+        let body = upload_resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let file_path = json["file_path"].as_str().unwrap();
+        let filename = std::path::Path::new(file_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(filename.starts_with("public__"));
+
+        let serve = Request::builder()
+            .uri(format!("/v1/files/{filename}"))
+            .method("GET")
+            .header("x-tenant-id", "tenant-b")
+            .body(Body::empty())
+            .unwrap();
+        let serve_resp = app.oneshot(serve).await.unwrap();
+        assert_eq!(serve_resp.status(), StatusCode::OK);
+
+        let _ = fs::remove_file(file_path);
+        let _ = fs::remove_file(video_path);
     }
 
     #[tokio::test]
@@ -720,6 +1357,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleted_run_is_not_addressable_and_releases_active_slot() {
+        let app = app_router(test_state_with_runtime(
+            None,
+            SecurityPolicy::from_config_for_tests(),
+            3600,
+            1,
+        ));
+        let create = || {
+            Request::builder()
+                .uri("/v1/runs")
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"mode":"balanced"}"#))
+                .unwrap()
+        };
+
+        let first = app.clone().oneshot(create()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let body = first.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let run_id = json.get("run_id").and_then(|v| v.as_str()).unwrap();
+
+        let delete = Request::builder()
+            .uri(format!("/v1/runs/{run_id}"))
+            .method("DELETE")
+            .body(Body::empty())
+            .unwrap();
+        let delete_response = app.clone().oneshot(delete).await.unwrap();
+        assert_eq!(delete_response.status(), StatusCode::OK);
+
+        let ingest = Request::builder()
+            .uri(format!("/v1/runs/{run_id}/ingest"))
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"frame_index":1}"#))
+            .unwrap();
+        let ingest_response = app.clone().oneshot(ingest).await.unwrap();
+        assert_eq!(ingest_response.status(), StatusCode::NOT_FOUND);
+
+        let analyze = Request::builder()
+            .uri(format!("/v1/runs/{run_id}/analyze"))
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{
+                    "model":"Qwen/Qwen3-VL-4B-Instruct",
+                    "frames":[
+                        {"frame_index":0,"pts_ms":0,"perceptual_hash":1,"luma_mean":0.2,"flicker_score":0.0,"ghosting_score":0.0,"noise_variance_score":0.0},
+                        {"frame_index":1,"pts_ms":33,"perceptual_hash":2,"luma_mean":0.3,"flicker_score":0.1,"ghosting_score":0.0,"noise_variance_score":0.0}
+                    ]
+                }"#,
+            ))
+            .unwrap();
+        let analyze_response = app.clone().oneshot(analyze).await.unwrap();
+        assert_eq!(analyze_response.status(), StatusCode::NOT_FOUND);
+
+        let feedback = Request::builder()
+            .uri(format!("/v1/runs/{run_id}/feedback"))
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"rating":5,"category":"quality"}"#))
+            .unwrap();
+        let feedback_response = app.clone().oneshot(feedback).await.unwrap();
+        assert_eq!(feedback_response.status(), StatusCode::NOT_FOUND);
+
+        let query = Request::builder()
+            .uri("/v1/query")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({ "run_id": run_id })).unwrap(),
+            ))
+            .unwrap();
+        let query_response = app.clone().oneshot(query).await.unwrap();
+        assert_eq!(query_response.status(), StatusCode::NOT_FOUND);
+
+        let state = Request::builder()
+            .uri(format!("/v1/runs/{run_id}/state"))
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let state_response = app.clone().oneshot(state).await.unwrap();
+        assert_eq!(state_response.status(), StatusCode::NOT_FOUND);
+
+        let second = app.clone().oneshot(create()).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn infer_uses_external_provider_and_returns_text() {
         let completion =
             "{\"choices\":[{\"message\":{\"content\":\"hello from provider\"}}]}".to_string();
@@ -959,6 +1685,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn analyze_label_maps_key_on_authenticated_principal_not_tenant_header() {
+        let principal_a = format!("api-key:{}", crate::auth::strong_hash_hex("key-a"));
+        let principal_b = format!("api-key:{}", crate::auth::strong_hash_hex("key-b"));
+        let maps = crate::tenant_labels::TenantLabelMaps::from_test_file(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                (
+                    principal_a,
+                    (
+                        HashMap::from([("keyframe_keep".to_string(), "event.a".to_string())]),
+                        HashMap::from([("keyframe_candidate".to_string(), "object.a".to_string())]),
+                    ),
+                ),
+                (
+                    principal_b.clone(),
+                    (
+                        HashMap::from([("keyframe_keep".to_string(), "event.b".to_string())]),
+                        HashMap::from([("keyframe_candidate".to_string(), "object.b".to_string())]),
+                    ),
+                ),
+            ]),
+        );
+        let policy = SecurityPolicy::from_test_policy(
+            true,
+            vec!["key-a".to_string(), "key-b".to_string()],
+            false,
+            false,
+            vec![],
+        );
+        let state = test_state_with_provider_and_policy(None, policy)
+            .with_tenant_label_maps_for_tests(maps);
+        let app = app_router(state);
+
+        let create_req = Request::builder()
+            .uri("/v1/runs")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-api-key", "key-a")
+            .body(Body::from(r#"{"mode":"balanced"}"#))
+            .unwrap();
+        let create_response = app.clone().oneshot(create_req).await.unwrap();
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let create_body = create_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let create_json: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
+        let run_id = create_json.get("run_id").and_then(|v| v.as_str()).unwrap();
+
+        let analyze_req = Request::builder()
+            .uri(format!("/v1/runs/{run_id}/analyze"))
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-api-key", "key-a")
+            .header("x-tenant-id", principal_b)
+            .body(Body::from(
+                r#"{
+                    "model":"Qwen/Qwen3-VL-4B-Instruct",
+                    "frames":[
+                        {"frame_index":0,"pts_ms":0,"perceptual_hash":1,"luma_mean":0.2,"flicker_score":0.0,"ghosting_score":0.0,"noise_variance_score":0.0}
+                    ]
+                }"#,
+            ))
+            .unwrap();
+        let analyze_response = app.oneshot(analyze_req).await.unwrap();
+        assert_eq!(analyze_response.status(), StatusCode::OK);
+        let analyze_body = analyze_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let analyze_json: serde_json::Value = serde_json::from_slice(&analyze_body).unwrap();
+        let first = analyze_json["metadata"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .expect("metadata row");
+        assert_eq!(
+            first["annotations"]["events"][0]["type"].as_str(),
+            Some("event.a")
+        );
+        assert_eq!(
+            first["annotations"]["objects"][0]["label"].as_str(),
+            Some("object.a")
+        );
+    }
+
+    #[tokio::test]
     async fn analyze_fixed_sampling_requires_fixed_fps() {
         let app = app_router(test_state());
         let create_req = Request::builder()
@@ -1053,14 +1870,8 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_mp4_then_analyze_without_frames_uses_decoded_signals() {
-        if !ffmpeg_available() {
-            eprintln!("skipping test: ffmpeg unavailable");
-            return;
-        }
-        let Some(video_path) = create_test_mp4() else {
-            eprintln!("skipping test: ffmpeg failed to generate fixture");
-            return;
-        };
+        assert!(ffmpeg_available(), "ffmpeg must be available for ingest tests");
+        let video_path = create_test_mp4().expect("ffmpeg should generate fixture");
 
         let app = app_router(test_state());
         let create_req = Request::builder()
@@ -1271,14 +2082,8 @@ mod tests {
 
     #[tokio::test]
     async fn realtime_reason_endpoint_generates_markers_and_lag_stats() {
-        if !ffmpeg_available() {
-            eprintln!("skipping test: ffmpeg unavailable");
-            return;
-        }
-        let Some(video_path) = create_test_mp4() else {
-            eprintln!("skipping test: ffmpeg failed to generate fixture");
-            return;
-        };
+        assert!(ffmpeg_available(), "ffmpeg must be available for realtime tests");
+        let video_path = create_test_mp4().expect("ffmpeg should generate fixture");
 
         let app = app_router(test_state());
         let create_req = Request::builder()
@@ -1343,14 +2148,8 @@ mod tests {
 
     #[tokio::test]
     async fn realtime_reason_uses_provider_semantic_overlay_when_configured() {
-        if !ffmpeg_available() {
-            eprintln!("skipping test: ffmpeg unavailable");
-            return;
-        }
-        let Some(video_path) = create_test_mp4() else {
-            eprintln!("skipping test: ffmpeg failed to generate fixture");
-            return;
-        };
+        assert!(ffmpeg_available(), "ffmpeg must be available for realtime provider tests");
+        let video_path = create_test_mp4().expect("ffmpeg should generate fixture");
 
         let completion = "{\"choices\":[{\"message\":{\"content\":\"{\\\"event_type\\\":\\\"scene_cut\\\",\\\"object_label\\\":\\\"temple\\\",\\\"summary\\\":\\\"Temple visible\\\",\\\"description\\\":\\\"Temple appears in this chunk\\\",\\\"confidence\\\":0.91}\"}}]}".to_string();
         let (base_url, server) = spawn_mock_provider_http_server(200, completion);
@@ -1528,6 +2327,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tenant_rate_limit_keys_on_authenticated_principal_not_tenant_header() {
+        let policy = SecurityPolicy::from_config(&ServerConfig {
+            bind_addr: "127.0.0.1:8080".to_string(),
+            h3_bind_addr: "127.0.0.1:8443".to_string(),
+            h3_tls_cert_path: "deploy/certs/dev.crt".to_string(),
+            h3_tls_key_path: "deploy/certs/dev.key".to_string(),
+            data_dir: ".vidarax-data".to_string(),
+            ingest_file_roots: vec![std::env::temp_dir()],
+            inference_vllm_base_url: None,
+            inference_sglang_base_url: None,
+            security_require_api_key: true,
+            security_api_keys: vec!["key-a".to_string(), "key-b".to_string()],
+            security_require_tenant_id: false,
+            security_global_rps: None,
+            security_tenant_rps: Some(1),
+            security_tenant_slots: 16,
+            security_metrics_require_api_key: false,
+            cors_allowed_origins: vec![],
+            stream_ttl_secs: 3600,
+            active_stream_limit: 5,
+            transport: TransportMode::H1H2,
+            decode_backend: "cpu-ffmpeg".to_string(),
+            webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+            webrtc_turn_url: None,
+            webrtc_turn_username: None,
+            webrtc_turn_credential: None,
+            webrtc_max_output_tokens_per_second: 128,
+            webrtc_decode_workers: 2,
+            webrtc_analysis_workers: 1,
+            webrtc_vlm_workers: 2,
+            distillation: DistillationConfig::default(),
+        })
+        .unwrap();
+        let app = app_router(test_state_with_provider_and_policy(None, policy));
+
+        let first = Request::builder()
+            .uri("/v1/runs")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-api-key", "key-a")
+            .header("x-tenant-id", "tenant-a")
+            .body(Body::from(r#"{"mode":"balanced"}"#))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(first).await.unwrap().status(), StatusCode::OK);
+
+        let rotated_tenant = Request::builder()
+            .uri("/v1/runs")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-api-key", "key-a")
+            .header("x-tenant-id", "tenant-b")
+            .body(Body::from(r#"{"mode":"balanced"}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(rotated_tenant).await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "same API key must not bypass quota by rotating x-tenant-id"
+        );
+
+        let other_key = Request::builder()
+            .uri("/v1/runs")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-api-key", "key-b")
+            .header("x-tenant-id", "tenant-a")
+            .body(Body::from(r#"{"mode":"balanced"}"#))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(other_key).await.unwrap().status(),
+            StatusCode::OK,
+            "a different API key gets an independent quota bucket"
+        );
+    }
+
+    #[tokio::test]
     async fn security_policy_requires_tenant_header_when_enabled() {
         let policy = SecurityPolicy::from_config(&ServerConfig {
             bind_addr: "127.0.0.1:8080".to_string(),
@@ -1538,8 +2412,8 @@ mod tests {
             ingest_file_roots: vec![std::env::temp_dir()],
             inference_vllm_base_url: None,
             inference_sglang_base_url: None,
-            security_require_api_key: false,
-            security_api_keys: vec![],
+            security_require_api_key: true,
+            security_api_keys: vec!["test-key".to_string()],
             security_require_tenant_id: true,
             security_global_rps: None,
             security_tenant_rps: Some(10),
@@ -1566,6 +2440,7 @@ mod tests {
         let req_missing = Request::builder()
             .uri("/v1/runs")
             .method("POST")
+            .header("x-api-key", "test-key")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"mode":"balanced"}"#))
             .unwrap();
@@ -1575,12 +2450,56 @@ mod tests {
         let req_present = Request::builder()
             .uri("/v1/runs")
             .method("POST")
+            .header("x-api-key", "test-key")
             .header("x-tenant-id", "tenant-a")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"mode":"balanced"}"#))
             .unwrap();
         let resp_present = app.oneshot(req_present).await.unwrap();
         assert_eq!(resp_present.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn security_policy_rejects_required_tenant_without_api_keys() {
+        let err = match SecurityPolicy::from_config(&ServerConfig {
+            bind_addr: "127.0.0.1:8080".to_string(),
+            h3_bind_addr: "127.0.0.1:8443".to_string(),
+            h3_tls_cert_path: "deploy/certs/dev.crt".to_string(),
+            h3_tls_key_path: "deploy/certs/dev.key".to_string(),
+            data_dir: ".vidarax-data".to_string(),
+            ingest_file_roots: vec![std::env::temp_dir()],
+            inference_vllm_base_url: None,
+            inference_sglang_base_url: None,
+            security_require_api_key: false,
+            security_api_keys: vec![],
+            security_require_tenant_id: true,
+            security_global_rps: None,
+            security_tenant_rps: None,
+            security_tenant_slots: 16,
+            security_metrics_require_api_key: false,
+            cors_allowed_origins: vec![],
+            stream_ttl_secs: 3600,
+            active_stream_limit: 5,
+            transport: TransportMode::H1H2,
+            decode_backend: "cpu-ffmpeg".to_string(),
+            webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+            webrtc_turn_url: None,
+            webrtc_turn_username: None,
+            webrtc_turn_credential: None,
+            webrtc_max_output_tokens_per_second: 128,
+            webrtc_decode_workers: 2,
+            webrtc_analysis_workers: 1,
+            webrtc_vlm_workers: 2,
+            distillation: DistillationConfig::default(),
+        }) {
+            Ok(_) => panic!("required-tenant without required API keys should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("VIDARAX_REQUIRE_TENANT_ID requires VIDARAX_REQUIRE_API_KEY=true"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

@@ -44,7 +44,6 @@ use vidarax_core::webrtc::workers::{
     VLM_WORK_QUEUE_CAPACITY, spawn_analysis_workers, spawn_decode_workers, spawn_vlm_workers,
 };
 
-use crate::auth::principal_key_from_headers;
 use crate::models::AttachStreamRequest;
 use crate::state::AppState;
 use crate::wal_sink::WalEventSink;
@@ -174,7 +173,7 @@ pub async fn whip_offer(
 
     let session = Arc::new(session);
     let sess_id = new_session_id();
-    let principal = principal_key_from_headers(&headers);
+    let principal = state.security_policy().principal_key_from_headers(&headers);
 
     // Create a session-scoped span so all worker-thread log events are
     // attributed to this WebRTC session.
@@ -425,7 +424,7 @@ pub async fn whip_ice(
     };
 
     // Verify the caller owns this session.
-    let caller = principal_key_from_headers(&headers);
+    let caller = state.security_policy().principal_key_from_headers(&headers);
     if caller != owner_principal {
         tracing::warn!("WHIP ICE sess={sess_id} principal mismatch");
         return StatusCode::FORBIDDEN;
@@ -474,7 +473,7 @@ pub async fn whip_terminate(
         return StatusCode::NOT_FOUND;
     };
 
-    let caller = principal_key_from_headers(&headers);
+    let caller = state.security_policy().principal_key_from_headers(&headers);
     if caller != owner_principal {
         tracing::warn!("WHIP terminate sess={sess_id} principal mismatch");
         return StatusCode::FORBIDDEN;
@@ -544,7 +543,7 @@ pub async fn whip_update_prompt(
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let caller = principal_key_from_headers(&headers);
+    let caller = state.security_policy().principal_key_from_headers(&headers);
     if caller != owner_principal {
         tracing::warn!("WHIP update_prompt sess={sess_id} principal mismatch");
         return StatusCode::FORBIDDEN.into_response();

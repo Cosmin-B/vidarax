@@ -71,6 +71,24 @@ impl TenantLabelMaps {
         Self { default, tenants }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_test_file(
+        default_events: HashMap<String, String>,
+        default_objects: HashMap<String, String>,
+        tenants: HashMap<String, (HashMap<String, String>, HashMap<String, String>)>,
+    ) -> Self {
+        Self {
+            default: TenantLabelMap {
+                events: default_events,
+                objects: default_objects,
+            },
+            tenants: tenants
+                .into_iter()
+                .map(|(tenant, (events, objects))| (tenant, TenantLabelMap { events, objects }))
+                .collect(),
+        }
+    }
+
     pub fn map_event(&self, tenant_id: Option<&str>, label: &str) -> LabelMapResult {
         self.map_label(tenant_id, label, |map| map.events.get(label))
     }

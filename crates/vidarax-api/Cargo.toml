@@ -11,7 +11,7 @@ h3-experimental = ["dep:futures-util", "dep:tokio-quiche"]
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "sync", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "sync", "fs", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-util = { version = "0.3.32", optional = true }
@@ -24,6 +24,7 @@ getrandom = "0.4"
 governor = "0.6.3"
 arc-swap = "1.8"
 base64 = "0.22.1"
+sha2 = "0.10"
 vidarax-contracts = { path = "../vidarax-contracts" }
 vidarax-core = { path = "../vidarax-core" }
 kanal = "0.1.1"

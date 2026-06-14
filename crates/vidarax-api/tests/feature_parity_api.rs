@@ -7,6 +7,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -22,6 +23,16 @@ fn tmp_wal(tag: &str) -> PathBuf {
     let n = WAL_COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     std::env::temp_dir().join(format!("vidarax-fp-{tag}-{pid}-{n}.wal"))
+}
+
+fn api_key_principal(api_key: &str) -> String {
+    let digest = Sha256::digest(api_key.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut hex, "{byte:02x}").unwrap();
+    }
+    format!("api-key:{hex}")
 }
 
 /// Parse a response body as JSON.
@@ -110,31 +121,40 @@ async fn test_submit_feedback_validates_category() {
     );
 }
 
-/// POST with valid data → 200 (opt-in: requires VIDARAX_SPACETIMEDB_URL).
-///
-/// Set `VIDARAX_SPACETIMEDB_URL=http://127.0.0.1:3000` to run this test
-/// against a live SpacetimeDB instance.  Skipped automatically when the
-/// env var is absent so CI passes without an external service.
+/// POST with valid data → 200 against a live SpacetimeDB instance.
 #[tokio::test]
 async fn test_submit_feedback_success() {
-    let Some(stdb_url) = std::env::var("VIDARAX_SPACETIMEDB_URL").ok() else {
-        eprintln!(
-            "skipping test_submit_feedback_success: \
-             set VIDARAX_SPACETIMEDB_URL to enable this test"
-        );
-        return;
-    };
+    let stdb_url = std::env::var("VIDARAX_SPACETIMEDB_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
 
     use vidarax_api::spacetime_client::SpacetimeClient;
-    let state = AppState::with_wal_for_tests(tmp_wal("fb-success"))
+    let state = AppState::with_wal_for_tests_requiring_api_keys(
+        tmp_wal("fb-success"),
+        vec!["test-key".to_string()],
+    )
         .with_spacetime_client(SpacetimeClient::new(&stdb_url, "vidarax"));
+    state
+        .append_run_event(
+            VALID_RUN_ID,
+            "run_created",
+            json!({ "principal_key": api_key_principal("test-key") }),
+        )
+        .unwrap();
     let router = app_router(state);
 
     let res = router
-        .oneshot(post_json(
-            &format!("/v1/runs/{VALID_RUN_ID}/feedback"),
-            json!({ "rating": 8, "category": "quality", "feedback": "looks great" }),
-        ))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/runs/{VALID_RUN_ID}/feedback"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-api-key", "test-key")
+                .body(Body::from(
+                    json!({ "rating": 8, "category": "quality", "feedback": "looks great" })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
         .await
         .unwrap();
 

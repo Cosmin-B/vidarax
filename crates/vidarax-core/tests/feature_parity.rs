@@ -531,24 +531,25 @@ fn clip_work_pts_span_covers_window() {
 // ── 5. HLS URL validation ─────────────────────────────────────────────────────
 
 #[test]
-fn https_m3u8_url_is_accepted_as_hls_stream() {
+fn https_m3u8_url_is_rejected_as_remote_hls_by_default() {
     let allowed = vec![std::env::temp_dir()];
     let result =
         InputSource::parse_and_validate("https://example.com/live/feed.m3u8", &allowed);
-    assert!(result.is_ok(), "valid https .m3u8 should be accepted: {result:?}");
     assert!(
-        matches!(result.unwrap(), InputSource::HlsStream(_)),
-        "should resolve to HlsStream"
+        result.is_err(),
+        "remote https .m3u8 should require explicit opt-in"
     );
 }
 
 #[test]
-fn http_m3u8_url_is_accepted_as_hls_stream() {
+fn http_m3u8_url_is_rejected_as_remote_hls_by_default() {
     let allowed = vec![std::env::temp_dir()];
     let result =
         InputSource::parse_and_validate("http://example.com/live/stream.m3u8", &allowed);
-    assert!(result.is_ok(), "valid http .m3u8 should be accepted: {result:?}");
-    assert!(matches!(result.unwrap(), InputSource::HlsStream(_)));
+    assert!(
+        result.is_err(),
+        "remote http .m3u8 should require explicit opt-in"
+    );
 }
 
 #[test]
@@ -610,15 +611,14 @@ fn hls_url_targeting_metadata_endpoint_is_rejected() {
 }
 
 #[test]
-fn hls_scheme_url_is_accepted_as_hls_stream() {
+fn hls_scheme_url_is_rejected_as_remote_hls_by_default() {
     let allowed = vec![std::env::temp_dir()];
-    // hls:// is a native scheme that ffmpeg supports directly.
+    // hls:// is a VidaraX alias and must still require remote-HLS opt-in.
     let result =
         InputSource::parse_and_validate("hls://example.com/live.m3u8", &allowed);
-    assert!(result.is_ok(), "hls:// URL should be accepted: {result:?}");
     assert!(
-        matches!(result.unwrap(), InputSource::HlsStream(_)),
-        "hls:// URL should resolve to HlsStream variant"
+        result.is_err(),
+        "remote hls:// URL should require explicit opt-in"
     );
 }
 

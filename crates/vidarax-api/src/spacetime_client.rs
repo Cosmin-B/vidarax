@@ -137,7 +137,6 @@ struct Inner {
     base_url: String,
     database: String,
     async_client: reqwest::Client,
-    sync_client: reqwest::blocking::Client,
     /// JWT issued by SpacetimeDB — persisted across calls for identity continuity.
     token: ArcSwapOption<Arc<str>>,
 }
@@ -162,7 +161,6 @@ impl SpacetimeClient {
                 base_url: base_url.into(),
                 database: database.into(),
                 async_client: reqwest::Client::new(),
-                sync_client: reqwest::blocking::Client::new(),
                 token: ArcSwapOption::from(None::<Arc<Arc<str>>>),
             }),
         }
@@ -202,6 +200,10 @@ impl SpacetimeClient {
 
     fn auth_header(&self) -> Option<String> {
         self.read_token().map(|t| format!("Bearer {t}"))
+    }
+
+    fn blocking_client() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::new()
     }
 
     // ── Async methods ────────────────────────────────────────────────────────
@@ -387,9 +389,8 @@ impl SpacetimeClient {
             req.confidence,
             req.description,
         ]);
-        let mut rb = self
-            .inner
-            .sync_client
+        let client = Self::blocking_client();
+        let mut rb = client
             .post(self.reducer_url("emit_event"))
             .header("Content-Type", "application/json")
             .json(&body);
@@ -418,9 +419,8 @@ impl SpacetimeClient {
             req.description,
             req.jpeg_data,
         ]);
-        let mut rb = self
-            .inner
-            .sync_client
+        let client = Self::blocking_client();
+        let mut rb = client
             .post(self.reducer_url("store_keyframe"))
             .header("Content-Type", "application/json")
             .json(&body);
@@ -464,9 +464,8 @@ impl SpacetimeClient {
     }
 
     fn sql_sync(&self, sql: &str) -> Result<Vec<Value>, SpacetimeError> {
-        let mut rb = self
-            .inner
-            .sync_client
+        let client = Self::blocking_client();
+        let mut rb = client
             .post(self.sql_url())
             .header("Content-Type", "text/plain")
             .body(sql.to_string());

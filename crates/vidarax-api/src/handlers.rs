@@ -4,8 +4,12 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Value};
 use std::cmp::min;
+use std::collections::HashSet;
+use std::io::Read;
+use std::path::{Path as FsPath, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
 use vidarax_contracts::models::{
     fallback_candidates, REQUIRED_MEDIUM_MODELS, REQUIRED_SMALL_MODELS,
@@ -21,7 +25,8 @@ use vidarax_core::provider::{
 };
 use vidarax_core::timeline::TimelineEvent;
 
-use crate::auth::{header_value, principal_key_from_headers, HEADER_TENANT_ID};
+use crate::auth::{header_value, strong_hash_hex, HEADER_TENANT_ID};
+use crate::config::UPLOAD_DIR_NAME;
 use crate::ids::validate_run_id;
 use crate::models::{
     AnalyzeFrameMetadata, AnalyzeFramesRequest, AnalyzeFramesResponse, AnalyzeMarker,
@@ -40,6 +45,8 @@ use crate::semantic_infer::{
     run_semantic_dispatch, semantic_marker_to_api_marker, ChunkPrep, ChunkSemanticResult,
 };
 use crate::state::AppState;
+
+const UPLOAD_MEDIA_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 use crate::validation::{normalize_mode, normalize_model};
 
 #[derive(Debug, serde::Deserialize)]
@@ -87,7 +94,7 @@ pub async fn create_run(
     };
 
     let tenant_id = header_value(&headers, HEADER_TENANT_ID).map(ToString::to_string);
-    let principal = principal_key_from_headers(&headers);
+    let principal = state.security_policy().principal_key_from_headers(&headers);
     let active = state.count_active_runs_for_principal(&principal, now_epoch_ms());
     if active >= state.active_stream_limit() {
         return conflict_error(
@@ -225,8 +232,9 @@ pub async fn ingest_run(
             .and_then(|value| value.as_str())
             .unwrap_or("stream-0")
             .to_string();
+        let allowed_roots = ingest_file_roots_with_upload_root(&state);
         let decode_source =
-            match InputSource::parse_and_validate(&source_uri, state.ingest_file_roots()) {
+            match InputSource::parse_and_validate(&source_uri, &allowed_roots) {
                 Ok(source) => source,
                 Err(message) => {
                     return validation_error(
@@ -236,6 +244,17 @@ pub async fn ingest_run(
                     );
                 }
             };
+        if let Err(error) =
+            enforce_file_source_visibility(
+                &state,
+                &headers,
+                &source_uri,
+                &decode_source,
+                "invalid ingest request",
+            )
+        {
+            return error;
+        }
         let requested_sample_fps = sample_fps.unwrap_or(2.0);
         let decode_pipeline = state.decode_pipeline();
         let decoded = match tokio::task::spawn_blocking(move || {
@@ -883,7 +902,8 @@ pub async fn analyze_run(
         (signals, sampling_policy, sample_fps)
     };
 
-    let tenant_id = header_value(&headers, HEADER_TENANT_ID);
+    let principal = state.security_policy().principal_key_from_headers(&headers);
+    let label_map_key = label_map_key_from_principal(&principal);
     let stream_id = payload.stream_id.unwrap_or_else(|| "stream-0".to_string());
     let request_id = state.next_request_id();
     let trace_id = payload
@@ -906,7 +926,7 @@ pub async fn analyze_run(
         .map(|m| {
             let (metadata, marker_input) = compose_frame_metadata(
                 &state,
-                tenant_id,
+                label_map_key,
                 &run_id,
                 &stream_id,
                 &mode,
@@ -1123,8 +1143,9 @@ fn validate_realtime_reason_params(
         }
     };
 
+    let allowed_roots = ingest_file_roots_with_upload_root(state);
     let decode_source =
-        InputSource::parse_and_validate(&payload.source_uri, state.ingest_file_roots()).map_err(
+        InputSource::parse_and_validate(&payload.source_uri, &allowed_roots).map_err(
             |message| {
                 validation_error(
                     state,
@@ -1402,6 +1423,15 @@ pub async fn reason_realtime_run(
         Ok(params) => params,
         Err(error) => return error,
     };
+    if let Err(error) = enforce_file_source_visibility(
+        &state,
+        &headers,
+        &payload.source_uri,
+        &params.decode_source,
+        "invalid realtime reason request",
+    ) {
+        return error;
+    }
     let mode = params.mode;
     let model = params.model;
     let sampling_policy = params.sampling_policy;
@@ -1482,7 +1512,8 @@ pub async fn reason_realtime_run(
         .trace_id
         .unwrap_or_else(|| format!("trace-{}", &request_id[4..]));
     let stream_id = payload.stream_id.unwrap_or_else(|| "stream-0".to_string());
-    let tenant_id = header_value(&headers, HEADER_TENANT_ID);
+    let principal = state.security_policy().principal_key_from_headers(&headers);
+    let label_map_key = label_map_key_from_principal(&principal);
     // Optional index tag — carried through all WAL events for this pass so
     // callers can filter with GET /v1/runs/{id}/events?index=<name>.
     let index_name: Option<String> = payload.index_name;
@@ -1587,7 +1618,7 @@ pub async fn reason_realtime_run(
         semantic_segment_ms,
         &request_id,
         &trace_id,
-        tenant_id,
+        label_map_key,
         &index_name,
         &marker_config,
         chunk_preps,
@@ -1741,6 +1772,7 @@ pub async fn health() -> impl IntoResponse {
 #[tracing::instrument(name = "api.search", skip_all)]
 pub async fn search(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<SearchRequest>,
 ) -> impl IntoResponse {
     let query = payload.query.trim();
@@ -1774,13 +1806,25 @@ pub async fn search(
         );
     }
 
-    // Load all events — either run-scoped or global.
+    let principal = state.security_policy().principal_key_from_headers(&headers);
     let events = if let Some(ref run_id) = payload.run_id {
         if let Some(error) = validate_run_id_or_error(&state, run_id, "invalid search request") {
             return error;
         }
+        if let Err(error) = load_run_snapshot(&state, &headers, run_id) {
+            return error;
+        }
         match state.read_run_events_async(run_id).await {
-            Ok(events) => events,
+            Ok(events) => {
+                if events.iter().any(|event| event.kind == "run_deleted") {
+                    return not_found_error(
+                        &state,
+                        "run_id was not found",
+                        vec![field_error("run_id", run_id.to_string())],
+                    );
+                }
+                events
+            }
             Err(err) => return internal_error(&state, format!("failed to read events: {err}")),
         }
     } else {
@@ -1790,15 +1834,27 @@ pub async fn search(
         }
     };
 
-    let scanned = events.len();
+    let owned_run_ids = if payload.run_id.is_some() {
+        None
+    } else {
+        Some(owned_run_ids_from_events(&events, &principal))
+    };
 
     // Case-insensitive substring search over the `description` field in every
     // event payload.  The lowercase query is computed once.
     let query_lower = query.to_lowercase();
 
     let mut hits: Vec<SearchHit> = Vec::new();
+    let mut scanned = 0usize;
+    let mut total_hits = 0usize;
 
     for event in events {
+        if let Some(owned_run_ids) = &owned_run_ids {
+            if !owned_run_ids.contains(&event.run_id) {
+                continue;
+            }
+        }
+        scanned += 1;
         let payload_val = parse_payload(&event.payload);
 
         // Extract a description string from the event payload.  Different event
@@ -1821,6 +1877,7 @@ pub async fn search(
         if !description.to_lowercase().contains(&query_lower) {
             continue;
         }
+        total_hits += 1;
 
         // Extract optional index_name for cross-index searches.
         let index_name = payload_val
@@ -1828,21 +1885,17 @@ pub async fn search(
             .and_then(|v| v.as_str())
             .map(ToString::to_string);
 
-        hits.push(SearchHit {
-            seq: event.seq,
-            run_id: event.run_id,
-            pts_ms: event.pts_ms,
-            kind: event.kind,
-            description,
-            index_name,
-        });
-
-        if hits.len() >= limit {
-            break;
+        if hits.len() < limit {
+            hits.push(SearchHit {
+                seq: event.seq,
+                run_id: event.run_id,
+                pts_ms: event.pts_ms,
+                kind: event.kind,
+                description,
+                index_name,
+            });
         }
     }
-
-    let total_hits = hits.len();
 
     ok(json!(SearchResponse {
         request_id: state.next_request_id(),
@@ -2247,11 +2300,18 @@ fn infer_execution_error_to_response(state: &AppState, err: InferExecutionError)
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_infer_request, InferRequest};
+    use super::{
+        feedback_rows_to_json_for_owned_runs, owned_run_ids_from_events, run_command_with_timeout,
+        validate_infer_request, InferRequest,
+    };
+    use crate::spacetime_client::FeedbackRow;
     use crate::state::AppState;
     use axum::http::HeaderMap;
     use serde_json::json;
+    use std::collections::HashSet;
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     static WAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -2316,12 +2376,92 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(schema).unwrap();
         assert_eq!(value["properties"]["ok"]["type"].as_str(), Some("boolean"));
     }
+
+    #[test]
+    fn feedback_list_filters_rows_to_owned_runs() {
+        let rows = vec![
+            FeedbackRow {
+                id: 1,
+                agent_id: "0xagent".to_string(),
+                run_id: "run-00000000000000aa".to_string(),
+                session_id: "sess-a".to_string(),
+                rating: 8,
+                category: "quality".to_string(),
+                feedback: "owned".to_string(),
+                timestamp_micros: 1,
+            },
+            FeedbackRow {
+                id: 2,
+                agent_id: "0xagent".to_string(),
+                run_id: "run-00000000000000bb".to_string(),
+                session_id: "sess-b".to_string(),
+                rating: 2,
+                category: "quality".to_string(),
+                feedback: "other".to_string(),
+                timestamp_micros: 2,
+            },
+        ];
+        let owned = HashSet::from(["run-00000000000000aa".to_string()]);
+
+        let filtered = feedback_rows_to_json_for_owned_runs(rows, &owned);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["run_id"].as_str(), Some("run-00000000000000aa"));
+        assert_eq!(filtered[0]["feedback"].as_str(), Some("owned"));
+    }
+
+    #[test]
+    fn visible_owned_run_set_excludes_deleted_runs() {
+        let principal = "public";
+        let live_run = "run-00000000000000aa";
+        let deleted_run = "run-00000000000000bb";
+        let state = test_state("deleted-visible-set");
+        state
+            .append_run_event(live_run, "run_created", json!({ "principal_key": principal }))
+            .unwrap();
+        state
+            .append_run_event(deleted_run, "run_created", json!({ "principal_key": principal }))
+            .unwrap();
+        state
+            .append_run_event(deleted_run, "run_deleted", json!({}))
+            .unwrap();
+        let events = state.read_all_events().unwrap();
+
+        let visible = owned_run_ids_from_events(&events, principal);
+
+        assert!(visible.contains(live_run));
+        assert!(
+            !visible.contains(deleted_run),
+            "deleted runs must not remain visible to search or feedback listing"
+        );
+    }
+
+    #[test]
+    fn upload_probe_command_timeout_kills_slow_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 5"]);
+        let started = Instant::now();
+
+        let err = run_command_with_timeout(
+            &mut command,
+            Duration::from_millis(50),
+            "uploaded media inspection timed out",
+        )
+        .expect_err("slow probe command must time out");
+
+        assert_eq!(err, "uploaded media inspection timed out");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout path should not wait for the child sleep duration"
+        );
+    }
 }
 
 #[tracing::instrument(name = "api.submit_feedback", skip_all)]
 pub async fn submit_feedback(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
+    headers: HeaderMap,
     Json(payload): Json<crate::models::FeedbackRequest>,
 ) -> impl IntoResponse {
     if let Some(error) = validate_run_id_or_error(&state, &run_id, "invalid feedback request") {
@@ -2341,6 +2481,9 @@ pub async fn submit_feedback(
             "invalid feedback payload",
             vec![field_error("category", "category must not be empty".to_string())],
         );
+    }
+    if let Err(error) = load_run_snapshot(&state, &headers, &run_id) {
+        return error;
     }
 
     let Some(stdb) = state.spacetime_client() else {
@@ -2366,27 +2509,23 @@ pub async fn submit_feedback(
 }
 
 #[tracing::instrument(name = "api.list_feedback", skip_all)]
-pub async fn list_feedback(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn list_feedback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let Some(stdb) = state.spacetime_client() else {
         return internal_error(&state, "spacetimedb client not configured");
     };
+    let principal = state.security_policy().principal_key_from_headers(&headers);
+    let all_events = match state.read_all_events_async().await {
+        Ok(events) => events,
+        Err(err) => return internal_error(&state, format!("failed to read events: {err}")),
+    };
+    let owned_run_ids = owned_run_ids_from_events(&all_events, &principal);
 
     match stdb.query_feedback_async(None).await {
         Ok(rows) => {
-            let items: Vec<Value> = rows
-                .into_iter()
-                .map(|r| {
-                    json!({
-                        "id": r.id,
-                        "run_id": r.run_id,
-                        "session_id": r.session_id,
-                        "rating": r.rating,
-                        "category": r.category,
-                        "feedback": r.feedback,
-                        "timestamp_micros": r.timestamp_micros,
-                    })
-                })
-                .collect();
+            let items = feedback_rows_to_json_for_owned_runs(rows, &owned_run_ids);
             ok(json!({
                 "request_id": state.next_request_id(),
                 "feedback": items
@@ -2403,7 +2542,7 @@ pub async fn list_runs(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let principal = principal_key_from_headers(&headers);
+    let principal = state.security_policy().principal_key_from_headers(&headers);
     let all_events = match state.read_all_events_async().await {
         Ok(events) => events,
         Err(err) => return internal_error(&state, format!("failed to read events: {err}")),
@@ -2527,14 +2666,16 @@ pub async fn delete_run(
 /// GET /v1/files/{filename}
 ///
 /// Serve a file by bare filename from any directory listed in `VIDARAX_INGEST_FILE_ROOTS`.
-/// This allows the browser to load videos that were uploaded to the server's temp directory
-/// via the `/v1/upload` endpoint, which returns an absolute file path.
+/// Uploaded files in the dedicated upload root are private to the uploader
+/// principal via a filename prefix. Other configured ingest roots are
+/// operator-trusted shared roots and do not use upload ownership prefixes.
 ///
 /// Security: only files whose canonical path starts with one of the allowed ingest roots
 /// are served.  Path traversal (`../`) is rejected by the canonicalization check.
 pub async fn serve_file(
     State(state): State<AppState>,
     Path(filename): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     use axum::http::{header, StatusCode};
     use axum::response::Response;
@@ -2547,9 +2688,17 @@ pub async fn serve_file(
             .body(Body::from("invalid filename"))
             .unwrap();
     }
+    if !allowed_served_file_extension(&filename) {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("unsupported file type"))
+            .unwrap();
+    }
+    let principal = state.security_policy().principal_key_from_headers(&headers);
+    let owner_prefix = upload_owner_prefix_from_principal(&principal);
 
-    // Search each allowed root for a file with this name.
-    for root in state.ingest_file_roots() {
+    // Search the dedicated upload root plus each operator-configured root.
+    for root in file_serve_roots(&state) {
         let candidate = root.join(&filename);
         // Canonicalize to resolve any symlinks and check containment.
         let canonical = match candidate.canonicalize() {
@@ -2563,6 +2712,16 @@ pub async fn serve_file(
         };
         if !canonical.starts_with(&root_canonical) {
             continue;
+        }
+        if uploaded_path_requires_owner_prefix(&state, &canonical) {
+            let Some(resolved_filename) =
+                upload_root_regular_file_name_for_visibility(&candidate, &canonical)
+            else {
+                continue;
+            };
+            if !filename_is_visible_to_principal(resolved_filename, &principal, &owner_prefix) {
+                continue;
+            }
         }
         // Read the file and stream it back.
         let data = match tokio::fs::read(&canonical).await {
@@ -2598,8 +2757,11 @@ pub async fn serve_file(
 
 pub async fn upload_file(
     State(state): State<AppState>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
+    let principal = state.security_policy().principal_key_from_headers(&headers);
+    let owner_prefix = upload_owner_prefix_from_principal(&principal);
     loop {
         let field = match multipart.next_field().await {
             Ok(Some(f)) => f,
@@ -2622,7 +2784,21 @@ pub async fn upload_file(
         } else {
             safe_name
         };
-        let dest = std::env::temp_dir().join(&safe_name);
+        if !allowed_served_file_extension(&safe_name) {
+            return validation_error(
+                &state,
+                "invalid upload request",
+                vec![field_error(
+                    "file",
+                    "unsupported file type".to_string(),
+                )],
+            );
+        }
+        let safe_name = format!("{owner_prefix}{safe_name}");
+        let Some(upload_root) = shared_upload_root() else {
+            return internal_error(&state, "failed to prepare upload root".to_string());
+        };
+        let dest = upload_root.join(&safe_name);
         let data = match field.bytes().await {
             Ok(data) => data,
             Err(err) => {
@@ -2631,6 +2807,14 @@ pub async fn upload_file(
         };
         if let Err(err) = tokio::fs::write(&dest, &data).await {
             return internal_error(&state, format!("failed to write upload: {err}"));
+        }
+        if let Err(message) = validate_uploaded_media_container(&dest, &data).await {
+            let _ = tokio::fs::remove_file(&dest).await;
+            return validation_error(
+                &state,
+                "invalid upload request",
+                vec![field_error("file", message)],
+            );
         }
         return ok(json!({ "file_path": dest.display().to_string() }));
     }
@@ -2726,6 +2910,299 @@ fn validate_run_id_or_error(
     })
 }
 
+fn owned_run_ids_from_events(events: &[TimelineEvent], principal: &str) -> HashSet<String> {
+    let mut owned = HashSet::new();
+    let mut deleted = HashSet::new();
+    for event in events {
+        match event.kind.as_str() {
+            "run_created" => {
+                let payload = parse_payload(&event.payload);
+                let event_principal = payload
+                    .get("principal_key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("public");
+                if event_principal == principal {
+                    owned.insert(event.run_id.clone());
+                }
+            }
+            "run_deleted" => {
+                deleted.insert(event.run_id.clone());
+            }
+            _ => {}
+        }
+    }
+    for run_id in deleted {
+        owned.remove(&run_id);
+    }
+    owned
+}
+
+fn label_map_key_from_principal(principal: &str) -> Option<&str> {
+    (principal != "public").then_some(principal)
+}
+
+fn feedback_rows_to_json_for_owned_runs(
+    rows: Vec<crate::spacetime_client::FeedbackRow>,
+    owned_run_ids: &HashSet<String>,
+) -> Vec<Value> {
+    rows.into_iter()
+        .filter(|r| owned_run_ids.contains(&r.run_id))
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "run_id": r.run_id,
+                "session_id": r.session_id,
+                "rating": r.rating,
+                "category": r.category,
+                "feedback": r.feedback,
+                "timestamp_micros": r.timestamp_micros,
+            })
+        })
+        .collect()
+}
+
+fn upload_owner_prefix_from_principal(principal: &str) -> String {
+    if principal == "public" {
+        // Public/open mode is a shared, development-only upload namespace. It
+        // provides no tenant isolation; authenticated callers use a namespace
+        // derived from the API-key principal. One API key = one tenant; for
+        // sub-tenant isolation issue separate keys.
+        return "public__".to_string();
+    }
+    principal
+        .strip_prefix("api-key:")
+        .filter(|_| !principal.is_empty())
+        .map(|_| format!("{}__", strong_hash_hex(principal)))
+        .unwrap_or_else(|| "public__".to_string())
+}
+
+fn filename_is_visible_to_principal(
+    filename: &str,
+    principal: &str,
+    owner_prefix: &str,
+) -> bool {
+    filename.starts_with(owner_prefix) || (principal == "public" && !filename.contains("__"))
+}
+
+fn uploaded_path_requires_owner_prefix(_state: &AppState, canonical: &FsPath) -> bool {
+    let Some(upload_root) = shared_upload_root() else {
+        return false;
+    };
+    canonical.starts_with(&upload_root)
+}
+
+fn upload_root_regular_file_name_for_visibility<'a>(
+    requested_path: &FsPath,
+    canonical: &'a FsPath,
+) -> Option<&'a str> {
+    let file_type = std::fs::symlink_metadata(requested_path).ok()?.file_type();
+    if !file_type.is_file() {
+        return None;
+    }
+    canonical.file_name().and_then(|name| name.to_str())
+}
+
+fn allowed_served_file_extension(filename: &str) -> bool {
+    let Some((_, ext)) = filename.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "mp4" | "webm" | "mov" | "avi"
+    )
+}
+
+fn enforce_file_source_visibility(
+    state: &AppState,
+    headers: &HeaderMap,
+    requested_source_uri: &str,
+    source: &InputSource,
+    context: &'static str,
+) -> Result<(), ApiResponse> {
+    let InputSource::FilePath(path) = source else {
+        return Ok(());
+    };
+    let Ok(canonical) = FsPath::new(path).canonicalize() else {
+        return Err(validation_error(
+            state,
+            context,
+            vec![field_error(
+                "source_uri",
+                "source_uri file path is invalid or does not exist".to_string(),
+            )],
+        ));
+    };
+    if !uploaded_path_requires_owner_prefix(state, &canonical) {
+        // Non-upload ingest roots are admin-configured and trusted shared media
+        // roots.
+        return Ok(());
+    }
+    let requested_path = requested_file_path_for_visibility(requested_source_uri)
+        .unwrap_or_else(|| PathBuf::from(path));
+    let Some(filename) =
+        upload_root_regular_file_name_for_visibility(&requested_path, &canonical)
+    else {
+        return Err(validation_error(
+            state,
+            context,
+            vec![field_error(
+                "source_uri",
+                "source_uri file is not visible to the caller".to_string(),
+            )],
+        ));
+    };
+    let principal = state.security_policy().principal_key_from_headers(headers);
+    let owner_prefix = upload_owner_prefix_from_principal(&principal);
+    // Legacy unprefixed files in the upload temp root are not auto-claimed by
+    // authenticated callers; open-mode `public` remains a shared dev namespace.
+    if filename_is_visible_to_principal(filename, &principal, &owner_prefix) {
+        return Ok(());
+    }
+    Err(validation_error(
+        state,
+        context,
+        vec![field_error(
+            "source_uri",
+            "source_uri file is not visible to the caller".to_string(),
+        )],
+    ))
+}
+
+fn requested_file_path_for_visibility(source_uri: &str) -> Option<PathBuf> {
+    let trimmed = source_uri.trim();
+    if trimmed.contains("://") {
+        let url = reqwest::Url::parse(trimmed).ok()?;
+        if url.scheme() != "file" {
+            return None;
+        }
+        return url.to_file_path().ok();
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+fn shared_upload_root() -> Option<PathBuf> {
+    let root = std::env::temp_dir().join(UPLOAD_DIR_NAME);
+    std::fs::create_dir_all(&root).ok()?;
+    root.canonicalize().ok()
+}
+
+fn ingest_file_roots_with_upload_root(state: &AppState) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(state.ingest_file_roots().len() + 1);
+    if let Some(upload_root) = shared_upload_root() {
+        roots.push(upload_root);
+    }
+    roots.extend_from_slice(state.ingest_file_roots());
+    roots
+}
+
+fn file_serve_roots(state: &AppState) -> Vec<PathBuf> {
+    ingest_file_roots_with_upload_root(state)
+}
+
+async fn validate_uploaded_media_container(path: &FsPath, data: &[u8]) -> Result<(), String> {
+    let trimmed = data
+        .iter()
+        .copied()
+        .skip_while(|b| b.is_ascii_whitespace())
+        .take(7)
+        .collect::<Vec<_>>();
+    if trimmed.eq_ignore_ascii_case(b"#EXTM3U") {
+        return Err("uploaded file must be a media container, not a playlist manifest".to_string());
+    }
+
+    let path = path.to_path_buf();
+    let probe = tokio::task::spawn_blocking(move || validate_uploaded_media_container_file(&path));
+    match tokio::time::timeout(UPLOAD_MEDIA_PROBE_TIMEOUT + Duration::from_secs(1), probe).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_join_err)) => Err("failed to inspect uploaded media".to_string()),
+        Err(_elapsed) => Err("uploaded media inspection timed out".to_string()),
+    }
+}
+
+fn validate_uploaded_media_container_file(path: &FsPath) -> Result<(), String> {
+    // Extension checks are not a security boundary. Probe the just-written file
+    // with file-only protocols and reject playlist/manifest demuxers where raw
+    // uploaded media is expected.
+    let mut command = Command::new(vidarax_core::ingest::ffprobe_path());
+    command
+        .args([
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            "file",
+            "-show_entries",
+            "format=format_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path);
+    let output = run_command_with_timeout(
+        &mut command,
+        UPLOAD_MEDIA_PROBE_TIMEOUT,
+        "uploaded media inspection timed out",
+    )?;
+    if !output.status.success() {
+        return Err("uploaded file must be a valid media container".to_string());
+    }
+    let format_name = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    if format_name.is_empty() {
+        return Err("uploaded file must declare a media container format".to_string());
+    }
+    if format_name
+        .split(',')
+        .any(|name| matches!(name, "hls" | "concat"))
+    {
+        return Err("uploaded file must be a media container, not a playlist manifest".to_string());
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct TimedCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+}
+
+fn run_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    timeout_message: &'static str,
+) -> Result<TimedCommandOutput, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .map_err(|_| "failed to inspect uploaded media".to_string())?;
+    let started = Instant::now();
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    pipe.read_to_end(&mut stdout)
+                        .map_err(|_| "failed to inspect uploaded media".to_string())?;
+                }
+                return Ok(TimedCommandOutput { status, stdout });
+            }
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(timeout_message.to_string());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("failed to inspect uploaded media".to_string());
+            }
+        }
+    }
+}
+
 async fn load_existing_events(
     state: &AppState,
     run_id: &str,
@@ -2748,7 +3225,9 @@ fn load_run_snapshot(
             vec![field_error("run_id", run_id.to_string())],
         ));
     };
-    let requested = principal_key_from_headers(headers);
+    let requested = state.security_policy().principal_key_from_headers(headers);
+    // Principal ownership is introduced in this release; pre-ownership runs
+    // without `principal_key` are public only. See docs/security.md.
     if snapshot.principal_key == requested {
         return Ok(snapshot);
     }

@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 
 use crate::gate::FrameSignal;
 
+use super::fetch::with_prefetched_downloadable_source;
 use super::InputSource;
 
 static FFMPEG_PATH: OnceLock<String> = OnceLock::new();
@@ -36,7 +37,81 @@ pub fn nvidia_smi_path() -> &'static str {
     })
 }
 
-pub(crate) const FFMPEG_PROTOCOL_WHITELIST: &str = "file,http,https,tcp,tls,rtsp,rtp,udp,hls";
+// ffmpeg applies protocol whitelists to redirects and nested demuxer resources,
+// so each source kind gets the narrowest useful set. Residual limitation:
+// redirects or nested resources that resolve to private IPs over an allowed
+// scheme cannot be fully blocked here; hardened deployments need an egress
+// proxy/resolver that enforces public-IP policy on every connection. See
+// docs/security.md for the accepted residual and recommended control.
+pub(crate) const FFMPEG_LOCAL_PROTOCOL_WHITELIST: &str = "file";
+pub(crate) const FFMPEG_HTTPS_PROTOCOL_WHITELIST: &str = "https,tls,tcp";
+pub(crate) const FFMPEG_HTTP_PROTOCOL_WHITELIST: &str = "http,tcp";
+pub(crate) const FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST: &str = "hls,https,tls,tcp";
+pub(crate) const FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST: &str = "hls,http,tcp";
+pub(crate) const FFMPEG_RTSPS_PROTOCOL_WHITELIST: &str = "rtsp,rtsps,tls,tcp,udp,rtp";
+pub(crate) const FFMPEG_RTSP_PROTOCOL_WHITELIST: &str = "rtsp,tcp,udp,rtp";
+
+pub(crate) fn ffmpeg_protocol_whitelist_for_source(source: &InputSource) -> &'static str {
+    match source {
+        InputSource::FilePath(_) => FFMPEG_LOCAL_PROTOCOL_WHITELIST,
+        InputSource::HlsStream(url) if url.starts_with("http://") => {
+            FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST
+        }
+        InputSource::HlsStream(_) => FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST,
+        InputSource::Url(url) if url.starts_with("http://") => FFMPEG_HTTP_PROTOCOL_WHITELIST,
+        InputSource::Url(url) if url.starts_with("rtsps://") => FFMPEG_RTSPS_PROTOCOL_WHITELIST,
+        InputSource::Url(url) if url.starts_with("rtsp://") => FFMPEG_RTSP_PROTOCOL_WHITELIST,
+        InputSource::Url(_) => FFMPEG_HTTPS_PROTOCOL_WHITELIST,
+        InputSource::WebRtcStream(_) => FFMPEG_LOCAL_PROTOCOL_WHITELIST,
+    }
+}
+
+pub(crate) fn ffmpeg_input_options_for_source(source: &InputSource) -> Vec<String> {
+    let mut options = Vec::new();
+    match source {
+        InputSource::Url(url) if url.starts_with("http://") || url.starts_with("https://") => {
+            options.extend(["-max_redirects".to_string(), "0".to_string()]);
+        }
+        InputSource::HlsStream(_) => {
+            options.extend(["-max_redirects".to_string(), "0".to_string()]);
+        }
+        _ => {}
+    }
+    if tls_verify_required_for_source(source) {
+        options.extend(["-tls_verify".to_string(), "1".to_string()]);
+        if let Some(host) = tls_verify_host_for_source(source) {
+            options.extend(["-verifyhost".to_string(), host]);
+        }
+    }
+    options
+}
+
+fn tls_verify_required_for_source(source: &InputSource) -> bool {
+    if insecure_tls_enabled() {
+        return false;
+    }
+    match source {
+        InputSource::Url(url) => url.starts_with("rtsps://"),
+        InputSource::HlsStream(url) => url.starts_with("https://"),
+        _ => false,
+    }
+}
+
+fn tls_verify_host_for_source(source: &InputSource) -> Option<String> {
+    let raw = match source {
+        InputSource::Url(url) if url.starts_with("rtsps://") => url,
+        _ => return None,
+    };
+    reqwest::Url::parse(raw)
+        .ok()
+        .and_then(|url| url.host_str().map(|host| host.to_string()))
+}
+
+fn insecure_tls_enabled() -> bool {
+    std::env::var("VIDARAX_ALLOW_INSECURE_TLS")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FramePacket {
@@ -140,13 +215,27 @@ pub struct DecodedJpegFrame {
 }
 
 pub fn probe_source_fps(source: &InputSource) -> Option<f32> {
+    match with_prefetched_downloadable_source(source, probe_source_fps_inner) {
+        Ok(fps) => fps,
+        Err(err) => {
+            tracing::warn!(error = %err, "remote media prefetch failed during ffprobe");
+            None
+        }
+    }
+}
+
+fn probe_source_fps_inner(source: &InputSource) -> Option<f32> {
     let source_uri = source.as_ffmpeg_input();
+    let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
     let output = Command::new(ffprobe_path())
         .args([
             "-v",
             "error",
             "-protocol_whitelist",
-            FFMPEG_PROTOCOL_WHITELIST,
+            protocol_whitelist,
+        ])
+        .args(ffmpeg_input_options_for_source(source))
+        .args([
             "-select_streams",
             "v:0",
             "-show_entries",
@@ -168,6 +257,33 @@ pub fn decode_mp4_to_frame_signals(
     source: &InputSource,
     config: Mp4DecodeConfig,
 ) -> Result<DecodedMp4Batch, String> {
+    let mut decoded =
+        with_prefetched_downloadable_source(source, |source| {
+            decode_mp4_to_frame_signals_inner(source, config)
+        })??;
+    decoded.source_uri = source.as_ffmpeg_input().to_string();
+    Ok(decoded)
+}
+
+#[cfg(test)]
+fn decode_mp4_to_frame_signals_with_prefetch_validator(
+    source: &InputSource,
+    config: Mp4DecodeConfig,
+    validate_url: super::fetch::FetchUrlValidator,
+) -> Result<DecodedMp4Batch, String> {
+    let mut decoded = super::fetch::with_prefetched_downloadable_source_and_validator(
+        source,
+        validate_url,
+        |source| decode_mp4_to_frame_signals_inner(source, config),
+    )??;
+    decoded.source_uri = source.as_ffmpeg_input().to_string();
+    Ok(decoded)
+}
+
+fn decode_mp4_to_frame_signals_inner(
+    source: &InputSource,
+    config: Mp4DecodeConfig,
+) -> Result<DecodedMp4Batch, String> {
     if !config.sample_fps.is_finite() || config.sample_fps <= 0.0 {
         return Err("sample_fps must be > 0".to_string());
     }
@@ -176,13 +292,17 @@ pub fn decode_mp4_to_frame_signals(
     }
 
     let source_uri = source.as_ffmpeg_input();
+    let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
     let fps_expr = format!("fps={:.3}", config.sample_fps);
     let output = Command::new(ffmpeg_path())
         .args([
             "-v",
             "error",
             "-protocol_whitelist",
-            FFMPEG_PROTOCOL_WHITELIST,
+            protocol_whitelist,
+        ])
+        .args(ffmpeg_input_options_for_source(source))
+        .args([
             "-i",
             source_uri,
             "-an",
@@ -212,6 +332,15 @@ pub fn decode_mp4_to_jpeg_frames(
     source: &InputSource,
     config: Mp4DecodeConfig,
 ) -> Result<Vec<DecodedJpegFrame>, String> {
+    with_prefetched_downloadable_source(source, |source| {
+        decode_mp4_to_jpeg_frames_inner(source, config)
+    })?
+}
+
+fn decode_mp4_to_jpeg_frames_inner(
+    source: &InputSource,
+    config: Mp4DecodeConfig,
+) -> Result<Vec<DecodedJpegFrame>, String> {
     if !config.sample_fps.is_finite() || config.sample_fps <= 0.0 {
         return Err("sample_fps must be > 0".to_string());
     }
@@ -220,13 +349,17 @@ pub fn decode_mp4_to_jpeg_frames(
     }
 
     let source_uri = source.as_ffmpeg_input();
+    let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
     let fps_expr = format!("fps={:.3}", config.sample_fps);
     let output = Command::new(ffmpeg_path())
         .args([
             "-v",
             "error",
             "-protocol_whitelist",
-            FFMPEG_PROTOCOL_WHITELIST,
+            protocol_whitelist,
+        ])
+        .args(ffmpeg_input_options_for_source(source))
+        .args([
             "-i",
             source_uri,
             "-an",
@@ -550,6 +683,16 @@ pub fn extract_video_clip(
     start_s: f32,
     duration_s: f32,
 ) -> Result<Vec<u8>, String> {
+    with_prefetched_downloadable_source(source, |source| {
+        extract_video_clip_inner(source, start_s, duration_s)
+    })?
+}
+
+fn extract_video_clip_inner(
+    source: &InputSource,
+    start_s: f32,
+    duration_s: f32,
+) -> Result<Vec<u8>, String> {
     if !start_s.is_finite() || start_s < 0.0 {
         return Err("start_s must be >= 0".to_string());
     }
@@ -558,6 +701,7 @@ pub fn extract_video_clip(
     }
 
     let source_uri = source.as_ffmpeg_input();
+    let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
     let start_str = format!("{start_s:.6}");
     let duration_str = format!("{duration_s:.6}");
 
@@ -580,7 +724,10 @@ pub fn extract_video_clip(
         Command::new(ffmpeg_path())
             .args([
                 "-v", "error",
-                "-protocol_whitelist", FFMPEG_PROTOCOL_WHITELIST,
+                "-protocol_whitelist", protocol_whitelist,
+            ])
+            .args(ffmpeg_input_options_for_source(source))
+            .args([
                 "-ss", &start_str,
                 "-t", &duration_str,
                 "-i", source_uri,
@@ -595,7 +742,10 @@ pub fn extract_video_clip(
         Command::new(ffmpeg_path())
             .args([
                 "-v", "error",
-                "-protocol_whitelist", FFMPEG_PROTOCOL_WHITELIST,
+                "-protocol_whitelist", protocol_whitelist,
+            ])
+            .args(ffmpeg_input_options_for_source(source))
+            .args([
                 "-ss", &start_str,
                 "-t", &duration_str,
                 "-i", source_uri,
@@ -643,6 +793,17 @@ pub fn decode_selective_jpeg_frames(
     frame_indices: &[u64],
     max_frames: usize,
 ) -> Result<Vec<DecodedJpegFrame>, String> {
+    with_prefetched_downloadable_source(source, |source| {
+        decode_selective_jpeg_frames_inner(source, sample_fps, frame_indices, max_frames)
+    })?
+}
+
+pub(crate) fn decode_selective_jpeg_frames_inner(
+    source: &InputSource,
+    sample_fps: f32,
+    frame_indices: &[u64],
+    max_frames: usize,
+) -> Result<Vec<DecodedJpegFrame>, String> {
     if frame_indices.is_empty() {
         return Ok(Vec::new());
     }
@@ -655,10 +816,14 @@ pub fn decode_selective_jpeg_frames(
     let frames_cap = frame_indices.len().min(max_frames).to_string();
 
     let source_uri = source.as_ffmpeg_input();
+    let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
     let output = Command::new(ffmpeg_path())
         .args([
             "-v", "error",
-            "-protocol_whitelist", FFMPEG_PROTOCOL_WHITELIST,
+            "-protocol_whitelist", protocol_whitelist,
+        ])
+        .args(ffmpeg_input_options_for_source(source))
+        .args([
             "-i", source_uri,
             "-an", "-sn", "-dn",
             "-vf", &vf_chain,
@@ -694,10 +859,49 @@ pub fn decode_selective_jpeg_frames(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::process::Command;
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::{
+        ffmpeg_input_options_for_source, ffmpeg_protocol_whitelist_for_source,
         parse_ffprobe_frame_rate, parse_framemd5_to_signals, parse_jpeg_stream_to_frames,
-        Mp4DecodeConfig, TimestampNormalizer, FFMPEG_PROTOCOL_WHITELIST,
+        Mp4DecodeConfig, TimestampNormalizer, FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST,
+        FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST, FFMPEG_HTTP_PROTOCOL_WHITELIST,
+        FFMPEG_HTTPS_PROTOCOL_WHITELIST, FFMPEG_LOCAL_PROTOCOL_WHITELIST,
+        FFMPEG_RTSPS_PROTOCOL_WHITELIST,
     };
+    use crate::ingest::InputSource;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.old.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn with_env<T>(key: &'static str, value: Option<&str>, test: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old = std::env::var_os(key);
+        let _restore = EnvRestore { key, old };
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        test()
+    }
 
     #[test]
     fn normalizes_pts_monotonically() {
@@ -758,10 +962,197 @@ mod tests {
     }
 
     #[test]
-    fn hls_protocol_whitelist_contains_hls() {
+    fn protocol_whitelists_are_scoped_by_input_kind() {
         assert!(
-            FFMPEG_PROTOCOL_WHITELIST.split(',').any(|p| p == "hls"),
-            "hls must be in FFMPEG_PROTOCOL_WHITELIST"
+            !FFMPEG_HTTPS_PROTOCOL_WHITELIST
+                .split(',')
+                .any(|p| matches!(p, "file" | "hls" | "http")),
+            "default HTTPS inputs must not allow file, hls, or plain http subresources"
         );
+        assert_eq!(FFMPEG_LOCAL_PROTOCOL_WHITELIST, "file");
+        let https_hls_protocols = FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST
+            .split(',')
+            .collect::<Vec<_>>();
+        assert!(https_hls_protocols.contains(&"hls"));
+        assert!(https_hls_protocols.contains(&"https"));
+        assert!(https_hls_protocols.contains(&"tls"));
+        assert!(!https_hls_protocols.contains(&"http"));
+        assert!(!https_hls_protocols.contains(&"file"));
+
+        let http_hls_protocols = FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST
+            .split(',')
+            .collect::<Vec<_>>();
+        assert!(http_hls_protocols.contains(&"hls"));
+        assert!(http_hls_protocols.contains(&"http"));
+        assert!(!http_hls_protocols.contains(&"https"));
+        assert!(!http_hls_protocols.contains(&"tls"));
+        assert!(!http_hls_protocols.contains(&"file"));
+        assert_eq!(
+            ffmpeg_protocol_whitelist_for_source(&InputSource::Url(
+                "https://cdn.example.com/video.mp4".to_string()
+            )),
+            FFMPEG_HTTPS_PROTOCOL_WHITELIST
+        );
+        assert_eq!(
+            ffmpeg_protocol_whitelist_for_source(&InputSource::Url(
+                "http://cdn.example.com/video.mp4".to_string()
+            )),
+            FFMPEG_HTTP_PROTOCOL_WHITELIST
+        );
+        assert_eq!(
+            ffmpeg_protocol_whitelist_for_source(&InputSource::HlsStream(
+                "https://cdn.example.com/live.m3u8".to_string()
+            )),
+            FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST
+        );
+        assert_eq!(
+            ffmpeg_protocol_whitelist_for_source(&InputSource::HlsStream(
+                "http://cdn.example.com/live.m3u8".to_string()
+            )),
+            FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST
+        );
+        assert_eq!(
+            ffmpeg_protocol_whitelist_for_source(&InputSource::Url(
+                "rtsps://camera.example.com/live".to_string()
+            )),
+            FFMPEG_RTSPS_PROTOCOL_WHITELIST
+        );
+        assert_eq!(
+            ffmpeg_protocol_whitelist_for_source(&InputSource::FilePath(
+                "/tmp/video.mp4".to_string()
+            )),
+            FFMPEG_LOCAL_PROTOCOL_WHITELIST
+        );
+    }
+
+    #[test]
+    fn remote_http_inputs_disable_ffmpeg_redirects() {
+        assert_eq!(
+            ffmpeg_input_options_for_source(&InputSource::Url(
+                "https://cdn.example.com/video.mp4".to_string()
+            )),
+            vec!["-max_redirects".to_string(), "0".to_string()]
+        );
+        let hls_options = ffmpeg_input_options_for_source(&InputSource::HlsStream(
+            "https://cdn.example.com/live.m3u8".to_string(),
+        ));
+        assert_eq!(hls_options[0], "-max_redirects");
+        assert_eq!(hls_options[1], "0");
+        assert!(
+            ffmpeg_input_options_for_source(&InputSource::FilePath(
+                "/tmp/video.mp4".to_string()
+            ))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn hls_tls_verifies_chain_without_pinning_manifest_host() {
+        with_env("VIDARAX_ALLOW_INSECURE_TLS", None, || {
+            let hls_options = ffmpeg_input_options_for_source(&InputSource::HlsStream(
+                "https://cdn.example.com/live.m3u8".to_string(),
+            ));
+            assert!(hls_options
+                .windows(2)
+                .any(|w| w[0] == "-tls_verify" && w[1] == "1"));
+            assert!(
+                !hls_options.iter().any(|arg| arg == "-verifyhost"),
+                "HLS must not pin every segment/key request to the manifest host"
+            );
+        });
+    }
+
+    #[test]
+    fn rtsps_tls_verifies_chain_and_pins_original_host() {
+        with_env("VIDARAX_ALLOW_INSECURE_TLS", None, || {
+            assert_eq!(
+                ffmpeg_input_options_for_source(&InputSource::Url(
+                    "rtsps://camera.example.com/live".to_string()
+                )),
+                vec![
+                    "-tls_verify".to_string(),
+                    "1".to_string(),
+                    "-verifyhost".to_string(),
+                    "camera.example.com".to_string(),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn insecure_tls_opt_out_omits_peer_verification_args() {
+        with_env("VIDARAX_ALLOW_INSECURE_TLS", Some("true"), || {
+            let options = ffmpeg_input_options_for_source(&InputSource::Url(
+                "rtsps://camera.example.com/live".to_string(),
+            ));
+
+            assert!(!options.iter().any(|arg| arg == "-tls_verify"));
+            assert!(!options.iter().any(|arg| arg == "-verifyhost"));
+        });
+    }
+
+    #[test]
+    fn public_https_media_url_prefetches_and_decodes() {
+        let mp4 = create_test_mp4_bytes();
+        let server = crate::ingest::fetch::test_helpers::MockHttpServer::serve_once(
+            "200 OK",
+            &[("Content-Type", "video/mp4")],
+            mp4,
+        );
+        let url = server.url("/media.mp4");
+        let source = InputSource::Url(url.clone());
+        let decoded = super::decode_mp4_to_frame_signals_with_prefetch_validator(
+            &source,
+            Mp4DecodeConfig {
+                sample_fps: 1.0,
+                max_frames: 1,
+            },
+            server.allow_origin_validator(),
+        )
+        .expect("local mock media URL should prefetch and decode");
+
+        assert_eq!(decoded.source_uri, url);
+        assert_eq!(decoded.frame_signals.len(), 1);
+    }
+
+    fn create_test_mp4_bytes() -> Vec<u8> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "vidarax-test-media-{}-{nanos}.mp4",
+            std::process::id()
+        ));
+        let output = Command::new(super::ffmpeg_path())
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=16x16:rate=1:duration=1",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "mpeg4",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-y",
+            ])
+            .arg(&path)
+            .output()
+            .expect("run ffmpeg to generate test mp4");
+        assert!(
+            output.status.success(),
+            "ffmpeg failed to generate test mp4: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = fs::read(&path).expect("read generated test mp4");
+        let _ = fs::remove_file(&path);
+        assert!(!bytes.is_empty(), "generated test mp4 must not be empty");
+        bytes
     }
 }
