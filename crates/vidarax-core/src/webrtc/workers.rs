@@ -44,6 +44,11 @@ use crate::webrtc::decode::{Decoder, DecoderConfig};
 use crate::webrtc::session::RtpFrame;
 use crate::webrtc::signals::{yuv_to_frame_signal, yuv_to_jpeg};
 
+const DEFAULT_DECODE_WIDTH: u32 = 1920;
+const DEFAULT_DECODE_HEIGHT: u32 = 1080;
+const DEFAULT_LOOP_WINDOW: u32 = 6;
+const DEFAULT_LOOP_REPEAT_THRESHOLD: usize = 3;
+
 // ─── EventSink trait ──────────────────────────────────────────────────────────
 
 /// Abstraction over SpacetimeDB event writes used by the worker pools.
@@ -177,7 +182,9 @@ pub fn spawn_decode_workers(
                 let mut active_codec: Option<VideoCodec> = None;
                 let mut prev_signal: Option<crate::gate::FrameSignal> = None;
                 // Reused across frames to avoid per-frame 6MB YCbCr allocation.
-                let mut ycbcr_scratch: Vec<u8> = Vec::with_capacity(1920 * 1080 * 3);
+                let mut ycbcr_scratch: Vec<u8> = Vec::with_capacity(
+                    DEFAULT_DECODE_WIDTH as usize * DEFAULT_DECODE_HEIGHT as usize * 3,
+                );
 
                 while let Ok(frame) = rtp_rx.recv() {
                     let _guard = session_span.enter();
@@ -189,8 +196,8 @@ pub fn spawn_decode_workers(
                         let config = DecoderConfig {
                             gpu_available: gpu,
                             codec: frame.codec,
-                            width: 1920,
-                            height: 1080,
+                            width: DEFAULT_DECODE_WIDTH,
+                            height: DEFAULT_DECODE_HEIGHT,
                         };
                         decoder = Some(Decoder::new(&config));
                         active_codec = Some(frame.codec);
@@ -276,10 +283,10 @@ pub fn spawn_analysis_workers(
         std::thread::Builder::new()
             .name(format!("vx-analysis-{i}"))
             .spawn(move || {
-
                 let mut pipeline =
                     TwoPassPipeline::new(TwoPassConfig::default(), GateConfig::default());
-                let mut loop_det = LoopDetector::new(6, 3);
+                let mut loop_det =
+                    LoopDetector::new(DEFAULT_LOOP_WINDOW, DEFAULT_LOOP_REPEAT_THRESHOLD);
                 // True while the loop detector considers the stream stuck.
                 // Cleared when the detector stops firing for a full window.
                 let mut loop_active = false;
@@ -391,7 +398,24 @@ enum SinkEvent {
     },
 }
 
-/// Spawn `n` VLM inference worker threads with 3-tier routing + training pair collection.
+pub struct VlmWorkerParams<I>
+where
+    I: InferenceProvider + 'static,
+{
+    pub workers: usize,
+    pub vlm_rx: kanal::Receiver<KeyframeWork>,
+    pub provider: Arc<I>,
+    pub stdb: Arc<dyn EventSink>,
+    pub config: TieredVlmConfig,
+    pub metrics: Arc<PipelineMetrics>,
+    pub session_span: tracing::Span,
+    pub max_output_tokens_per_second: u32,
+    pub guided_json: Arc<RwLock<Option<Arc<str>>>>,
+    pub training_store: Option<Arc<Mutex<TrainingStore>>>,
+    pub distillation: DistillationConfig,
+}
+
+/// Spawn VLM inference worker threads with 3-tier routing + training pair collection.
 ///
 /// **Tier 1 — KNN cache** (when `distillation.enabled` and embedding server is reachable):
 /// Fetches a SigLIP2 embedding for the frame, then asks the `TrainingStore` for the
@@ -413,28 +437,27 @@ enum SinkEvent {
 /// a bounded kanal channel; a dedicated writer thread drains it sequentially,
 /// so inference latency is never stalled by SpacetimeDB HTTP round-trips.
 ///
-/// Threads exit when `vlm_rx` is closed.
-pub fn spawn_vlm_workers<I>(
-    n: usize,
-    vlm_rx: kanal::Receiver<KeyframeWork>,
-    provider: Arc<I>,
-    stdb: Arc<dyn EventSink>,
-    config: TieredVlmConfig,
-    metrics: Arc<PipelineMetrics>,
-    session_span: tracing::Span,
-    max_output_tokens_per_second: u32,
-    // Shared guided-JSON schema handle.  When the inner `Option` is `Some`,
-    // the schema is passed to the first-pass VLM request and `max_tokens`
-    // is raised to 1024 to accommodate structured output.
-    guided_json: Arc<RwLock<Option<Arc<str>>>>,
-    #[cfg(feature = "training")]
-    training_store: Option<Arc<Mutex<TrainingStore>>>,
-    #[cfg(not(feature = "training"))]
-    _training_store: Option<Arc<Mutex<TrainingStore>>>,
-    distillation: DistillationConfig,
-) where
+/// Threads exit when `params.vlm_rx` is closed.
+pub fn spawn_vlm_workers<I>(params: VlmWorkerParams<I>)
+where
     I: InferenceProvider + 'static,
 {
+    let VlmWorkerParams {
+        workers,
+        vlm_rx,
+        provider,
+        stdb,
+        config,
+        metrics,
+        session_span,
+        max_output_tokens_per_second,
+        guided_json,
+        training_store,
+        distillation,
+    } = params;
+    #[cfg(not(feature = "training"))]
+    let _training_store = training_store;
+
     // FIFO channel between VLM workers and the SpacetimeDB writer.
     let (event_tx, event_rx) = kanal::bounded::<SinkEvent>(512);
 
@@ -472,7 +495,7 @@ pub fn spawn_vlm_workers<I>(
         })
         .expect("stdb writer thread spawn failed");
 
-    for i in 0..n.max(1) {
+    for i in 0..workers.max(1) {
         let vlm_rx = vlm_rx.clone();
         let provider = Arc::clone(&provider);
         let event_tx = event_tx.clone();

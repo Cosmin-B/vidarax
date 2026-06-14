@@ -101,6 +101,9 @@ pub struct ServerConfig {
     pub webrtc_turn_credential: Option<String>,
     /// VLM output token rate cap per session in tokens/s (`VIDARAX_WEBRTC_MAX_OUTPUT_TOKENS_PER_SECOND`).
     pub webrtc_max_output_tokens_per_second: u32,
+    pub webrtc_decode_workers: usize,
+    pub webrtc_analysis_workers: usize,
+    pub webrtc_vlm_workers: usize,
     pub distillation: DistillationConfig,
 }
 
@@ -153,6 +156,10 @@ impl ServerConfig {
         let webrtc_turn_credential = env::var("VIDARAX_WEBRTC_TURN_CREDENTIAL").ok();
         let webrtc_max_output_tokens_per_second =
             parse_usize_env("VIDARAX_WEBRTC_MAX_OUTPUT_TOKENS_PER_SECOND", 128)? as u32;
+        let webrtc_decode_workers = parse_usize_env("VIDARAX_WEBRTC_DECODE_WORKERS", 2)?.max(1);
+        let webrtc_analysis_workers =
+            parse_usize_env("VIDARAX_WEBRTC_ANALYSIS_WORKERS", 1)?.max(1);
+        let webrtc_vlm_workers = parse_usize_env("VIDARAX_WEBRTC_VLM_WORKERS", 2)?.max(1);
         let distillation = parse_distillation_config()?;
         Ok(Self {
             bind_addr,
@@ -180,6 +187,9 @@ impl ServerConfig {
             webrtc_turn_username,
             webrtc_turn_credential,
             webrtc_max_output_tokens_per_second,
+            webrtc_decode_workers,
+            webrtc_analysis_workers,
+            webrtc_vlm_workers,
             distillation,
         })
     }
@@ -546,6 +556,9 @@ mod tests {
             webrtc_turn_username: Some("alice".into()),
             webrtc_turn_credential: Some("secret".into()),
             webrtc_max_output_tokens_per_second: 64,
+            webrtc_decode_workers: 2,
+            webrtc_analysis_workers: 1,
+            webrtc_vlm_workers: 2,
             distillation: DistillationConfig::default(),
         };
 
@@ -556,6 +569,9 @@ mod tests {
         assert_eq!(cfg.webrtc_turn_username.as_deref(), Some("alice"));
         assert_eq!(cfg.webrtc_turn_credential.as_deref(), Some("secret"));
         assert_eq!(cfg.webrtc_max_output_tokens_per_second, 64);
+        assert_eq!(cfg.webrtc_decode_workers, 2);
+        assert_eq!(cfg.webrtc_analysis_workers, 1);
+        assert_eq!(cfg.webrtc_vlm_workers, 2);
         assert_eq!(cfg.webrtc_stun_servers, vec!["stun:custom.example.com:3478"]);
     }
 
@@ -587,6 +603,9 @@ mod tests {
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
             webrtc_max_output_tokens_per_second: 128,
+            webrtc_decode_workers: 2,
+            webrtc_analysis_workers: 1,
+            webrtc_vlm_workers: 2,
             distillation: DistillationConfig::default(),
         };
 

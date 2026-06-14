@@ -35,7 +35,9 @@ use serde::{Deserialize, Serialize};
 use vidarax_core::provider::{InferenceProvider, InferenceRequest, InferenceResult, ProviderError, ProviderKind};
 use vidarax_core::tiered_vlm::TieredVlmConfig;
 use vidarax_core::webrtc::session::WebRtcSession;
-use vidarax_core::webrtc::workers::{EventSink, spawn_decode_workers, spawn_analysis_workers, spawn_vlm_workers};
+use vidarax_core::webrtc::workers::{
+    EventSink, VlmWorkerParams, spawn_analysis_workers, spawn_decode_workers, spawn_vlm_workers,
+};
 
 use crate::state::AppState;
 use crate::wal_sink::WalEventSink;
@@ -242,6 +244,7 @@ pub async fn whip_offer(
     // Use the HTTP router when provider endpoints are configured.
     let metrics_arc = Arc::clone(state.pipeline_metrics_arc());
     let vlm_config = TieredVlmConfig::default();
+    let webrtc_config_for_workers = state.webrtc_config().clone();
 
     // Capture everything needed by the spawn_blocking closure.
     let run_id_for_workers = Arc::clone(&run_id);
@@ -260,9 +263,9 @@ pub async fn whip_offer(
     // Use spawn_blocking as a bridge from async context to the thread spawns;
     // the actual worker threads are spawned inside and run independently.
     tokio::task::spawn_blocking(move || {
-        // ── Decode workers (2 threads) ─────────────────────────────────
+        // ── Decode workers ─────────────────────────────────────────────
         spawn_decode_workers(
-            2,
+            webrtc_config_for_workers.decode_workers,
             frame_rx,
             stream_tx,
             false, // gpu_available — conservative default; no GPU assumed
@@ -270,9 +273,9 @@ pub async fn whip_offer(
             session_span_for_workers.clone(),
         );
 
-        // ── Analysis workers (1 thread) ────────────────────────────────
+        // ── Analysis workers ───────────────────────────────────────────
         spawn_analysis_workers(
-            1,
+            webrtc_config_for_workers.analysis_workers,
             stream_rx,
             vlm_tx,
             None, // clip_tx — normal keyframe mode, not clip mode
@@ -283,41 +286,25 @@ pub async fn whip_offer(
             session_span_for_workers.clone(),
         );
 
-        // ── VLM workers (2 threads) ────────────────────────────────────
+        // ── VLM workers ────────────────────────────────────────────────
         let guided_json = guided_json_for_workers;
-
-        match provider {
-            Some(p) => {
-                spawn_vlm_workers(
-                    2,
-                    vlm_rx,
-                    Arc::new(p),
-                    event_sink_for_workers,
-                    vlm_config_for_workers,
-                    metrics_for_workers,
-                    session_span_for_workers,
-                    0, // max_output_tokens_per_second — 0 = unlimited
-                    Arc::clone(&guided_json),
-                    None, // _training_store
-                    vidarax_core::tiered_vlm::DistillationConfig::default(),
-                );
-            }
-            None => {
-                spawn_vlm_workers(
-                    2,
-                    vlm_rx,
-                    Arc::new(NullInferenceProvider),
-                    event_sink_for_workers,
-                    vlm_config_for_workers,
-                    metrics_for_workers,
-                    session_span_for_workers,
-                    0,
-                    Arc::clone(&guided_json),
-                    None,
-                    vidarax_core::tiered_vlm::DistillationConfig::default(),
-                );
-            }
-        }
+        let vlm_provider: Arc<dyn InferenceProvider + Send + Sync> = match provider {
+            Some(p) => p,
+            None => Arc::new(NullInferenceProvider),
+        };
+        spawn_vlm_workers(VlmWorkerParams {
+            workers: webrtc_config_for_workers.vlm_workers,
+            vlm_rx,
+            provider: Arc::new(vlm_provider),
+            stdb: event_sink_for_workers,
+            config: vlm_config_for_workers,
+            metrics: metrics_for_workers,
+            session_span: session_span_for_workers,
+            max_output_tokens_per_second: webrtc_config_for_workers.max_output_tokens_per_second,
+            guided_json: Arc::clone(&guided_json),
+            training_store: None,
+            distillation: vidarax_core::tiered_vlm::DistillationConfig::default(),
+        });
     });
 
     // Build the 201 Created response with SDP answer.
