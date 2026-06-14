@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::State;
@@ -8,19 +10,23 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, St
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota, RateLimiter};
 use serde_json::json;
 
-use crate::auth::{fnv1a64, HEADER_API_KEY, HEADER_TENANT_ID};
+use crate::auth::{HEADER_API_KEY, HEADER_TENANT_ID};
 use crate::config::ServerConfig;
 use crate::state::AppState;
+
+const TENANT_LIMITER_RETAIN_EVERY_REQUESTS: u64 = 64;
+const IDLE_TENANT_RETENTION: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct SecurityPolicy {
     require_api_key: bool,
     api_keys: Arc<Vec<String>>,
     require_tenant_id: bool,
-    global_limiter: Option<Arc<FixedWindowLimiter>>,
-    tenant_limiter: Option<Arc<TenantWindowLimiter>>,
+    global_limiter: Option<Arc<GlobalRateLimiter>>,
+    tenant_limiter: Option<Arc<TenantRateLimiter>>,
     metrics_require_api_key: bool,
     cors_allowed_origins: Arc<Vec<String>>,
 }
@@ -43,13 +49,15 @@ impl SecurityPolicy {
             require_tenant_id: config.security_require_tenant_id,
             global_limiter: config
                 .security_global_rps
-                .map(|limit| Arc::new(FixedWindowLimiter::new(limit))),
-            tenant_limiter: config.security_tenant_rps.map(|limit| {
-                Arc::new(TenantWindowLimiter::new(
-                    limit,
-                    config.security_tenant_slots,
-                ))
-            }),
+                .map(|limit| Arc::new(GlobalRateLimiter::new(limit))),
+            tenant_limiter: config
+                .security_tenant_rps
+                .map(|limit| {
+                    Arc::new(TenantRateLimiter::new(
+                        limit,
+                        config.security_tenant_slots,
+                    ))
+                }),
             metrics_require_api_key: config.security_metrics_require_api_key,
             cors_allowed_origins: Arc::new(normalize_cors_origins(&config.cors_allowed_origins)),
         })
@@ -143,8 +151,7 @@ pub async fn enforce_security(
 
     // Only the API key check is skipped for health/preflight, not the rate limit.
     if let Some(global) = &policy.global_limiter {
-        let now_sec = epoch_seconds();
-        if !global.allow(now_sec) {
+        if !global.allow() {
             let request_id = state.next_request_id();
             let response = error_response(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -237,9 +244,8 @@ pub async fn enforce_security(
     // Note: global rate limiting is enforced at the top of this function
     // (before the preflight/health bypass) so it is not duplicated here.
 
-    let now_sec = epoch_seconds();
     if let Some(tenant_limiter) = &policy.tenant_limiter {
-        let Some(tenant_id) = tenant_id.as_deref() else {
+        let Some(tenant_id) = tenant_id.as_ref() else {
             let response = error_response(
                 StatusCode::UNAUTHORIZED,
                 "unauthorized",
@@ -248,7 +254,7 @@ pub async fn enforce_security(
             );
             return finalize_response(policy, origin.as_deref(), response);
         };
-        if !tenant_limiter.allow(tenant_id, now_sec) {
+        if !tenant_limiter.allow(tenant_id) {
             let response = error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limited",
@@ -398,114 +404,99 @@ fn error_response(status: StatusCode, code: &str, message: &str, request_id: Str
         .into_response()
 }
 
-fn epoch_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+struct GlobalRateLimiter {
+    limiter: DefaultDirectRateLimiter,
 }
 
-struct FixedWindowLimiter {
-    limit_per_sec: u64,
-    window: AtomicU64,
-    count: AtomicU64,
-}
-
-impl FixedWindowLimiter {
+impl GlobalRateLimiter {
     fn new(limit_per_sec: u64) -> Self {
         Self {
-            limit_per_sec: limit_per_sec.max(1),
-            window: AtomicU64::new(0),
-            count: AtomicU64::new(0),
+            limiter: RateLimiter::direct(quota_per_second(limit_per_sec)),
         }
     }
 
-    fn allow(&self, now_sec: u64) -> bool {
-        reset_counter_if_window_changed(&self.window, &self.count, bounded_window(now_sec));
-        self.count.fetch_add(1, Ordering::AcqRel) + 1 <= self.limit_per_sec
+    fn allow(&self) -> bool {
+        self.limiter.check().is_ok()
     }
 }
 
-struct TenantWindowLimiter {
-    limit_per_sec: u64,
-    slots: Vec<TenantSlot>,
+struct TenantRateLimiter {
+    limiter: DefaultKeyedRateLimiter<String>,
+    max_tenants: usize,
+    retain_counter: AtomicU64,
+    tenants: Mutex<HashMap<String, Instant>>,
 }
 
-impl TenantWindowLimiter {
-    fn new(limit_per_sec: u64, slot_count: usize) -> Self {
-        let mut slots = Vec::with_capacity(slot_count);
-        for _ in 0..slot_count {
-            slots.push(TenantSlot::default());
-        }
+impl TenantRateLimiter {
+    fn new(limit_per_sec: u64, max_tenants: usize) -> Self {
         Self {
-            limit_per_sec: limit_per_sec.max(1),
-            slots,
+            limiter: RateLimiter::keyed(quota_per_second(limit_per_sec)),
+            max_tenants: max_tenants.max(1),
+            retain_counter: AtomicU64::new(0),
+            tenants: Mutex::new(HashMap::new()),
         }
     }
 
-    fn allow(&self, tenant_id: &str, now_sec: u64) -> bool {
-        let target = stable_hash(tenant_id);
-        let now_window = bounded_window(now_sec) as u64;
-        let mut stale_candidate: Option<usize> = None;
+    fn allow(&self, tenant_id: &String) -> bool {
+        let now = Instant::now();
+        if self.retain_counter.fetch_add(1, Ordering::Relaxed)
+            % TENANT_LIMITER_RETAIN_EVERY_REQUESTS
+            == 0
+        {
+            self.retain_recent(now);
+        }
 
-        for probe in 0..self.slots.len() {
-            let idx = ((target as usize).wrapping_add(probe)) % self.slots.len();
-            let slot = &self.slots[idx];
-            let key = slot.hash.load(Ordering::Acquire);
-            if key == target {
-                return slot.allow(now_sec, self.limit_per_sec);
-            }
-
-            if stale_candidate.is_none() {
-                let observed_window = slot.window.load(Ordering::Acquire);
-                if key == 0 || observed_window != now_window {
-                    stale_candidate = Some(idx);
-                }
+        if !self.admit_tenant(tenant_id, now) {
+            self.retain_recent(now);
+            if !self.admit_tenant(tenant_id, now) {
+                return false;
             }
         }
 
-        if let Some(idx) = stale_candidate {
-            let slot = &self.slots[idx];
-            slot.count.store(0, Ordering::Release);
-            slot.window.store(now_window, Ordering::Release);
-            slot.hash.store(target, Ordering::Release);
-            return slot.allow(now_sec, self.limit_per_sec);
+        self.limiter.check_key(tenant_id).is_ok()
+    }
+
+    fn admit_tenant(&self, tenant_id: &String, now: Instant) -> bool {
+        // Admission needs an exact cap across arbitrary tenant IDs. This mutex is
+        // outside the video hot path and guards only a small in-memory index; the
+        // governor limiter still handles the per-tenant rate accounting.
+        let Ok(mut tenants) = self.tenants.lock() else {
+            return false;
+        };
+
+        if let Some(last_seen) = tenants.get_mut(tenant_id) {
+            *last_seen = now;
+            return true;
         }
 
-        false
+        if tenants.len() >= self.max_tenants {
+            return false;
+        }
+
+        tenants.insert(tenant_id.clone(), now);
+        true
+    }
+
+    fn retain_recent(&self, now: Instant) {
+        self.limiter.retain_recent();
+        self.limiter.shrink_to_fit();
+        if let Ok(mut tenants) = self.tenants.lock() {
+            tenants.retain(|_, last_seen| {
+                now.duration_since(*last_seen) < IDLE_TENANT_RETENTION
+            });
+            tenants.shrink_to_fit();
+        }
+    }
+
+    #[cfg(test)]
+    fn tracked_tenants(&self) -> usize {
+        self.tenants.lock().map(|tenants| tenants.len()).unwrap_or(0)
     }
 }
 
-#[derive(Default)]
-struct TenantSlot {
-    hash: AtomicU64,
-    window: AtomicU64,
-    count: AtomicU64,
-}
-
-impl TenantSlot {
-    fn allow(&self, now_sec: u64, limit_per_sec: u64) -> bool {
-        reset_counter_if_window_changed(&self.window, &self.count, bounded_window(now_sec));
-        self.count.fetch_add(1, Ordering::AcqRel) + 1 <= limit_per_sec
-    }
-}
-
-fn stable_hash(value: &str) -> u64 {
-    fnv1a64(value) | 1
-}
-
-#[inline]
-fn bounded_window(now_sec: u64) -> u32 {
-    now_sec.min(u32::MAX as u64) as u32
-}
-
-#[inline]
-fn reset_counter_if_window_changed(window: &AtomicU64, count: &AtomicU64, now_window: u32) {
-    let now_window = now_window as u64;
-    if window.load(Ordering::Acquire) != now_window {
-        count.store(0, Ordering::Release);
-        window.store(now_window, Ordering::Release);
-    }
+fn quota_per_second(limit_per_sec: u64) -> Quota {
+    let limit = limit_per_sec.max(1).min(u32::MAX as u64) as u32;
+    Quota::per_second(NonZeroU32::new(limit).expect("limit is clamped to >= 1"))
 }
 
 fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
@@ -521,32 +512,120 @@ fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, FixedWindowLimiter, SecurityPolicy, TenantWindowLimiter};
+    use super::{constant_time_eq, GlobalRateLimiter, SecurityPolicy, TenantRateLimiter};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Barrier,
+    };
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn fixed_window_enforces_limit_and_resets_on_next_second() {
-        let limiter = FixedWindowLimiter::new(2);
-        assert!(limiter.allow(10));
-        assert!(limiter.allow(10));
-        assert!(!limiter.allow(10));
-        assert!(limiter.allow(11));
+    fn governor_global_limiter_enforces_burst_limit() {
+        let limiter = GlobalRateLimiter::new(2);
+        assert!(limiter.allow());
+        assert!(limiter.allow());
+        assert!(!limiter.allow());
     }
 
     #[test]
-    fn tenant_window_isolated_by_tenant_id() {
-        let limiter = TenantWindowLimiter::new(1, 8);
-        let now = 100;
-        assert!(limiter.allow("tenant-a", now));
-        assert!(!limiter.allow("tenant-a", now));
-        assert!(limiter.allow("tenant-b", now));
+    fn keyed_governor_limiter_isolated_by_tenant_id() {
+        let limiter = TenantRateLimiter::new(1, 8);
+        let tenant_a = "tenant-a".to_string();
+        let tenant_b = "tenant-b".to_string();
+        assert!(limiter.allow(&tenant_a));
+        assert!(!limiter.allow(&tenant_a));
+        assert!(limiter.allow(&tenant_b));
     }
 
     #[test]
-    fn tenant_window_reuses_stale_slot_after_window_rollover() {
-        let limiter = TenantWindowLimiter::new(1, 1);
-        assert!(limiter.allow("tenant-a", 10));
-        assert!(!limiter.allow("tenant-b", 10));
-        assert!(limiter.allow("tenant-b", 11));
+    fn keyed_governor_limiter_honors_tenant_slot_cap() {
+        let limiter = TenantRateLimiter::new(100, 2);
+        let tenant_a = "tenant-a".to_string();
+        let tenant_b = "tenant-b".to_string();
+        let tenant_c = "tenant-c".to_string();
+
+        assert!(limiter.allow(&tenant_a));
+        assert!(limiter.allow(&tenant_b));
+        assert!(!limiter.allow(&tenant_c));
+        assert!(limiter.allow(&tenant_a));
+        assert_eq!(limiter.tracked_tenants(), 2);
+    }
+
+    #[test]
+    fn keyed_governor_limiter_evicts_idle_tenants() {
+        let limiter = TenantRateLimiter::new(100, 1);
+        let tenant_a = "tenant-a".to_string();
+        let tenant_b = "tenant-b".to_string();
+
+        assert!(limiter.allow(&tenant_a));
+        assert!(!limiter.allow(&tenant_b));
+        thread::sleep(Duration::from_millis(1100));
+        assert!(limiter.allow(&tenant_b));
+        assert_eq!(limiter.tracked_tenants(), 1);
+    }
+
+    #[test]
+    fn keyed_governor_limiter_does_not_bypass_at_second_boundary() {
+        const THREADS: usize = 64;
+        const LIMIT: u64 = 8;
+
+        let limiter = Arc::new(TenantRateLimiter::new(LIMIT, 8));
+        let tenant = "tenant-boundary".to_string();
+        for _ in 0..LIMIT {
+            assert!(limiter.allow(&tenant));
+        }
+        assert!(!limiter.allow(&tenant));
+
+        wait_for_epoch_second_rollover();
+
+        let barrier = Arc::new(Barrier::new(THREADS + 1));
+        let allowed = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::with_capacity(THREADS);
+
+        for _ in 0..THREADS {
+            let limiter = Arc::clone(&limiter);
+            let barrier = Arc::clone(&barrier);
+            let allowed = Arc::clone(&allowed);
+            let tenant = tenant.clone();
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                if limiter.allow(&tenant) {
+                    allowed.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let allowed = allowed.load(Ordering::Relaxed);
+        assert!(
+            allowed <= LIMIT as usize,
+            "allowed {allowed} requests across second boundary with limit {LIMIT}"
+        );
+
+        let fresh = "tenant-fresh".to_string();
+        for _ in 0..LIMIT {
+            assert!(limiter.allow(&fresh), "fresh tenant should receive its full quota");
+        }
+        assert!(!limiter.allow(&fresh));
+    }
+
+    fn wait_for_epoch_second_rollover() {
+        let start = epoch_second_for_test();
+        while epoch_second_for_test() == start {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn epoch_second_for_test() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 
     #[test]

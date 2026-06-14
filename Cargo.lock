@@ -4475,6 +4475,7 @@ dependencies = [
  "base64",
  "futures-util",
  "getrandom 0.4.1",
+ "governor",
  "http-body-util",
  "kanal",
  "opentelemetry",
