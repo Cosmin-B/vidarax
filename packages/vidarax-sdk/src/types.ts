@@ -318,8 +318,6 @@ export interface InferResponse {
   output_text: string;
   finish_reason: string | null;
   inference_latency_ms: number;
-  total_latency_ms?: number;
-  model_backend?: string;
 }
 
 /**
@@ -366,6 +364,9 @@ export class InferResult {
   readonly model_name: string;
 
   /** Inference backend that executed the request, e.g. `"vllm"` or `"sglang"`. */
+  readonly provider: string;
+
+  /** Alias for `provider`, kept for existing high-level SDK callers. */
   readonly model_backend: string;
 
   /** The prompt that was submitted to the model. */
@@ -380,7 +381,7 @@ export class InferResult {
     total_latency_ms: number;
     id: string;
     model_name: string;
-    model_backend: string;
+    provider: string;
     prompt: string;
   }) {
     this.result = fields.result;
@@ -391,7 +392,8 @@ export class InferResult {
     this.total_latency_ms = fields.total_latency_ms;
     this.id = fields.id;
     this.model_name = fields.model_name;
-    this.model_backend = fields.model_backend;
+    this.provider = fields.provider;
+    this.model_backend = fields.provider;
     this.prompt = fields.prompt;
   }
 

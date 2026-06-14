@@ -419,6 +419,7 @@ pub struct AttachStreamRequest {
     pub prompt: Option<String>,
     /// Maximum VLM output tokens per second (backpressure).
     /// Overrides the server default (`VIDARAX_WEBRTC_MAX_OUTPUT_TOKENS_PER_SECOND`).
+    #[serde(alias = "token_cap", alias = "token-cap")]
     pub max_output_tokens_per_second: Option<u32>,
     /// Optional clip-mode config. When set, frames are accumulated into
     /// temporal windows for multi-image VLM inference instead of per-keyframe.

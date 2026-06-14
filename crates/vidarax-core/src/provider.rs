@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use vidarax_contracts::errors::classify_status_code;
 use vidarax_contracts::models::normalize_model_id;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,7 +106,7 @@ pub enum ProviderError {
 impl ProviderError {
     pub fn is_retryable(&self) -> bool {
         match self {
-            ProviderError::HttpStatus(code) => classify_status_code(*code).is_retryable(),
+            ProviderError::HttpStatus(code) => matches!(*code, 408 | 429 | 500..=599),
             ProviderError::Transport(_) => true,
             ProviderError::UnsupportedModel(_) | ProviderError::InvalidResponse(_) => false,
         }
@@ -496,6 +495,40 @@ mod tests {
     #[test]
     fn uses_fallback_on_retryable_error() {
         let primary = OpenAiCompatProvider::new(MockTransport::err(ProviderError::HttpStatus(503)), ProviderKind::Vllm);
+        let fallback = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("fallback")), ProviderKind::Sglang);
+        let router = ProviderRouter::new(primary, fallback);
+
+        let result = router.infer(&request()).expect("fallback");
+        assert!(result.fallback_used);
+        assert_eq!(result.output_text, "fallback");
+    }
+
+    #[test]
+    fn uses_fallback_on_http_timeout_statuses() {
+        for code in [408, 504] {
+            let primary = OpenAiCompatProvider::new(MockTransport::err(ProviderError::HttpStatus(code)), ProviderKind::Vllm);
+            let fallback = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("fallback")), ProviderKind::Sglang);
+            let router = ProviderRouter::new(primary, fallback);
+
+            let result = router.infer(&request()).expect("fallback");
+            assert!(result.fallback_used, "status {code} should be retryable");
+            assert_eq!(result.output_text, "fallback");
+        }
+    }
+
+    #[test]
+    fn does_not_fallback_on_non_retryable_4xx() {
+        let primary = OpenAiCompatProvider::new(MockTransport::err(ProviderError::HttpStatus(400)), ProviderKind::Vllm);
+        let fallback = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("fallback")), ProviderKind::Sglang);
+        let router = ProviderRouter::new(primary, fallback);
+
+        let err = router.infer(&request()).unwrap_err();
+        assert_eq!(err, ProviderError::HttpStatus(400));
+    }
+
+    #[test]
+    fn uses_fallback_on_transport_error() {
+        let primary = OpenAiCompatProvider::new(MockTransport::err(ProviderError::Transport("connection reset".to_string())), ProviderKind::Vllm);
         let fallback = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("fallback")), ProviderKind::Sglang);
         let router = ProviderRouter::new(primary, fallback);
 

@@ -2100,7 +2100,9 @@ async fn validate_infer_request(
             temperature,
             timeout_ms,
             allow_fallback: payload.allow_fallback.unwrap_or(true),
-            guided_json: None,
+            guided_json: payload
+                .output_schema
+                .map(|schema| Arc::from(schema.to_string())),
         },
         primary_provider,
     })
@@ -2216,6 +2218,79 @@ fn infer_execution_error_to_response(state: &AppState, err: InferExecutionError)
         );
     }
     internal_error(state, err.message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_infer_request, InferRequest};
+    use crate::state::AppState;
+    use axum::http::HeaderMap;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static WAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_state(tag: &str) -> AppState {
+        let n = WAL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("vidarax-handlers-{tag}-{n}.wal"));
+        AppState::with_wal_for_tests(path)
+    }
+
+    fn infer_request(schema: serde_json::Value) -> InferRequest {
+        InferRequest {
+            run_id: None,
+            model: "Qwen/Qwen3-VL-2B-Instruct".to_string(),
+            prompt: "return structured data".to_string(),
+            max_tokens: None,
+            temperature: None,
+            timeout_ms: None,
+            allow_fallback: None,
+            primary_provider: Some("vllm".to_string()),
+            output_schema: Some(schema),
+        }
+    }
+
+    #[tokio::test]
+    async fn infer_validation_maps_output_schema_to_guided_json() {
+        let state = test_state("infer-schema");
+        let prepared = validate_infer_request(
+            &state,
+            &HeaderMap::new(),
+            infer_request(json!({
+                "type":"object",
+                "properties":{"count":{"type":"number"}},
+                "required":["count"]
+            })),
+            "invalid infer payload",
+        )
+        .await
+        .unwrap();
+
+        let schema = prepared.request.guided_json.as_deref().unwrap();
+        let value: serde_json::Value = serde_json::from_str(schema).unwrap();
+        assert_eq!(value["properties"]["count"]["type"].as_str(), Some("number"));
+    }
+
+    #[tokio::test]
+    async fn infer_batch_validation_maps_output_schema_to_guided_json() {
+        let state = test_state("batch-schema");
+        let prepared = validate_infer_request(
+            &state,
+            &HeaderMap::new(),
+            infer_request(json!({
+                "type":"object",
+                "properties":{"ok":{"type":"boolean"}},
+                "required":["ok"]
+            })),
+            "invalid infer-batch payload",
+        )
+        .await
+        .unwrap();
+
+        let schema = prepared.request.guided_json.as_deref().unwrap();
+        let value: serde_json::Value = serde_json::from_str(schema).unwrap();
+        assert_eq!(value["properties"]["ok"]["type"].as_str(), Some("boolean"));
+    }
 }
 
 #[tracing::instrument(name = "api.submit_feedback", skip_all)]

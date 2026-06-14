@@ -512,18 +512,13 @@ export class Vidarax {
    * }
    */
   async infer(options: InferOptions): Promise<InferResult> {
-    const { model, prompt, output_schema, ...rest } = options;
+    const { model, prompt, ...rest } = options;
 
-    const body: InferRequest & { guided_json?: Record<string, unknown> } = {
+    const body: InferRequest = {
       model: model ?? "llama3.2-vision:11b",
       prompt,
       ...rest,
     };
-
-    // Forward output_schema to the backend field name expected by vllm / sglang.
-    if (output_schema !== undefined) {
-      body.guided_json = output_schema;
-    }
 
     const started = Date.now();
     const raw = await this.post<InferResponse>("/v1/infer", body);
@@ -535,10 +530,10 @@ export class Vidarax {
       error: null,
       finish_reason: normaliseFinishReason(raw.finish_reason),
       inference_latency_ms: raw.inference_latency_ms,
-      total_latency_ms: raw.total_latency_ms ?? total_latency_ms,
+      total_latency_ms,
       id: raw.request_id,
       model_name: raw.model,
-      model_backend: raw.model_backend ?? raw.provider,
+      provider: raw.provider,
       prompt,
     });
   }
@@ -802,9 +797,8 @@ export class Vidarax {
    * `RTCPeerConnection.createOffer()` and receive back the server SDP answer
    * along with the session resource URL for trickle-ICE and teardown.
    *
-   * The optional `attachConfig` is appended as a JSON body field alongside the
-   * SDP — non-standard but supported by the Vidarax WHIP handler for setting
-   * the initial prompt and clip mode.
+   * The optional `attachConfig` is sent in the `x-attach-config` header for
+   * setting the initial prompt and clip mode.
    *
    * Per RFC 9725 the offer body is sent as `Content-Type: application/sdp`.
    *
