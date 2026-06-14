@@ -35,7 +35,7 @@ use base64::Engine as _;
 use crate::gate::FrameSignal;
 use crate::metrics::PipelineMetrics;
 use crate::provider::{InferenceImage, InferenceProvider, InferenceRequest};
-use crate::tiered_vlm::TieredVlmConfig;
+use crate::tiered_vlm::{run_tiered, TieredVlmConfig};
 use crate::webrtc::recycle::RecycledBytes;
 use crate::webrtc::workers::{EventSink, StreamFrame};
 
@@ -345,45 +345,29 @@ pub fn spawn_clip_vlm_workers<I>(
                     // Snapshot the current guided_json schema once per inference.
                     let current_guided_json: Option<Arc<str>> =
                         guided_json.load_full().map(|schema| Arc::clone(&*schema));
-                    let first_max_tokens = if current_guided_json.is_some() { 1024 } else { 256 };
 
-                    let first_request = InferenceRequest {
+                    let request = InferenceRequest {
                         model: Arc::clone(&config.first_pass_model),
                         prompt: Arc::clone(&prompt),
                         input_images,
                         input_videos: vec![],
                         // Allow more tokens and time for multi-frame analysis.
-                        max_tokens: first_max_tokens,
+                        max_tokens: 256,
                         temperature: 0.0,
                         timeout_ms: 15_000,
                         allow_fallback: true,
                         guided_json: current_guided_json,
                     };
 
-                    let (description, used_second_pass) = match provider.infer(&first_request) {
-                        Ok(result) => {
-                            let first_conf = parse_confidence(&result.output_text);
-                            if config.needs_second_pass(first_conf) {
-                                let second_request = InferenceRequest {
-                                    model: Arc::clone(&config.second_pass_model),
-                                    prompt,
-                                    input_images: first_request.input_images,
-                                    input_videos: vec![],
-                                    max_tokens: config.second_pass_max_tokens,
-                                    temperature: 0.0,
-                                    timeout_ms: 20_000,
-                                    allow_fallback: true,
-                                    guided_json: None,
-                                };
-                                match provider.infer(&second_request) {
-                                    Ok(second) => (second.output_text, true),
-                                    Err(_) => (result.output_text, false),
-                                }
-                            } else {
-                                (result.output_text, false)
-                            }
-                        }
-                        Err(err) => (format!("clip_vlm_error: {err:?}"), false),
+                    let (description, used_second_pass) = match run_tiered(
+                        provider.as_ref(),
+                        &config,
+                        request,
+                        1024,
+                        20_000,
+                    ) {
+                        Ok(output) => (output.result.output_text, output.used_second_pass),
+                        Err(err) => (format!("clip_vlm_error: {:?}", err.error), false),
                     };
 
                     let event_type = if used_second_pass {
@@ -429,15 +413,6 @@ pub fn spawn_clip_vlm_workers<I>(
             })
             .expect("clip vlm thread spawn failed");
     }
-}
-
-fn parse_confidence(text: &str) -> f32 {
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
-        if let Some(conf) = val.get("confidence").and_then(|v| v.as_f64()) {
-            return conf as f32;
-        }
-    }
-    0.5 // default: trigger second pass when tiered
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
