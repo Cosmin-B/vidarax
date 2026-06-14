@@ -12,8 +12,7 @@ For these ffmpeg paths, decoded frames are therefore labeled by the decode
 worker with the current RTP access unit's `seq` and `pts_ms` as a best-effort
 approximation. The pixels and perceptual signals are exact for the decoded
 output; only the timestamp/index label can be off, typically by about 1-2
-frames of decoder latency. This is negligible for low-latency WebRTC streams
-without B-frames.
+frames of decoder latency on low-latency WebRTC streams without B-frames.
 
 The ffmpeg YUV reader handoff is bounded and uses blocking sends. Each
 `decode()` call still drains all currently-ready reader output before writing

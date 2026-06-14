@@ -12,3 +12,6 @@ pub mod tiered_vlm;
 pub mod timeline;
 #[cfg(feature = "training")]
 pub mod training_data;
+
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

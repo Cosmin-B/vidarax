@@ -296,10 +296,7 @@ fn blocked_ip(ip: &IpAddr) -> bool {
 mod tests {
     use super::InputSource;
     use std::fs;
-    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvRestore {
         key: &'static str,
@@ -316,7 +313,7 @@ mod tests {
     }
 
     fn with_env<T>(key: &'static str, value: Option<&str>, test: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK
+        let _guard = crate::ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let old = std::env::var_os(key);

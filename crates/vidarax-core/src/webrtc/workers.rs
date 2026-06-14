@@ -1,28 +1,7 @@
-//! Core streaming analysis worker pools.
+//! WebRTC decode, analysis, and VLM worker pools.
 //!
-//! Three pools form the real-time pipeline:
-//!
-//! ```text
-//! WebRTC peer (kanal::Receiver<RtpFrame>)
-//!   ↓
-//! decode_workers   — H.264 → YUV → FrameSignal + JPEG
-//!   ↓ kanal::Sender<StreamFrame>
-//! analysis_workers — TwoPassPipeline + LoopDetector
-//!   ↓ kanal::Sender<KeyframeWork>  (non-blocking; drops if full)
-//! vlm_workers      — one stateful thread; VLM inference → SpacetimeDB events + keyframes
-//! ```
-//!
-//! All worker threads are `std::thread::spawn`ed (long-running, no async).
-//! They each terminate when their input `kanal` channel is closed (sender
-//! dropped), so shutdown is cooperative and propagates automatically from the
-//! decode stage forward.
-//!
-//! # SpacetimeDB integration
-//!
-//! Workers accept `Arc<dyn EventSink>`.  Implement this trait on your
-//! SpacetimeDB client and pass it in.  The sync methods must not block
-//! indefinitely; they are called from worker threads that must keep up with
-//! the frame rate.
+//! The pipeline is ordered through bounded `kanal` queues. Closing an upstream
+//! sender propagates shutdown to downstream worker threads.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -116,10 +95,7 @@ pub fn jpeg_pool_slots(analysis_workers: usize, vlm_workers: usize) -> usize {
 
 // ─── EventSink trait ──────────────────────────────────────────────────────────
 
-/// Abstraction over SpacetimeDB event writes used by the worker pools.
-///
-/// Implement this on your `SpacetimeClient` (or a test mock) and pass
-/// `Arc<dyn EventSink>` to the spawn functions.
+/// Event writes used by worker pools.
 ///
 /// # Thread-safety
 ///
@@ -221,31 +197,12 @@ fn build_stream_frame_from_yuv(
 
 // ─── Decode workers ───────────────────────────────────────────────────────────
 
-/// Spawn video decode worker threads for one ordered media stream.
+/// Spawn decode workers for one ordered media stream.
 ///
-/// Each thread:
-/// 1. Waits for the first [`RtpFrame`] to determine the stream codec, then
-///    constructs a [`Decoder`] for that codec.  All subsequent frames on the
-///    same worker are decoded with the same [`Decoder`] instance.
-/// 2. Decodes every [`RtpFrame`] to planar YUV 4:2:0.
-/// 3. Computes a [`crate::gate::FrameSignal`] from the luma plane.
-/// 4. Encodes a JPEG thumbnail at quality 75.
-/// 5. Sends the [`StreamFrame`] to `frame_tx`.
-///
-/// Codec detection is lazy (first frame) so the workers do not need to be
-/// restarted when the codec changes across sessions — they simply re-initialise
-/// the decoder the first time they see a frame whose codec differs from the
-/// previous one.
-///
-/// Threads exit when `rtp_rx` is closed (all senders dropped).  Although the
-/// API keeps the `cores` parameter for compatibility, a single H.264/VP8 stream
-/// is stateful and ordered, so it is always decoded by exactly one decoder.
-/// Decode parallelism is across sessions, never by racing decoders on one
-/// stream.
-///
-/// `metrics` counters are incremented for each received / decoded frame.
-/// `session_span` is entered inside each thread so all log events are
-/// attributed to the owning session.
+/// One stream uses one stateful decoder. Codec detection is lazy on the first
+/// frame, and the decoder is rebuilt if a later session uses another codec on
+/// the same worker.
+/// `cores` is API-compatible only; one ordered stream gets one stateful decoder, so parallelism is across sessions, not within it.
 pub fn spawn_decode_workers(
     cores: usize,
     rtp_rx: kanal::Receiver<RtpFrame>,
@@ -312,7 +269,6 @@ pub fn spawn_decode_workers(
                         &jpeg_pool,
                     );
 
-                    // Record decode latency (decode + signal + JPEG encoding).
                     let decode_us = decode_start.elapsed().as_micros() as u64;
                     metrics.decode_latency_us.record(decode_us);
 
@@ -328,21 +284,11 @@ pub fn spawn_decode_workers(
 
 // ─── Analysis workers ─────────────────────────────────────────────────────────
 
-/// Spawn `cores` analysis worker threads.
+/// Spawn analysis workers.
 ///
-/// Each thread maintains its own stateful [`TwoPassPipeline`] and
-/// [`LoopDetector`].  For every [`StreamFrame`] received:
-///
-/// - **Loop detection** (perceptual-hash ring buffer): if a loop is detected,
-///   `stdb.emit_event_sync("loop_detected", …)` is called immediately.
-/// - **Normal mode** (`clip_tx` is `None`): the gate engine ([`TwoPassPipeline`])
-///   decides which frames are keyframes; those are base64-encoded and forwarded
-///   to `vlm_tx` via a non-blocking try-send (dropped when VLM queue is full).
-/// - **Clip mode** (`clip_tx` is `Some`): the gate engine is bypassed; every
-///   accepted [`StreamFrame`] is forwarded (non-blocking) to the
-///   [`crate::webrtc::clip::ClipAccumulator`] channel.
-///
-/// Threads exit when `frame_rx` is closed.
+/// Normal mode runs the gate engine and forwards kept keyframes to the VLM
+/// queue with `try_send`. Clip mode bypasses the gate and forwards accepted
+/// frames to the clip accumulator with `try_send`, dropping if its queue is full.
 pub fn spawn_analysis_workers(
     cores: usize,
     frame_rx: kanal::Receiver<StreamFrame>,
@@ -405,11 +351,8 @@ pub fn spawn_analysis_workers(
                     }
 
                     if let Some(ref clip_tx) = clip_tx {
-                        // ── Clip mode: forward every frame to accumulator ─
-                        // Non-blocking: drop if accumulator queue is full.
                         let _ = clip_tx.try_send(sf);
                     } else {
-                        // ── Normal mode: gate engine → VLM ───────────────
                         let gate_start = std::time::Instant::now();
                         let metas = pipeline.analyze_batch(&[sf.signal]);
                         let gate_us = gate_start.elapsed().as_micros() as u64;
@@ -731,7 +674,7 @@ where
 
                 // Temporal context: carry the previous keyframe's VLM description
                 // so the next inference knows what came before without sending a
-                // second image (saves ~2000 tokens per call).
+                // second image.
                 let default_prompt: Arc<str> =
                     Arc::from("Briefly describe what is happening in this video frame.");
                 let mut last_description: Arc<str> = Arc::from("");
@@ -745,7 +688,6 @@ where
                 while let Ok(work) = vlm_rx.recv() {
                     let _guard = session_span.enter();
 
-                    // ── Loop suppression ────────────────────────────────
                     // The analysis worker already fired `loop_detected`; skip
                     // the expensive VLM inference call entirely while the scene
                     // is stuck in a loop.
@@ -770,9 +712,8 @@ where
 
                     metrics.inc_vlm_inferences();
 
-                    // Build prompt with temporal context injected as a prefix.
-                    // Default prompt asks for scene description (not interaction
-                    // detection) — state diffs are computed server-side below.
+                    // State diffs are computed server-side below, so the
+                    // default prompt only asks for a scene description.
                     let prompt: Arc<str> = if work.prompt.is_empty() {
                         Arc::clone(&default_prompt)
                     } else {
@@ -891,7 +832,6 @@ where
                             }
                         }
                     };
-                    // Record VLM latency (covers both tier-2 and tier-3 calls).
                     let vlm_elapsed_ms = vlm_start.elapsed().as_millis() as u64;
                     metrics.vlm_latency_ms.record(vlm_elapsed_ms);
 
@@ -911,13 +851,8 @@ where
                     // the same allocation without cloning the String content.
                     let description: Arc<str> = Arc::from(description_str.into_boxed_str());
 
-                    // ── Temporal diff: detect state transitions ───────────
-                    // Compare current VLM description against the previous one.
-                    // When descriptions differ significantly, emit a
-                    // `state_transition` event with both states.  This is the
-                    // core interaction detection mechanism: the VLM describes
-                    // what it sees (cheap, always succeeds), and state changes
-                    // are detected server-side (instant, deterministic).
+                    // Compare current and previous descriptions to detect
+                    // coarse state transitions without sending a second image.
                     let prev_desc = Arc::clone(&last_description);
                     let state_changed = if prev_desc.is_empty() {
                         // First frame — always emit as initial state.

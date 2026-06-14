@@ -10,27 +10,21 @@ static FFMPEG_PATH: OnceLock<String> = OnceLock::new();
 static FFPROBE_PATH: OnceLock<String> = OnceLock::new();
 static NVIDIA_SMI_PATH: OnceLock<String> = OnceLock::new();
 
-/// Return the configured ffmpeg binary path (cached after first call).
-///
-/// Checks `VIDARAX_FFMPEG_PATH` env var first, falls back to `"ffmpeg"`.
+/// Configured ffmpeg binary path, cached after first call.
 pub fn ffmpeg_path() -> &'static str {
     FFMPEG_PATH.get_or_init(|| {
         std::env::var("VIDARAX_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string())
     })
 }
 
-/// Return the configured ffprobe binary path (cached after first call).
-///
-/// Checks `VIDARAX_FFPROBE_PATH` env var first, falls back to `"ffprobe"`.
+/// Configured ffprobe binary path, cached after first call.
 pub fn ffprobe_path() -> &'static str {
     FFPROBE_PATH.get_or_init(|| {
         std::env::var("VIDARAX_FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_string())
     })
 }
 
-/// Return the configured nvidia-smi binary path (cached after first call).
-///
-/// Checks `VIDARAX_NVIDIA_SMI_PATH` env var first, falls back to `"nvidia-smi"`.
+/// Configured nvidia-smi binary path, cached after first call.
 pub fn nvidia_smi_path() -> &'static str {
     NVIDIA_SMI_PATH.get_or_init(|| {
         std::env::var("VIDARAX_NVIDIA_SMI_PATH").unwrap_or_else(|_| "nvidia-smi".to_string())
@@ -656,28 +650,10 @@ pub fn build_select_expr(indices: &[u64]) -> String {
     expr
 }
 
-/// Extract a short MP4 clip from `source` starting at `start_s` for `duration_s` seconds.
+/// Extract a short MP4 clip from `source`.
 ///
-/// Uses `-c copy` (stream copy) when the source is a local file path so the
-/// operation is near-instant; falls back to `-c:v libx264 -preset ultrafast`
-/// for remote/HLS sources where a re-encode is required.  Output is written to
-/// a temporary file (MP4 requires seekable output) then read back.
-///
-/// Returns the raw MP4 bytes on success.
-///
-/// # Errors
-///
-/// Returns a human-readable error string when ffmpeg is not found, the source
-/// cannot be read, or the requested time range is out of bounds.
-///
-/// # Example
-///
-/// ```no_run
-/// use vidarax_core::ingest::{InputSource, extract_video_clip};
-/// let source = InputSource::FilePath("/tmp/video.mp4".to_string());
-/// let mp4_bytes = extract_video_clip(&source, 0.0, 0.5).unwrap();
-/// assert!(!mp4_bytes.is_empty());
-/// ```
+/// Local files use stream copy; remote/HLS sources are re-encoded into a
+/// self-contained temporary MP4 and read back.
 pub fn extract_video_clip(
     source: &InputSource,
     start_s: f32,
@@ -705,7 +681,7 @@ fn extract_video_clip_inner(
     let start_str = format!("{start_s:.6}");
     let duration_str = format!("{duration_s:.6}");
 
-    // For local files use stream copy (near-instant, no re-encode).
+    // Local files can use stream copy without re-encoding.
     // Remote/HLS sources need a re-encode to produce a self-contained clip.
     let use_stream_copy = matches!(source, InputSource::FilePath(_));
 
@@ -861,7 +837,6 @@ pub(crate) fn decode_selective_jpeg_frames_inner(
 mod tests {
     use std::fs;
     use std::process::Command;
-    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
@@ -873,8 +848,6 @@ mod tests {
         FFMPEG_RTSPS_PROTOCOL_WHITELIST,
     };
     use crate::ingest::InputSource;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvRestore {
         key: &'static str,
@@ -891,7 +864,7 @@ mod tests {
     }
 
     fn with_env<T>(key: &'static str, value: Option<&str>, test: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK
+        let _guard = crate::ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let old = std::env::var_os(key);
