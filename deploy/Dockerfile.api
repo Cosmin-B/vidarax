@@ -11,7 +11,7 @@ COPY scripts ./scripts
 RUN cargo build --release -p vidarax-api
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/* \
     && useradd --system --home /nonexistent --shell /usr/sbin/nologin vidarax \
     && mkdir -p /var/lib/vidarax \
     && chown -R vidarax:vidarax /var/lib/vidarax
@@ -25,4 +25,5 @@ ENV VIDARAX_H3_BIND_ADDR=0.0.0.0:8443
 ENV VIDARAX_DATA_DIR=/var/lib/vidarax
 
 USER vidarax
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 CMD port="${VIDARAX_BIND_ADDR##*:}"; curl -fsS "http://127.0.0.1:${port:-8080}/v1/health" >/dev/null || exit 1
 ENTRYPOINT ["/usr/local/bin/vidarax-api"]

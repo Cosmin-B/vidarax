@@ -14,8 +14,8 @@ Vidarax decodes live or file-based video, runs a deterministic gate engine (scen
 │ RTSP/HLS  │──>│               │                │         │──>│   SDK        │
 │ Upload    │──>│          Markers +         Semantic       │──>│ Vue 3 UI     │
 │           │   │          Keyframes        Events          │   │ Prometheus   │
-│           │   │               │                │         │   │ SpacetimeDB  │
-│           │   │            WAL  ◄──── SpacetimeDB        │   │              │
+│           │   │               │                │         │   │ Optional     │
+│           │   │            WAL event log       │         │   │ SpacetimeDB  │
 └──────────┘   └──────────────────────────────────────────┘   └──────────────┘
 ```
 
@@ -36,7 +36,7 @@ one only when it is uncertain.
 ```bash
 git clone https://github.com/vidarax/vidarax && cd vidarax
 cargo build --release -p vidarax-api
-VIDARAX_VLLM_BASE_URL=http://localhost:8000 cargo run --release -p vidarax-api
+VIDARAX_API_KEYS=dev-key VIDARAX_VLLM_BASE_URL=http://localhost:8000 cargo run --release -p vidarax-api
 ```
 
 Frontend (separate terminal):
@@ -79,17 +79,24 @@ The SDK also supports WebRTC streaming, batch inference, structured JSON output 
 | `POST` | `/v1/runs/:id/analyze` | Deterministic frame analysis |
 | `POST` | `/v1/runs/:id/reason` | Realtime semantic reasoning (tiered VLM) |
 | `POST` | `/v1/runs/:id/stop` | Stop a run |
+| `POST` | `/v1/runs/:id/keepalive` | Refresh active run TTL |
 | `GET` | `/v1/runs/:id/events` | Stream run events |
 | `GET` | `/v1/runs/:id/markers` | Marker timeline (filterable) |
 | `GET` | `/v1/runs/:id/state` | Derived run state |
+| `GET` | `/v1/runs/:id/interactions` | Interaction timeline |
+| `POST` | `/v1/runs/:id/feedback` | Submit feedback for a run |
+| `GET` | `/v1/feedback` | List feedback |
 | `POST` | `/v1/query` | Query events across runs |
+| `POST` | `/v1/search` | Search VLM descriptions |
 | `POST` | `/v1/infer` | Single VLM inference |
 | `POST` | `/v1/infer/batch` | Batch inference (bounded parallelism) |
 | `GET` | `/v1/models` | Model catalog with availability |
 | `POST` | `/v1/stream/whip` | WHIP WebRTC offer (RFC 9725) |
 | `PATCH` | `/v1/stream/whip/:sess` | ICE trickle candidate |
 | `DELETE` | `/v1/stream/whip/:sess` | Terminate WebRTC session |
+| `PATCH` | `/v1/stream/whip/:sess/prompt` | Update live-session prompt |
 | `POST` | `/v1/upload` | Upload a file for processing |
+| `GET` | `/v1/files/:filename` | Serve an uploaded or allowed-root file |
 | `GET` | `/v1/health` | Health check |
 | `GET` | `/v1/metrics` | Prometheus-compatible metrics |
 
@@ -101,9 +108,10 @@ The SDK also supports WebRTC streaming, batch inference, structured JSON output 
 | `VIDARAX_SGLANG_BASE_URL` | — | SGLang inference endpoint (fallback) |
 | `VIDARAX_BIND_ADDR` | `127.0.0.1:8080` | HTTP bind address |
 | `VIDARAX_REQUIRE_API_KEY` | `true` | Require `x-api-key` header |
+| `VIDARAX_API_KEYS` | — | Comma-separated accepted API keys |
 | `VIDARAX_TRANSPORT` | `h1h2` | Transport mode (`h1h2` or `h3`) |
 | `VIDARAX_DATA_DIR` | `.vidarax-data` | WAL and runtime data directory |
-| `VIDARAX_ACTIVE_STREAM_LIMIT` | `5` | Max concurrent runs per tenant |
+| `VIDARAX_ACTIVE_STREAM_LIMIT` | `5` | Max active runs per resolved principal |
 | `VIDARAX_STREAM_TTL_SECS` | `3600` | Run idle TTL |
 
 Full configuration reference in [docs/deployment.md](docs/deployment.md).
@@ -114,8 +122,9 @@ Full configuration reference in [docs/deployment.md](docs/deployment.md).
 |-------|------------|
 | Backend | Rust, Axum, Hyper (HTTP/1.1 + H2, optional H3) |
 | Gate engine | Deterministic frame analysis on a single-threaded hot path |
-| Inference | vLLM, SGLang, MLX — tiered routing with fallback |
-| Persistence | WAL-backed event log, SpacetimeDB, Supabase |
+| Inference | vLLM and SGLang through OpenAI-compatible backends with fallback |
+| Decode | ffmpeg CPU and NVDEC; the registered MLX decode path currently falls back to CPU ffmpeg |
+| Persistence | WAL-backed event log; optional SpacetimeDB client and module are present but not wired into the production server path |
 | Frontend | Vue 3, dark command-center UI |
 | Streaming | WebRTC via WHIP (RFC 9725) |
 | SDK | TypeScript (`vidarax` on npm) |

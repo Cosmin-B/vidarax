@@ -5,6 +5,7 @@
 /.venv-model-provision
 /.env
 /.env.*
+!/.env.example
 *.key
 *.pem
 *.p12
