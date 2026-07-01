@@ -30,5 +30,6 @@ __pycache__/
 
 # Local agent/dev tooling (not part of the project)
 .agents/
+.beads/
 .mlx-venv/
 .serena/
