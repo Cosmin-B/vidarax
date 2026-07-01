@@ -13,6 +13,28 @@ function validateId(id: string): string {
   return id
 }
 
+const BASE64URL_ALPHABET =
+  'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+
+function base64UrlEncodeUtf8(input: string): string {
+  const bytes = new TextEncoder().encode(input)
+  let output = ''
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i] ?? 0
+    const b1 = bytes[i + 1] ?? 0
+    const b2 = bytes[i + 2] ?? 0
+    output += BASE64URL_ALPHABET[b0 >> 2]
+    output += BASE64URL_ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)]
+    if (i + 1 < bytes.length) {
+      output += BASE64URL_ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)]
+    }
+    if (i + 2 < bytes.length) {
+      output += BASE64URL_ALPHABET[b2 & 0x3f]
+    }
+  }
+  return output
+}
+
 export class ApiError extends Error {
   readonly status: number
 
@@ -218,12 +240,18 @@ export const api = {
   },
 
   stream: {
-    async whipOffer(offerSdp: string): Promise<{ answer_sdp: string; session_id: string; location: string }> {
+    async whipOffer(
+      offerSdp: string,
+      attachConfig?: { prompt?: string },
+    ): Promise<{ answer_sdp: string; session_id: string; location: string; run_id?: string }> {
       // WHIP (RFC 9725): POST raw SDP text, response is 201 + SDP body + Location header.
       const auth = useAuthStore()
       const url = `${auth.apiEndpoint}/v1/stream/whip`
       const headers: Record<string, string> = { 'Content-Type': 'application/sdp' }
       if (auth.apiKey) headers['x-api-key'] = auth.apiKey
+      if (attachConfig) {
+        headers['x-attach-config'] = base64UrlEncodeUtf8(JSON.stringify(attachConfig))
+      }
       const res = await fetch(url, { method: 'POST', headers, body: offerSdp })
       if (!res.ok) {
         const text = await res.text().catch(() => res.statusText)
@@ -232,7 +260,8 @@ export const api = {
       const answer_sdp = await res.text()
       const location = res.headers.get('location') ?? '/v1/stream/whip/unknown'
       const session_id = location.split('/').pop() ?? ''
-      return { answer_sdp, session_id, location }
+      const run_id = res.headers.get('x-vidarax-run-id') ?? undefined
+      return { answer_sdp, session_id, location, run_id }
     },
     whipIce(sessionId: string, candidate: string): Promise<void> {
       return request<void>('PATCH', `/v1/stream/whip/${validateId(sessionId)}`, candidate, {
@@ -241,9 +270,6 @@ export const api = {
     },
     whipTerminate(sessionId: string): Promise<void> {
       return request<void>('DELETE', `/v1/stream/whip/${validateId(sessionId)}`)
-    },
-    attachToRun(runId: string, data: { session_id: string; model?: string; prompt?: string }): Promise<void> {
-      return request<void>('POST', `/v1/runs/${validateId(runId)}/stream`, data)
     },
     uploadFile(file: File): Promise<{ file_path: string }> {
       const auth = useAuthStore()

@@ -265,20 +265,40 @@ fn test_attach_stream_accepts_token_rate() {
 /// Serialise env-var access so parallel tests don't clobber each other.
 static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+struct EnvRestore {
+    key: &'static str,
+    old: Option<std::ffi::OsString>,
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        match self.old.take() {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+fn set_env(key: &'static str, value: Option<&str>) -> EnvRestore {
+    let old = std::env::var_os(key);
+    match value {
+        Some(value) => std::env::set_var(key, value),
+        None => std::env::remove_var(key),
+    }
+    EnvRestore { key, old }
+}
+
 #[test]
 fn test_config_parses_stun_servers() {
     let _guard = ENV_MUTEX.lock().unwrap();
 
-    std::env::set_var("VIDARAX_REQUIRE_API_KEY", "false");
-    std::env::set_var(
+    let _require_api_key = set_env("VIDARAX_REQUIRE_API_KEY", Some("false"));
+    let _stun_servers = set_env(
         "VIDARAX_WEBRTC_STUN_SERVERS",
-        "stun:primary.example.com:3478,stun:backup.example.com:3478",
+        Some("stun:primary.example.com:3478,stun:backup.example.com:3478"),
     );
 
     let result = ServerConfig::from_env();
-
-    std::env::remove_var("VIDARAX_REQUIRE_API_KEY");
-    std::env::remove_var("VIDARAX_WEBRTC_STUN_SERVERS");
 
     let cfg = result.expect("from_env should succeed");
     assert_eq!(
@@ -295,17 +315,12 @@ fn test_config_parses_stun_servers() {
 fn test_config_parses_turn_server() {
     let _guard = ENV_MUTEX.lock().unwrap();
 
-    std::env::set_var("VIDARAX_REQUIRE_API_KEY", "false");
-    std::env::set_var("VIDARAX_WEBRTC_TURN_URL", "turn:relay.example.com:3478");
-    std::env::set_var("VIDARAX_WEBRTC_TURN_USERNAME", "alice");
-    std::env::set_var("VIDARAX_WEBRTC_TURN_CREDENTIAL", "s3cret");
+    let _require_api_key = set_env("VIDARAX_REQUIRE_API_KEY", Some("false"));
+    let _turn_url = set_env("VIDARAX_WEBRTC_TURN_URL", Some("turn:relay.example.com:3478"));
+    let _turn_username = set_env("VIDARAX_WEBRTC_TURN_USERNAME", Some("alice"));
+    let _turn_credential = set_env("VIDARAX_WEBRTC_TURN_CREDENTIAL", Some("s3cret"));
 
     let result = ServerConfig::from_env();
-
-    std::env::remove_var("VIDARAX_REQUIRE_API_KEY");
-    std::env::remove_var("VIDARAX_WEBRTC_TURN_URL");
-    std::env::remove_var("VIDARAX_WEBRTC_TURN_USERNAME");
-    std::env::remove_var("VIDARAX_WEBRTC_TURN_CREDENTIAL");
 
     let cfg = result.expect("from_env should succeed");
     assert_eq!(

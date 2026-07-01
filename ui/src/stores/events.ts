@@ -46,6 +46,7 @@ export const useEventsStore = defineStore('events', () => {
   const eventsByRunId = shallowRef<Map<string, AgentEvent[]>>(markRaw(new Map()))
   const keyframesByRunId = shallowRef<Map<string, KeyframeEntry[]>>(markRaw(new Map()))
   const latestEventsIndex = shallowRef<AgentEvent[]>([])
+  const eventIdentityIndex = markRaw(new Map<string, AgentEvent>())
 
   const activeEvents = computed(() => {
     eventVersion.value
@@ -101,6 +102,56 @@ export const useEventsStore = defineStore('events', () => {
     if (idx >= 0) arr.splice(idx, 1)
   }
 
+  function eventIdentityMatches(a: AgentEvent, b: AgentEvent): boolean {
+    return a.run_id === b.run_id
+      && a.session_id === b.session_id
+      && a.frame_index === b.frame_index
+      && a.pts_ms === b.pts_ms
+      && a.event_type === b.event_type
+      && a.timestamp_ms === b.timestamp_ms
+  }
+
+  function eventIdentityKey(event: AgentEvent): string {
+    // Keep this exact rather than delimiter-based; run and session ids are caller data.
+    return JSON.stringify([
+      event.run_id,
+      event.session_id,
+      event.frame_index,
+      event.pts_ms,
+      event.event_type,
+      event.timestamp_ms,
+    ])
+  }
+
+  function eventContentMatches(a: AgentEvent, b: AgentEvent): boolean {
+    return eventIdentityMatches(a, b)
+      && a.confidence === b.confidence
+      && a.description === b.description
+  }
+
+  function keyframeIdentityMatches(a: KeyframeEntry, b: KeyframeEntry): boolean {
+    if (a.run_id !== b.run_id) return false
+    if (a.id !== 0 || b.id !== 0) return a.id === b.id
+    return a.timestamp_ms === b.timestamp_ms
+      && a.frame_index === b.frame_index
+      && a.pts_ms === b.pts_ms
+  }
+
+  function keyframeContentMatches(a: KeyframeEntry, b: KeyframeEntry): boolean {
+    return keyframeIdentityMatches(a, b)
+      && a.event_type === b.event_type
+      && a.description === b.description
+      && a.jpeg_b64 === b.jpeg_b64
+      && a.timestamp_ms === b.timestamp_ms
+  }
+
+  function removeMatching<T>(arr: T[], predicate: (item: T) => boolean): T | null {
+    const idx = arr.findIndex(predicate)
+    if (idx < 0) return null
+    const [removed] = arr.splice(idx, 1)
+    return removed ?? null
+  }
+
   function touchEvents(): void {
     eventVersion.value++
     triggerRef(events)
@@ -115,7 +166,22 @@ export const useEventsStore = defineStore('events', () => {
   }
 
   function addEvent(event: AgentEvent) {
+    const identityKey = eventIdentityKey(event)
+    const existing = eventIdentityIndex.get(identityKey)
+    if (existing) {
+      if (eventContentMatches(existing, event)) return
+      removeByIdentity(events.value, existing)
+      const indexed = eventsByRunId.value.get(existing.run_id)
+      if (indexed) {
+        removeByIdentity(indexed, existing)
+        if (indexed.length === 0) eventsByRunId.value.delete(existing.run_id)
+      }
+      removeByIdentity(latestEventsIndex.value, existing)
+      eventIdentityIndex.delete(identityKey)
+    }
+
     const stored = markRaw(event)
+    eventIdentityIndex.set(identityKey, stored)
     binaryInsert(events.value, stored, eventOrder)
 
     let runEvents = eventsByRunId.value.get(stored.run_id)
@@ -130,6 +196,7 @@ export const useEventsStore = defineStore('events', () => {
     if (events.value.length > MAX_EVENTS) {
       const dropped = events.value.splice(0, events.value.length - MAX_EVENTS)
       for (const evt of dropped) {
+        eventIdentityIndex.delete(eventIdentityKey(evt))
         const indexed = eventsByRunId.value.get(evt.run_id)
         if (indexed) {
           removeByIdentity(indexed, evt)
@@ -142,6 +209,17 @@ export const useEventsStore = defineStore('events', () => {
   }
 
   function addKeyframe(kf: KeyframeEntry) {
+    const existing = keyframes.value.find(keyframe => keyframeIdentityMatches(keyframe, kf))
+    if (existing) {
+      if (keyframeContentMatches(existing, kf)) return
+      removeMatching(keyframes.value, keyframe => keyframeIdentityMatches(keyframe, kf))
+      const indexed = keyframesByRunId.value.get(existing.run_id)
+      if (indexed) {
+        removeMatching(indexed, keyframe => keyframeIdentityMatches(keyframe, kf))
+        if (indexed.length === 0) keyframesByRunId.value.delete(existing.run_id)
+      }
+    }
+
     const stored = markRaw(kf)
     binaryInsert(keyframes.value, stored, keyframeOrder)
 
@@ -175,6 +253,9 @@ export const useEventsStore = defineStore('events', () => {
   }
 
   function clearEventsForRun(runId: string) {
+    for (const event of events.value) {
+      if (event.run_id === runId) eventIdentityIndex.delete(eventIdentityKey(event))
+    }
     events.value = events.value.filter(e => e.run_id !== runId)
     latestEventsIndex.value = latestEventsIndex.value.filter(e => e.run_id !== runId)
     eventsByRunId.value.delete(runId)
@@ -190,6 +271,7 @@ export const useEventsStore = defineStore('events', () => {
     eventsByRunId.value = markRaw(new Map())
     keyframesByRunId.value = markRaw(new Map())
     latestEventsIndex.value = []
+    eventIdentityIndex.clear()
     touchEvents()
     touchKeyframes()
   }

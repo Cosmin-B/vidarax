@@ -109,7 +109,7 @@ fn validate_remote_url_string(url: reqwest::Url, default_port: u16) -> Result<St
     validate_remote_url_string_with_resolver(url, default_port, validate_resolved_public_host)
 }
 
-pub(crate) fn validate_remote_fetch_url(url: &reqwest::Url) -> Result<(), String> {
+pub(crate) fn validate_remote_fetch_url(url: &reqwest::Url) -> Result<Vec<SocketAddr>, String> {
     match url.scheme() {
         "https" => {}
         "http" => {
@@ -127,13 +127,13 @@ pub(crate) fn validate_remote_fetch_url(url: &reqwest::Url) -> Result<(), String
     validate_resolved_public_host(host, port)
 }
 
-fn validate_remote_url_string_with_resolver<F>(
+fn validate_remote_url_string_with_resolver<F, R>(
     url: reqwest::Url,
     default_port: u16,
     mut validate_resolved: F,
 ) -> Result<String, String>
 where
-    F: FnMut(&str, u16) -> Result<(), String>,
+    F: FnMut(&str, u16) -> Result<R, String>,
 {
     let host = validate_remote_host(&url)?;
     let port = url.port_or_known_default().unwrap_or(default_port);
@@ -151,12 +151,12 @@ fn validate_hls_url_string(url: reqwest::Url) -> Result<String, String> {
     validate_hls_url_string_with_resolver(url, validate_resolved_public_host)
 }
 
-fn validate_hls_url_string_with_resolver<F>(
+fn validate_hls_url_string_with_resolver<F, R>(
     url: reqwest::Url,
     mut validate_resolved: F,
 ) -> Result<String, String>
 where
-    F: FnMut(&str, u16) -> Result<(), String>,
+    F: FnMut(&str, u16) -> Result<R, String>,
 {
     let transport_url = if url.scheme() == "hls" {
         let transport_scheme = if insecure_http_enabled() { "http" } else { "https" };
@@ -210,7 +210,7 @@ fn validate_remote_host(url: &reqwest::Url) -> Result<&str, String> {
     Ok(host)
 }
 
-fn validate_resolved_public_host(host: &str, port: u16) -> Result<(), String> {
+fn validate_resolved_public_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
     let resolve_target = format!("{host}:{port}");
     let addrs: Vec<SocketAddr> = resolve_target
         .to_socket_addrs()
@@ -224,7 +224,7 @@ fn validate_resolved_public_host(host: &str, port: u16) -> Result<(), String> {
             return Err("source_uri host must not be private, loopback, or link-local".to_string());
         }
     }
-    Ok(())
+    Ok(addrs)
 }
 
 fn validate_file_url(

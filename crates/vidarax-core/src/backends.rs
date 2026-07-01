@@ -251,19 +251,41 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.old.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn set_env(key: &'static str, value: Option<&str>) -> EnvRestore {
+        let old = std::env::var_os(key);
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        EnvRestore { key, old }
+    }
+
     #[test]
     fn interpolate_replaces_set_variable() {
         let _guard = env_guard();
-        std::env::set_var("_VIDARAX_TEST_VAR", "hello");
+        let _var = set_env("_VIDARAX_TEST_VAR", Some("hello"));
         let result = interpolate_env_vars("prefix_${_VIDARAX_TEST_VAR}_suffix");
         assert_eq!(result, "prefix_hello_suffix");
-        std::env::remove_var("_VIDARAX_TEST_VAR");
     }
 
     #[test]
     fn interpolate_leaves_unset_variable_literal() {
         let _guard = env_guard();
-        std::env::remove_var("_VIDARAX_MISSING_VAR_XYZ");
+        let _var = set_env("_VIDARAX_MISSING_VAR_XYZ", None);
         let result = interpolate_env_vars("${_VIDARAX_MISSING_VAR_XYZ}");
         assert_eq!(result, "${_VIDARAX_MISSING_VAR_XYZ}");
     }
@@ -277,12 +299,10 @@ mod tests {
     #[test]
     fn interpolate_multiple_placeholders() {
         let _guard = env_guard();
-        std::env::set_var("_VDX_A", "foo");
-        std::env::set_var("_VDX_B", "bar");
+        let _a = set_env("_VDX_A", Some("foo"));
+        let _b = set_env("_VDX_B", Some("bar"));
         let result = interpolate_env_vars("${_VDX_A}/${_VDX_B}");
         assert_eq!(result, "foo/bar");
-        std::env::remove_var("_VDX_A");
-        std::env::remove_var("_VDX_B");
     }
 
     // ── parse_config ──────────────────────────────────────────────────────────
@@ -323,7 +343,7 @@ base_url = "http://localhost:8000"
     #[test]
     fn parse_config_interpolates_base_url() {
         let _guard = env_guard();
-        std::env::set_var("_VDX_TEST_URL", "http://myhost:1234");
+        let _url = set_env("_VDX_TEST_URL", Some("http://myhost:1234"));
         let toml = r#"
 [[backends]]
 name = "vllm"
@@ -335,7 +355,6 @@ base_url = "${_VDX_TEST_URL}"
             config.backends[0].base_url.as_deref(),
             Some("http://myhost:1234")
         );
-        std::env::remove_var("_VDX_TEST_URL");
     }
 
     // ── build_provider_chain ──────────────────────────────────────────────────
@@ -392,7 +411,7 @@ base_url = "${_VDX_TEST_URL}"
     #[test]
     fn build_chain_gemini_unresolved_env_var_api_key_returns_err() {
         let _guard = env_guard();
-        std::env::remove_var("_VDX_NONEXISTENT_GEMINI_KEY");
+        let _key = set_env("_VDX_NONEXISTENT_GEMINI_KEY", None);
         let entry = BackendEntry {
             name: "gemini".into(),
             backend_type: "gemini".into(),
@@ -421,7 +440,7 @@ base_url = "${_VDX_TEST_URL}"
     #[test]
     fn build_chain_openai_compat_unresolved_env_var_base_url_returns_err() {
         let _guard = env_guard();
-        std::env::remove_var("_VDX_NONEXISTENT_VLLM_URL");
+        let _url = set_env("_VDX_NONEXISTENT_VLLM_URL", None);
         let entry = BackendEntry {
             name: "vllm".into(),
             backend_type: "openai_compat".into(),

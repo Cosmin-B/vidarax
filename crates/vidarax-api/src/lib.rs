@@ -25,8 +25,9 @@ mod whip;
 pub use config::{resolve_wal_path, ServerConfig, TransportMode};
 pub use models::AttachStreamRequest;
 pub use router::app_router;
-pub use state::AppState;
+pub use state::{AppState, StreamSlotGuard};
 use vidarax_core::ingest::pipeline::{build_decode_pipeline, DecodePipeline, PipelineBackend};
+use vidarax_core::webrtc::workers::per_stream_analysis_workers;
 use vidarax_core::webrtc::session::{TurnServer, WebRtcConfig};
 
 pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -151,7 +152,7 @@ fn build_webrtc_config(config: &ServerConfig) -> WebRtcConfig {
         turn_servers,
         max_output_tokens_per_second: config.webrtc_max_output_tokens_per_second,
         decode_workers: config.webrtc_decode_workers,
-        analysis_workers: config.webrtc_analysis_workers,
+        analysis_workers: per_stream_analysis_workers(config.webrtc_analysis_workers),
         vlm_workers: config.webrtc_vlm_workers,
     }
 }
@@ -159,7 +160,7 @@ fn build_webrtc_config(config: &ServerConfig) -> WebRtcConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{app_router, AppState, ServerConfig, TransportMode};
+    use super::{app_router, build_webrtc_config, AppState, ServerConfig, TransportMode};
     use vidarax_core::ingest::pipeline::{register_decode_backend, CpuFfmpegPipeline, PipelineBackend};
     use vidarax_core::tiered_vlm::DistillationConfig;
     use crate::security::SecurityPolicy;
@@ -187,6 +188,40 @@ mod tests {
 
     fn test_state() -> AppState {
         test_state_with_provider(None)
+    }
+
+    fn default_test_server_config() -> ServerConfig {
+        ServerConfig {
+            bind_addr: "127.0.0.1:8080".to_string(),
+            h3_bind_addr: "127.0.0.1:8443".to_string(),
+            h3_tls_cert_path: "deploy/certs/dev.crt".to_string(),
+            h3_tls_key_path: "deploy/certs/dev.key".to_string(),
+            data_dir: ".vidarax-data".to_string(),
+            ingest_file_roots: vec![std::env::temp_dir()],
+            inference_vllm_base_url: None,
+            inference_sglang_base_url: None,
+            security_require_api_key: false,
+            security_api_keys: vec![],
+            security_require_tenant_id: false,
+            security_global_rps: None,
+            security_tenant_rps: None,
+            security_tenant_slots: 16,
+            security_metrics_require_api_key: false,
+            cors_allowed_origins: vec![],
+            stream_ttl_secs: 3600,
+            active_stream_limit: 5,
+            transport: TransportMode::H1H2,
+            decode_backend: "cpu-ffmpeg".to_string(),
+            webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+            webrtc_turn_url: None,
+            webrtc_turn_username: None,
+            webrtc_turn_credential: None,
+            webrtc_max_output_tokens_per_second: 128,
+            webrtc_decode_workers: 2,
+            webrtc_analysis_workers: 1,
+            webrtc_vlm_workers: 2,
+            distillation: DistillationConfig::default(),
+        }
     }
 
     fn build_provider_from_url(base_url: &str) -> Arc<dyn vidarax_core::provider::InferenceProvider + Send + Sync> {
@@ -334,6 +369,16 @@ mod tests {
             .expect("registered backend should build");
 
         assert!(matches!(pipeline.backend(), PipelineBackend::CpuFfmpeg));
+    }
+
+    #[test]
+    fn build_webrtc_config_clamps_programmatic_analysis_workers() {
+        let mut config = default_test_server_config();
+        config.webrtc_analysis_workers = 8;
+
+        let webrtc = build_webrtc_config(&config);
+
+        assert_eq!(webrtc.analysis_workers, 1);
     }
 
     #[test]
@@ -2557,6 +2602,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_metrics_endpoint_uses_principal_rate_limit() {
+        let mut config = default_test_server_config();
+        config.security_api_keys = vec!["metrics-key".to_string(), "metrics-key-b".to_string()];
+        config.security_tenant_rps = Some(1);
+        config.security_metrics_require_api_key = true;
+        let policy = SecurityPolicy::from_config(&config).unwrap();
+        let app = app_router(test_state_with_provider_and_policy(None, policy));
+
+        let first = Request::builder()
+            .uri("/v1/metrics")
+            .method("GET")
+            .header("x-api-key", "metrics-key")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.clone().oneshot(first).await.unwrap().status(), StatusCode::OK);
+
+        let second = Request::builder()
+            .uri("/v1/metrics")
+            .method("GET")
+            .header("x-api-key", "metrics-key")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(second).await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        let other_key = Request::builder()
+            .uri("/v1/metrics")
+            .method("GET")
+            .header("x-api-key", "metrics-key-b")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(other_key).await.unwrap().status(),
+            StatusCode::OK,
+            "a different metrics API key gets an independent quota bucket"
+        );
+    }
+
+    #[tokio::test]
     async fn cors_preflight_rejects_unlisted_origin() {
         let policy = SecurityPolicy::from_test_policy(
             false,
@@ -2604,6 +2690,37 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("https://app.example.com")
         );
+    }
+
+    #[tokio::test]
+    async fn whip_offer_cors_exposes_location_and_run_id_headers() {
+        let policy = SecurityPolicy::from_test_policy(
+            false,
+            vec![],
+            false,
+            false,
+            vec!["https://app.example.com".to_string()],
+        );
+        let app = app_router(test_state_with_provider_and_policy(None, policy));
+
+        let req = Request::builder()
+            .uri("/v1/stream/whip")
+            .method("POST")
+            .header("origin", "https://app.example.com")
+            .header("content-type", "application/sdp")
+            .body(Body::from("v=0\r\n"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let exposed = resp
+            .headers()
+            .get("access-control-expose-headers")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+
+        assert!(exposed.split(',').any(|header| header.trim() == "location"));
+        assert!(exposed
+            .split(',')
+            .any(|header| header.trim() == "x-vidarax-run-id"));
     }
 
     #[tokio::test]

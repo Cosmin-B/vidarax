@@ -216,6 +216,12 @@ pub async fn enforce_security(
             );
             return finalize_response(policy, origin.as_deref(), response);
         }
+        let principal = principal_key_from_headers(request.headers(), true);
+        if let Some(response) =
+            per_principal_rate_limit_response_for_principal(policy, &principal, request_id.clone())
+        {
+            return finalize_response(policy, origin.as_deref(), response);
+        }
         return finalize_response(policy, origin.as_deref(), next.run(request).await);
     }
 
@@ -259,20 +265,40 @@ pub async fn enforce_security(
     // Note: global rate limiting is enforced at the top of this function
     // (before the preflight/health bypass) so it is not duplicated here.
 
-    if let Some(tenant_limiter) = &policy.tenant_limiter {
-        let principal = policy.principal_key_from_headers(request.headers());
-        if !tenant_limiter.allow(&principal) {
-            let response = error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limited",
-                "principal request rate exceeded",
-                request_id,
-            );
-            return finalize_response(policy, origin.as_deref(), response);
-        }
+    if let Some(response) =
+        per_principal_rate_limit_response(policy, request.headers(), request_id)
+    {
+        return finalize_response(policy, origin.as_deref(), response);
     }
 
     finalize_response(policy, origin.as_deref(), next.run(request).await)
+}
+
+fn per_principal_rate_limit_response(
+    policy: &SecurityPolicy,
+    headers: &HeaderMap,
+    request_id: String,
+) -> Option<Response> {
+    let principal = policy.principal_key_from_headers(headers);
+    per_principal_rate_limit_response_for_principal(policy, &principal, request_id)
+}
+
+fn per_principal_rate_limit_response_for_principal(
+    policy: &SecurityPolicy,
+    principal: &str,
+    request_id: String,
+) -> Option<Response> {
+    let tenant_limiter = policy.tenant_limiter.as_ref()?;
+    let principal = principal.to_string();
+    if tenant_limiter.allow(&principal) {
+        return None;
+    }
+    Some(error_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limited",
+        "principal request rate exceeded",
+        request_id,
+    ))
 }
 
 fn is_cors_preflight(request: &Request<Body>) -> bool {
@@ -335,6 +361,10 @@ fn add_cors_origin_header(policy: &SecurityPolicy, headers: &mut HeaderMap, orig
         return;
     };
     headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, header_value);
+    headers.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static("location,x-vidarax-run-id"),
+    );
     if vary_origin {
         headers.insert(header::VARY, HeaderValue::from_static("origin"));
     }

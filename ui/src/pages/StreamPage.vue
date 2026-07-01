@@ -168,13 +168,17 @@ async function patchPrompt(value: string) {
   const sessionId = streamStore.activeSession?.sessionId
   if (!sessionId) return
   try {
-    await fetch(`${authStore.apiEndpoint}/v1/stream/whip/${sessionId}/prompt`, {
+    const response = await fetch(`${authStore.apiEndpoint}/v1/stream/whip/${sessionId}/prompt`, {
       method: 'PATCH',
       headers: { ...authStore.defaultHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ prompt: value }),
     })
-  } catch {
-    // best-effort
+    if (!response.ok) {
+      const text = await response.text().catch(() => response.statusText)
+      throw new Error(text || `Prompt update failed with HTTP ${response.status}`)
+    }
+  } catch (err) {
+    streamStore.setError(err instanceof Error ? err.message : 'Prompt update failed')
   }
 }
 

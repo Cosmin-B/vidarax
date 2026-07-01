@@ -65,6 +65,12 @@ pub fn per_stream_vlm_workers(_configured: usize) -> usize {
     1
 }
 
+pub fn per_stream_analysis_workers(_configured: usize) -> usize {
+    // Analysis owns stream-order gate and loop-detector state. Parallelism is
+    // across sessions; splitting one ordered stream would race that state.
+    1
+}
+
 pub fn decode_output_pool_slots(gpu_available: bool, codec: VideoCodec) -> usize {
     let backend = DecoderBackend::select(gpu_available, codec);
     match backend {
@@ -78,7 +84,7 @@ pub fn decode_output_pool_slots(gpu_available: bool, codec: VideoCodec) -> usize
 }
 
 pub fn jpeg_pool_slots(analysis_workers: usize, vlm_workers: usize) -> usize {
-    let analysis_workers = analysis_workers.max(1);
+    let analysis_workers = per_stream_analysis_workers(analysis_workers);
     let vlm_workers = per_stream_vlm_workers(vlm_workers);
     let decode_to_analysis = STREAM_FRAME_QUEUE_CAPACITY + analysis_workers + 1;
     let normal_path =
@@ -301,7 +307,7 @@ pub fn spawn_analysis_workers(
     metrics: Arc<PipelineMetrics>,
     session_span: tracing::Span,
 ) {
-    for i in 0..cores.max(1) {
+    for i in 0..per_stream_analysis_workers(cores) {
         let frame_rx = frame_rx.clone();
         let vlm_tx = vlm_tx.clone();
         let clip_tx = clip_tx.clone();
@@ -1345,6 +1351,8 @@ mod tests {
         assert_eq!(super::per_stream_decode_workers(8), 1);
         assert_eq!(super::per_stream_vlm_workers(0), 1);
         assert_eq!(super::per_stream_vlm_workers(8), 1);
+        assert_eq!(super::per_stream_analysis_workers(0), 1);
+        assert_eq!(super::per_stream_analysis_workers(8), 1);
     }
 
     #[test]
