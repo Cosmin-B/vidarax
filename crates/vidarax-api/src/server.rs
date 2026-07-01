@@ -1,4 +1,4 @@
-use std::io;
+use std::{future::Future, io};
 
 use axum::Router;
 
@@ -6,8 +6,55 @@ use crate::config::ServerConfig;
 
 pub async fn serve_h1h2(addr: &str, app: Router) -> io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(addr, "vidarax-api h1/h2 listening");
-    axum::serve(listener, app).await
+    serve_h1h2_with_shutdown(listener, app, shutdown_signal()).await
+}
+
+async fn serve_h1h2_with_shutdown(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> io::Result<()> {
+    let addr = listener.local_addr()?;
+    tracing::info!(addr = %addr, "vidarax-api h1/h2 listening");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ) {
+            Ok(sigterm) => sigterm,
+            Err(err) => {
+                tracing::warn!(%err, "failed to install SIGTERM handler; waiting for SIGINT only");
+                wait_for_ctrl_c().await;
+                return;
+            }
+        };
+
+        tokio::select! {
+            _ = wait_for_ctrl_c() => {}
+            _ = sigterm.recv() => {
+                tracing::info!(signal = "SIGTERM", "vidarax-api shutdown signal received");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        wait_for_ctrl_c().await;
+    }
+}
+
+async fn wait_for_ctrl_c() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        tracing::warn!(%err, "failed to wait for SIGINT");
+        return;
+    }
+    tracing::info!(signal = "SIGINT", "vidarax-api shutdown signal received");
 }
 
 #[cfg(feature = "h3-experimental")]
@@ -49,6 +96,8 @@ const MAX_H3_BODY_BYTES: usize = 4 * 1024 * 1024;
 pub async fn serve_h3_experimental(config: &ServerConfig, app: Router) -> io::Result<()> {
     let h1_addr = config.bind_addr.clone();
     let h1_app = app.clone();
+    // Both listeners register the same process-level shutdown signal; h3 stops
+    // accepting here while the h1/h2 task drains through axum.
     let _h1_task = tokio::spawn(async move { serve_h1h2(&h1_addr, h1_app).await });
 
     let socket = tokio::net::UdpSocket::bind(&config.h3_bind_addr).await?;
@@ -69,7 +118,18 @@ pub async fn serve_h3_experimental(config: &ServerConfig, app: Router) -> io::Re
     tracing::info!(addr = %config.h3_bind_addr, "vidarax-api h3 listening");
 
     let accepted_connection_stream = &mut listeners[0];
-    while let Some(conn_res) = accepted_connection_stream.next().await {
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        let conn_res = tokio::select! {
+            _ = &mut shutdown => break,
+            conn_res = accepted_connection_stream.next() => conn_res,
+        };
+
+        let Some(conn_res) = conn_res else {
+            break;
+        };
+
         let conn = match conn_res {
             Ok(conn) => conn,
             Err(err) => {
@@ -321,4 +381,155 @@ pub async fn serve_h3_experimental(_config: &ServerConfig, _app: Router) -> io::
         io::ErrorKind::InvalidInput,
         "h3 transport requested but binary was built without feature `h3-experimental`",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serve_h1h2_with_shutdown;
+    use axum::{routing::get, Router};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn injected_shutdown_stops_h1h2_server_promptly() {
+        let app = Router::new().route("/v1/health", get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test requires loopback bind");
+        let addr = listener.local_addr().expect("listener should have local addr");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let serve_task = tokio::spawn(serve_h1h2_with_shutdown(
+            listener,
+            app,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("server should accept loopback connection");
+        stream
+            .write_all(b"GET /v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("health request should write");
+
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .expect("health response timed out")
+            .expect("health response should read");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("200 OK"), "unexpected response: {response}");
+        assert!(response.contains("ok"), "unexpected response body: {response}");
+
+        shutdown_tx.send(()).expect("server task should still be live");
+        let serve_result = tokio::time::timeout(Duration::from_secs(2), serve_task)
+            .await
+            .expect("server did not stop after injected shutdown")
+            .expect("server task panicked");
+
+        assert!(serve_result.is_ok(), "server returned error: {serve_result:?}");
+    }
+
+    #[tokio::test]
+    async fn injected_shutdown_drains_in_flight_request() {
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let handler_completed = Arc::new(AtomicBool::new(false));
+
+        let release_rx_for_handler = Arc::clone(&release_rx);
+        let handler_completed_for_handler = Arc::clone(&handler_completed);
+        let app = Router::new().route(
+            "/v1/slow",
+            get(move || {
+                let started_tx = started_tx.clone();
+                let release_rx = Arc::clone(&release_rx_for_handler);
+                let handler_completed = Arc::clone(&handler_completed_for_handler);
+
+                async move {
+                    let release_rx = {
+                        let mut release_rx =
+                            release_rx.lock().expect("release receiver lock poisoned");
+                        release_rx.take().expect("slow handler should run once")
+                    };
+
+                    started_tx
+                        .send(())
+                        .await
+                        .expect("test should wait for handler start");
+                    let _ = release_rx.await;
+                    handler_completed.store(true, Ordering::SeqCst);
+                    "slow-ok"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test requires loopback bind");
+        let addr = listener.local_addr().expect("listener should have local addr");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let serve_task = tokio::spawn(serve_h1h2_with_shutdown(
+            listener,
+            app,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("server should accept loopback connection");
+        stream
+            .write_all(b"GET /v1/slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("slow request should write");
+
+        tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+            .await
+            .expect("slow handler did not start")
+            .expect("slow handler start channel closed");
+
+        shutdown_tx.send(()).expect("server task should still be live");
+
+        // Graceful shutdown must stop accepting new work without resolving the
+        // serve future until the already-running handler has completed.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !serve_task.is_finished(),
+            "server returned before in-flight handler completed"
+        );
+        assert!(
+            !handler_completed.load(Ordering::SeqCst),
+            "handler completed before the test released it"
+        );
+
+        release_tx.send(()).expect("slow handler should still wait");
+
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .expect("slow response timed out")
+            .expect("slow response should read");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("200 OK"), "unexpected response: {response}");
+        assert!(
+            response.contains("slow-ok"),
+            "unexpected response body: {response}"
+        );
+
+        let serve_result = tokio::time::timeout(Duration::from_secs(2), serve_task)
+            .await
+            .expect("server did not stop after in-flight request drained")
+            .expect("server task panicked");
+
+        assert!(serve_result.is_ok(), "server returned error: {serve_result:?}");
+    }
 }

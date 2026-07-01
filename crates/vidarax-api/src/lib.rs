@@ -82,10 +82,13 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
     let app = app_router(state);
 
     tracing::info!(transport = config.transport.label(), "vidarax-api startup");
-    match config.transport {
-        TransportMode::H1H2 => server::serve_h1h2(&config.bind_addr, app).await?,
-        TransportMode::H3Experimental => server::serve_h3_experimental(&config, app).await?,
-    }
+    let serve_result = match config.transport {
+        TransportMode::H1H2 => server::serve_h1h2(&config.bind_addr, app).await,
+        TransportMode::H3Experimental => server::serve_h3_experimental(&config, app).await,
+    };
+    telemetry::shutdown_telemetry();
+    tracing::info!("vidarax-api shutdown complete");
+    serve_result?;
     Ok(())
 }
 
