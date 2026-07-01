@@ -91,6 +91,28 @@ function normaliseFinishReason(
   return null;
 }
 
+const BASE64URL_ALPHABET =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+function base64UrlEncodeUtf8(input: string): string {
+  const bytes = new TextEncoder().encode(input);
+  let output = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i] ?? 0;
+    const b1 = bytes[i + 1] ?? 0;
+    const b2 = bytes[i + 2] ?? 0;
+    output += BASE64URL_ALPHABET[b0 >> 2];
+    output += BASE64URL_ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)];
+    if (i + 1 < bytes.length) {
+      output += BASE64URL_ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)];
+    }
+    if (i + 2 < bytes.length) {
+      output += BASE64URL_ALPHABET[b2 & 0x3f];
+    }
+  }
+  return output;
+}
+
 // ─── Vidarax class ────────────────────────────────────────────────────────────
 
 /**
@@ -795,10 +817,11 @@ export class Vidarax {
    *
    * This is a browser-only helper.  Pass the SDP string produced by
    * `RTCPeerConnection.createOffer()` and receive back the server SDP answer
-   * along with the session resource URL for trickle-ICE and teardown.
+   * along with the server-created run ID and the session resource URL for
+   * trickle-ICE and teardown.
    *
-   * The optional `attachConfig` is sent in the `x-attach-config` header for
-   * setting the initial prompt and clip mode.
+   * The optional `attachConfig` is sent as base64url-encoded JSON in the
+   * `x-attach-config` header for setting the initial prompt and clip mode.
    *
    * Per RFC 9725 the offer body is sent as `Content-Type: application/sdp`.
    *
@@ -824,9 +847,8 @@ export class Vidarax {
     if (this.apiKey !== undefined) {
       headers["x-api-key"] = this.apiKey;
     }
-    // Encode optional attach config as a custom header (non-standard extension).
     if (attachConfig !== undefined) {
-      headers["x-attach-config"] = JSON.stringify(attachConfig);
+      headers["x-attach-config"] = base64UrlEncodeUtf8(JSON.stringify(attachConfig));
     }
 
     let response: Response;
@@ -858,6 +880,7 @@ export class Vidarax {
 
     const answerSdp = await response.text();
     const location = response.headers.get("Location") ?? "";
+    const runId = response.headers.get("x-vidarax-run-id") ?? undefined;
     const resourceUrl = location.startsWith("http")
       ? location
       : `${this.baseUrl}${location}`;
@@ -865,7 +888,9 @@ export class Vidarax {
     // Extract session ID from the Location path.
     const sessionId = location.split("/").pop() ?? "";
 
-    return { sessionId, answerSdp, resourceUrl };
+    return runId === undefined
+      ? { sessionId, answerSdp, resourceUrl }
+      : { sessionId, runId, answerSdp, resourceUrl };
   }
 
   /**

@@ -523,6 +523,8 @@ export interface AttachStreamRequest {
 /** An active WHIP session returned after a successful offer exchange. */
 export interface WhipSession {
   sessionId: string;
+  /** Server-side run ID created for this WHIP session, when returned by the API. */
+  runId?: string;
   /** The SDP answer returned by the server. */
   answerSdp: string;
   /** Absolute URL for trickle-ICE PATCH and DELETE. */

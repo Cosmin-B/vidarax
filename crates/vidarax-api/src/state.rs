@@ -2,7 +2,7 @@ use arc_swap::ArcSwap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, RwLock};
 
@@ -34,6 +34,7 @@ type SessionEntry = (String, Arc<str>, Arc<WebRtcSession>);
 type SessionMap = Arc<RwLock<HashMap<String, SessionEntry>>>;
 type ReclaimedSessionEntry = (String, Arc<str>);
 type ReclaimedSessionMap = Arc<RwLock<ReclaimedSessions>>;
+type StreamReservations = Arc<Mutex<HashMap<String, usize>>>;
 
 /// WHIP DELETE remains idempotent for watcher-reclaimed sessions within this
 /// window. Older random session IDs are tombstones only; retaining them forever
@@ -130,6 +131,7 @@ pub struct AppState {
     pipeline_metrics: Arc<PipelineMetrics>,
     distillation_config: Arc<DistillationConfig>,
     run_registry: Arc<ArcSwap<RunRegistry>>,
+    stream_reservations: StreamReservations,
     tenant_label_maps: Arc<TenantLabelMaps>,
     stream_ttl_secs: u64,
     active_stream_limit: usize,
@@ -141,6 +143,28 @@ pub struct AppState {
     reclaimed_sessions: ReclaimedSessionMap,
     /// WebRTC configuration (STUN/TURN servers, token rate limit).
     webrtc_config: WebRtcConfig,
+}
+
+#[must_use]
+pub struct StreamSlotGuard {
+    reservations: StreamReservations,
+    principal_key: String,
+}
+
+impl Drop for StreamSlotGuard {
+    fn drop(&mut self) {
+        let mut reservations = self
+            .reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = reservations.get_mut(&self.principal_key) {
+            if *count <= 1 {
+                reservations.remove(&self.principal_key);
+            } else {
+                *count -= 1;
+            }
+        }
+    }
 }
 
 struct AppStateConfig {
@@ -176,6 +200,7 @@ impl AppStateConfig {
             pipeline_metrics: Arc::new(PipelineMetrics::new()),
             distillation_config: Arc::new(DistillationConfig::default()),
             run_registry: Arc::new(ArcSwap::from_pointee(RunRegistry::default())),
+            stream_reservations: Arc::new(Mutex::new(HashMap::new())),
             tenant_label_maps: Arc::new(TenantLabelMaps::default()),
             stream_ttl_secs: self.stream_ttl_secs.max(1),
             active_stream_limit: self.active_stream_limit.max(1),
@@ -229,6 +254,7 @@ impl AppState {
             pipeline_metrics: Arc::new(PipelineMetrics::new()),
             distillation_config: Arc::new(distillation),
             run_registry,
+            stream_reservations: Arc::new(Mutex::new(HashMap::new())),
             tenant_label_maps,
             stream_ttl_secs,
             active_stream_limit: active_stream_limit.max(1),
@@ -789,6 +815,36 @@ impl AppState {
             .count()
     }
 
+    /// Reserve a per-principal stream slot before persisting a new run.
+    ///
+    /// The committed active count and in-flight reservations are checked under
+    /// one lock so concurrent creators cannot all pass the same snapshot. The
+    /// returned guard releases the reservation once the run is durably
+    /// registered and visible to active-run accounting.
+    pub fn try_reserve_stream_slot(
+        &self,
+        principal_key: &str,
+        now_ms: u64,
+    ) -> Option<StreamSlotGuard> {
+        let mut reservations = self
+            .stream_reservations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let committed = self.count_active_runs_for_principal(principal_key, now_ms);
+        let reserved = *reservations.get(principal_key).unwrap_or(&0);
+        if committed.saturating_add(reserved) >= self.active_stream_limit {
+            return None;
+        }
+
+        *reservations
+            .entry(principal_key.to_string())
+            .or_insert(0) += 1;
+        Some(StreamSlotGuard {
+            reservations: Arc::clone(&self.stream_reservations),
+            principal_key: principal_key.to_string(),
+        })
+    }
+
     pub fn stream_ttl_secs(&self) -> u64 {
         self.stream_ttl_secs
     }
@@ -1189,6 +1245,37 @@ mod tests {
         let events = state.read_run_events("run-1").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stream_id, "camera-west");
+    }
+
+    #[test]
+    fn stream_slot_reservations_enforce_limit_before_registry_writes() {
+        let state = AppState::with_wal_for_tests_runtime(
+            std::env::temp_dir().join(format!(
+                "vidarax-state-reservation-limit-{}.wal",
+                std::process::id()
+            )),
+            None,
+            SecurityPolicy::from_config_for_tests(),
+            3600,
+            2,
+        );
+        let principal = "tenant-a";
+        let now_ms = now_epoch_ms();
+
+        let mut guards = Vec::new();
+        for _ in 0..state.active_stream_limit() {
+            guards.push(
+                state
+                    .try_reserve_stream_slot(principal, now_ms)
+                    .expect("reservation should fit under the per-principal limit"),
+            );
+        }
+
+        assert!(state.try_reserve_stream_slot(principal, now_ms).is_none());
+        drop(guards.pop().expect("held reservation"));
+        assert!(state.try_reserve_stream_slot(principal, now_ms).is_some());
+        drop(guards);
+        assert!(state.try_reserve_stream_slot(principal, now_ms).is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

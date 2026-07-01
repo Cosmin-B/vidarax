@@ -354,6 +354,29 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    struct EnvRestore {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.old.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn set_env(key: &'static str, value: Option<&str>) -> EnvRestore {
+        let old = std::env::var_os(key);
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+        EnvRestore { key, old }
+    }
+
     // ─── TransportMode parsing ────────────────────────────────────────────────
 
     #[test]
@@ -397,13 +420,10 @@ mod tests {
     #[test]
     fn server_config_preserves_custom_decode_backend_name() {
         let _guard = env_guard();
-        std::env::set_var("VIDARAX_DECODE_BACKEND", "test-custom-backend");
-        std::env::set_var("VIDARAX_REQUIRE_API_KEY", "false");
+        let _decode_backend = set_env("VIDARAX_DECODE_BACKEND", Some("test-custom-backend"));
+        let _require_api_key = set_env("VIDARAX_REQUIRE_API_KEY", Some("false"));
 
         let cfg = ServerConfig::from_env().expect("custom decode backend should parse");
-
-        std::env::remove_var("VIDARAX_DECODE_BACKEND");
-        std::env::remove_var("VIDARAX_REQUIRE_API_KEY");
 
         assert_eq!(cfg.decode_backend, "test-custom-backend");
     }
@@ -411,17 +431,12 @@ mod tests {
     #[test]
     fn server_config_clamps_webrtc_worker_counts() {
         let _guard = env_guard();
-        std::env::set_var("VIDARAX_REQUIRE_API_KEY", "false");
-        std::env::set_var("VIDARAX_WEBRTC_DECODE_WORKERS", "999");
-        std::env::set_var("VIDARAX_WEBRTC_ANALYSIS_WORKERS", "999");
-        std::env::set_var("VIDARAX_WEBRTC_VLM_WORKERS", "999");
+        let _require_api_key = set_env("VIDARAX_REQUIRE_API_KEY", Some("false"));
+        let _decode_workers = set_env("VIDARAX_WEBRTC_DECODE_WORKERS", Some("999"));
+        let _analysis_workers = set_env("VIDARAX_WEBRTC_ANALYSIS_WORKERS", Some("999"));
+        let _vlm_workers = set_env("VIDARAX_WEBRTC_VLM_WORKERS", Some("999"));
 
         let cfg = ServerConfig::from_env().expect("worker counts should parse");
-
-        std::env::remove_var("VIDARAX_REQUIRE_API_KEY");
-        std::env::remove_var("VIDARAX_WEBRTC_DECODE_WORKERS");
-        std::env::remove_var("VIDARAX_WEBRTC_ANALYSIS_WORKERS");
-        std::env::remove_var("VIDARAX_WEBRTC_VLM_WORKERS");
 
         assert_eq!(cfg.webrtc_decode_workers, 1);
         assert_eq!(cfg.webrtc_analysis_workers, 1);
@@ -431,12 +446,10 @@ mod tests {
     #[test]
     fn server_config_default_ingest_roots_are_empty() {
         let _guard = env_guard();
-        std::env::remove_var("VIDARAX_INGEST_FILE_ROOTS");
-        std::env::set_var("VIDARAX_REQUIRE_API_KEY", "false");
+        let _ingest_roots = set_env("VIDARAX_INGEST_FILE_ROOTS", None);
+        let _require_api_key = set_env("VIDARAX_REQUIRE_API_KEY", Some("false"));
 
         let cfg = ServerConfig::from_env().expect("default config should parse");
-
-        std::env::remove_var("VIDARAX_REQUIRE_API_KEY");
 
         assert!(
             cfg.ingest_file_roots.is_empty(),
@@ -463,13 +476,13 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        std::env::set_var("VIDARAX_INGEST_FILE_ROOTS", root.to_string_lossy().to_string());
-        std::env::set_var("VIDARAX_REQUIRE_API_KEY", "false");
+        let _ingest_roots = set_env(
+            "VIDARAX_INGEST_FILE_ROOTS",
+            Some(root.to_string_lossy().as_ref()),
+        );
+        let _require_api_key = set_env("VIDARAX_REQUIRE_API_KEY", Some("false"));
 
         let cfg = ServerConfig::from_env().expect("explicit ingest root should parse");
-
-        std::env::remove_var("VIDARAX_INGEST_FILE_ROOTS");
-        std::env::remove_var("VIDARAX_REQUIRE_API_KEY");
 
         assert_eq!(cfg.ingest_file_roots, vec![root.canonicalize().unwrap()]);
         let _ = std::fs::remove_dir(root);

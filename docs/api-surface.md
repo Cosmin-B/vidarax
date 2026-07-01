@@ -63,10 +63,16 @@ Complete endpoint reference for `vidarax-api`. All routes are defined in
 
 | Method   | Path                                          | Description                                    |
 |----------|-----------------------------------------------|------------------------------------------------|
-| `POST`   | `/v1/stream/whip`                             | SDP offer/answer exchange. Returns 201 + Location header. |
+| `POST`   | `/v1/stream/whip`                             | SDP offer/answer exchange. Returns raw SDP with `Location` and `x-vidarax-run-id` headers. |
 | `PATCH`  | `/v1/stream/whip/{sess_id}`                   | Trickle ICE candidate.                         |
 | `DELETE` | `/v1/stream/whip/{sess_id}`                   | Terminate WebRTC session.                      |
 | `PATCH`  | `/v1/stream/whip/{sess_id}/prompt`            | Update the analysis prompt for a live session. |
+
+`POST /v1/stream/whip` accepts an optional `x-attach-config` header for initial
+stream configuration that must be applied before workers start. The header value
+is base64url-encoded JSON without padding, capped at 8 KiB encoded. Use
+`PATCH /v1/stream/whip/{sess_id}/prompt` for larger prompt updates after the
+session has been created.
 
 ---
 

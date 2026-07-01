@@ -95,21 +95,21 @@ pub async fn create_run(
 
     let tenant_id = header_value(&headers, HEADER_TENANT_ID).map(ToString::to_string);
     let principal = state.security_policy().principal_key_from_headers(&headers);
-    let active = state.count_active_runs_for_principal(&principal, now_epoch_ms());
-    if active >= state.active_stream_limit() {
-        return conflict_error(
+    let _slot = match state.try_reserve_stream_slot(&principal, now_epoch_ms()) {
+        Some(slot) => slot,
+        None => return conflict_error(
             &state,
             "active stream limit exceeded",
             vec![field_error(
                 "run_id",
                 format!(
                     "principal exceeded active stream limit: {}/{}",
-                    active,
+                    state.active_stream_limit(),
                     state.active_stream_limit()
                 ),
             )],
-        );
-    }
+        ),
+    };
 
     let run_id = state.next_run_id();
     let request_id = state.next_request_id();

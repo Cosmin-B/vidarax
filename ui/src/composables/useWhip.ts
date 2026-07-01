@@ -41,7 +41,7 @@ function waitForIceComplete(pc: RTCPeerConnection): Promise<string> {
 }
 
 export interface WhipStartOptions {
-  /** Optional analysis prompt forwarded to the VLM via attachToRun. */
+  /** Optional analysis prompt sent with the WHIP offer attach config. */
   prompt?: string
 }
 
@@ -96,25 +96,25 @@ export function useWhip() {
       if (!offerSdp) throw new Error('Failed to build local SDP')
 
       // ── 4. WHIP negotiation ───────────────────────────────────────────
-      let whipResult: { answer_sdp: string; session_id: string; location: string }
+      let whipResult: { answer_sdp: string; session_id: string; location: string; run_id?: string }
       try {
-        whipResult = await api.stream.whipOffer(offerSdp)
+        const prompt = options.prompt?.trim()
+        whipResult = await api.stream.whipOffer(
+          offerSdp,
+          prompt ? { prompt } : undefined,
+        )
       } catch (whipErr) {
         const msg = whipErr instanceof Error ? whipErr.message : 'WHIP negotiation failed'
         throw new Error(`WHIP negotiation failed: ${msg}`)
       }
-      const { answer_sdp, session_id, location } = whipResult
+      const { answer_sdp, session_id, location, run_id } = whipResult
 
       await conn.setRemoteDescription({ type: 'answer', sdp: answer_sdp })
 
       // ── 5. Store session ──────────────────────────────────────────────
-      const runId = options.prompt !== undefined
-        ? await _attachToRun(session_id, options.prompt)
-        : ''
-
       streamStore.setSession({
         sessionId: session_id,
-        runId,
+        runId: run_id ?? '',
         locationUrl: location,
         createdAt: new Date().toISOString(),
       })
@@ -134,21 +134,6 @@ export function useWhip() {
       const msg = err instanceof Error ? err.message : 'Stream failed'
       streamStore.setError(msg)
       cleanup()
-    }
-  }
-
-  /** Best-effort: create a run and attach the WHIP session to it. */
-  async function _attachToRun(sessionId: string, prompt: string): Promise<string> {
-    try {
-      const run = await api.runs.create({ source_uri: `whip://${sessionId}` })
-      await api.stream.attachToRun(run.run_id, {
-        session_id: sessionId,
-        prompt: prompt || undefined,
-      })
-      return run.run_id
-    } catch {
-      // non-fatal — stream still works without a run ID
-      return ''
     }
   }
 

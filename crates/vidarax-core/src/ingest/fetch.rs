@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -24,7 +25,7 @@ const REMOTE_MEDIA_PREFETCH_ANALYZE_DURATION_US: &str = "5000000";
 const PREFETCH_DIR_NAME: &str = "vidarax-prefetches";
 static PREFETCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub(crate) type FetchUrlValidator =
-    Arc<dyn Fn(&reqwest::Url) -> Result<(), String> + Send + Sync + 'static>;
+    Arc<dyn Fn(&reqwest::Url) -> Result<Vec<SocketAddr>, String> + Send + Sync + 'static>;
 
 pub(crate) fn with_prefetched_downloadable_source<T>(
     source: &InputSource,
@@ -64,15 +65,11 @@ fn prefetch_remote_media_with_limit_and_validator(
     validate_url: FetchUrlValidator,
 ) -> Result<PrefetchedMedia, String> {
     let parsed = reqwest::Url::parse(url).map_err(|err| format!("invalid remote media URL: {err}"))?;
-    validate_url(&parsed)?;
+    let validated_addrs = validate_url(&parsed)?;
     let started = Instant::now();
 
-    let client = Client::builder()
-        .redirect(redirect::Policy::none())
-        .build()
-        .map_err(|err| format!("failed to build remote media fetch client: {err}"))?;
-
-    let mut response = fetch_remote_media_response(&client, parsed, validate_url, started)?;
+    let mut response =
+        fetch_remote_media_response(parsed, validated_addrs, validate_url, started)?;
     if !response.status().is_success() {
         return Err(format!(
             "remote media fetch failed with HTTP status {}",
@@ -131,12 +128,13 @@ fn prefetch_remote_media_with_limit_and_validator(
 }
 
 fn fetch_remote_media_response(
-    client: &Client,
     mut url: reqwest::Url,
+    mut validated_addrs: Vec<SocketAddr>,
     validate_url: FetchUrlValidator,
     started: Instant,
 ) -> Result<reqwest::blocking::Response, String> {
     for redirect_count in 0..=REMOTE_MEDIA_PREFETCH_MAX_REDIRECTS {
+        let client = pinned_fetch_client(&url, &validated_addrs)?;
         let response = client
             .get(url.clone())
             .timeout(prefetch_time_remaining(started)?)
@@ -160,32 +158,51 @@ fn fetch_remote_media_response(
         let next_url = url
             .join(location)
             .map_err(|err| format!("invalid redirect Location header: {err}"))?;
-        validate_redirect_target(&url, &next_url, &validate_url)?;
+        validated_addrs = validate_redirect_target(&url, &next_url, &validate_url)?;
         url = next_url;
     }
 
     Err("too many redirects".to_string())
 }
 
+fn pinned_fetch_client(
+    url: &reqwest::Url,
+    validated_addrs: &[SocketAddr],
+) -> Result<Client, String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| "remote media fetch URL must include a host".to_string())?;
+    Client::builder()
+        .redirect(redirect::Policy::none())
+        .resolve_to_addrs(host, validated_addrs)
+        // This fetch path must dial the addresses that passed validation. A proxy
+        // would resolve the origin name itself and skip the pinned address list.
+        .no_proxy()
+        .build()
+        .map_err(|err| format!("failed to build remote media fetch client: {err}"))
+}
+
 fn validate_redirect_target(
     current_url: &reqwest::Url,
     next_url: &reqwest::Url,
     validate_url: &FetchUrlValidator,
-) -> Result<(), String> {
+) -> Result<Vec<SocketAddr>, String> {
     if !matches!(next_url.scheme(), "http" | "https") {
         return Err("redirect target rejected: unsupported scheme".to_string());
     }
     if current_url.scheme() == "https" && next_url.scheme() == "http" {
         return Err("redirect target rejected: https->http downgrade".to_string());
     }
-    if let Err(err) = validate_url(next_url) {
-        if err == "insecure http scheme" {
-            return Err("redirect target rejected: insecure http scheme".to_string());
+    match validate_url(next_url) {
+        Ok(addrs) => Ok(addrs),
+        Err(err) => {
+            if err == "insecure http scheme" {
+                return Err("redirect target rejected: insecure http scheme".to_string());
+            }
+            let host = next_url.host_str().unwrap_or("<missing host>");
+            Err(format!("redirect target rejected: {host} ({err})"))
         }
-        let host = next_url.host_str().unwrap_or("<missing host>");
-        return Err(format!("redirect target rejected: {host} ({err})"));
     }
-    Ok(())
 }
 
 fn prefetch_time_remaining(started: Instant) -> Result<Duration, String> {
@@ -389,8 +406,9 @@ mod tests {
         REMOTE_MEDIA_PREFETCH_MAX_BYTES,
     };
     use std::fs;
+    use std::process::Command;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     struct EnvRestore {
         key: &'static str,
@@ -407,14 +425,25 @@ mod tests {
     }
 
     fn with_env<T>(key: &'static str, value: Option<&str>, test: impl FnOnce() -> T) -> T {
+        with_envs(&[(key, value)], test)
+    }
+
+    fn with_envs<T>(values: &[(&'static str, Option<&str>)], test: impl FnOnce() -> T) -> T {
         let _guard = crate::ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let old = std::env::var_os(key);
-        let _restore = EnvRestore { key, old };
-        match value {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
+        let _restore = values
+            .iter()
+            .map(|(key, _)| EnvRestore {
+                key,
+                old: std::env::var_os(key),
+            })
+            .collect::<Vec<_>>();
+        for (key, value) in values {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
         test()
     }
@@ -465,7 +494,12 @@ mod tests {
     fn https_redirect_to_plain_http_is_rejected_before_url_validator() {
         let current = reqwest::Url::parse("https://example.com/media.mp4").unwrap();
         let next = reqwest::Url::parse("http://127.0.0.1:9/media.mp4").unwrap();
-        let allow_all: super::FetchUrlValidator = Arc::new(|_: &reqwest::Url| Ok(()));
+        let allow_all: super::FetchUrlValidator = Arc::new(|url: &reqwest::Url| {
+            Ok(vec![std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                url.port_or_known_default().unwrap_or(80),
+            )])
+        });
 
         let err = validate_redirect_target(&current, &next, &allow_all)
             .expect_err("https to http downgrade must be rejected");
@@ -512,6 +546,60 @@ mod tests {
     }
 
     #[test]
+    fn prefetch_connects_to_validated_address_for_hostname() {
+        let server = super::test_helpers::MockHttpServer::serve_once(
+            "200 OK",
+            &[("Content-Type", "application/vnd.apple.mpegurl")],
+            b"#EXTM3U\n#EXT-X-VERSION:3\n".to_vec(),
+        );
+        let err = prefetch_remote_media_with_limit_and_validator_for_test(
+            &server.url_for_host("vidarax-prefetch.test", "/playlist"),
+            REMOTE_MEDIA_PREFETCH_MAX_BYTES,
+            server.allow_host_validator("vidarax-prefetch.test"),
+        )
+        .expect_err("pinned hostname request should reach the mock server");
+
+        assert!(err.contains("playlist manifest"), "{err}");
+    }
+
+    #[test]
+    fn prefetch_proxy_env_cannot_bypass_pinned_address() {
+        let proxy = super::test_helpers::ProxyTrap::serve();
+        let proxy_url = proxy.url();
+        let server = super::test_helpers::MockHttpServer::serve_once(
+            "200 OK",
+            &[("Content-Type", "video/mp4")],
+            create_test_mp4_bytes(),
+        );
+
+        with_envs(
+            &[
+                ("HTTP_PROXY", Some(proxy_url.as_str())),
+                ("HTTPS_PROXY", Some(proxy_url.as_str())),
+                ("ALL_PROXY", Some(proxy_url.as_str())),
+                ("http_proxy", Some(proxy_url.as_str())),
+                ("https_proxy", Some(proxy_url.as_str())),
+                ("all_proxy", Some(proxy_url.as_str())),
+                ("NO_PROXY", None),
+                ("no_proxy", None),
+            ],
+            || {
+                prefetch_remote_media_with_limit_and_validator_for_test(
+                    &server.url_for_host("vidarax-prefetch.test", "/media.mp4"),
+                    REMOTE_MEDIA_PREFETCH_MAX_BYTES,
+                    server.allow_host_validator("vidarax-prefetch.test"),
+                )
+                .expect("prefetch must use the validated address instead of proxy env");
+            },
+        );
+
+        assert!(
+            !proxy.saw_connection(),
+            "pinned prefetch client must not connect to proxy env listeners"
+        );
+    }
+
+    #[test]
     fn public_https_oversize_body_is_rejected_by_cap() {
         let server = super::test_helpers::MockHttpServer::serve_once(
             "200 OK",
@@ -551,6 +639,47 @@ mod tests {
         );
         let _ = fs::remove_file(path);
     }
+
+    fn create_test_mp4_bytes() -> Vec<u8> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "vidarax-prefetch-test-media-{}-{nanos}.mp4",
+            std::process::id()
+        ));
+        let output = Command::new(crate::ingest::ffmpeg::ffmpeg_path())
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=16x16:rate=1:duration=1",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "mpeg4",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-y",
+            ])
+            .arg(&path)
+            .output()
+            .expect("run ffmpeg to generate test mp4");
+        assert!(
+            output.status.success(),
+            "ffmpeg failed to generate test mp4: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = fs::read(&path).expect("read generated test mp4");
+        let _ = fs::remove_file(&path);
+        assert!(!bytes.is_empty(), "generated test mp4 must not be empty");
+        bytes
+    }
 }
 
 #[cfg(test)]
@@ -560,6 +689,7 @@ pub(crate) mod test_helpers {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Sender};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
@@ -574,6 +704,13 @@ pub(crate) mod test_helpers {
         pub(crate) status: &'static str,
         pub(crate) headers: &'static [(&'static str, &'static str)],
         pub(crate) body: Vec<u8>,
+    }
+
+    pub(crate) struct ProxyTrap {
+        addr: SocketAddr,
+        saw_connection: Arc<AtomicBool>,
+        shutdown: Option<Sender<()>>,
+        handle: Option<JoinHandle<Result<(), String>>>,
     }
 
     impl MockHttpServer {
@@ -640,14 +777,23 @@ pub(crate) mod test_helpers {
             format!("http://{}:{}{path}", self.addr.ip(), self.addr.port())
         }
 
+        pub(crate) fn url_for_host(&self, host: &str, path: &str) -> String {
+            format!("http://{}:{}{path}", host, self.addr.port())
+        }
+
         pub(crate) fn allow_origin_validator(&self) -> FetchUrlValidator {
+            self.allow_host_validator("127.0.0.1")
+        }
+
+        pub(crate) fn allow_host_validator(&self, allowed_host: &'static str) -> FetchUrlValidator {
             let allowed_port = self.addr.port();
+            let allowed_addr = self.addr;
             Arc::new(move |url| {
                 let is_mock_origin = url.scheme() == "http"
-                    && url.host_str() == Some("127.0.0.1")
+                    && url.host_str() == Some(allowed_host)
                     && url.port_or_known_default() == Some(allowed_port);
                 if is_mock_origin {
-                    Ok(())
+                    Ok(vec![allowed_addr])
                 } else {
                     validate_remote_fetch_url(url)
                 }
@@ -656,6 +802,70 @@ pub(crate) mod test_helpers {
     }
 
     impl Drop for MockHttpServer {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    impl ProxyTrap {
+        pub(crate) fn serve() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy trap");
+            listener.set_nonblocking(true).expect("configure proxy trap");
+            let addr = listener.local_addr().expect("read proxy trap addr");
+            let (shutdown_tx, shutdown_rx) = mpsc::channel();
+            let saw_connection = Arc::new(AtomicBool::new(false));
+            let saw_connection_for_thread = Arc::clone(&saw_connection);
+            let handle = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if shutdown_rx.try_recv().is_ok() {
+                        return Ok(());
+                    }
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            saw_connection_for_thread.store(true, Ordering::SeqCst);
+                            let _ = read_request_headers(&mut stream);
+                            let _ = write_response(
+                                &mut stream,
+                                "502 Bad Gateway",
+                                &[("Content-Type", "text/plain")],
+                                b"proxy trap",
+                            );
+                            return Ok(());
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return Ok(());
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(err) => return Err(format!("proxy trap accept failed: {err}")),
+                    }
+                }
+            });
+            Self {
+                addr,
+                saw_connection,
+                shutdown: Some(shutdown_tx),
+                handle: Some(handle),
+            }
+        }
+
+        pub(crate) fn url(&self) -> String {
+            format!("http://{}:{}", self.addr.ip(), self.addr.port())
+        }
+
+        pub(crate) fn saw_connection(&self) -> bool {
+            self.saw_connection.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for ProxyTrap {
         fn drop(&mut self) {
             if let Some(shutdown) = self.shutdown.take() {
                 let _ = shutdown.send(());
