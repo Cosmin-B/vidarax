@@ -14,14 +14,13 @@ use std::os::raw::{c_int, c_uint};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{mpsc, Arc};
 
+use openh264::formats::YUVSource;
 #[cfg(feature = "vp8")]
 use vpx_sys::{
-    vpx_codec_ctx_t, vpx_codec_dec_init_ver, vpx_codec_decode, vpx_codec_destroy,
-    vpx_codec_err_t, vpx_codec_error, vpx_codec_error_detail, vpx_codec_get_frame,
-    vpx_codec_iter_t, vpx_codec_vp8_dx, vpx_image_t, vpx_img_fmt_t,
-    VPX_DECODER_ABI_VERSION,
+    vpx_codec_ctx_t, vpx_codec_dec_init_ver, vpx_codec_decode, vpx_codec_destroy, vpx_codec_err_t,
+    vpx_codec_error, vpx_codec_error_detail, vpx_codec_get_frame, vpx_codec_iter_t,
+    vpx_codec_vp8_dx, vpx_image_t, vpx_img_fmt_t, VPX_DECODER_ABI_VERSION,
 };
-use openh264::formats::YUVSource;
 
 use crate::metrics::PipelineMetrics;
 use crate::webrtc::recycle::{RecycledBytes, VecPool};
@@ -885,13 +884,7 @@ impl Decoder {
             ));
         }
 
-        copy_vpx_plane(
-            &mut scratch.y,
-            img.planes[0],
-            img.stride[0],
-            width,
-            height,
-        )?;
+        copy_vpx_plane(&mut scratch.y, img.planes[0], img.stride[0], width, height)?;
 
         let uv_width = width / 2;
         let uv_height = height / 2;
@@ -928,11 +921,12 @@ fn copy_vpx_plane(
     width: usize,
     height: usize,
 ) -> Result<(), DecodeError> {
-    let stride = usize::try_from(stride).map_err(|_| {
-        DecodeError::Vp8Decode("invalid libvpx plane layout".to_string())
-    })?;
+    let stride = usize::try_from(stride)
+        .map_err(|_| DecodeError::Vp8Decode("invalid libvpx plane layout".to_string()))?;
     if src.is_null() || stride < width {
-        return Err(DecodeError::Vp8Decode("invalid libvpx plane layout".to_string()));
+        return Err(DecodeError::Vp8Decode(
+            "invalid libvpx plane layout".to_string(),
+        ));
     }
 
     dst.clear();
