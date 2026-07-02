@@ -55,3 +55,80 @@ jobs:
 
       - name: Release gates
         run: ./scripts/release_gates.sh
+
+  web-sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Setup Node
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: packages/vidarax-sdk/package-lock.json
+
+      - name: Install dependencies
+        working-directory: packages/vidarax-sdk
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: packages/vidarax-sdk
+        run: npm run typecheck
+
+      - name: Build
+        working-directory: packages/vidarax-sdk
+        run: npm run build
+
+      - name: Unit tests
+        working-directory: packages/vidarax-sdk
+        run: npx vitest run tests/client.test.ts
+
+  web-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Setup Node
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Build
+        working-directory: ui
+        run: npm run build
+
+  spacetime-wasm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+        with:
+          toolchain: 1.93.0
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db
+        with:
+          workspaces: spacetime-module
+
+      - name: Build
+        working-directory: spacetime-module
+        run: cargo build --locked --release --target wasm32-unknown-unknown
