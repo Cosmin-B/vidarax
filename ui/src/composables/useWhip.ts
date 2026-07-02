@@ -15,7 +15,7 @@
 
 import { ref, onUnmounted } from 'vue'
 import { api } from '@/lib/api'
-import { ICE_SERVERS } from '@/lib/config'
+import { iceServersWithTurn, ls, STORAGE_KEYS, UI_DEFAULTS } from '@/lib/config'
 import { useStreamStore } from '@/stores/stream'
 import type { StreamSourceType } from '@/stores/stream'
 
@@ -82,7 +82,8 @@ export function useWhip() {
       streamStore.setMediaStream(stream)
 
       // ── 2. Peer connection ────────────────────────────────────────────
-      const conn = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+      const turnUrl = ls(STORAGE_KEYS.turnUrl, UI_DEFAULTS.turnUrl)
+      const conn = new RTCPeerConnection({ iceServers: iceServersWithTurn(turnUrl) })
       pc.value = conn
 
       stream.getTracks().forEach(track => conn.addTrack(track, stream))

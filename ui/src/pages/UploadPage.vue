@@ -145,6 +145,14 @@ const activeKeyframes = computed(() =>
   createdRunId.value ? eventsStore.keyframesForRun(createdRunId.value) : []
 )
 
+function parseSemanticFramesPerChunk(raw: string | null): number | undefined {
+  if (raw === null) return undefined
+  const trimmed = raw.trim()
+  if (trimmed === '') return undefined
+  const parsed = Number(trimmed)
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 4 ? parsed : undefined
+}
+
 const statusLabel = computed(() => {
   switch (uploadState.value) {
     case 'uploading':  return 'Uploading file…'
@@ -205,6 +213,12 @@ async function startUpload(): Promise<void> {
 
     const fps = lsNum(STORAGE_KEYS.fps, UI_DEFAULTS.fps)
     const chunkSize = lsNum(STORAGE_KEYS.chunkSize, UI_DEFAULTS.chunkSize)
+    const firstPassModel = ls(STORAGE_KEYS.firstPassModel, UI_DEFAULTS.firstPassModel).trim()
+    const secondPassModel = ls(STORAGE_KEYS.secondPassModel, UI_DEFAULTS.secondPassModel).trim()
+    const semanticFramesPerChunk = parseSemanticFramesPerChunk(
+      localStorage.getItem(STORAGE_KEYS.semanticFramesPerChunk)
+        ?? String(UI_DEFAULTS.semanticFramesPerChunk),
+    )
 
     const effectivePrompt = prompt.value.trim() || DEFAULT_ANALYSIS_PROMPT
 
@@ -246,6 +260,9 @@ async function startUpload(): Promise<void> {
       semantic_inference: semanticInference.value,
       fps,
       chunk_size: chunkSize,
+      firstPassModel: firstPassModel || undefined,
+      secondPassModel: secondPassModel || undefined,
+      semanticFramesPerChunk,
     })
 
     stopVizPolling()

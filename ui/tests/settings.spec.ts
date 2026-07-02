@@ -209,6 +209,10 @@ test.describe('Settings panel', () => {
   test('connection section: TURN server URL field is present', async ({ page }) => {
     await page.goto('/settings')
     // Connection section is open by default
+    await expect(page.getByText(
+      'Supports STUN or credential-less TURN URLs only; configure credentialed TURN relays server-side.',
+      { exact: true },
+    )).toBeVisible()
     await expect(page.getByTestId('turn-url')).toBeVisible()
   })
 
@@ -226,64 +230,62 @@ test.describe('Settings panel', () => {
 
   // ── Token rate cap slider ─────────────────────────────────────────────────
 
-  test('stream section: token rate cap slider is present', async ({ page }) => {
+  test('stream section: token rate cap is shown as server-managed', async ({ page }) => {
     await page.goto('/settings')
     await page.getByRole('button', { name: /^stream$/i }).click()
     await expect(page.getByTestId('token-rate-cap')).toBeVisible()
+    await expect(page.getByTestId('token-rate-cap')).toBeDisabled()
+    await expect(page.getByText(/configured server-side/i)).toBeVisible()
   })
 
-  test('token rate cap value display updates with slider', async ({ page }) => {
+  test('server-managed controls do not persist inert localStorage values', async ({ page }) => {
     await page.goto('/settings')
     await page.getByRole('button', { name: /^stream$/i }).click()
+    await expect(page.getByTestId('token-rate-cap')).toBeDisabled()
+    await expect(page.getByTestId('clip-mode-toggle')).toBeDisabled()
 
-    await page.getByTestId('token-rate-cap').fill('200')
-    await expect(page.getByTestId('token-rate-cap-value')).toContainText('200')
-  })
+    await page.getByRole('button', { name: /gate engine/i }).click()
+    await expect(page.getByTestId('scene-cut-hamming-threshold')).toBeDisabled()
+    await expect(page.getByTestId('luma-shift-threshold')).toBeDisabled()
+    await expect(page.getByTestId('loop-detection-toggle')).toBeDisabled()
+    await expect(page.getByTestId('loop-repeat-trigger')).toBeDisabled()
 
-  test('token rate cap persists after save and reload', async ({ page }) => {
-    await page.goto('/settings')
-    await page.getByRole('button', { name: /^stream$/i }).click()
+    await page.getByRole('button', { name: /advanced/i }).click()
+    await expect(page.getByTestId('gpu-decode')).toBeDisabled()
 
-    await page.getByTestId('token-rate-cap').fill('100')
     await page.getByTestId('save-button').click()
 
-    await page.reload()
-    await page.getByRole('button', { name: /^stream$/i }).click()
-    await expect(page.getByTestId('token-rate-cap-value')).toContainText('100')
+    const inertValues = await page.evaluate(() => ({
+      tokenRateCap: localStorage.getItem('vidarax_token_rate_cap'),
+      clipMode: localStorage.getItem('vidarax_clip_mode'),
+      sceneCutHammingThreshold: localStorage.getItem('vidarax_scene_cut_hamming_threshold'),
+      lumaShiftThreshold: localStorage.getItem('vidarax_luma_shift_threshold'),
+      loopDetection: localStorage.getItem('vidarax_loop_detection'),
+      loopRepeatTrigger: localStorage.getItem('vidarax_loop_repeat_trigger'),
+      gpuDecode: localStorage.getItem('vidarax_gpu_decode'),
+    }))
+
+    expect(inertValues).toEqual({
+      tokenRateCap: null,
+      clipMode: null,
+      sceneCutHammingThreshold: null,
+      lumaShiftThreshold: null,
+      loopDetection: null,
+      loopRepeatTrigger: null,
+      gpuDecode: null,
+    })
   })
 
   // ── Clip mode toggle ──────────────────────────────────────────────────────
 
-  test('stream section: clip mode toggle is present', async ({ page }) => {
+  test('stream section: clip mode is shown as non-actionable', async ({ page }) => {
     await page.goto('/settings')
     await page.getByRole('button', { name: /^stream$/i }).click()
     await expect(page.getByTestId('clip-mode-toggle')).toBeVisible()
-  })
-
-  test('clip mode toggle changes aria-checked when clicked', async ({ page }) => {
-    await page.goto('/settings')
-    await page.getByRole('button', { name: /^stream$/i }).click()
-
-    const toggle = page.getByTestId('clip-mode-toggle')
-    const initial = await toggle.getAttribute('aria-checked')
-
-    await toggle.click()
-    const updated = await toggle.getAttribute('aria-checked')
-    expect(updated).not.toBe(initial)
-  })
-
-  test('clip mode toggle state persists after save and reload', async ({ page }) => {
-    await page.goto('/settings')
-    await page.getByRole('button', { name: /^stream$/i }).click()
-
-    const toggle = page.getByTestId('clip-mode-toggle')
-    // Default is false — click once to enable
-    await toggle.click()
-    await expect(toggle).toHaveAttribute('aria-checked', 'true')
-
-    await page.getByTestId('save-button').click()
-    await page.reload()
-    await page.getByRole('button', { name: /^stream$/i }).click()
-    await expect(page.getByTestId('clip-mode-toggle')).toHaveAttribute('aria-checked', 'true')
+    await expect(page.getByTestId('clip-mode-toggle')).toBeDisabled()
+    await expect(page.getByText(
+      'This page does not send clip_mode; streaming clip mode is applied through the WHIP attach path, not from this page.',
+      { exact: true },
+    )).toBeVisible()
   })
 })

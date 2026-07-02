@@ -105,6 +105,16 @@ test.describe('Tracing page', () => {
     await expect(timelineSection.getByText(/trace timeline/i).first()).toBeVisible()
   })
 
+  test('Trace Timeline section is labelled as synthetic sample data', async ({ page }) => {
+    await page.goto('/tracing')
+
+    const timelineSection = page.getByRole('region', { name: 'Trace waterfall timeline' })
+    await expect(timelineSection).toBeVisible({ timeout: 10_000 })
+    await expect(timelineSection.getByText('SYNTHETIC')).toBeVisible()
+    await expect(timelineSection.getByText(/illustrative sample data/i)).toBeVisible()
+    await expect(timelineSection.getByText(/per-span tracing is not exposed by the API yet/i)).toBeVisible()
+  })
+
   test('Trace Timeline legend shows Decode, Gate, VLM labels', async ({ page }) => {
     await page.goto('/tracing')
 

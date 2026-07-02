@@ -23,17 +23,17 @@ const form = reactive({
   // Stream
   fps:                    lsNum(STORAGE_KEYS.fps, UI_DEFAULTS.fps),
   chunkSize:              lsNum(STORAGE_KEYS.chunkSize, UI_DEFAULTS.chunkSize),
-  tokenRateCap:           lsNum(STORAGE_KEYS.tokenRateCap, UI_DEFAULTS.tokenRateCap),
-  clipMode:               lsBool(STORAGE_KEYS.clipMode, UI_DEFAULTS.clipMode),
+  tokenRateCap:           UI_DEFAULTS.tokenRateCap,
+  clipMode:               UI_DEFAULTS.clipMode,
   semanticInference:      lsBool(STORAGE_KEYS.semanticInference, UI_DEFAULTS.semanticInference),
   semanticFramesPerChunk: lsNum(STORAGE_KEYS.semanticFramesPerChunk, UI_DEFAULTS.semanticFramesPerChunk),
   // Gate engine
-  sceneCutHammingThreshold: lsNum(STORAGE_KEYS.sceneCutHammingThreshold, UI_DEFAULTS.sceneCutHammingThreshold),
-  lumaShiftThreshold:       lsNum(STORAGE_KEYS.lumaShiftThreshold, UI_DEFAULTS.lumaShiftThreshold),
-  loopDetection:            lsBool(STORAGE_KEYS.loopDetection, UI_DEFAULTS.loopDetection),
-  loopRepeatTrigger:        lsNum(STORAGE_KEYS.loopRepeatTrigger, UI_DEFAULTS.loopRepeatTrigger),
+  sceneCutHammingThreshold: UI_DEFAULTS.sceneCutHammingThreshold,
+  lumaShiftThreshold:       UI_DEFAULTS.lumaShiftThreshold,
+  loopDetection:            UI_DEFAULTS.loopDetection,
+  loopRepeatTrigger:        UI_DEFAULTS.loopRepeatTrigger,
   // Advanced
-  gpuDecode:  ls(STORAGE_KEYS.gpuDecode, UI_DEFAULTS.gpuDecode),
+  gpuDecode:  UI_DEFAULTS.gpuDecode,
 })
 
 // ── Models fetched from API ───────────────────────────────────────────────────
@@ -127,19 +127,8 @@ function saveSettings(): void {
   // Stream
   localStorage.setItem(STORAGE_KEYS.fps,                      String(form.fps))
   localStorage.setItem(STORAGE_KEYS.chunkSize,                String(form.chunkSize))
-  localStorage.setItem(STORAGE_KEYS.tokenRateCap,             String(form.tokenRateCap))
-  localStorage.setItem(STORAGE_KEYS.clipMode,                 String(form.clipMode))
   localStorage.setItem(STORAGE_KEYS.semanticInference,        String(form.semanticInference))
   localStorage.setItem(STORAGE_KEYS.semanticFramesPerChunk,   String(form.semanticFramesPerChunk))
-
-  // Gate engine
-  localStorage.setItem(STORAGE_KEYS.sceneCutHammingThreshold, String(form.sceneCutHammingThreshold))
-  localStorage.setItem(STORAGE_KEYS.lumaShiftThreshold,       String(form.lumaShiftThreshold))
-  localStorage.setItem(STORAGE_KEYS.loopDetection,            String(form.loopDetection))
-  localStorage.setItem(STORAGE_KEYS.loopRepeatTrigger,        String(form.loopRepeatTrigger))
-
-  // Advanced
-  localStorage.setItem(STORAGE_KEYS.gpuDecode,  form.gpuDecode)
 
   saved.value = true
   setTimeout(() => { saved.value = false }, 2000)
@@ -299,7 +288,7 @@ function toggle(section: SectionKey): void {
         <!-- TURN server URL -->
         <div class="space-y-1.5">
           <label class="text-[#94a3b8] text-xs font-medium" for="turn-url">TURN Server URL</label>
-          <div class="text-[#475569] text-xs">Optional — required behind symmetric NATs</div>
+          <div class="text-[#475569] text-xs">Supports STUN or credential-less TURN URLs only; configure credentialed TURN relays server-side.</div>
           <input
             id="turn-url"
             v-model="form.turnUrl"
@@ -487,13 +476,15 @@ function toggle(section: SectionKey): void {
         <div class="space-y-2">
           <div class="flex items-center justify-between">
             <label class="text-[#94a3b8] text-xs font-medium">Token Rate Cap <span class="text-[#475569]">(tokens/s, 0 = unlimited)</span></label>
-            <span class="mono text-[#f59e0b] text-sm" data-testid="token-rate-cap-value">{{ form.tokenRateCap === 0 ? '∞' : form.tokenRateCap }}</span>
+            <span class="mono text-[#64748b] text-sm" data-testid="token-rate-cap-value">{{ form.tokenRateCap === 0 ? '∞' : form.tokenRateCap }}</span>
           </div>
+          <div class="text-[#475569] text-xs">Configured server-side and cannot be changed from the browser.</div>
           <input
             v-model.number="form.tokenRateCap"
             data-testid="token-rate-cap"
             type="range" min="0" max="500" step="10"
-            class="w-full accent-[#2dd4bf] cursor-pointer"
+            disabled
+            class="w-full accent-[#64748b] cursor-not-allowed opacity-60"
           />
           <div class="flex justify-between text-xs text-[#475569] mono">
             <span>unlimited</span><span>500 t/s</span>
@@ -504,17 +495,17 @@ function toggle(section: SectionKey): void {
         <div class="flex items-center justify-between">
           <div>
             <div class="text-[#94a3b8] text-xs font-medium">Clip Mode</div>
-            <div class="text-[#475569] text-xs mt-0.5">Send temporal multi-frame clips to VLM</div>
+            <div class="text-[#475569] text-xs mt-0.5">This page does not send clip_mode; streaming clip mode is applied through the WHIP attach path, not from this page.</div>
           </div>
           <button
             data-testid="clip-mode-toggle"
-            class="relative rounded-full transition-colors duration-200 shrink-0"
+            class="relative rounded-full transition-colors duration-200 shrink-0 cursor-not-allowed opacity-60"
             style="width:40px;height:22px;"
             :style="form.clipMode ? 'background:#2dd4bf;' : 'background:#1e2633;'"
             :aria-pressed="form.clipMode"
             role="switch"
             :aria-checked="form.clipMode"
-            @click="form.clipMode = !form.clipMode"
+            disabled
           >
             <div
               class="absolute rounded-full bg-white transition-transform duration-200"
@@ -588,6 +579,9 @@ function toggle(section: SectionKey): void {
 
       <div v-if="openSection === 'gate'"
            class="px-5 pb-5 pt-4 space-y-5 border-t border-[#1e2633]">
+        <p class="text-[#475569] text-xs">
+          Gate thresholds and loop detection are configured server-side and cannot be changed from the browser.
+        </p>
 
         <!-- Scene cut Hamming threshold -->
         <div class="space-y-2">
@@ -600,8 +594,10 @@ function toggle(section: SectionKey): void {
           </div>
           <input
             v-model.number="form.sceneCutHammingThreshold"
+            data-testid="scene-cut-hamming-threshold"
             type="range" min="1" max="32" step="1"
-            class="w-full accent-[#2dd4bf] cursor-pointer"
+            disabled
+            class="w-full accent-[#64748b] cursor-not-allowed opacity-60"
           />
           <div class="flex justify-between text-xs text-[#475569] mono">
             <span>1 (strict)</span><span>32 (loose)</span>
@@ -619,8 +615,10 @@ function toggle(section: SectionKey): void {
           </div>
           <input
             v-model.number="form.lumaShiftThreshold"
+            data-testid="luma-shift-threshold"
             type="range" min="0.01" max="1.0" step="0.01"
-            class="w-full accent-[#2dd4bf] cursor-pointer"
+            disabled
+            class="w-full accent-[#64748b] cursor-not-allowed opacity-60"
           />
           <div class="flex justify-between text-xs text-[#475569] mono">
             <span>0.01</span><span>1.0</span>
@@ -634,13 +632,14 @@ function toggle(section: SectionKey): void {
             <div class="text-[#475569] text-xs mt-0.5">Detect repeating screen states via pHash ring</div>
           </div>
           <button
-            class="relative rounded-full transition-colors duration-200 shrink-0"
+            data-testid="loop-detection-toggle"
+            class="relative rounded-full transition-colors duration-200 shrink-0 cursor-not-allowed opacity-60"
             style="width:40px;height:22px;"
             :style="form.loopDetection ? 'background:#2dd4bf;' : 'background:#1e2633;'"
             :aria-pressed="form.loopDetection"
             role="switch"
             :aria-checked="form.loopDetection"
-            @click="form.loopDetection = !form.loopDetection"
+            disabled
           >
             <div
               class="absolute rounded-full bg-white transition-transform duration-200"
@@ -661,8 +660,10 @@ function toggle(section: SectionKey): void {
           </div>
           <input
             v-model.number="form.loopRepeatTrigger"
+            data-testid="loop-repeat-trigger"
             type="range" min="1" max="8" step="1"
-            class="w-full accent-[#2dd4bf] cursor-pointer"
+            disabled
+            class="w-full accent-[#64748b] cursor-not-allowed opacity-60"
           />
           <div class="flex justify-between text-xs text-[#475569] mono">
             <span>1</span><span>8</span>
@@ -690,6 +691,9 @@ function toggle(section: SectionKey): void {
 
       <div v-if="openSection === 'advanced'"
            class="px-5 pb-5 pt-4 space-y-5 border-t border-[#1e2633]">
+        <p class="text-[#475569] text-xs">
+          Advanced runtime options are configured server-side and cannot be changed from the browser.
+        </p>
 
         <!-- GPU decode -->
         <div class="space-y-1.5">
@@ -697,7 +701,9 @@ function toggle(section: SectionKey): void {
           <select
             id="gpu-decode"
             v-model="form.gpuDecode"
-            class="w-full px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] outline-none"
+            data-testid="gpu-decode"
+            disabled
+            class="w-full px-3 py-2 rounded-[8px] mono text-sm text-[#64748b] outline-none cursor-not-allowed opacity-70"
             style="background: #050507; border: 1px solid #1e2633;"
           >
             <option value="auto">auto (detect nvidia-smi)</option>
