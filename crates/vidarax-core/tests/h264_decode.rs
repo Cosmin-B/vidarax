@@ -16,6 +16,7 @@ fn software_decoder_creates_without_panic() {
 }
 
 #[test]
+#[cfg(not(feature = "vp8"))]
 fn vp8_selects_unsupported_without_spawning_ffmpeg() {
     assert_eq!(
         DecoderBackend::select(false, VideoCodec::Vp8),
@@ -45,6 +46,32 @@ fn vp8_selects_unsupported_without_spawning_ffmpeg() {
 }
 
 #[test]
+#[cfg(feature = "vp8")]
+fn vp8_selects_native_decoder() {
+    assert_eq!(
+        DecoderBackend::select(false, VideoCodec::Vp8),
+        DecoderBackend::Vp8
+    );
+    assert_eq!(
+        DecoderBackend::select(true, VideoCodec::Vp8),
+        DecoderBackend::Vp8
+    );
+
+    for gpu_available in [false, true] {
+        let config = DecoderConfig {
+            gpu_available,
+            codec: VideoCodec::Vp8,
+            width: 1280,
+            height: 720,
+            output_pool_slots: 1,
+        };
+        let decoder = Decoder::new(&config);
+        assert!(matches!(decoder, Decoder::Vp8 { .. }));
+    }
+}
+
+#[test]
+#[cfg(not(feature = "vp8"))]
 fn vp8_decode_returns_unsupported_codec_error() {
     let config = DecoderConfig {
         gpu_available: false,
@@ -56,6 +83,24 @@ fn vp8_decode_returns_unsupported_codec_error() {
     let mut decoder = Decoder::new(&config);
     let err = decoder.decode(b"vp8 payload").unwrap_err();
     assert!(matches!(
+        err,
+        DecodeError::UnsupportedCodec(VideoCodec::Vp8)
+    ));
+}
+
+#[test]
+#[cfg(feature = "vp8")]
+fn vp8_decode_does_not_return_unsupported_codec_error() {
+    let config = DecoderConfig {
+        gpu_available: false,
+        codec: VideoCodec::Vp8,
+        width: 1280,
+        height: 720,
+        output_pool_slots: 1,
+    };
+    let mut decoder = Decoder::new(&config);
+    let err = decoder.decode(b"vp8 payload").unwrap_err();
+    assert!(!matches!(
         err,
         DecodeError::UnsupportedCodec(VideoCodec::Vp8)
     ));

@@ -1,13 +1,26 @@
 //! WebRTC video decoders for H.264 and unsupported negotiated codecs.
 //!
 //! GPU H.264 uses a long-lived ffmpeg sidecar; software H.264 uses openh264
-//! in-process.
+//! in-process. With `--features vp8`, VP8 uses libvpx in-process.
 
 use std::collections::VecDeque;
+#[cfg(feature = "vp8")]
+use std::ffi::CStr;
 use std::io::{BufReader, Read, Write};
+#[cfg(feature = "vp8")]
+use std::mem::MaybeUninit;
+#[cfg(feature = "vp8")]
+use std::os::raw::{c_int, c_uint};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{mpsc, Arc};
 
+#[cfg(feature = "vp8")]
+use vpx_sys::{
+    vpx_codec_ctx_t, vpx_codec_dec_init_ver, vpx_codec_decode, vpx_codec_destroy,
+    vpx_codec_err_t, vpx_codec_error, vpx_codec_error_detail, vpx_codec_get_frame,
+    vpx_codec_iter_t, vpx_codec_vp8_dx, vpx_image_t, vpx_img_fmt_t,
+    VPX_DECODER_ABI_VERSION,
+};
 use openh264::formats::YUVSource;
 
 use crate::metrics::PipelineMetrics;
@@ -105,6 +118,9 @@ pub enum DecoderBackend {
     Software,
     /// CPU ffmpeg pipe path.
     FfmpegSw,
+    /// In-process libvpx VP8 path.
+    #[cfg(feature = "vp8")]
+    Vp8,
     /// No supported live decoder for the negotiated codec.
     Unsupported,
 }
@@ -112,6 +128,9 @@ pub enum DecoderBackend {
 impl DecoderBackend {
     pub fn select(gpu_available: bool, codec: VideoCodec) -> Self {
         match (gpu_available, codec) {
+            #[cfg(feature = "vp8")]
+            (_, VideoCodec::Vp8) => DecoderBackend::Vp8,
+            #[cfg(not(feature = "vp8"))]
             (_, VideoCodec::Vp8) => DecoderBackend::Unsupported,
             (true, VideoCodec::H264) => DecoderBackend::NvDec,
             (false, VideoCodec::H264) => DecoderBackend::Software,
@@ -122,6 +141,8 @@ impl DecoderBackend {
         match self {
             DecoderBackend::NvDec | DecoderBackend::FfmpegSw => FFMPEG_YUV_READER_POOL_MIN_SLOTS,
             DecoderBackend::Software => SOFTWARE_YUV_POOL_MIN_SLOTS,
+            #[cfg(feature = "vp8")]
+            DecoderBackend::Vp8 => SOFTWARE_YUV_POOL_MIN_SLOTS,
             DecoderBackend::Unsupported => 0,
         }
     }
@@ -235,6 +256,9 @@ pub enum DecodeError {
     FlushError(std::io::Error),
     /// openh264 reported a hard decode error (bad bitstream, invalid state).
     SoftwareDecode(String),
+    /// libvpx reported a hard decode error or unsupported output shape.
+    #[cfg(feature = "vp8")]
+    Vp8Decode(String),
     /// The negotiated codec has no supported live decoder in this build.
     UnsupportedCodec(VideoCodec),
 }
@@ -247,6 +271,8 @@ impl std::fmt::Display for DecodeError {
             DecodeError::WriteError(e) => write!(f, "ffmpeg write: {e}"),
             DecodeError::FlushError(e) => write!(f, "ffmpeg flush: {e}"),
             DecodeError::SoftwareDecode(e) => write!(f, "openh264 decode error: {e}"),
+            #[cfg(feature = "vp8")]
+            DecodeError::Vp8Decode(e) => write!(f, "libvpx decode error: {e}"),
             DecodeError::UnsupportedCodec(codec) => {
                 write!(f, "no supported decoder for {codec:?}")
             }
@@ -259,6 +285,48 @@ impl std::error::Error for DecodeError {
         match self {
             DecodeError::WriteError(e) | DecodeError::FlushError(e) => Some(e),
             _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "vp8")]
+pub struct Vp8DecoderCtx {
+    ctx: Box<vpx_codec_ctx_t>,
+}
+
+#[cfg(feature = "vp8")]
+impl Vp8DecoderCtx {
+    fn new() -> Self {
+        // A zeroed vpx_codec_ctx_t is the libvpx-required initial state.
+        let mut ctx = Box::new(unsafe { MaybeUninit::<vpx_codec_ctx_t>::zeroed().assume_init() });
+        let ctx_ptr = ctx.as_mut() as *mut vpx_codec_ctx_t;
+        // ctx_ptr is stable inside Box and cfg is null per libvpx defaults.
+        let result = unsafe {
+            vpx_codec_dec_init_ver(
+                ctx_ptr,
+                vpx_codec_vp8_dx(),
+                std::ptr::null(),
+                0,
+                VPX_DECODER_ABI_VERSION as c_int,
+            )
+        };
+        if result != vpx_codec_err_t::VPX_CODEC_OK {
+            panic!("libvpx VP8 decoder initialisation failed: {result:?}");
+        }
+        Self { ctx }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut vpx_codec_ctx_t {
+        self.ctx.as_mut() as *mut vpx_codec_ctx_t
+    }
+}
+
+#[cfg(feature = "vp8")]
+impl Drop for Vp8DecoderCtx {
+    fn drop(&mut self) {
+        // ctx was initialised by vpx_codec_dec_init_ver and is destroyed once here.
+        unsafe {
+            vpx_codec_destroy(self.as_mut_ptr());
         }
     }
 }
@@ -291,6 +359,13 @@ pub enum Decoder {
     /// In-process openh264 decoder.
     Software {
         decoder: openh264::decoder::Decoder,
+        scratch: SoftwareScratch,
+        yuv_pools: YuvPlanePools,
+    },
+    /// In-process libvpx VP8 decoder.
+    #[cfg(feature = "vp8")]
+    Vp8 {
+        ctx: Vp8DecoderCtx,
         scratch: SoftwareScratch,
         yuv_pools: YuvPlanePools,
     },
@@ -475,9 +550,9 @@ impl Decoder {
     /// | `gpu_available` | `codec`          | Backend     |
     /// |-----------------|------------------|-------------|
     /// | `true`          | H.264            | `NvDec`     |
-    /// | `true`          | VP8              | `Unsupported` |
+    /// | `true`          | VP8              | `Vp8` with `--features vp8`; otherwise `Unsupported` |
     /// | `false`         | H.264            | `Software`  |
-    /// | `false`         | VP8              | `Unsupported` |
+    /// | `false`         | VP8              | `Vp8` with `--features vp8`; otherwise `Unsupported` |
     ///
     /// # Panics
     ///
@@ -503,6 +578,10 @@ impl Decoder {
             DecoderBackend::Software => {
                 Self::new_software(config.width, config.height, config.output_pool_slots)
             }
+            #[cfg(feature = "vp8")]
+            DecoderBackend::Vp8 => {
+                Self::new_vp8(config.width, config.height, config.output_pool_slots)
+            }
             DecoderBackend::FfmpegSw => Self::new_ffmpeg_sw(
                 config.codec,
                 config.width,
@@ -513,6 +592,16 @@ impl Decoder {
             DecoderBackend::Unsupported => Decoder::Unsupported {
                 codec: config.codec,
             },
+        }
+    }
+
+    #[cfg(feature = "vp8")]
+    fn new_vp8(width: u32, height: u32, output_pool_slots: usize) -> Self {
+        let output_pool_slots = output_pool_slots.max(SOFTWARE_YUV_POOL_MIN_SLOTS);
+        Decoder::Vp8 {
+            ctx: Vp8DecoderCtx::new(),
+            scratch: SoftwareScratch::default(),
+            yuv_pools: YuvPlanePools::new(width, height, output_pool_slots),
         }
     }
 
@@ -666,6 +755,12 @@ impl Decoder {
                 scratch,
                 yuv_pools,
             } => Self::decode_software(decoder, scratch, yuv_pools, payload),
+            #[cfg(feature = "vp8")]
+            Decoder::Vp8 {
+                ctx,
+                scratch,
+                yuv_pools,
+            } => Self::decode_vp8(ctx, scratch, yuv_pools, payload),
             Decoder::Unsupported { codec } => Err(DecodeError::UnsupportedCodec(*codec)),
         }
     }
@@ -727,6 +822,148 @@ impl Decoder {
             height: height as u32,
         })
     }
+
+    #[cfg(feature = "vp8")]
+    fn decode_vp8(
+        ctx: &mut Vp8DecoderCtx,
+        scratch: &mut SoftwareScratch,
+        yuv_pools: &YuvPlanePools,
+        payload: &[u8],
+    ) -> Result<YuvFrame, DecodeError> {
+        let ctx_ptr = ctx.as_mut_ptr();
+        let payload_len = c_uint::try_from(payload.len())
+            .map_err(|_| DecodeError::Vp8Decode("VP8 payload too large".to_string()))?;
+        // ctx_ptr is a live decoder and payload points to immutable bytes for this call.
+        let result = unsafe {
+            vpx_codec_decode(
+                ctx_ptr,
+                payload.as_ptr(),
+                payload_len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != vpx_codec_err_t::VPX_CODEC_OK {
+            return Err(DecodeError::Vp8Decode(vpx_error_message(ctx_ptr)));
+        }
+
+        let mut iter: vpx_codec_iter_t = std::ptr::null();
+        let mut output: *mut vpx_image_t = std::ptr::null_mut();
+        loop {
+            // iter is owned by libvpx for this drain and ctx remains live.
+            let img = unsafe { vpx_codec_get_frame(ctx_ptr, &mut iter) };
+            if img.is_null() {
+                break;
+            }
+            if output.is_null() {
+                output = img;
+            } else {
+                return Err(DecodeError::Vp8Decode(
+                    "multiple frames returned for one VP8 access unit".to_string(),
+                ));
+            }
+        }
+
+        if output.is_null() {
+            return Err(DecodeError::Buffered);
+        }
+
+        // output points to decoder-owned image memory valid until the next decode call.
+        let img = unsafe { &*output };
+        if img.fmt != vpx_img_fmt_t::VPX_IMG_FMT_I420 {
+            return Err(DecodeError::Vp8Decode(format!(
+                "unsupported libvpx image format {:?}",
+                img.fmt
+            )));
+        }
+
+        let width = img.d_w as usize;
+        let height = img.d_h as usize;
+        if width % 2 != 0 || height % 2 != 0 {
+            return Err(DecodeError::Vp8Decode(
+                "odd VP8 frame dimensions unsupported".to_string(),
+            ));
+        }
+
+        copy_vpx_plane(
+            &mut scratch.y,
+            img.planes[0],
+            img.stride[0],
+            width,
+            height,
+        )?;
+
+        let uv_width = width / 2;
+        let uv_height = height / 2;
+        copy_vpx_plane(
+            &mut scratch.u,
+            img.planes[1],
+            img.stride[1],
+            uv_width,
+            uv_height,
+        )?;
+        copy_vpx_plane(
+            &mut scratch.v,
+            img.planes[2],
+            img.stride[2],
+            uv_width,
+            uv_height,
+        )?;
+
+        Ok(YuvFrame {
+            y: yuv_pools.y.copy_from_slice(&scratch.y),
+            u: yuv_pools.u.copy_from_slice(&scratch.u),
+            v: yuv_pools.v.copy_from_slice(&scratch.v),
+            width: img.d_w,
+            height: img.d_h,
+        })
+    }
+}
+
+#[cfg(feature = "vp8")]
+fn copy_vpx_plane(
+    dst: &mut Vec<u8>,
+    src: *const u8,
+    stride: c_int,
+    width: usize,
+    height: usize,
+) -> Result<(), DecodeError> {
+    let stride = usize::try_from(stride).map_err(|_| {
+        DecodeError::Vp8Decode("invalid libvpx plane layout".to_string())
+    })?;
+    if src.is_null() || stride < width {
+        return Err(DecodeError::Vp8Decode("invalid libvpx plane layout".to_string()));
+    }
+
+    dst.clear();
+    dst.reserve(width * height);
+    for row in 0..height {
+        // src is a top-down libvpx plane with at least width active bytes in this row.
+        let row_slice = unsafe { std::slice::from_raw_parts(src.add(row * stride), width) };
+        dst.extend_from_slice(row_slice);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "vp8")]
+fn vpx_error_message(ctx: *mut vpx_codec_ctx_t) -> String {
+    // ctx is a live decoder and libvpx returns null or static C strings.
+    let base = unsafe { c_string_or_default(vpx_codec_error(ctx), "unknown libvpx error") };
+    // ctx is a live decoder and detail is optional.
+    let detail = unsafe { c_string_or_default(vpx_codec_error_detail(ctx), "") };
+    if detail.is_empty() {
+        base
+    } else {
+        format!("{base}: {detail}")
+    }
+}
+
+#[cfg(feature = "vp8")]
+unsafe fn c_string_or_default(ptr: *const std::os::raw::c_char, default: &str) -> String {
+    if ptr.is_null() {
+        return default.to_string();
+    }
+    CStr::from_ptr(ptr).to_string_lossy().into_owned()
 }
 
 impl Drop for Decoder {
@@ -736,6 +973,8 @@ impl Drop for Decoder {
                 // Best-effort kill; ignore errors during shutdown.
                 let _ = child.kill();
             }
+            #[cfg(feature = "vp8")]
+            Decoder::Vp8 { .. } => {}
             Decoder::Software { .. } | Decoder::Unsupported { .. } => {}
         }
     }
