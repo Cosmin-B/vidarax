@@ -1,7 +1,7 @@
-//! WebRTC video decoders for H.264 and VP8.
+//! WebRTC video decoders for H.264 and unsupported negotiated codecs.
 //!
-//! GPU and VP8 paths use a long-lived ffmpeg sidecar; software H.264 uses
-//! openh264 in-process.
+//! GPU H.264 uses a long-lived ffmpeg sidecar; software H.264 uses openh264
+//! in-process.
 
 use std::collections::VecDeque;
 use std::io::{BufReader, Read, Write};
@@ -87,11 +87,11 @@ impl VideoCodec {
         VideoCodec::H264
     }
 
-    /// ffmpeg input format flag for this codec (used by the ffmpeg sidecar).
-    fn ffmpeg_input_format(self) -> &'static str {
+    /// ffmpeg input format flag for codecs with a live sidecar input path.
+    fn ffmpeg_input_format(self) -> Option<&'static str> {
         match self {
-            VideoCodec::H264 => "h264",
-            VideoCodec::Vp8 => "vp8",
+            VideoCodec::H264 => Some("h264"),
+            VideoCodec::Vp8 => None,
         }
     }
 }
@@ -105,17 +105,16 @@ pub enum DecoderBackend {
     Software,
     /// CPU ffmpeg pipe path.
     FfmpegSw,
+    /// No supported live decoder for the negotiated codec.
+    Unsupported,
 }
 
 impl DecoderBackend {
     pub fn select(gpu_available: bool, codec: VideoCodec) -> Self {
-        if gpu_available {
-            DecoderBackend::NvDec
-        } else {
-            match codec {
-                VideoCodec::H264 => DecoderBackend::Software,
-                VideoCodec::Vp8 => DecoderBackend::FfmpegSw,
-            }
+        match (gpu_available, codec) {
+            (_, VideoCodec::Vp8) => DecoderBackend::Unsupported,
+            (true, VideoCodec::H264) => DecoderBackend::NvDec,
+            (false, VideoCodec::H264) => DecoderBackend::Software,
         }
     }
 
@@ -123,6 +122,7 @@ impl DecoderBackend {
         match self {
             DecoderBackend::NvDec | DecoderBackend::FfmpegSw => FFMPEG_YUV_READER_POOL_MIN_SLOTS,
             DecoderBackend::Software => SOFTWARE_YUV_POOL_MIN_SLOTS,
+            DecoderBackend::Unsupported => 0,
         }
     }
 }
@@ -235,6 +235,8 @@ pub enum DecodeError {
     FlushError(std::io::Error),
     /// openh264 reported a hard decode error (bad bitstream, invalid state).
     SoftwareDecode(String),
+    /// The negotiated codec has no supported live decoder in this build.
+    UnsupportedCodec(VideoCodec),
 }
 
 impl std::fmt::Display for DecodeError {
@@ -245,6 +247,9 @@ impl std::fmt::Display for DecodeError {
             DecodeError::WriteError(e) => write!(f, "ffmpeg write: {e}"),
             DecodeError::FlushError(e) => write!(f, "ffmpeg flush: {e}"),
             DecodeError::SoftwareDecode(e) => write!(f, "openh264 decode error: {e}"),
+            DecodeError::UnsupportedCodec(codec) => {
+                write!(f, "no supported decoder for {codec:?}")
+            }
         }
     }
 }
@@ -258,8 +263,8 @@ impl std::error::Error for DecodeError {
     }
 }
 
-/// Multi-codec video decoder backed by either NVDEC, openh264, or a software
-/// ffmpeg sidecar.
+/// Multi-codec video decoder backed by either NVDEC, openh264, or an explicit
+/// unsupported state.
 ///
 /// The ffmpeg pipe paths (`NvDec`, `FfmpegSw`) use a dedicated reader thread
 /// to avoid deadlocks: H.264 commonly requires multiple NAL units (SPS, PPS,
@@ -301,6 +306,8 @@ pub enum Decoder {
         width: u32,
         height: u32,
     },
+    /// Negotiated codec with no working live decoder.
+    Unsupported { codec: VideoCodec },
 }
 
 /// Spawn a reader thread for complete YUV420 frames from ffmpeg stdout.
@@ -467,14 +474,15 @@ impl Decoder {
     ///
     /// | `gpu_available` | `codec`          | Backend     |
     /// |-----------------|------------------|-------------|
-    /// | `true`          | H.264 or VP8     | `NvDec`     |
+    /// | `true`          | H.264            | `NvDec`     |
+    /// | `true`          | VP8              | `Unsupported` |
     /// | `false`         | H.264            | `Software`  |
-    /// | `false`         | VP8              | `FfmpegSw`  |
+    /// | `false`         | VP8              | `Unsupported` |
     ///
     /// # Panics
     ///
     /// Panics if the selected backend cannot be initialised (ffmpeg not found
-    /// for `NvDec`/`FfmpegSw`, or openh264 library init failure for `Software`).
+    /// for `NvDec`, or openh264 library init failure for `Software`).
     pub fn new(config: &DecoderConfig) -> Self {
         Self::new_inner(config, None)
     }
@@ -484,27 +492,27 @@ impl Decoder {
     }
 
     fn new_inner(config: &DecoderConfig, metrics: Option<Arc<PipelineMetrics>>) -> Self {
-        if config.gpu_available {
-            Self::new_nvdec(
+        match DecoderBackend::select(config.gpu_available, config.codec) {
+            DecoderBackend::NvDec => Self::new_nvdec(
                 config.codec,
                 config.width,
                 config.height,
                 config.output_pool_slots,
                 metrics,
-            )
-        } else {
-            match config.codec {
-                VideoCodec::H264 => {
-                    Self::new_software(config.width, config.height, config.output_pool_slots)
-                }
-                VideoCodec::Vp8 => Self::new_ffmpeg_sw(
-                    config.codec,
-                    config.width,
-                    config.height,
-                    config.output_pool_slots,
-                    metrics,
-                ),
+            ),
+            DecoderBackend::Software => {
+                Self::new_software(config.width, config.height, config.output_pool_slots)
             }
+            DecoderBackend::FfmpegSw => Self::new_ffmpeg_sw(
+                config.codec,
+                config.width,
+                config.height,
+                config.output_pool_slots,
+                metrics,
+            ),
+            DecoderBackend::Unsupported => Decoder::Unsupported {
+                codec: config.codec,
+            },
         }
     }
 
@@ -520,8 +528,7 @@ impl Decoder {
     }
 
     /// Spawn an ffmpeg sidecar using `-hwaccel auto` so the same process
-    /// handles both H.264 (NVDEC) and VP8 (GPU VP8 decode) without needing to
-    /// hard-code the codec decoder name.
+    /// handles H.264 without hard-coding a decoder name.
     fn new_nvdec(
         codec: VideoCodec,
         width: u32,
@@ -529,7 +536,9 @@ impl Decoder {
         output_pool_slots: usize,
         metrics: Option<Arc<PipelineMetrics>>,
     ) -> Self {
-        let input_fmt = codec.ffmpeg_input_format();
+        let input_fmt = codec
+            .ffmpeg_input_format()
+            .expect("ffmpeg sidecar input is only defined for H.264");
         let mut child = Command::new(crate::ingest::ffmpeg_path())
             .args([
                 "-hwaccel",
@@ -569,11 +578,8 @@ impl Decoder {
         }
     }
 
-    /// Spawn a software-only ffmpeg sidecar for VP8 decode on CPU.
-    ///
-    /// Uses ffmpeg's bundled `libvpx` decoder; no GPU or special codec flags
-    /// required.  The `-s` scaling hint is not passed because VP8 streams carry
-    /// their dimensions in-band; ffmpeg reads them from the bitstream headers.
+    /// Spawn a software-only ffmpeg sidecar for codecs with a live raw input
+    /// format.
     fn new_ffmpeg_sw(
         codec: VideoCodec,
         width: u32,
@@ -581,7 +587,9 @@ impl Decoder {
         output_pool_slots: usize,
         metrics: Option<Arc<PipelineMetrics>>,
     ) -> Self {
-        let input_fmt = codec.ffmpeg_input_format();
+        let input_fmt = codec
+            .ffmpeg_input_format()
+            .expect("ffmpeg sidecar input is only defined for H.264");
         let mut child = Command::new(crate::ingest::ffmpeg_path())
             .args([
                 "-f", input_fmt, "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1",
@@ -590,7 +598,7 @@ impl Decoder {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .expect("ffmpeg software VP8 spawn failed — is ffmpeg with libvpx available?");
+            .expect("ffmpeg software sidecar spawn failed");
 
         let stdin = child.stdin.take().expect("ffmpeg stdin missing");
         let stdout = BufReader::new(child.stdout.take().expect("ffmpeg stdout missing"));
@@ -658,6 +666,7 @@ impl Decoder {
                 scratch,
                 yuv_pools,
             } => Self::decode_software(decoder, scratch, yuv_pools, payload),
+            Decoder::Unsupported { codec } => Err(DecodeError::UnsupportedCodec(*codec)),
         }
     }
 
@@ -727,7 +736,7 @@ impl Drop for Decoder {
                 // Best-effort kill; ignore errors during shutdown.
                 let _ = child.kill();
             }
-            Decoder::Software { .. } => {}
+            Decoder::Software { .. } | Decoder::Unsupported { .. } => {}
         }
     }
 }
@@ -795,8 +804,8 @@ mod tests {
 
     #[test]
     fn ffmpeg_input_format_strings_are_correct() {
-        assert_eq!(VideoCodec::H264.ffmpeg_input_format(), "h264");
-        assert_eq!(VideoCodec::Vp8.ffmpeg_input_format(), "vp8");
+        assert_eq!(VideoCodec::H264.ffmpeg_input_format(), Some("h264"));
+        assert_eq!(VideoCodec::Vp8.ffmpeg_input_format(), None);
     }
 
     #[test]

@@ -1,4 +1,6 @@
-use vidarax_core::webrtc::decode::{Decoder, DecoderConfig, VideoCodec, YuvFrame};
+use vidarax_core::webrtc::decode::{
+    DecodeError, Decoder, DecoderBackend, DecoderConfig, VideoCodec, YuvFrame,
+};
 
 #[test]
 fn software_decoder_creates_without_panic() {
@@ -14,7 +16,36 @@ fn software_decoder_creates_without_panic() {
 }
 
 #[test]
-fn ffmpeg_sw_decoder_selects_for_vp8_no_gpu() {
+fn vp8_selects_unsupported_without_spawning_ffmpeg() {
+    assert_eq!(
+        DecoderBackend::select(false, VideoCodec::Vp8),
+        DecoderBackend::Unsupported
+    );
+    assert_eq!(
+        DecoderBackend::select(true, VideoCodec::Vp8),
+        DecoderBackend::Unsupported
+    );
+
+    for gpu_available in [false, true] {
+        let config = DecoderConfig {
+            gpu_available,
+            codec: VideoCodec::Vp8,
+            width: 1280,
+            height: 720,
+            output_pool_slots: 1,
+        };
+        let decoder = Decoder::new(&config);
+        assert!(matches!(
+            decoder,
+            Decoder::Unsupported {
+                codec: VideoCodec::Vp8
+            }
+        ));
+    }
+}
+
+#[test]
+fn vp8_decode_returns_unsupported_codec_error() {
     let config = DecoderConfig {
         gpu_available: false,
         codec: VideoCodec::Vp8,
@@ -22,8 +53,12 @@ fn ffmpeg_sw_decoder_selects_for_vp8_no_gpu() {
         height: 720,
         output_pool_slots: 1,
     };
-    let decoder = Decoder::new(&config);
-    assert!(matches!(decoder, Decoder::FfmpegSw { .. }));
+    let mut decoder = Decoder::new(&config);
+    let err = decoder.decode(b"vp8 payload").unwrap_err();
+    assert!(matches!(
+        err,
+        DecodeError::UnsupportedCodec(VideoCodec::Vp8)
+    ));
 }
 
 #[test]
