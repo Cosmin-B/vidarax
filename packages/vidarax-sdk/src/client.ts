@@ -61,6 +61,10 @@ import type {
   WhipSession,
 } from "./types.js";
 
+// Default model used when a caller does not specify one. Must be a model id
+// present in the server's model contract, otherwise the request is rejected.
+const DEFAULT_MODEL = "Qwen/Qwen3-VL-2B-Instruct";
+
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
 /** Sleep for `ms` milliseconds. */
@@ -293,7 +297,7 @@ export class Vidarax {
    * Create a new run resource.
    *
    * @example
-   * const { run_id } = await v.createRun({ mode: 'analysis', model: 'llama3.2-vision' })
+   * const { run_id } = await v.createRun({ mode: 'analysis', model: 'Qwen/Qwen3-VL-2B-Instruct' })
    */
   async createRun(options: CreateRunRequest = {}): Promise<CreateRunResponse> {
     return this.post<CreateRunResponse>("/v1/runs", options);
@@ -456,7 +460,7 @@ export class Vidarax {
 
     // 4. Analyze — run the pipeline over the decoded frames.
     const analyzeOpts: AnalyzeFramesRequest = {
-      model: options.model ?? "llama3.2-vision:11b",
+      model: options.model ?? DEFAULT_MODEL,
     };
     if (options.mode !== undefined) analyzeOpts.mode = options.mode;
     if (options.windowSize !== undefined) analyzeOpts.window_size = options.windowSize;
@@ -537,7 +541,7 @@ export class Vidarax {
     const { model, prompt, ...rest } = options;
 
     const body: InferRequest = {
-      model: model ?? "llama3.2-vision:11b",
+      model: model ?? DEFAULT_MODEL,
       prompt,
       ...rest,
     };
