@@ -213,6 +213,8 @@ impl AppStateConfig {
 }
 
 impl AppState {
+    // WAL restoration receives distinct dependencies needed to rebuild AppState.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_wal(
         wal_path: PathBuf,
         ingest_file_roots: Vec<PathBuf>,
@@ -392,9 +394,7 @@ impl AppState {
         run_id: &str,
     ) -> Option<SessionEntry> {
         let mut map = self.sessions.write().await;
-        let Some((principal, existing_run_id, _session)) = map.get(sess_id) else {
-            return None;
-        };
+        let (principal, existing_run_id, _session) = map.get(sess_id)?;
         if &**existing_run_id != run_id {
             return None;
         }
@@ -594,9 +594,7 @@ impl AppState {
                         .map_err(|err| format!("timeline append worker join failure: {err}"))?
                         .map_err(|err| err.to_string());
 
-                        if let Err(err) = write_result {
-                            return Err(err);
-                        }
+                        write_result?;
 
                         state.apply_event_to_registry(&event);
                         guard.commit();

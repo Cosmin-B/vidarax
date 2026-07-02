@@ -589,7 +589,7 @@ mod tests {
         let cloned = frame.clone();
         assert_eq!(frame.seq, cloned.seq);
         assert_eq!(frame.codec, cloned.codec);
-        let _ = format!("{:?}", cloned);
+        let _ = format!("{cloned:?}");
     }
 
     #[test]
@@ -602,7 +602,7 @@ mod tests {
         };
         let cloned = frame.clone();
         assert_eq!(cloned.codec, VideoCodec::Vp8);
-        let _ = format!("{:?}", cloned);
+        let _ = format!("{cloned:?}");
     }
 
     #[tokio::test]

@@ -13,6 +13,9 @@ struct TenantLabelMap {
     objects: HashMap<String, String>,
 }
 
+#[cfg(test)]
+type TenantLabelEntries = HashMap<String, (HashMap<String, String>, HashMap<String, String>)>;
+
 #[derive(Debug, Clone)]
 pub struct LabelMapResult {
     pub label: String,
@@ -75,7 +78,7 @@ impl TenantLabelMaps {
     pub(crate) fn from_test_file(
         default_events: HashMap<String, String>,
         default_objects: HashMap<String, String>,
-        tenants: HashMap<String, (HashMap<String, String>, HashMap<String, String>)>,
+        tenants: TenantLabelEntries,
     ) -> Self {
         Self {
             default: TenantLabelMap {

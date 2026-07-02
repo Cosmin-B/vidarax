@@ -523,8 +523,7 @@ fn clip_work_pts_span_covers_window() {
     let span_ms = clip.pts_end.saturating_sub(clip.pts_start);
     assert!(
         span_ms >= 500,
-        "pts span {}ms should be >= 500ms (clip_length_seconds=0.5)",
-        span_ms
+        "pts span {span_ms}ms should be >= 500ms (clip_length_seconds=0.5)"
     );
 }
 

@@ -190,7 +190,7 @@ fn build_single_provider(
                 _ => ProviderKind::Vllm,
             };
 
-            let transport = HttpTransport::new(&base_url)
+            let transport = HttpTransport::new(base_url)
                 .map_err(|e| format!("backend '{}': transport error: {e:?}", entry.name))?;
 
             Ok(Box::new(OpenAiCompatProvider::new(transport, kind)))

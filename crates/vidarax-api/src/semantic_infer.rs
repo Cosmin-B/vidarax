@@ -177,6 +177,8 @@ pub fn load_decoded_signals_from_events(events: &[TimelineEvent]) -> Result<Deco
     })
 }
 
+// Realtime chunk preparation receives distinct decode controls and borrowed pipeline state.
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare_realtime_chunks(
     signals: &[FrameSignal],
     chunk_size: usize,
@@ -618,10 +620,10 @@ pub async fn infer_chunk_semantics(
     }
 }
 
-pub fn select_semantic_images<'a>(
-    chunk_jpegs: &'a [DecodedJpegFrame],
+pub fn select_semantic_images(
+    chunk_jpegs: &[DecodedJpegFrame],
     semantic_frames_per_chunk: usize,
-) -> Vec<&'a DecodedJpegFrame> {
+) -> Vec<&DecodedJpegFrame> {
     if chunk_jpegs.is_empty() {
         return Vec::new();
     }
@@ -715,6 +717,8 @@ fn truncate_context(text: &str, max_chars: usize) -> &str {
 }
 
 #[cfg(test)]
+// Helper functions below the test module are intentionally left in place.
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use vidarax_core::provider::{InferenceResult, ProviderKind};

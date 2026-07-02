@@ -377,6 +377,8 @@ fn try_receive_yuv_frame(frame_rx: &YuvFrameReceiver) -> Result<YuvFrame, Decode
 /// real-time analysis stays as close as possible to the current RTP label while
 /// still never dropping encoded input. The drain-before-write order keeps room
 /// in the bounded reader channel for the reader thread's blocking send.
+// Decodes one pipe payload; the caller supplies distinct state handles and frame metadata.
+#[allow(clippy::too_many_arguments)]
 fn decode_ffmpeg_pipe(
     stdin: &mut impl Write,
     frame_rx: &YuvFrameReceiver,

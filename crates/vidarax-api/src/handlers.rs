@@ -929,8 +929,8 @@ pub async fn analyze_run(
                 label_map_key,
                 &run_id,
                 &stream_id,
-                &mode,
-                &model,
+                mode,
+                model,
                 sampling_policy,
                 sample_fps,
                 segment_ms,
@@ -1157,20 +1157,19 @@ fn validate_realtime_reason_params(
 
     let video_clip_mode = payload.video_clip_mode.unwrap_or(false);
     let video_clip_duration_s = payload.video_clip_duration_s.unwrap_or(0.5);
-    if video_clip_mode {
-        if !video_clip_duration_s.is_finite()
+    if video_clip_mode
+        && (!video_clip_duration_s.is_finite()
             || video_clip_duration_s <= 0.0
-            || video_clip_duration_s > 60.0
-        {
-            return Err(validation_error(
-                state,
-                "invalid realtime reason request",
-                vec![field_error(
-                    "video_clip_duration_s",
-                    "video_clip_duration_s must be in (0, 60]".to_string(),
-                )],
-            ));
-        }
+            || video_clip_duration_s > 60.0)
+    {
+        return Err(validation_error(
+            state,
+            "invalid realtime reason request",
+            vec![field_error(
+                "video_clip_duration_s",
+                "video_clip_duration_s must be in (0, 60]".to_string(),
+            )],
+        ));
     }
 
     let fixed_fps = payload.fixed_fps.unwrap_or(1.0);
@@ -1732,7 +1731,7 @@ pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
             availability: status.to_string(),
             providers_available: providers_available.clone(),
             fallback_candidates: fallback_candidates(model)
-                .into_iter()
+                .iter()
                 .map(ToString::to_string)
                 .collect(),
         });
@@ -1744,7 +1743,7 @@ pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
             availability: status.to_string(),
             providers_available: providers_available.clone(),
             fallback_candidates: fallback_candidates(model)
-                .into_iter()
+                .iter()
                 .map(ToString::to_string)
                 .collect(),
         });
