@@ -8,7 +8,9 @@
 
 import { test, expect } from '@playwright/test'
 import path from 'path'
+import { fileURLToPath } from 'node:url'
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const SCREENSHOTS_DIR = path.join(__dirname, '..', '..', 'screenshots')
 
 function shot(name: string) {

@@ -26,7 +26,7 @@ test.describe('App navigation', () => {
   test('stream page renders at /stream', async ({ page }) => {
     await page.goto('/stream')
     await expect(page).toHaveTitle(/Stream.*Vidarax/i)
-    await expect(page.getByRole('heading', { name: /select source/i })).toBeVisible()
+    await expect(page.getByText('Source', { exact: true })).toBeVisible()
   })
 
   test('upload page renders at /upload', async ({ page }) => {
@@ -34,13 +34,13 @@ test.describe('App navigation', () => {
     await expect(page).toHaveTitle(/Upload.*Vidarax/i)
     await expect(page.getByRole('heading', { name: /upload video/i })).toBeVisible()
     // Dropzone should be present
-    await expect(page.getByRole('button', { name: /drop your video/i })).toBeVisible()
+    await expect(page.getByRole('button', { name: /drop video file/i })).toBeVisible()
   })
 
   test('settings page renders at /settings', async ({ page }) => {
     await page.goto('/settings')
     await expect(page).toHaveTitle(/Settings.*Vidarax/i)
-    await expect(page.getByRole('heading', { name: /settings/i })).toBeVisible()
+    await expect(page.getByRole('heading', { name: /settings/i, level: 2 })).toBeVisible()
   })
 
   test('unknown route redirects to dashboard', async ({ page }) => {

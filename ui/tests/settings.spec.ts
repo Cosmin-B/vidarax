@@ -8,9 +8,30 @@ import { test, expect } from '@playwright/test'
 const DEFAULT_ENDPOINT = 'http://localhost:8080'
 const CUSTOM_ENDPOINT = 'http://vidarax.example.com:9090'
 const CUSTOM_STDB = 'http://stdb.example.com:3001'
+const MODEL_2B = 'Qwen/Qwen3-VL-2B-Instruct'
+const MODEL_FETCHED_ONLY = 'Qwen/Qwen3-VL-30B-Instruct'
+const MODEL_CATALOG = {
+  models: [
+    { id: 'Qwen/Qwen3-VL-8B-Instruct', name: 'Qwen3-VL 8B', availability: 'available' },
+    { id: 'Qwen/Qwen3-VL-4B-Instruct', name: 'Qwen3-VL 4B', availability: 'available' },
+    { id: MODEL_2B, name: 'Qwen3-VL 2B', availability: 'available' },
+    // This fetch-only entry is absent from fallback defaults so the mock must resolve.
+    { id: MODEL_FETCHED_ONLY, name: 'Qwen3-VL 30B', availability: 'available' },
+    { id: 'OpenGVLab/InternVL3_5-4B', name: 'InternVL3.5 4B', availability: 'available' },
+    { id: 'LiquidAI/LFM2.5-VL-1.6B', name: 'LFM2.5-VL 1.6B', availability: 'available' },
+  ],
+}
 
 test.describe('Settings panel', () => {
   test.beforeEach(async ({ page }) => {
+    await page.route('**/v1/models', async route => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(MODEL_CATALOG),
+      })
+    })
+
     // Start with clean localStorage
     await page.goto('/settings')
     await page.evaluate(() => localStorage.clear())
@@ -90,15 +111,15 @@ test.describe('Settings panel', () => {
     await page.getByRole('button', { name: /models/i }).click()
 
     const defaultModelSelect = page.getByTestId('default-model')
-    await defaultModelSelect.selectOption('qwen2.5-vl-2b')
-    await expect(defaultModelSelect).toHaveValue('qwen2.5-vl-2b')
+    await defaultModelSelect.selectOption(MODEL_FETCHED_ONLY)
+    await expect(defaultModelSelect).toHaveValue(MODEL_FETCHED_ONLY)
 
     await page.getByTestId('save-button').click()
     await page.reload()
 
     // Reopen models section
     await page.getByRole('button', { name: /models/i }).click()
-    await expect(page.getByTestId('default-model')).toHaveValue('qwen2.5-vl-2b')
+    await expect(page.getByTestId('default-model')).toHaveValue(MODEL_FETCHED_ONLY)
   })
 
   // ── Stream section ───────────────────────────────────────────────────────
