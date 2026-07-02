@@ -35,6 +35,10 @@ function base64UrlEncodeUtf8(input: string): string {
   return output
 }
 
+function validSemanticFramesPerChunk(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isSafeInteger(value) && value >= 1 ? value : undefined
+}
+
 export class ApiError extends Error {
   readonly status: number
 
@@ -104,6 +108,9 @@ export interface ReasonRequest {
   semantic_inference?: boolean
   fps?: number
   chunk_size?: number
+  firstPassModel?: string
+  secondPassModel?: string
+  semanticFramesPerChunk?: number
   semantic_frames_per_chunk?: number
 }
 
@@ -195,9 +202,18 @@ export const api = {
         model: data.model,
         semantic_inference: data.semantic_inference,
         chunk_size: data.chunk_size,
-        semantic_frames_per_chunk: data.semantic_frames_per_chunk,
       }
       if (data.prompt) body.semantic_prompt = data.prompt
+      if (data.firstPassModel?.trim()) body.first_pass_model = data.firstPassModel.trim()
+      if (data.secondPassModel?.trim()) body.second_pass_model = data.secondPassModel.trim()
+      const semanticFramesPerChunk = validSemanticFramesPerChunk(
+        data.semanticFramesPerChunk !== undefined
+          ? data.semanticFramesPerChunk
+          : data.semantic_frames_per_chunk,
+      )
+      if (semanticFramesPerChunk !== undefined) {
+        body.semantic_frames_per_chunk = semanticFramesPerChunk
+      }
       if (data.fps !== undefined) {
         body.fixed_fps = data.fps
         body.sampling_policy = 'fixed'

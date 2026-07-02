@@ -165,11 +165,15 @@ onMounted(() => {
 
       <!-- 3. Trace Timeline -->
       <section aria-label="Trace waterfall timeline">
-        <div class="flex items-center gap-2 mb-3">
+        <div class="flex items-center gap-2 mb-1.5">
           <h3 class="text-[#64748b] text-xs font-medium uppercase tracking-wider">Trace Timeline</h3>
+          <span class="badge badge-amber">SYNTHETIC</span>
           <div class="flex-1 h-px" style="background: #1e2633;" />
           <span class="mono text-[#2d3748] text-[10px]">keyframe traces only</span>
         </div>
+        <p class="text-[#475569] text-xs mb-3">
+          These traces are illustrative sample data because per-span tracing is not exposed by the API yet.
+        </p>
         <TraceTimeline :traces="traces" />
       </section>
 

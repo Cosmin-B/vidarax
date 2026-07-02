@@ -30,15 +30,8 @@ export const STORAGE_KEYS = {
   secondPassModel: 'vidarax_second_pass_model',
   fps: 'vidarax_fps',
   chunkSize: 'vidarax_chunk_size',
-  tokenRateCap: 'vidarax_token_rate_cap',
-  clipMode: 'vidarax_clip_mode',
   semanticInference: 'vidarax_semantic_inference',
   semanticFramesPerChunk: 'vidarax_semantic_frames_per_chunk',
-  sceneCutHammingThreshold: 'vidarax_scene_cut_hamming_threshold',
-  lumaShiftThreshold: 'vidarax_luma_shift_threshold',
-  loopDetection: 'vidarax_loop_detection',
-  loopRepeatTrigger: 'vidarax_loop_repeat_trigger',
-  gpuDecode: 'vidarax_gpu_decode',
 } as const
 
 export const SPACETIME_MODULE_NAME = 'vidarax'
@@ -48,6 +41,11 @@ export const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
 ]
+
+export function iceServersWithTurn(turnUrl: string): RTCIceServer[] {
+  const trimmed = turnUrl.trim()
+  return trimmed ? [...ICE_SERVERS, { urls: trimmed }] : ICE_SERVERS
+}
 
 export function ls(key: string, fallback: string): string {
   return localStorage.getItem(key) ?? fallback
