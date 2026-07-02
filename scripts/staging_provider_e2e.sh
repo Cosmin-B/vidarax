@@ -10,4 +10,4 @@ if [[ -z "${VIDARAX_STAGING_VLLM_BASE_URL:-}" || -z "${VIDARAX_STAGING_SGLANG_BA
 fi
 
 echo "[staging-e2e] running live provider integration test"
-cargo test -p vidarax-api staging_live_provider_e2e_opt_in -- --nocapture
+cargo test -p vidarax-api --features live-tests staging_live_provider_e2e_opt_in -- --nocapture

@@ -8,6 +8,7 @@ authors.workspace = true
 [features]
 default = []
 h3-experimental = ["dep:futures-util", "dep:tokio-quiche"]
+live-tests = []
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
