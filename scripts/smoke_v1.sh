@@ -16,15 +16,24 @@ else
   export VIDARAX_API_KEYS="$smoke_api_key"
 fi
 
+# The smoke run never calls inference, but the server needs valid provider base
+# URLs to build its backend chain at startup. Default to local placeholders so a
+# bare CI runner (no inference backend) can still start the API.
+export VIDARAX_VLLM_BASE_URL="${VIDARAX_VLLM_BASE_URL:-http://127.0.0.1:18081/v1}"
+export VIDARAX_SGLANG_BASE_URL="${VIDARAX_SGLANG_BASE_URL:-http://127.0.0.1:18082/v1}"
+
 mkdir -p "$VIDARAX_DATA_DIR"
 rm -f "$VIDARAX_DATA_DIR/timeline.wal"
+
+echo "[smoke] building API binary"
+cargo build -q -p vidarax-api --bin vidarax-api
 
 echo "[smoke] starting API on $api_addr"
 $api_bin >/tmp/vidarax-smoke-api.log 2>&1 &
 api_pid=$!
 trap 'kill "$api_pid" >/dev/null 2>&1 || true' EXIT
 
-for _ in {1..200}; do
+for _ in {1..300}; do
   if curl -fsS "http://$api_addr/v1/health" >/dev/null 2>&1; then
     break
   fi
@@ -33,7 +42,7 @@ for _ in {1..200}; do
     cat /tmp/vidarax-smoke-api.log >&2 || true
     exit 1
   fi
-  sleep 0.1
+  sleep 0.2
 done
 
 if ! curl -fsS "http://$api_addr/v1/health" >/dev/null 2>&1; then
