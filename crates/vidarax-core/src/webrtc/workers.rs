@@ -79,6 +79,8 @@ pub fn decode_output_pool_slots(gpu_available: bool, codec: VideoCodec) -> usize
             // FIFO, one reader-constructed frame, and one decode-consumer frame.
             DECODE_OUTPUT_POOL_SLOTS_PER_WORKER
         }
+        #[cfg(feature = "vp8")]
+        DecoderBackend::Vp8 => crate::webrtc::decode::SOFTWARE_YUV_POOL_MIN_SLOTS,
         DecoderBackend::Software | DecoderBackend::Unsupported => backend.min_yuv_pool_slots(),
     }
 }
@@ -1121,7 +1123,8 @@ fn collect_training_pair(
 mod tests {
     use super::{
         build_stream_frame_from_yuv, decode_output_pool_slots, jpeg_pool_slots, token_budget_entry,
-        EventSink, KeyframeWork, StreamFrame, CLIP_FRAME_QUEUE_CAPACITY, CLIP_WORK_QUEUE_CAPACITY,
+        DecoderBackend, EventSink, KeyframeWork, StreamFrame, CLIP_FRAME_QUEUE_CAPACITY,
+        CLIP_WORK_QUEUE_CAPACITY,
         FFMPEG_YUV_READER_QUEUE_CAPACITY, JPEG_POOL_SLOT_CEILING, JPEG_SINK_EVENT_POOL_ALLOWANCE,
         SINK_EVENT_QUEUE_CAPACITY, STREAM_FRAME_QUEUE_CAPACITY, VLM_TOKEN_BUDGET_MAX_SESSIONS,
         VLM_WORK_QUEUE_CAPACITY,
@@ -1278,9 +1281,39 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "vp8"))]
     fn decode_output_pool_is_empty_for_unsupported_vp8() {
+        assert_eq!(
+            DecoderBackend::select(false, VideoCodec::Vp8),
+            DecoderBackend::Unsupported
+        );
+        assert_eq!(
+            DecoderBackend::select(true, VideoCodec::Vp8),
+            DecoderBackend::Unsupported
+        );
         assert_eq!(decode_output_pool_slots(true, VideoCodec::Vp8), 0);
         assert_eq!(decode_output_pool_slots(false, VideoCodec::Vp8), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "vp8")]
+    fn decode_output_pool_is_small_for_synchronous_vp8() {
+        assert_eq!(
+            DecoderBackend::select(false, VideoCodec::Vp8),
+            DecoderBackend::Vp8
+        );
+        assert_eq!(
+            DecoderBackend::select(true, VideoCodec::Vp8),
+            DecoderBackend::Vp8
+        );
+        assert_eq!(
+            decode_output_pool_slots(true, VideoCodec::Vp8),
+            SOFTWARE_YUV_POOL_MIN_SLOTS
+        );
+        assert_eq!(
+            decode_output_pool_slots(false, VideoCodec::Vp8),
+            SOFTWARE_YUV_POOL_MIN_SLOTS
+        );
     }
 
     #[test]
