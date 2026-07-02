@@ -132,3 +132,30 @@ jobs:
       - name: Build
         working-directory: spacetime-module
         run: cargo build --locked --release --target wasm32-unknown-unknown
+
+  web-ui-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Setup Node
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: ui
+        run: npx playwright install --with-deps chromium webkit
+
+      - name: End-to-end tests
+        working-directory: ui
+        run: npx playwright test

@@ -57,14 +57,14 @@ test.describe('Run detail — feedback panel', () => {
 
   test('run ID and all three tabs render after load', async ({ page }) => {
     await expect(page.getByText(RUN_ID)).toBeVisible()
-    await expect(page.getByRole('button', { name: /timeline/i })).toBeVisible()
+    await expect(page.getByRole('button', { name: /player/i })).toBeVisible()
     await expect(page.getByRole('button', { name: /keyframes/i })).toBeVisible()
     await expect(page.getByRole('button', { name: /metadata/i })).toBeVisible()
   })
 
   test('tab switching shows correct content', async ({ page }) => {
-    // Default tab is timeline — event timeline heading should be visible
-    await expect(page.getByRole('heading', { name: /event timeline/i })).toBeVisible()
+    // Default tab is Player.
+    await expect(page.getByRole('heading', { name: 'Events', exact: true })).toBeVisible()
 
     // Switch to keyframes tab
     await page.getByRole('button', { name: /keyframes/i }).click()
@@ -74,9 +74,9 @@ test.describe('Run detail — feedback panel', () => {
     await page.getByRole('button', { name: /metadata/i }).click()
     await expect(page.getByRole('heading', { name: /raw metadata/i })).toBeVisible()
 
-    // Switch back to timeline
-    await page.getByRole('button', { name: /timeline/i }).click()
-    await expect(page.getByRole('heading', { name: /event timeline/i })).toBeVisible()
+    // Switch back to Player
+    await page.getByRole('button', { name: /player/i }).click()
+    await expect(page.getByRole('heading', { name: 'Events', exact: true })).toBeVisible()
   })
 
   // ── Feedback panel ───────────────────────────────────────────────────────────
