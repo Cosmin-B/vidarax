@@ -55,7 +55,7 @@ import type {
   RealtimeReasonRequest,
   RealtimeReasonResponse,
   Run,
-  SearchResult,
+  SearchResponse,
   UploadResponse,
   VidaraxOptions,
   WhipSession,
@@ -557,6 +557,8 @@ export class Vidarax {
       model_name: raw.model,
       provider: raw.provider,
       prompt,
+      fallback_used: raw.fallback_used,
+      run_id: raw.run_id,
     });
   }
 
@@ -587,9 +589,8 @@ export class Vidarax {
   /**
    * Yield all timeline events for a run.
    *
-   * The current implementation fetches the full event list once and yields
-   * them in sequence order.  A future version will support long-poll /
-   * server-sent events for live streaming.
+   * This fetches the current event list once and yields it in sequence order.
+   * Incremental live streaming is not yet implemented.
    *
    * @example
    * for await (const event of v.streamEvents(runId)) {
@@ -605,6 +606,9 @@ export class Vidarax {
 
   /**
    * Yield all markers for a run.
+   *
+   * This fetches the current marker list once and yields it in response order.
+   * Incremental live streaming is not yet implemented.
    *
    * @example
    * for await (const marker of v.streamMarkers(runId)) {
@@ -795,19 +799,23 @@ export class Vidarax {
     return res.feedback;
   }
 
-  // ─── Search (future) ──────────────────────────────────────────────────────
+  // ─── Search ───────────────────────────────────────────────────────────────
 
   /**
-   * Semantic search over processed runs.
+   * Search VLM descriptions recorded in the run timeline.
    *
-   * This method is a forward-looking stub; the `/v1/search` endpoint is not
-   * yet part of the server.  It will throw an `HttpError` (404) until the
-   * endpoint is deployed.
+   * The server performs a case-insensitive substring search over stored VLM
+   * descriptions and returns the hits plus scan counts.  Pass `run_id` to
+   * restrict the scan to one run, and `limit` to cap returned hits.
    *
    * @param query  Natural-language search query.
+   * @param options  Optional run filter and result limit.
    */
-  async search(query: string): Promise<SearchResult[]> {
-    return this.post<SearchResult[]>("/v1/search", { query });
+  async search(
+    query: string,
+    options: { run_id?: string; limit?: number } = {},
+  ): Promise<SearchResponse> {
+    return this.post<SearchResponse>("/v1/search", { query, ...options });
   }
 
   // ─── WHIP WebRTC (browser-only) ───────────────────────────────────────────

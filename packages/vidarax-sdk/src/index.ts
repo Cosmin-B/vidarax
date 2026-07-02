@@ -119,5 +119,7 @@ export type {
   WhipSession,
 
   // Search
+  SearchHit,
   SearchResult,
+  SearchResponse,
 } from "./types.js";
