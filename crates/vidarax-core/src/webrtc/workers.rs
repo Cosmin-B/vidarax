@@ -22,7 +22,7 @@ use crate::training_data::TrainingStore;
 #[allow(dead_code)]
 pub struct TrainingStore;
 use crate::webrtc::decode::{
-    Decoder, DecoderBackend, DecoderConfig, VideoCodec, YuvFrame,
+    DecodeError, Decoder, DecoderBackend, DecoderConfig, VideoCodec, YuvFrame,
     FFMPEG_YUV_PENDING_POOL_ALLOWANCE, FFMPEG_YUV_READER_QUEUE_CAPACITY,
 };
 use crate::webrtc::recycle::{RecycledBytes, VecPool};
@@ -79,7 +79,7 @@ pub fn decode_output_pool_slots(gpu_available: bool, codec: VideoCodec) -> usize
             // FIFO, one reader-constructed frame, and one decode-consumer frame.
             DECODE_OUTPUT_POOL_SLOTS_PER_WORKER
         }
-        DecoderBackend::Software => backend.min_yuv_pool_slots(),
+        DecoderBackend::Software | DecoderBackend::Unsupported => backend.min_yuv_pool_slots(),
     }
 }
 
@@ -266,6 +266,13 @@ pub fn spawn_decode_workers(
                     let decode_start = std::time::Instant::now();
                     let yuv = match dec.decode(&frame.nals) {
                         Ok(yuv) => yuv,
+                        Err(DecodeError::UnsupportedCodec(codec)) => {
+                            tracing::error!(
+                                ?codec,
+                                "no supported WebRTC decoder for negotiated codec; VP8 software decode is unsupported in the live zero-dependency pipeline; configure the client to offer H.264"
+                            );
+                            return;
+                        }
                         Err(_) => continue 'rtp_frames,
                     };
 
@@ -1259,8 +1266,6 @@ mod tests {
             FFMPEG_YUV_READER_QUEUE_CAPACITY + FFMPEG_YUV_PENDING_POOL_ALLOWANCE + 2
         );
         assert_eq!(decode_output_pool_slots(true, VideoCodec::H264), expected);
-        assert_eq!(decode_output_pool_slots(true, VideoCodec::Vp8), expected);
-        assert_eq!(decode_output_pool_slots(false, VideoCodec::Vp8), expected);
     }
 
     #[test]
@@ -1270,6 +1275,12 @@ mod tests {
             SOFTWARE_YUV_POOL_MIN_SLOTS
         );
         const _: () = assert!(SOFTWARE_YUV_POOL_MIN_SLOTS < FFMPEG_YUV_READER_POOL_MIN_SLOTS);
+    }
+
+    #[test]
+    fn decode_output_pool_is_empty_for_unsupported_vp8() {
+        assert_eq!(decode_output_pool_slots(true, VideoCodec::Vp8), 0);
+        assert_eq!(decode_output_pool_slots(false, VideoCodec::Vp8), 0);
     }
 
     #[test]
