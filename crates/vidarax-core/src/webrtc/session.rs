@@ -3,9 +3,9 @@
 //! [`WebRtcSession`] manages the full lifecycle of a single WebRTC peer
 //! connection: SDP offer/answer negotiation, trickle ICE, and media ingestion.
 //! Video payload bytes are forwarded through a [`kanal`] channel to the
-//! downstream decode workers.  Both H.264 and VP8 codecs are supported; the
-//! active codec is detected from the SDP offer and tagged on every [`RtpFrame`]
-//! so the correct decode backend is chosen automatically.
+//! downstream decode workers. H.264, H.265 / HEVC, and VP8 codec selection is
+//! detected from the SDP offer and tagged on every [`RtpFrame`] so the correct
+//! decode backend is chosen automatically.
 //!
 //! # Example
 //!
@@ -54,11 +54,12 @@ use crate::metrics::PipelineMetrics;
 use crate::webrtc::decode::VideoCodec;
 use crate::webrtc::recycle::{RecycledBytes, VecPool};
 
-/// Annex B start code prepended to every H.264 NAL unit.
+/// Annex B start code prepended to every H.264 or H.265 NAL unit.
 ///
 /// rustrtc delivers H.264 NAL payloads **without** start codes; openh264 and
-/// ffmpeg expect them prepended.  VP8 payloads are passed through unchanged
-/// (no start code wrapping).
+/// ffmpeg expect them prepended.  H.265 / HEVC is wrapped the same way for
+/// ffmpeg sidecar input once depacketized. VP8 payloads are passed through
+/// unchanged.
 const ANNEX_B_START: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
 pub const RTP_FRAME_QUEUE_CAPACITY: usize = 128;
 
@@ -72,8 +73,8 @@ pub fn rtp_nal_pool_slots(decode_workers: usize) -> usize {
 
 /// A single video access unit ready for the decode pipeline.
 ///
-/// For H.264, `nals` always begins with the 4-byte Annex B start code
-/// `00 00 00 01` followed by the raw NAL data.
+/// For H.264 and H.265 / HEVC, `nals` always begins with the 4-byte Annex B
+/// start code `00 00 00 01` followed by the raw NAL data.
 /// For VP8, `nals` contains the raw VP8 bitstream payload exactly as
 /// delivered by rustrtc (no framing added).
 ///
@@ -83,7 +84,7 @@ pub fn rtp_nal_pool_slots(decode_workers: usize) -> usize {
 pub struct RtpFrame {
     /// Video payload bytes.
     ///
-    /// - H.264: Annex B encoded (starts with `00 00 00 01`).
+    /// - H.264 and H.265 / HEVC: Annex B encoded (starts with `00 00 00 01`).
     /// - VP8: raw bitstream payload.
     pub nals: RecycledBytes,
     /// Presentation timestamp derived from the 90 kHz RTP clock (in ms).
@@ -163,7 +164,7 @@ pub struct WebRtcSession {
     pub guided_json: Arc<ArcSwapOption<Arc<str>>>,
     /// Token output rate cap (tokens/s) for backpressure in VLM workers.
     pub max_output_tokens_per_second: u32,
-    /// Video codec negotiated from the SDP offer (H.264 or VP8).
+    /// Video codec negotiated from the SDP offer.
     pub codec: VideoCodec,
     rtp_nal_pool_slots: usize,
     #[cfg(any(test, debug_assertions))]
@@ -290,7 +291,7 @@ impl WebRtcSession {
             .map_err(|e| format!("add_ice_candidate: {e}"))
     }
 
-    /// Drive the peer connection event loop, forwarding H.264 NAL units
+    /// Drive the peer connection event loop, forwarding video access units
     /// through `frame_tx` until the connection closes or the sender is dropped.
     ///
     /// Returns an **owned** future (no lifetime ties to `self`) that can be
@@ -298,8 +299,9 @@ impl WebRtcSession {
     /// `PeerConnection` handle so the caller may store `WebRtcSession` in a
     /// shared structure while the task runs concurrently.
     ///
-    /// - Annex B start codes (`00 00 00 01`) are **prepended** to every NAL
-    ///   before sending — rustrtc delivers raw NAL payloads without them.
+    /// - Annex B start codes (`00 00 00 01`) are **prepended** to H.264 and
+    ///   H.265 / HEVC payloads before sending. VP8 payloads are passed through.
+    ///   Live HEVC still needs an HEVC RTP depacketizer.
     /// - Audio tracks are silently ignored.
     /// - For each video track a Tokio task is spawned; all share the same
     ///   atomic sequence counter.
@@ -469,8 +471,9 @@ async fn enqueue_rtp_frame_lossless(
 fn frame_payload_to_nals(codec: VideoCodec, payload: &[u8], pool: &VecPool) -> RecycledBytes {
     let mut nals = pool.acquire();
     match codec {
-        VideoCodec::H264 => {
-            // rustrtc delivers H.264 NAL payload without Annex B start codes.
+        VideoCodec::H264 | VideoCodec::H265 => {
+            // ffmpeg h264/hevc demuxers expect Annex B start codes.
+            // Live HEVC still needs an HEVC RTP depacketizer; rustrtc's default video depacketizer is H.264-only.
             nals.reserve(ANNEX_B_START.len() + payload.len());
             nals.extend_from_slice(&ANNEX_B_START);
             nals.extend_from_slice(payload);
@@ -491,7 +494,7 @@ fn frame_payload_to_nals(codec: VideoCodec, payload: &[u8], pool: &VecPool) -> R
 mod tests {
     use super::{
         enqueue_rtp_frame_lossless, frame_payload_to_nals, rtp_nal_pool_slots, RtpFrame,
-        WebRtcConfig, WebRtcSession, RTP_FRAME_QUEUE_CAPACITY,
+        WebRtcConfig, WebRtcSession, ANNEX_B_START, RTP_FRAME_QUEUE_CAPACITY,
     };
     use crate::webrtc::decode::VideoCodec;
     use crate::webrtc::recycle::{RecycledBytes, VecPool};
@@ -527,6 +530,23 @@ mod tests {
         // No Annex B prefix — first byte should be the raw VP8 payload byte.
         assert_eq!(frame.nals[0], 0x30);
         assert_eq!(&frame.nals[..], &payload[..]);
+    }
+
+    #[test]
+    fn frame_payload_to_nals_h265_annex_b_vp8_passthrough() {
+        let pool = VecPool::with_slots(1);
+        let h265_payload = vec![0x26, 0x01, 0x02, 0x03]; // synthetic HEVC bytes
+        let h265_nals = frame_payload_to_nals(VideoCodec::H265, &h265_payload, &pool);
+
+        assert!(h265_nals.starts_with(&ANNEX_B_START));
+        assert_eq!(&h265_nals[ANNEX_B_START.len()..], &h265_payload[..]);
+
+        drop(h265_nals);
+
+        let vp8_payload = vec![0x30, 0x01, 0x02, 0x03]; // synthetic VP8 bytes
+        let vp8_nals = frame_payload_to_nals(VideoCodec::Vp8, &vp8_payload, &pool);
+
+        assert_eq!(&vp8_nals[..], &vp8_payload[..]);
     }
 
     #[test]
