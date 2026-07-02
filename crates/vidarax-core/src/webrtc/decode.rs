@@ -1,7 +1,8 @@
-//! WebRTC video decoders for H.264 and unsupported negotiated codecs.
+//! WebRTC video decoders for H.264, H.265 / HEVC, and unsupported negotiated codecs.
 //!
-//! GPU H.264 uses a long-lived ffmpeg sidecar; software H.264 uses openh264
-//! in-process. With `--features vp8`, VP8 uses libvpx in-process.
+//! GPU H.264 and H.265 use a long-lived ffmpeg sidecar; software H.264 uses
+//! openh264 in-process. Software H.265 uses the ffmpeg sidecar. With
+//! `--features vp8`, VP8 uses libvpx in-process.
 
 use std::collections::VecDeque;
 #[cfg(feature = "vp8")]
@@ -62,6 +63,8 @@ pub enum VideoCodec {
     /// ITU-T H.264 / AVC — default when the offer codec cannot be determined.
     #[default]
     H264,
+    /// ITU-T H.265 / HEVC.
+    H265,
     /// Google VP8 — negotiated by rustrtc when the browser prefers it.
     Vp8,
 }
@@ -91,6 +94,7 @@ impl VideoCodec {
                 match codec_name.as_str() {
                     "VP8" => return VideoCodec::Vp8,
                     "H264" => return VideoCodec::H264,
+                    "H265" | "HEVC" => return VideoCodec::H265,
                     _ => {}
                 }
             }
@@ -103,6 +107,7 @@ impl VideoCodec {
     fn ffmpeg_input_format(self) -> Option<&'static str> {
         match self {
             VideoCodec::H264 => Some("h264"),
+            VideoCodec::H265 => Some("hevc"),
             VideoCodec::Vp8 => None,
         }
     }
@@ -133,6 +138,8 @@ impl DecoderBackend {
             (_, VideoCodec::Vp8) => DecoderBackend::Unsupported,
             (true, VideoCodec::H264) => DecoderBackend::NvDec,
             (false, VideoCodec::H264) => DecoderBackend::Software,
+            (true, VideoCodec::H265) => DecoderBackend::NvDec,
+            (false, VideoCodec::H265) => DecoderBackend::FfmpegSw,
         }
     }
 
@@ -549,9 +556,14 @@ impl Decoder {
     /// | `gpu_available` | `codec`          | Backend     |
     /// |-----------------|------------------|-------------|
     /// | `true`          | H.264            | `NvDec`     |
+    /// | `true`          | H.265 / HEVC     | `NvDec`     |
     /// | `true`          | VP8              | `Vp8` with `--features vp8`; otherwise `Unsupported` |
     /// | `false`         | H.264            | `Software`  |
+    /// | `false`         | H.265 / HEVC     | `FfmpegSw`  |
     /// | `false`         | VP8              | `Vp8` with `--features vp8`; otherwise `Unsupported` |
+    ///
+    /// H.265 / HEVC uses the ffmpeg sidecar, including software ffmpeg when no
+    /// GPU is available.
     ///
     /// # Panics
     ///
@@ -626,7 +638,7 @@ impl Decoder {
     ) -> Self {
         let input_fmt = codec
             .ffmpeg_input_format()
-            .expect("ffmpeg sidecar input is only defined for H.264");
+            .expect("ffmpeg sidecar requires a codec with an input demuxer format");
         let mut child = Command::new(crate::ingest::ffmpeg_path())
             .args([
                 "-hwaccel",
@@ -677,10 +689,20 @@ impl Decoder {
     ) -> Self {
         let input_fmt = codec
             .ffmpeg_input_format()
-            .expect("ffmpeg sidecar input is only defined for H.264");
+            .expect("ffmpeg sidecar requires a codec with an input demuxer format");
         let mut child = Command::new(crate::ingest::ffmpeg_path())
             .args([
-                "-f", input_fmt, "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1",
+                "-f",
+                input_fmt,
+                "-i",
+                "pipe:0",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "-s",
+                &format!("{width}x{height}"),
+                "pipe:1",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -988,8 +1010,8 @@ mod tests {
 
     use super::{
         decode_ffmpeg_pipe, send_yuv_frame_lossless, try_receive_yuv_frame, DecodeError,
-        VideoCodec, YuvFrame, FFMPEG_YUV_PENDING_POOL_ALLOWANCE, FFMPEG_YUV_READER_POOL_MIN_SLOTS,
-        FFMPEG_YUV_READER_QUEUE_CAPACITY,
+        DecoderBackend, VideoCodec, YuvFrame, FFMPEG_YUV_PENDING_POOL_ALLOWANCE,
+        FFMPEG_YUV_READER_POOL_MIN_SLOTS, FFMPEG_YUV_READER_QUEUE_CAPACITY,
     };
 
     #[test]
@@ -1002,6 +1024,15 @@ mod tests {
     fn detects_h264_from_sdp_rtpmap() {
         let sdp = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 H264/90000\r\n";
         assert_eq!(VideoCodec::from_sdp(sdp), VideoCodec::H264);
+    }
+
+    #[test]
+    fn detects_h265_from_sdp_rtpmap() {
+        let h265_sdp = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 98\r\na=rtpmap:98 H265/90000\r\n";
+        let hevc_sdp = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 98\r\na=rtpmap:98 HEVC/90000\r\n";
+
+        assert_eq!(VideoCodec::from_sdp(h265_sdp), VideoCodec::H265);
+        assert_eq!(VideoCodec::from_sdp(hevc_sdp), VideoCodec::H265);
     }
 
     #[test]
@@ -1038,7 +1069,20 @@ mod tests {
     #[test]
     fn ffmpeg_input_format_strings_are_correct() {
         assert_eq!(VideoCodec::H264.ffmpeg_input_format(), Some("h264"));
+        assert_eq!(VideoCodec::H265.ffmpeg_input_format(), Some("hevc"));
         assert_eq!(VideoCodec::Vp8.ffmpeg_input_format(), None);
+    }
+
+    #[test]
+    fn h265_backend_selection_uses_ffmpeg_sidecars() {
+        assert_eq!(
+            DecoderBackend::select(true, VideoCodec::H265),
+            DecoderBackend::NvDec
+        );
+        assert_eq!(
+            DecoderBackend::select(false, VideoCodec::H265),
+            DecoderBackend::FfmpegSw
+        );
     }
 
     #[test]
