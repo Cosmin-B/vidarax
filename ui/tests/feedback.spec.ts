@@ -11,7 +11,7 @@ const MOCK_RUN = {
   run_id: RUN_ID,
   status: 'completed',
   mode: 'batch',
-  model: 'qwen2.5-vl-7b',
+  model: 'Qwen/Qwen3-VL-2B-Instruct',
   source_uri: 'file://test.mp4',
   created_at: '2024-01-15T10:00:00Z',
   updated_at: '2024-01-15T10:05:00Z',
