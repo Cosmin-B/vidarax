@@ -231,6 +231,11 @@ impl WebRtcSession {
                     .with_credential(turn.username.clone(), turn.credential.clone()),
             );
         }
+        rtc_config.depacketizer_strategy = rustrtc::config::DepacketizerStrategy {
+            factory: Arc::new(crate::webrtc::depacketize::VidaraxDepacketizerFactory::new(
+                codec,
+            )),
+        };
         let pc = PeerConnection::new(rtc_config);
 
         let offer = SessionDescription::parse(SdpType::Offer, offer_sdp)
@@ -299,9 +304,10 @@ impl WebRtcSession {
     /// `PeerConnection` handle so the caller may store `WebRtcSession` in a
     /// shared structure while the task runs concurrently.
     ///
-    /// - Annex B start codes (`00 00 00 01`) are **prepended** to H.264 and
+    /// - H.264 is depacketized by rustrtc. VP8 is depacketized in-crate.
+    ///   Annex B start codes (`00 00 00 01`) are **prepended** to H.264 and
     ///   H.265 / HEVC payloads before sending. VP8 payloads are passed through.
-    ///   Live HEVC still needs an HEVC RTP depacketizer.
+    ///   Live HEVC still needs a dedicated HEVC RTP depacketizer.
     /// - Audio tracks are silently ignored.
     /// - For each video track a Tokio task is spawned; all share the same
     ///   atomic sequence counter.
