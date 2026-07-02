@@ -45,6 +45,8 @@ async fn staging_live_provider_e2e_opt_in() {
         webrtc_turn_url: None,
         webrtc_turn_username: None,
         webrtc_turn_credential: None,
+        spacetimedb_url: None,
+        spacetimedb_module: None,
         webrtc_max_output_tokens_per_second: 128,
         webrtc_decode_workers: 2,
         webrtc_analysis_workers: 1,

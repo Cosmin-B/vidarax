@@ -79,6 +79,7 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
         config.distillation.clone(),
     )
     .map_err(invalid_input)?;
+    let state = attach_spacetime_client(state, &config);
     let app = app_router(state);
 
     tracing::info!(transport = config.transport.label(), "vidarax-api startup");
@@ -90,6 +91,31 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
     tracing::info!("vidarax-api shutdown complete");
     serve_result?;
     Ok(())
+}
+
+/// Attach a SpacetimeDB client when VIDARAX_SPACETIMEDB_URL is configured.
+/// With no URL the state is returned unchanged: stream events use the local
+/// WAL and the feedback endpoints stay disabled.
+fn attach_spacetime_client(state: AppState, config: &ServerConfig) -> AppState {
+    match config.spacetimedb_url.as_deref() {
+        Some(url) => {
+            let module = config.spacetimedb_module.as_deref().unwrap_or("vidarax");
+            tracing::info!(
+                spacetimedb_url = url,
+                spacetimedb_module = module,
+                "SpacetimeDB integration enabled"
+            );
+            state.with_spacetime_client(
+                crate::spacetime_client::SpacetimeClient::new(url, module),
+            )
+        }
+        None => {
+            tracing::info!(
+                "SpacetimeDB not configured; stream events use the local WAL and feedback endpoints are disabled"
+            );
+            state
+        }
+    }
 }
 
 pub fn invalid_input(message: String) -> io::Error {
@@ -163,7 +189,7 @@ fn build_webrtc_config(config: &ServerConfig) -> WebRtcConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{app_router, build_webrtc_config, AppState, ServerConfig, TransportMode};
+    use super::{app_router, attach_spacetime_client, build_webrtc_config, AppState, ServerConfig, TransportMode};
     use vidarax_core::ingest::pipeline::{register_decode_backend, CpuFfmpegPipeline, PipelineBackend};
     use vidarax_core::tiered_vlm::DistillationConfig;
     use crate::security::SecurityPolicy;
@@ -219,6 +245,8 @@ mod tests {
             webrtc_turn_url: None,
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
+            spacetimedb_url: None,
+            spacetimedb_module: None,
             webrtc_max_output_tokens_per_second: 128,
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
@@ -385,6 +413,31 @@ mod tests {
     }
 
     #[test]
+    fn attach_spacetime_client_respects_env_gated_config() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let disabled_wal_path = std::env::temp_dir().join(format!(
+            "vidarax-spacetime-client-disabled-{nanos}.wal"
+        ));
+        let enabled_wal_path = std::env::temp_dir().join(format!(
+            "vidarax-spacetime-client-enabled-{nanos}.wal"
+        ));
+        let mut config = default_test_server_config();
+
+        let state = AppState::with_wal_for_tests(disabled_wal_path);
+        let state = attach_spacetime_client(state, &config);
+        assert!(state.spacetime_client().is_none());
+
+        config.spacetimedb_url = Some("http://127.0.0.1:3000".to_string());
+
+        let state = AppState::with_wal_for_tests(enabled_wal_path);
+        let state = attach_spacetime_client(state, &config);
+        assert!(state.spacetime_client().is_some());
+    }
+
+    #[test]
     fn explicit_inference_urls_build_provider_backend_entries() {
         let config = ServerConfig {
             bind_addr: "127.0.0.1:8080".to_string(),
@@ -411,6 +464,8 @@ mod tests {
             webrtc_turn_url: None,
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
+            spacetimedb_url: None,
+            spacetimedb_module: None,
             webrtc_max_output_tokens_per_second: 128,
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
@@ -2294,6 +2349,8 @@ mod tests {
             webrtc_turn_url: None,
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
+            spacetimedb_url: None,
+            spacetimedb_module: None,
             webrtc_max_output_tokens_per_second: 128,
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
@@ -2349,6 +2406,8 @@ mod tests {
             webrtc_turn_url: None,
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
+            spacetimedb_url: None,
+            spacetimedb_module: None,
             webrtc_max_output_tokens_per_second: 128,
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
@@ -2401,6 +2460,8 @@ mod tests {
             webrtc_turn_url: None,
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
+            spacetimedb_url: None,
+            spacetimedb_module: None,
             webrtc_max_output_tokens_per_second: 128,
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
@@ -2476,6 +2537,8 @@ mod tests {
             webrtc_turn_url: None,
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
+            spacetimedb_url: None,
+            spacetimedb_module: None,
             webrtc_max_output_tokens_per_second: 128,
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
@@ -2534,6 +2597,8 @@ mod tests {
             webrtc_turn_url: None,
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
+            spacetimedb_url: None,
+            spacetimedb_module: None,
             webrtc_max_output_tokens_per_second: 128,
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
@@ -2577,6 +2642,8 @@ mod tests {
             webrtc_turn_url: None,
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
+            spacetimedb_url: None,
+            spacetimedb_module: None,
             webrtc_max_output_tokens_per_second: 128,
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
@@ -2805,6 +2872,8 @@ mod tests {
             webrtc_turn_url: None,
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
+            spacetimedb_url: None,
+            spacetimedb_module: None,
             webrtc_max_output_tokens_per_second: 128,
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
@@ -2937,6 +3006,8 @@ mod tests {
             webrtc_turn_url: None,
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
+            spacetimedb_url: None,
+            spacetimedb_module: None,
             webrtc_max_output_tokens_per_second: 128,
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,

@@ -101,6 +101,13 @@ pub struct ServerConfig {
     pub webrtc_turn_username: Option<String>,
     /// TURN credential (`VIDARAX_WEBRTC_TURN_CREDENTIAL`).
     pub webrtc_turn_credential: Option<String>,
+    /// Optional SpacetimeDB base URL (`VIDARAX_SPACETIMEDB_URL`). When set, the
+    /// feedback endpoints and the WHIP event sink use SpacetimeDB; when unset,
+    /// stream events use the local WAL and the feedback endpoints are disabled.
+    pub spacetimedb_url: Option<String>,
+    /// SpacetimeDB database/module name (`VIDARAX_SPACETIMEDB_MODULE`). Only
+    /// used when `spacetimedb_url` is set; defaults to "vidarax".
+    pub spacetimedb_module: Option<String>,
     /// VLM output token rate cap per session in tokens/s (`VIDARAX_WEBRTC_MAX_OUTPUT_TOKENS_PER_SECOND`).
     pub webrtc_max_output_tokens_per_second: u32,
     pub webrtc_decode_workers: usize,
@@ -157,6 +164,8 @@ impl ServerConfig {
         let webrtc_turn_url = env::var("VIDARAX_WEBRTC_TURN_URL").ok();
         let webrtc_turn_username = env::var("VIDARAX_WEBRTC_TURN_USERNAME").ok();
         let webrtc_turn_credential = env::var("VIDARAX_WEBRTC_TURN_CREDENTIAL").ok();
+        let spacetimedb_url = env::var("VIDARAX_SPACETIMEDB_URL").ok();
+        let spacetimedb_module = env::var("VIDARAX_SPACETIMEDB_MODULE").ok();
         let webrtc_max_output_tokens_per_second =
             parse_usize_env("VIDARAX_WEBRTC_MAX_OUTPUT_TOKENS_PER_SECOND", 128)? as u32;
         // One ordered stream is decoded by one stateful decoder. Keep the env
@@ -198,6 +207,8 @@ impl ServerConfig {
             webrtc_turn_url,
             webrtc_turn_username,
             webrtc_turn_credential,
+            spacetimedb_url,
+            spacetimedb_module,
             webrtc_max_output_tokens_per_second,
             webrtc_decode_workers,
             webrtc_analysis_workers,
@@ -458,6 +469,36 @@ mod tests {
     }
 
     #[test]
+    fn server_config_reads_spacetimedb_env() {
+        let _guard = env_guard();
+        let _url = set_env("VIDARAX_SPACETIMEDB_URL", None);
+        let _module = set_env("VIDARAX_SPACETIMEDB_MODULE", None);
+        let _require_api_key = set_env("VIDARAX_REQUIRE_API_KEY", Some("false"));
+
+        let cfg = ServerConfig::from_env().expect("default config should parse");
+        assert!(cfg.spacetimedb_url.is_none());
+        assert!(cfg.spacetimedb_module.is_none());
+
+        let _url = set_env("VIDARAX_SPACETIMEDB_URL", Some("http://127.0.0.1:3000"));
+
+        let cfg = ServerConfig::from_env().expect("url-only config should parse");
+        assert_eq!(
+            cfg.spacetimedb_url.as_deref(),
+            Some("http://127.0.0.1:3000")
+        );
+        assert!(cfg.spacetimedb_module.is_none());
+
+        let _module = set_env("VIDARAX_SPACETIMEDB_MODULE", Some("custom_module"));
+
+        let cfg = ServerConfig::from_env().expect("url and module config should parse");
+        assert_eq!(
+            cfg.spacetimedb_url.as_deref(),
+            Some("http://127.0.0.1:3000")
+        );
+        assert_eq!(cfg.spacetimedb_module.as_deref(), Some("custom_module"));
+    }
+
+    #[test]
     fn server_config_rejects_required_tenant_without_required_api_key() {
         let err = validate_tenant_auth_config(false, true)
             .expect_err("required tenant IDs without required API-key auth should be rejected");
@@ -547,6 +588,8 @@ mod tests {
             webrtc_turn_url: Some("turn:relay.example.com:3478".into()),
             webrtc_turn_username: Some("alice".into()),
             webrtc_turn_credential: Some("secret".into()),
+            spacetimedb_url: None,
+            spacetimedb_module: None,
             webrtc_max_output_tokens_per_second: 64,
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
@@ -594,6 +637,8 @@ mod tests {
             webrtc_turn_url: None,
             webrtc_turn_username: None,
             webrtc_turn_credential: None,
+            spacetimedb_url: None,
+            spacetimedb_module: None,
             webrtc_max_output_tokens_per_second: 128,
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
