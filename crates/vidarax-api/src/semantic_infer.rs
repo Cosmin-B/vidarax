@@ -70,6 +70,8 @@ impl ChunkSemanticResult {
                 "semantic_error": self.error,
                 "event_type": self.overlay.as_ref().map(|o| o.event_type.clone()),
                 "object_label": self.overlay.as_ref().map(|o| o.object_label.clone()),
+                "summary": self.overlay.as_ref().map(|o| o.summary.clone()),
+                "description": self.overlay.as_ref().map(|o| o.description.clone()),
                 "confidence": self.overlay.as_ref().map(|o| o.confidence),
                 "raw_output": self.raw_output,
             })
@@ -763,6 +765,40 @@ mod tests {
         let truncated = truncate_context(&longer, 200);
         assert_eq!(truncated.chars().count(), 200);
         assert!(longer.starts_with(truncated));
+    }
+
+    #[test]
+    fn chunk_semantic_event_payload_includes_overlay_text() {
+        let skipped = ChunkSemanticResult {
+            attempted: false,
+            ..ChunkSemanticResult::default()
+        };
+        assert_eq!(skipped.event_payload(0, "req-1", "stream-1"), None);
+
+        let result = ChunkSemanticResult {
+            overlay: Some(SemanticOverlay {
+                event_type: "context_observation".to_string(),
+                object_label: "frame_context".to_string(),
+                summary: "person crosses the lobby".to_string(),
+                description: "A person walks past the front desk carrying a bag.".to_string(),
+                confidence: 0.91,
+            }),
+            attempted: true,
+            ..ChunkSemanticResult::default()
+        };
+
+        let payload = result
+            .event_payload(3, "req-1", "stream-1")
+            .expect("attempted semantic result should emit payload");
+
+        assert_eq!(
+            payload.get("summary").and_then(Value::as_str),
+            Some("person crosses the lobby")
+        );
+        assert_eq!(
+            payload.get("description").and_then(Value::as_str),
+            Some("A person walks past the front desk carrying a bag.")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
