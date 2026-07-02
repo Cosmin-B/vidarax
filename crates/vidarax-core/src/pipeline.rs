@@ -143,7 +143,10 @@ impl TwoPassPipeline {
             drift += (sample.luma_mean - luma_mean).abs();
         }
         let inv = 1.0 / self.window_len as f32;
-        ((similarity * inv).clamp(0.0, 1.0), (drift * inv).clamp(0.0, 1.0))
+        (
+            (similarity * inv).clamp(0.0, 1.0),
+            (drift * inv).clamp(0.0, 1.0),
+        )
     }
 
     fn motion_score(&self, hash: u64) -> f32 {
@@ -178,9 +181,8 @@ fn hamming_similarity(a: u64, b: u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        TwoPassConfig, TwoPassPipeline, TwoPassWeights,
-        TWO_PASS_CONFIDENCE_INSTABILITY_WEIGHT, TWO_PASS_CONFIDENCE_MOTION_WEIGHT,
-        TWO_PASS_CONFIDENCE_NOVELTY_WEIGHT,
+        TwoPassConfig, TwoPassPipeline, TwoPassWeights, TWO_PASS_CONFIDENCE_INSTABILITY_WEIGHT,
+        TWO_PASS_CONFIDENCE_MOTION_WEIGHT, TWO_PASS_CONFIDENCE_NOVELTY_WEIGHT,
     };
     use crate::gate::{FrameSignal, GateConfig, GateEventType};
 

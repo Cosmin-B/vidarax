@@ -76,7 +76,10 @@ impl Default for RecycledBytes {
 
 impl From<Vec<u8>> for RecycledBytes {
     fn from(bytes: Vec<u8>) -> Self {
-        Self { bytes, free_tx: None }
+        Self {
+            bytes,
+            free_tx: None,
+        }
     }
 }
 
@@ -102,7 +105,9 @@ impl Deref for RecycledBytes {
 
 impl std::fmt::Debug for RecycledBytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RecycledBytes").field("len", &self.len()).finish()
+        f.debug_struct("RecycledBytes")
+            .field("len", &self.len())
+            .finish()
     }
 }
 

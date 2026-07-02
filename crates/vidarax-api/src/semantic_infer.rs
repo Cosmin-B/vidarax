@@ -53,7 +53,12 @@ pub struct ChunkSemanticResult {
 }
 
 impl ChunkSemanticResult {
-    pub fn event_payload(&self, chunk_idx: usize, request_id: &str, stream_id: &str) -> Option<Value> {
+    pub fn event_payload(
+        &self,
+        chunk_idx: usize,
+        request_id: &str,
+        stream_id: &str,
+    ) -> Option<Value> {
         self.attempted.then(|| {
             json!({
                 "request_id": request_id,
@@ -83,7 +88,9 @@ pub struct ChunkPrep {
     pub started: Instant,
 }
 
-pub fn load_decoded_signals_from_events(events: &[TimelineEvent]) -> Result<DecodedSignals, String> {
+pub fn load_decoded_signals_from_events(
+    events: &[TimelineEvent],
+) -> Result<DecodedSignals, String> {
     let Some(decoded_event) = events
         .iter()
         .rev()
@@ -263,7 +270,8 @@ pub async fn run_semantic_dispatch(
     vlm_concurrency: usize,
 ) -> (Vec<Option<ChunkSemanticResult>>, Vec<Instant>) {
     let num_chunks = chunk_preps.len();
-    let mut semantic_results: Vec<Option<ChunkSemanticResult>> = (0..num_chunks).map(|_| None).collect();
+    let mut semantic_results: Vec<Option<ChunkSemanticResult>> =
+        (0..num_chunks).map(|_| None).collect();
     let mut task_end_times: Vec<Instant> = vec![Instant::now(); num_chunks];
 
     if !semantic_available {
@@ -285,7 +293,11 @@ pub async fn run_semantic_dispatch(
                 )
             };
 
-            let prev_jpeg_ref = if visual_diff { last_jpeg.as_deref() } else { None };
+            let prev_jpeg_ref = if visual_diff {
+                last_jpeg.as_deref()
+            } else {
+                None
+            };
             let result = infer_chunk_semantics(
                 providers.clone(),
                 true,
@@ -780,8 +792,7 @@ mod tests {
         )
         .await;
 
-        SEMANTIC_TASK_PANIC_CHUNK_FOR_TESTS
-            .store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+        SEMANTIC_TASK_PANIC_CHUNK_FOR_TESTS.store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
 
         assert_eq!(results.len(), 5);
         for idx in [0usize, 2, 3, 4] {
@@ -789,7 +800,10 @@ mod tests {
             assert!(result.attempted, "chunk {idx} should be attempted");
             assert_eq!(result.error, None, "chunk {idx} should not inherit panic");
             assert_eq!(
-                result.overlay.as_ref().map(|overlay| overlay.summary.as_str()),
+                result
+                    .overlay
+                    .as_ref()
+                    .map(|overlay| overlay.summary.as_str()),
                 Some("ok")
             );
         }

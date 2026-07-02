@@ -4,15 +4,15 @@
 //! Uses `tower::ServiceExt::oneshot` — no live TCP socket required.
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{header, Request, StatusCode};
 use http_body_util::BodyExt;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tower::ServiceExt;
-use vidarax_api::{AppState, AttachStreamRequest, ServerConfig, app_router};
+use vidarax_api::{app_router, AppState, AttachStreamRequest, ServerConfig};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -90,10 +90,15 @@ async fn test_submit_feedback_validates_rating() {
 
     assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body = json_body(res.into_body()).await;
-    assert_eq!(body["error"]["code"].as_str().unwrap_or(""), "validation_error");
+    assert_eq!(
+        body["error"]["code"].as_str().unwrap_or(""),
+        "validation_error"
+    );
     let details = body["error"]["details"].as_array().unwrap();
     assert!(
-        details.iter().any(|d| d["field"].as_str() == Some("rating")),
+        details
+            .iter()
+            .any(|d| d["field"].as_str() == Some("rating")),
         "expected a 'rating' detail entry; got: {details:?}"
     );
 }
@@ -113,10 +118,15 @@ async fn test_submit_feedback_validates_category() {
 
     assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body = json_body(res.into_body()).await;
-    assert_eq!(body["error"]["code"].as_str().unwrap_or(""), "validation_error");
+    assert_eq!(
+        body["error"]["code"].as_str().unwrap_or(""),
+        "validation_error"
+    );
     let details = body["error"]["details"].as_array().unwrap();
     assert!(
-        details.iter().any(|d| d["field"].as_str() == Some("category")),
+        details
+            .iter()
+            .any(|d| d["field"].as_str() == Some("category")),
         "expected a 'category' detail entry; got: {details:?}"
     );
 }
@@ -132,7 +142,7 @@ async fn test_submit_feedback_success() {
         tmp_wal("fb-success"),
         vec!["test-key".to_string()],
     )
-        .with_spacetime_client(SpacetimeClient::new(&stdb_url, "vidarax"));
+    .with_spacetime_client(SpacetimeClient::new(&stdb_url, "vidarax"));
     state
         .append_run_event(
             VALID_RUN_ID,
@@ -190,10 +200,7 @@ async fn test_whip_prompt_update_schema() {
     let router = app_router(AppState::with_wal_for_tests(tmp_wal("whip-schema")));
 
     // Body missing the required `prompt` field.
-    let req = patch_json(
-        "/v1/stream/whip/sess-nonexistent0001/prompt",
-        json!({}),
-    );
+    let req = patch_json("/v1/stream/whip/sess-nonexistent0001/prompt", json!({}));
     let res = router.oneshot(req).await.unwrap();
 
     // axum returns 422 when a required JSON field is absent.
@@ -220,7 +227,9 @@ async fn test_models_includes_saturated_status() {
     assert_eq!(res.status(), StatusCode::OK);
 
     let body = json_body(res.into_body()).await;
-    let models = body["models"].as_array().expect("'models' must be an array");
+    let models = body["models"]
+        .as_array()
+        .expect("'models' must be an array");
     assert!(!models.is_empty());
 
     // Validate that every availability value is one of the known enum members,
@@ -316,7 +325,10 @@ fn test_config_parses_turn_server() {
     let _guard = ENV_MUTEX.lock().unwrap();
 
     let _require_api_key = set_env("VIDARAX_REQUIRE_API_KEY", Some("false"));
-    let _turn_url = set_env("VIDARAX_WEBRTC_TURN_URL", Some("turn:relay.example.com:3478"));
+    let _turn_url = set_env(
+        "VIDARAX_WEBRTC_TURN_URL",
+        Some("turn:relay.example.com:3478"),
+    );
     let _turn_username = set_env("VIDARAX_WEBRTC_TURN_USERNAME", Some("alice"));
     let _turn_credential = set_env("VIDARAX_WEBRTC_TURN_CREDENTIAL", Some("s3cret"));
 

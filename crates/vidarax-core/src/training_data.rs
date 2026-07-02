@@ -354,8 +354,7 @@ impl TrainingStore {
         let avg_distance = neighbors.iter().map(|(d, _)| *d).sum::<f32>() / total as f32;
 
         // Plurality vote across neighbours.
-        let mut counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for (_, label) in &neighbors {
             *counts.entry(label.as_str()).or_insert(0) += 1;
         }
@@ -567,10 +566,24 @@ mod tests {
         let emb_b = unit_embedding(1);
 
         let id1 = store
-            .store_pair("tenant1", b"fake-jpeg", r#"{"event":"motion"}"#, "teacher", 0.9, &emb_a)
+            .store_pair(
+                "tenant1",
+                b"fake-jpeg",
+                r#"{"event":"motion"}"#,
+                "teacher",
+                0.9,
+                &emb_a,
+            )
             .unwrap();
         let id2 = store
-            .store_pair("tenant1", b"fake-jpeg", r#"{"event":"idle"}"#, "teacher", 0.8, &emb_b)
+            .store_pair(
+                "tenant1",
+                b"fake-jpeg",
+                r#"{"event":"idle"}"#,
+                "teacher",
+                0.8,
+                &emb_b,
+            )
             .unwrap();
 
         assert!(id1 > 0);
@@ -649,10 +662,24 @@ mod tests {
         let dir = tempdir();
         let store = TrainingStore::new(&dir).unwrap();
         store
-            .store_pair("t", b"j", r#"{"event":"a"}"#, "model", 0.9, &unit_embedding(0))
+            .store_pair(
+                "t",
+                b"j",
+                r#"{"event":"a"}"#,
+                "model",
+                0.9,
+                &unit_embedding(0),
+            )
             .unwrap();
         store
-            .store_pair("t", b"j", r#"{"event":"b"}"#, "model", 0.8, &unit_embedding(1))
+            .store_pair(
+                "t",
+                b"j",
+                r#"{"event":"b"}"#,
+                "model",
+                0.8,
+                &unit_embedding(1),
+            )
             .unwrap();
 
         let out = dir.join("export.jsonl");
@@ -674,7 +701,14 @@ mod tests {
 
         for i in 0u8..5 {
             store
-                .store_pair("t", &[i], "label", "model", 0.9, &unit_embedding(i as usize))
+                .store_pair(
+                    "t",
+                    &[i],
+                    "label",
+                    "model",
+                    0.9,
+                    &unit_embedding(i as usize),
+                )
                 .unwrap();
         }
         assert_eq!(store.pair_count("t").unwrap(), 5);
@@ -709,20 +743,24 @@ mod tests {
         };
         let dir = tempdir().join("zvec_str");
         let mut schema = CollectionSchema::new("test_coll");
-        schema.add_field(VectorSchema::fp32("vec", 4).into()).unwrap();
+        schema
+            .add_field(VectorSchema::fp32("vec", 4).into())
+            .unwrap();
         schema.add_field(FieldSchema::string("label")).unwrap();
         schema.add_field(FieldSchema::string("grp")).unwrap();
         let coll = create_and_open_shared(&dir, schema).unwrap();
 
-        let docs: Vec<Doc> = (0..4).map(|i| {
-            let mut doc = Doc::id(format!("doc_{}", i));
-            let mut v = [0.0f32; 4];
-            v[i % 4] = 1.0;
-            doc.set_vector("vec", &v).unwrap();
-            doc.set_string("label", &format!("label_{}", i)).unwrap();
-            doc.set_string("grp", "tenant_a").unwrap();
-            doc
-        }).collect();
+        let docs: Vec<Doc> = (0..4)
+            .map(|i| {
+                let mut doc = Doc::id(format!("doc_{}", i));
+                let mut v = [0.0f32; 4];
+                v[i % 4] = 1.0;
+                doc.set_vector("vec", &v).unwrap();
+                doc.set_string("label", &format!("label_{}", i)).unwrap();
+                doc.set_string("grp", "tenant_a").unwrap();
+                doc
+            })
+            .collect();
         coll.insert(&docs).unwrap();
 
         let query = VectorQuery::new("vec")

@@ -46,8 +46,7 @@ async fn main() {
     let concurrency = 16usize;
     let blocking =
         bench_blocking_spawn(requests, concurrency, base_url.clone(), request.clone()).await;
-    let async_stats =
-        bench_async_reqwest(requests, concurrency, base_url.clone()).await;
+    let async_stats = bench_async_reqwest(requests, concurrency, base_url.clone()).await;
 
     let recommendation = if async_stats.throughput_rps > (blocking.throughput_rps * 1.15)
         && async_stats.p95_ms < (blocking.p95_ms * 0.9)

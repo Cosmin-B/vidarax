@@ -18,9 +18,9 @@ fn tiered_config_detects_when_second_pass_needed() {
         second_pass_threshold: 0.7,
         second_pass_max_tokens: 256,
     };
-    assert!(config.needs_second_pass(0.5));   // below threshold
-    assert!(!config.needs_second_pass(0.8));  // above threshold
-    assert!(!config.needs_second_pass(0.7));  // at threshold = no second pass
+    assert!(config.needs_second_pass(0.5)); // below threshold
+    assert!(!config.needs_second_pass(0.8)); // above threshold
+    assert!(!config.needs_second_pass(0.7)); // at threshold = no second pass
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use arc_swap::ArcSwap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, RwLock};
@@ -271,10 +271,7 @@ impl AppState {
         AppStateConfig::for_tests(wal_path).build()
     }
 
-    pub fn with_wal_for_tests_requiring_api_keys(
-        wal_path: PathBuf,
-        api_keys: Vec<String>,
-    ) -> Self {
+    pub fn with_wal_for_tests_requiring_api_keys(wal_path: PathBuf, api_keys: Vec<String>) -> Self {
         Self::with_wal_for_tests_full(
             wal_path,
             None,
@@ -286,11 +283,7 @@ impl AppState {
         wal_path: PathBuf,
         provider: Option<Arc<dyn InferenceProvider + Send + Sync>>,
     ) -> Self {
-        Self::with_wal_for_tests_full(
-            wal_path,
-            provider,
-            SecurityPolicy::from_config_for_tests(),
-        )
+        Self::with_wal_for_tests_full(wal_path, provider, SecurityPolicy::from_config_for_tests())
     }
 
     pub fn with_wal_for_tests_full(
@@ -537,8 +530,7 @@ impl AppState {
             match self.begin_run_deleted_append(run_id) {
                 RunDeleteClaim::Claimed(run) => {
                     let guard = RunDeleteAppendGuard::new(run);
-                    let event =
-                        self.new_timeline_event(run_id, stream_id, "run_deleted", &payload);
+                    let event = self.new_timeline_event(run_id, stream_id, "run_deleted", &payload);
                     if let Err(err) = append_event(self.wal_path.as_ref(), &event) {
                         return Err(err.to_string());
                     }
@@ -557,10 +549,8 @@ impl AppState {
                 }
                 RunDeleteClaim::InFlight(run) => run.wait_delete_append_blocking(),
                 RunDeleteClaim::Missing => {
-                    let event =
-                        self.new_timeline_event(run_id, stream_id, "run_deleted", &payload);
-                    append_event(self.wal_path.as_ref(), &event)
-                        .map_err(|err| err.to_string())?;
+                    let event = self.new_timeline_event(run_id, stream_id, "run_deleted", &payload);
+                    append_event(self.wal_path.as_ref(), &event).map_err(|err| err.to_string())?;
                     self.apply_event_to_registry(&event);
                     return Ok(RunDeletedAppend {
                         event,
@@ -580,8 +570,7 @@ impl AppState {
         loop {
             match self.begin_run_deleted_append(run_id) {
                 RunDeleteClaim::Claimed(run) => {
-                    let event =
-                        self.new_timeline_event(run_id, stream_id, "run_deleted", &payload);
+                    let event = self.new_timeline_event(run_id, stream_id, "run_deleted", &payload);
                     let state = self.clone();
                     let append_task = tokio::spawn(async move {
                         let guard = RunDeleteAppendGuard::new(run);
@@ -604,9 +593,9 @@ impl AppState {
                         })
                     });
 
-                    return append_task
-                        .await
-                        .map_err(|err| format!("timeline append coordinator join failure: {err}"))?;
+                    return append_task.await.map_err(|err| {
+                        format!("timeline append coordinator join failure: {err}")
+                    })?;
                 }
                 RunDeleteClaim::AlreadyDeleted => {
                     return Ok(RunDeletedAppend {
@@ -616,8 +605,7 @@ impl AppState {
                 }
                 RunDeleteClaim::InFlight(run) => run.wait_delete_append().await,
                 RunDeleteClaim::Missing => {
-                    let event =
-                        self.new_timeline_event(run_id, stream_id, "run_deleted", &payload);
+                    let event = self.new_timeline_event(run_id, stream_id, "run_deleted", &payload);
                     let wal_path = Arc::clone(&self.wal_path);
                     let event_for_write = event.clone();
                     tokio::task::spawn_blocking(move || {
@@ -834,9 +822,7 @@ impl AppState {
             return None;
         }
 
-        *reservations
-            .entry(principal_key.to_string())
-            .or_insert(0) += 1;
+        *reservations.entry(principal_key.to_string()).or_insert(0) += 1;
         Some(StreamSlotGuard {
             reservations: Arc::clone(&self.stream_reservations),
             principal_key: principal_key.to_string(),
@@ -927,8 +913,10 @@ impl RunRegistry {
         }
 
         if !after.created || after.deleted {
-            self.runs
-                .insert(event.run_id.clone(), Arc::new(RunState::from_summary(after)));
+            self.runs.insert(
+                event.run_id.clone(),
+                Arc::new(RunState::from_summary(after)),
+            );
             return;
         }
 
@@ -936,8 +924,10 @@ impl RunRegistry {
             .entry(after.principal_key.clone())
             .or_default()
             .insert(event.run_id.clone());
-        self.runs
-            .insert(event.run_id.clone(), Arc::new(RunState::from_summary(after)));
+        self.runs.insert(
+            event.run_id.clone(),
+            Arc::new(RunState::from_summary(after)),
+        );
     }
 }
 
@@ -1206,9 +1196,9 @@ mod tests {
 
     #[test]
     fn registry_keeps_same_map_snapshot_for_existing_run_event() {
-        let state = AppState::with_wal_for_tests(std::env::temp_dir().join(
-            format!("vidarax-state-test-{}.wal", std::process::id()),
-        ));
+        let state = AppState::with_wal_for_tests(
+            std::env::temp_dir().join(format!("vidarax-state-test-{}.wal", std::process::id())),
+        );
         state.apply_event_to_registry(&event(
             1,
             "run_created",
@@ -1232,9 +1222,10 @@ mod tests {
 
     #[test]
     fn append_run_event_for_stream_persists_stream_id() {
-        let state = AppState::with_wal_for_tests(std::env::temp_dir().join(
-            format!("vidarax-state-stream-test-{}.wal", std::process::id()),
-        ));
+        let state = AppState::with_wal_for_tests(std::env::temp_dir().join(format!(
+            "vidarax-state-stream-test-{}.wal",
+            std::process::id()
+        )));
 
         state
             .append_run_event_for_stream("run-1", "camera-west", "analysis_generated", json!({}))
@@ -1291,7 +1282,10 @@ mod tests {
                 json!({ "principal_key": principal }),
             )
             .unwrap();
-        assert_eq!(state.count_active_runs_for_principal(principal, now_epoch_ms()), 1);
+        assert_eq!(
+            state.count_active_runs_for_principal(principal, now_epoch_ms()),
+            1
+        );
 
         let barrier = Arc::new(tokio::sync::Barrier::new(8));
         let mut tasks = Vec::new();
@@ -1301,10 +1295,7 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
                 state
-                    .append_run_deleted_idempotent_async(
-                        "run-1",
-                        json!({ "worker": worker }),
-                    )
+                    .append_run_deleted_idempotent_async("run-1", json!({ "worker": worker }))
                     .await
             }));
         }
@@ -1325,8 +1316,13 @@ mod tests {
             1
         );
         assert_eq!(appended, 1);
-        assert_eq!(state.count_active_runs_for_principal(principal, now_epoch_ms()), 0);
-        assert!(state.run_runtime_snapshot("run-1", now_epoch_ms()).is_none());
+        assert_eq!(
+            state.count_active_runs_for_principal(principal, now_epoch_ms()),
+            0
+        );
+        assert!(state
+            .run_runtime_snapshot("run-1", now_epoch_ms())
+            .is_none());
     }
 
     #[cfg(unix)]
@@ -1399,8 +1395,13 @@ mod tests {
         .await
         .expect("retry after cancelled delete must not wait forever")
         .expect("retry delete append should succeed");
-        assert!(!appended, "cancelled caller must not force a duplicate tombstone");
-        assert!(state.run_runtime_snapshot("run-1", now_epoch_ms()).is_none());
+        assert!(
+            !appended,
+            "cancelled caller must not force a duplicate tombstone"
+        );
+        assert!(state
+            .run_runtime_snapshot("run-1", now_epoch_ms())
+            .is_none());
     }
 
     #[tokio::test]
@@ -1433,7 +1434,10 @@ mod tests {
             state.reclaimed_sessions.read().await.len(),
             RECLAIMED_SESSION_MAX_ENTRIES
         );
-        assert!(state.get_reclaimed_session("sess-reclaimed-0000").await.is_none());
+        assert!(state
+            .get_reclaimed_session("sess-reclaimed-0000")
+            .await
+            .is_none());
     }
 
     #[test]

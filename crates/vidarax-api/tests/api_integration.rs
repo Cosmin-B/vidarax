@@ -5,16 +5,16 @@
 //! binding a real TCP socket, so tests start fast and run in parallel.
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{header, Request, StatusCode};
 use http_body_util::BodyExt;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tower::ServiceExt;
-use vidarax_api::{AppState, app_router};
+use vidarax_api::{app_router, AppState};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -44,7 +44,11 @@ fn hex_sha256(value: &str) -> String {
 fn key_required_state(tag: &str) -> AppState {
     AppState::with_wal_for_tests_requiring_api_keys(
         tmp_wal(tag),
-        vec!["key-a".to_string(), "key-b".to_string(), "test-key".to_string()],
+        vec![
+            "key-a".to_string(),
+            "key-b".to_string(),
+            "test-key".to_string(),
+        ],
     )
 }
 
@@ -111,13 +115,10 @@ fn multipart_upload_request(filename: &str, key: Option<&str>, bytes: &[u8]) -> 
     body.extend_from_slice(bytes);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
-    let mut builder = Request::builder()
-        .method("POST")
-        .uri("/v1/upload")
-        .header(
-            header::CONTENT_TYPE,
-            format!("multipart/form-data; boundary={boundary}"),
-        );
+    let mut builder = Request::builder().method("POST").uri("/v1/upload").header(
+        header::CONTENT_TYPE,
+        format!("multipart/form-data; boundary={boundary}"),
+    );
     if let Some(key) = key {
         builder = builder.header("x-api-key", key);
     }
@@ -150,7 +151,10 @@ fn tiny_mp4_bytes(tag: &str) -> Vec<u8> {
         .arg(&path)
         .status()
         .expect("ffmpeg should be available for ingest isolation tests");
-    assert!(status.success(), "ffmpeg failed to create a tiny mp4 fixture");
+    assert!(
+        status.success(),
+        "ffmpeg failed to create a tiny mp4 fixture"
+    );
     let bytes = fs::read(&path).expect("tiny mp4 fixture should be readable");
     let _ = fs::remove_file(&path);
     bytes
@@ -177,11 +181,16 @@ async fn feedback_rating_above_10_returns_unprocessable_entity() {
 
     assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body = collect_json(res.into_body()).await;
-    assert_eq!(body["error"]["code"].as_str().unwrap_or(""), "validation_error");
+    assert_eq!(
+        body["error"]["code"].as_str().unwrap_or(""),
+        "validation_error"
+    );
     // The field-level detail should mention "rating".
     let details = body["error"]["details"].as_array().unwrap();
     assert!(
-        details.iter().any(|d| d["field"].as_str() == Some("rating")),
+        details
+            .iter()
+            .any(|d| d["field"].as_str() == Some("rating")),
         "expected a 'rating' field error, got: {details:?}"
     );
 }
@@ -200,10 +209,15 @@ async fn feedback_empty_category_returns_unprocessable_entity() {
 
     assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body = collect_json(res.into_body()).await;
-    assert_eq!(body["error"]["code"].as_str().unwrap_or(""), "validation_error");
+    assert_eq!(
+        body["error"]["code"].as_str().unwrap_or(""),
+        "validation_error"
+    );
     let details = body["error"]["details"].as_array().unwrap();
     assert!(
-        details.iter().any(|d| d["field"].as_str() == Some("category")),
+        details
+            .iter()
+            .any(|d| d["field"].as_str() == Some("category")),
         "expected a 'category' field error, got: {details:?}"
     );
 }
@@ -231,7 +245,10 @@ async fn feedback_without_spacetimedb_returns_internal_error() {
 
     assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
     let body = collect_json(res.into_body()).await;
-    assert_eq!(body["error"]["code"].as_str().unwrap_or(""), "internal_error");
+    assert_eq!(
+        body["error"]["code"].as_str().unwrap_or(""),
+        "internal_error"
+    );
 }
 
 #[tokio::test]
@@ -290,15 +307,15 @@ async fn upload_rejects_hls_manifest_disguised_as_mp4() {
 
     assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let body = collect_json(res.into_body()).await;
-    assert_eq!(body["error"]["code"].as_str().unwrap_or(""), "validation_error");
+    assert_eq!(
+        body["error"]["code"].as_str().unwrap_or(""),
+        "validation_error"
+    );
     let details = body["error"]["details"].as_array().unwrap();
     assert!(
         details.iter().any(|d| {
             d["field"].as_str() == Some("file")
-                && d["message"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("playlist")
+                && d["message"].as_str().unwrap_or("").contains("playlist")
         }),
         "expected playlist upload rejection, got: {details:?}"
     );
@@ -356,10 +373,7 @@ async fn ingest_rejects_uploaded_file_owned_by_another_api_key() {
     assert!(
         details.iter().any(|d| {
             d["field"].as_str() == Some("source_uri")
-                && d["message"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("not visible")
+                && d["message"].as_str().unwrap_or("").contains("not visible")
         }),
         "expected cross-principal source_uri rejection, got: {details:?}"
     );
@@ -372,7 +386,11 @@ async fn uploaded_file_under_default_temp_root_is_not_served_to_another_api_key(
 
     let upload_res = router
         .clone()
-        .oneshot(multipart_upload_request("served.mp4", Some("key-a"), &video))
+        .oneshot(multipart_upload_request(
+            "served.mp4",
+            Some("key-a"),
+            &video,
+        ))
         .await
         .unwrap();
     assert_eq!(upload_res.status(), StatusCode::OK);
@@ -457,7 +475,9 @@ async fn models_returns_200_with_non_empty_catalog() {
     assert_eq!(res.status(), StatusCode::OK);
 
     let body = collect_json(res.into_body()).await;
-    let models = body["models"].as_array().expect("'models' should be an array");
+    let models = body["models"]
+        .as_array()
+        .expect("'models' should be an array");
     assert!(!models.is_empty(), "expected at least one model in catalog");
 }
 
@@ -594,7 +614,7 @@ async fn search_with_run_id_rejects_invalid_run_id() {
 #[tokio::test]
 async fn search_finds_matching_descriptions_in_wal() {
     // Seed the WAL with a timeline event that contains a description field.
-    use vidarax_core::timeline::{TimelineEvent, append_event};
+    use vidarax_core::timeline::{append_event, TimelineEvent};
 
     let wal = tmp_wal("search-match");
     let event = TimelineEvent {
@@ -748,7 +768,11 @@ async fn search_excludes_deleted_runs_from_global_and_run_scoped_results() {
     assert_eq!(global_res.status(), StatusCode::OK);
     let global_body = collect_json(global_res.into_body()).await;
     let global_hits = global_body["hits"].as_array().unwrap();
-    assert_eq!(global_hits.len(), 1, "deleted run should be hidden: {global_body}");
+    assert_eq!(
+        global_hits.len(),
+        1,
+        "deleted run should be hidden: {global_body}"
+    );
     assert_eq!(global_hits[0]["run_id"].as_str(), Some(live_run));
 
     let scoped_res = router
@@ -763,7 +787,7 @@ async fn search_excludes_deleted_runs_from_global_and_run_scoped_results() {
 
 #[tokio::test]
 async fn search_is_case_insensitive() {
-    use vidarax_core::timeline::{TimelineEvent, append_event};
+    use vidarax_core::timeline::{append_event, TimelineEvent};
 
     let wal = tmp_wal("search-case");
     let event = TimelineEvent {
@@ -794,12 +818,15 @@ async fn search_is_case_insensitive() {
     assert_eq!(res.status(), StatusCode::OK);
     let body = collect_json(res.into_body()).await;
     let hits = body["hits"].as_array().unwrap();
-    assert!(!hits.is_empty(), "case-insensitive match should return a hit");
+    assert!(
+        !hits.is_empty(),
+        "case-insensitive match should return a hit"
+    );
 }
 
 #[tokio::test]
 async fn search_respects_limit() {
-    use vidarax_core::timeline::{TimelineEvent, append_event};
+    use vidarax_core::timeline::{append_event, TimelineEvent};
 
     let wal = tmp_wal("search-limit");
     for i in 0u64..10 {
@@ -846,7 +873,7 @@ async fn search_respects_limit() {
 
 #[tokio::test]
 async fn search_no_match_returns_empty_hits() {
-    use vidarax_core::timeline::{TimelineEvent, append_event};
+    use vidarax_core::timeline::{append_event, TimelineEvent};
 
     let wal = tmp_wal("search-no-match");
     let event = TimelineEvent {

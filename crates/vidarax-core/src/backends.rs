@@ -24,7 +24,9 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use crate::gemini::GeminiProvider;
-use crate::provider::{HttpTransport, InferenceProvider, OpenAiCompatProvider, ProviderKind, ProviderRouter};
+use crate::provider::{
+    HttpTransport, InferenceProvider, OpenAiCompatProvider, ProviderKind, ProviderRouter,
+};
 
 // ── Config structs ────────────────────────────────────────────────────────────
 
@@ -203,10 +205,7 @@ fn build_single_provider(
                 .as_deref()
                 .unwrap_or("gemini-2.5-flash-preview-05-20");
             if api_key.is_empty() || api_key.contains("${") {
-                return Err(format!(
-                    "backend '{}': gemini requires api_key",
-                    entry.name
-                ));
+                return Err(format!("backend '{}': gemini requires api_key", entry.name));
             }
             Ok(Box::new(
                 GeminiProvider::new(api_key.to_string(), model.to_string())
@@ -388,7 +387,11 @@ base_url = "${_VDX_TEST_URL}"
             priority: 1,
         };
         let result = build_provider_chain(&[entry]);
-        assert!(result.is_ok(), "gemini with api_key should succeed, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "gemini with api_key should succeed, got: {:?}",
+            result.err()
+        );
         assert_eq!(result.unwrap().kind(), ProviderKind::Gemini);
     }
 
@@ -405,7 +408,10 @@ base_url = "${_VDX_TEST_URL}"
         let result = build_provider_chain(&[entry]);
         assert!(result.is_err(), "gemini without api_key should fail");
         let err = result.err().unwrap();
-        assert!(err.contains("api_key"), "expected api_key error, got: {err}");
+        assert!(
+            err.contains("api_key"),
+            "expected api_key error, got: {err}"
+        );
     }
 
     #[test]
@@ -452,7 +458,10 @@ base_url = "${_VDX_TEST_URL}"
         let result = build_provider_chain(&[entry]);
         assert!(result.is_err(), "unresolved base_url should fail");
         let err = result.err().unwrap();
-        assert!(err.contains("base_url"), "expected base_url error, got: {err}");
+        assert!(
+            err.contains("base_url"),
+            "expected base_url error, got: {err}"
+        );
     }
 
     #[test]

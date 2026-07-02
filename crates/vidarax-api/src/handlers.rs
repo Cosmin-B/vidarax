@@ -16,13 +16,11 @@ use vidarax_contracts::models::{
 };
 use vidarax_core::gate::{FrameSignal, GateConfig};
 use vidarax_core::ingest::{
-    compute_semantic_frame_indices, probe_source_fps, DecodedJpegFrame,
-    InputSource, Mp4DecodeConfig,
+    compute_semantic_frame_indices, probe_source_fps, DecodedJpegFrame, InputSource,
+    Mp4DecodeConfig,
 };
 use vidarax_core::pipeline::{TwoPassConfig, TwoPassPipeline};
-use vidarax_core::provider::{
-    InferenceProvider, InferenceRequest, ProviderError, ProviderKind,
-};
+use vidarax_core::provider::{InferenceProvider, InferenceRequest, ProviderError, ProviderKind};
 use vidarax_core::timeline::TimelineEvent;
 
 use crate::auth::{header_value, strong_hash_hex, HEADER_TENANT_ID};
@@ -32,8 +30,8 @@ use crate::models::{
     AnalyzeFrameMetadata, AnalyzeFramesRequest, AnalyzeFramesResponse, AnalyzeMarker,
     CreateRunRequest, CreateRunResponse, FieldError, InferBatchItemError, InferBatchItemResult,
     InferBatchRequest, InferBatchResponse, InferRequest, InferResponse, ModelCatalogItem,
-    ModelCatalogResponse, RealtimeReasonRequest, RealtimeReasonResponse, SamplingPolicy,
-    SearchHit, SearchRequest, SearchResponse,
+    ModelCatalogResponse, RealtimeReasonRequest, RealtimeReasonResponse, SamplingPolicy, SearchHit,
+    SearchRequest, SearchResponse,
 };
 use crate::response::{
     conflict_error, internal_error, not_found_error, ok, validation_error, ApiResponse,
@@ -97,18 +95,20 @@ pub async fn create_run(
     let principal = state.security_policy().principal_key_from_headers(&headers);
     let _slot = match state.try_reserve_stream_slot(&principal, now_epoch_ms()) {
         Some(slot) => slot,
-        None => return conflict_error(
-            &state,
-            "active stream limit exceeded",
-            vec![field_error(
-                "run_id",
-                format!(
-                    "principal exceeded active stream limit: {}/{}",
-                    state.active_stream_limit(),
-                    state.active_stream_limit()
-                ),
-            )],
-        ),
+        None => {
+            return conflict_error(
+                &state,
+                "active stream limit exceeded",
+                vec![field_error(
+                    "run_id",
+                    format!(
+                        "principal exceeded active stream limit: {}/{}",
+                        state.active_stream_limit(),
+                        state.active_stream_limit()
+                    ),
+                )],
+            )
+        }
     };
 
     let run_id = state.next_run_id();
@@ -233,26 +233,23 @@ pub async fn ingest_run(
             .unwrap_or("stream-0")
             .to_string();
         let allowed_roots = ingest_file_roots_with_upload_root(&state);
-        let decode_source =
-            match InputSource::parse_and_validate(&source_uri, &allowed_roots) {
-                Ok(source) => source,
-                Err(message) => {
-                    return validation_error(
-                        &state,
-                        "invalid ingest request",
-                        vec![field_error("source_uri", message)],
-                    );
-                }
-            };
-        if let Err(error) =
-            enforce_file_source_visibility(
-                &state,
-                &headers,
-                &source_uri,
-                &decode_source,
-                "invalid ingest request",
-            )
-        {
+        let decode_source = match InputSource::parse_and_validate(&source_uri, &allowed_roots) {
+            Ok(source) => source,
+            Err(message) => {
+                return validation_error(
+                    &state,
+                    "invalid ingest request",
+                    vec![field_error("source_uri", message)],
+                );
+            }
+        };
+        if let Err(error) = enforce_file_source_visibility(
+            &state,
+            &headers,
+            &source_uri,
+            &decode_source,
+            "invalid ingest request",
+        ) {
             return error;
         }
         let requested_sample_fps = sample_fps.unwrap_or(2.0);
@@ -1041,8 +1038,8 @@ fn validate_realtime_reason_params(
             )
         })?
         .expect("model is required");
-    let sampling_policy = SamplingPolicy::parse(payload.sampling_policy.as_deref())
-        .map_err(|message| {
+    let sampling_policy =
+        SamplingPolicy::parse(payload.sampling_policy.as_deref()).map_err(|message| {
             validation_error(
                 state,
                 "invalid realtime reason request",
@@ -1144,16 +1141,14 @@ fn validate_realtime_reason_params(
     };
 
     let allowed_roots = ingest_file_roots_with_upload_root(state);
-    let decode_source =
-        InputSource::parse_and_validate(&payload.source_uri, &allowed_roots).map_err(
-            |message| {
-                validation_error(
-                    state,
-                    "invalid realtime reason request",
-                    vec![field_error("source_uri", message)],
-                )
-            },
-        )?;
+    let decode_source = InputSource::parse_and_validate(&payload.source_uri, &allowed_roots)
+        .map_err(|message| {
+            validation_error(
+                state,
+                "invalid realtime reason request",
+                vec![field_error("source_uri", message)],
+            )
+        })?;
 
     let video_clip_mode = payload.video_clip_mode.unwrap_or(false);
     let video_clip_duration_s = payload.video_clip_duration_s.unwrap_or(0.5);
@@ -1237,13 +1232,10 @@ async fn assemble_realtime_reason_response(
     let mut chunk_lags = Vec::new();
 
     for (chunk_idx, prep) in chunk_preps.into_iter().enumerate() {
-        let semantic_overlay = semantic_results[chunk_idx]
-            .take()
-            .unwrap_or_default();
+        let semantic_overlay = semantic_results[chunk_idx].take().unwrap_or_default();
         let finished = task_end_times[chunk_idx];
 
-        if let Some(mut details) =
-            semantic_overlay.event_payload(chunk_idx, request_id, stream_id)
+        if let Some(mut details) = semantic_overlay.event_payload(chunk_idx, request_id, stream_id)
         {
             if let Some(ref idx) = index_name {
                 if let Some(obj) = details.as_object_mut() {
@@ -1709,17 +1701,16 @@ pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
     let request_id = state.next_request_id();
     let provider = state.provider().cloned();
     let is_saturated = state.inference_metrics().is_high_latency();
-    let availability =
-        match tokio::task::spawn_blocking(move || {
-            runtime_model_availability(provider, is_saturated)
-        })
-        .await
-        {
-            Ok(availability) => availability,
-            Err(err) => {
-                return internal_error(&state, format!("model catalog worker join failure: {err}"));
-            }
-        };
+    let availability = match tokio::task::spawn_blocking(move || {
+        runtime_model_availability(provider, is_saturated)
+    })
+    .await
+    {
+        Ok(availability) => availability,
+        Err(err) => {
+            return internal_error(&state, format!("model catalog worker join failure: {err}"));
+        }
+    };
     let providers_available = availability.providers;
     let status = availability.status;
 
@@ -1933,7 +1924,10 @@ pub async fn get_interactions(
     // Key: chunk_index  Value: (pts_start_ms, pts_end_ms)
     let mut chunk_timing: std::collections::HashMap<u64, (u64, u64)> =
         std::collections::HashMap::new();
-    for event in events.iter().filter(|e| e.kind == "semantic_chunk_generated") {
+    for event in events
+        .iter()
+        .filter(|e| e.kind == "semantic_chunk_generated")
+    {
         let payload = parse_payload(&event.payload);
         if let Some(idx) = payload.get("chunk_index").and_then(|v| v.as_u64()) {
             let pts_start = payload
@@ -1989,8 +1983,7 @@ pub async fn get_interactions(
                             .or_insert_with(|| json!(chunk_index));
                         obj.entry("pts_start_ms")
                             .or_insert_with(|| json!(pts_start_ms));
-                        obj.entry("pts_end_ms")
-                            .or_insert_with(|| json!(pts_end_ms));
+                        obj.entry("pts_end_ms").or_insert_with(|| json!(pts_end_ms));
                     }
                     interactions.push(enriched);
                 }
@@ -2003,8 +1996,7 @@ pub async fn get_interactions(
                         .or_insert_with(|| json!(chunk_index));
                     obj.entry("pts_start_ms")
                         .or_insert_with(|| json!(pts_start_ms));
-                    obj.entry("pts_end_ms")
-                        .or_insert_with(|| json!(pts_end_ms));
+                    obj.entry("pts_end_ms").or_insert_with(|| json!(pts_end_ms));
                 }
                 interactions.push(enriched);
             }
@@ -2189,44 +2181,38 @@ async fn execute_infer_request(
     state: AppState,
     prepared: PreparedInferRequest,
 ) -> Result<InferResponse, InferExecutionError> {
-    let provider = state
-        .provider()
-        .cloned()
-        .ok_or(InferExecutionError {
-            code: "internal_error",
-            message: "inference providers are not configured".to_string(),
-        })?;
+    let provider = state.provider().cloned().ok_or(InferExecutionError {
+        code: "internal_error",
+        message: "inference providers are not configured".to_string(),
+    })?;
 
     let request_id = state.next_request_id();
     let started = Instant::now();
     let primary_provider_for_metrics = prepared.primary_provider;
     let request_for_provider = prepared.request.clone();
-    let result = match tokio::task::spawn_blocking(move || {
-        provider.infer(&request_for_provider)
-    })
-    .await
-    {
-        Ok(result) => match result {
-            Ok(result) => result,
+    let result =
+        match tokio::task::spawn_blocking(move || provider.infer(&request_for_provider)).await {
+            Ok(result) => match result {
+                Ok(result) => result,
+                Err(err) => {
+                    state.inference_metrics().record_error(
+                        primary_provider_for_metrics,
+                        started.elapsed().as_millis() as u64,
+                    );
+                    return Err(map_provider_execution_error(err));
+                }
+            },
             Err(err) => {
                 state.inference_metrics().record_error(
                     primary_provider_for_metrics,
                     started.elapsed().as_millis() as u64,
                 );
-                return Err(map_provider_execution_error(err));
+                return Err(InferExecutionError {
+                    code: "internal_error",
+                    message: format!("inference worker join failure: {err}"),
+                });
             }
-        },
-        Err(err) => {
-            state.inference_metrics().record_error(
-                primary_provider_for_metrics,
-                started.elapsed().as_millis() as u64,
-            );
-            return Err(InferExecutionError {
-                code: "internal_error",
-                message: format!("inference worker join failure: {err}"),
-            });
-        }
-    };
+        };
     state.inference_metrics().record_success(
         result.provider,
         started.elapsed().as_millis() as u64,
@@ -2352,7 +2338,10 @@ mod tests {
 
         let schema = prepared.request.guided_json.as_deref().unwrap();
         let value: serde_json::Value = serde_json::from_str(schema).unwrap();
-        assert_eq!(value["properties"]["count"]["type"].as_str(), Some("number"));
+        assert_eq!(
+            value["properties"]["count"]["type"].as_str(),
+            Some("number")
+        );
     }
 
     #[tokio::test]
@@ -2416,10 +2405,18 @@ mod tests {
         let deleted_run = "run-00000000000000bb";
         let state = test_state("deleted-visible-set");
         state
-            .append_run_event(live_run, "run_created", json!({ "principal_key": principal }))
+            .append_run_event(
+                live_run,
+                "run_created",
+                json!({ "principal_key": principal }),
+            )
             .unwrap();
         state
-            .append_run_event(deleted_run, "run_created", json!({ "principal_key": principal }))
+            .append_run_event(
+                deleted_run,
+                "run_created",
+                json!({ "principal_key": principal }),
+            )
             .unwrap();
         state
             .append_run_event(deleted_run, "run_deleted", json!({}))
@@ -2471,14 +2468,20 @@ pub async fn submit_feedback(
         return validation_error(
             &state,
             "invalid feedback payload",
-            vec![field_error("rating", "rating must be between 0 and 10".to_string())],
+            vec![field_error(
+                "rating",
+                "rating must be between 0 and 10".to_string(),
+            )],
         );
     }
     if payload.category.is_empty() {
         return validation_error(
             &state,
             "invalid feedback payload",
-            vec![field_error("category", "category must not be empty".to_string())],
+            vec![field_error(
+                "category",
+                "category must not be empty".to_string(),
+            )],
         );
     }
     if let Err(error) = load_run_snapshot(&state, &headers, &run_id) {
@@ -2508,10 +2511,7 @@ pub async fn submit_feedback(
 }
 
 #[tracing::instrument(name = "api.list_feedback", skip_all)]
-pub async fn list_feedback(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub async fn list_feedback(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let Some(stdb) = state.spacetime_client() else {
         return internal_error(&state, "spacetimedb client not configured");
     };
@@ -2537,10 +2537,7 @@ pub async fn list_feedback(
 // ─── New resource endpoints ────────────────────────────────────────────────
 
 #[tracing::instrument(name = "api.list_runs", skip_all)]
-pub async fn list_runs(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub async fn list_runs(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let principal = state.security_policy().principal_key_from_headers(&headers);
     let all_events = match state.read_all_events_async().await {
         Ok(events) => events,
@@ -2647,11 +2644,7 @@ pub async fn delete_run(
     }
     let request_id = state.next_request_id();
     if let Err(err) = state
-        .append_run_event_async(
-            &run_id,
-            "run_deleted",
-            json!({ "request_id": request_id }),
-        )
+        .append_run_event_async(&run_id, "run_deleted", json!({ "request_id": request_id }))
         .await
     {
         return internal_error(&state, format!("failed to append run_deleted event: {err}"));
@@ -2676,9 +2669,9 @@ pub async fn serve_file(
     Path(filename): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    use axum::body::Body;
     use axum::http::{header, StatusCode};
     use axum::response::Response;
-    use axum::body::Body;
 
     // Reject filenames with path separators or obvious traversal attempts.
     if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
@@ -2787,10 +2780,7 @@ pub async fn upload_file(
             return validation_error(
                 &state,
                 "invalid upload request",
-                vec![field_error(
-                    "file",
-                    "unsupported file type".to_string(),
-                )],
+                vec![field_error("file", "unsupported file type".to_string())],
             );
         }
         let safe_name = format!("{owner_prefix}{safe_name}");
@@ -2887,9 +2877,7 @@ fn ms_to_iso(ms: u64) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { y + 1 } else { y };
 
-    format!(
-        "{year:04}-{month:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{millis:03}Z"
-    )
+    format!("{year:04}-{month:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}.{millis:03}Z")
 }
 
 fn validate_run_id_or_error(
@@ -2975,11 +2963,7 @@ fn upload_owner_prefix_from_principal(principal: &str) -> String {
         .unwrap_or_else(|| "public__".to_string())
 }
 
-fn filename_is_visible_to_principal(
-    filename: &str,
-    principal: &str,
-    owner_prefix: &str,
-) -> bool {
+fn filename_is_visible_to_principal(filename: &str, principal: &str, owner_prefix: &str) -> bool {
     filename.starts_with(owner_prefix) || (principal == "public" && !filename.contains("__"))
 }
 
@@ -3038,8 +3022,7 @@ fn enforce_file_source_visibility(
     }
     let requested_path = requested_file_path_for_visibility(requested_source_uri)
         .unwrap_or_else(|| PathBuf::from(path));
-    let Some(filename) =
-        upload_root_regular_file_name_for_visibility(&requested_path, &canonical)
+    let Some(filename) = upload_root_regular_file_name_for_visibility(&requested_path, &canonical)
     else {
         return Err(validation_error(
             state,

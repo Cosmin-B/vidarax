@@ -39,7 +39,9 @@ impl InferenceMetrics {
     /// Used by `GET /v1/models` to report `"saturated"` availability status
     /// when inference providers are reachable but overloaded.
     pub fn is_high_latency(&self) -> bool {
-        self.vllm.is_high_latency() || self.sglang.is_high_latency() || self.gemini.is_high_latency()
+        self.vllm.is_high_latency()
+            || self.sglang.is_high_latency()
+            || self.gemini.is_high_latency()
     }
 
     pub fn render_prometheus(&self) -> String {
@@ -58,21 +60,45 @@ impl InferenceMetrics {
         let sum_ms = p.latency_sum_ms.load(Ordering::Relaxed);
         let count = p.latency_count.load(Ordering::Relaxed);
 
-        let _ = writeln!(out, "vidarax_infer_requests_total{{provider=\"{name}\",status=\"ok\"}} {ok}");
-        let _ = writeln!(out, "vidarax_infer_requests_total{{provider=\"{name}\",status=\"error\"}} {err}");
-        let _ = writeln!(out, "vidarax_infer_fallback_total{{provider=\"{name}\"}} {fallback}");
+        let _ = writeln!(
+            out,
+            "vidarax_infer_requests_total{{provider=\"{name}\",status=\"ok\"}} {ok}"
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_requests_total{{provider=\"{name}\",status=\"error\"}} {err}"
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_fallback_total{{provider=\"{name}\"}} {fallback}"
+        );
 
         let mut cumulative = 0u64;
         for (idx, le) in LATENCY_BUCKETS_MS.iter().enumerate() {
             cumulative += p.latency_buckets[idx].load(Ordering::Relaxed);
-            let _ = writeln!(out, "vidarax_infer_latency_ms_bucket{{provider=\"{name}\",le=\"{le}\"}} {cumulative}");
+            let _ = writeln!(
+                out,
+                "vidarax_infer_latency_ms_bucket{{provider=\"{name}\",le=\"{le}\"}} {cumulative}"
+            );
         }
-        let _ = writeln!(out, "vidarax_infer_latency_ms_bucket{{provider=\"{name}\",le=\"+Inf\"}} {count}");
-        let _ = writeln!(out, "vidarax_infer_latency_ms_sum{{provider=\"{name}\"}} {sum_ms}");
-        let _ = writeln!(out, "vidarax_infer_latency_ms_count{{provider=\"{name}\"}} {count}");
+        let _ = writeln!(
+            out,
+            "vidarax_infer_latency_ms_bucket{{provider=\"{name}\",le=\"+Inf\"}} {count}"
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_latency_ms_sum{{provider=\"{name}\"}} {sum_ms}"
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_latency_ms_count{{provider=\"{name}\"}} {count}"
+        );
 
         // SLO tracking baselines for dashboards/alerts.
-        let _ = writeln!(out, "vidarax_infer_slo_target_ratio{{provider=\"{name}\"}} 0.99");
+        let _ = writeln!(
+            out,
+            "vidarax_infer_slo_target_ratio{{provider=\"{name}\"}} 0.99"
+        );
         let total = ok + err;
         let error_budget_remaining = if total == 0 {
             1.0

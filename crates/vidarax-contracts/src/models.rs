@@ -86,7 +86,10 @@ pub fn fallback_candidates(requested: &str) -> &'static [&'static str] {
     };
 
     match canonical {
-        "Qwen/Qwen3.5-35B-A3B-FP8" | "Qwen/Qwen3.5-9B" | "Qwen/Qwen3-VL-8B-Instruct" | "allenai/Molmo2-8B" => REQUIRED_MEDIUM_MODELS,
+        "Qwen/Qwen3.5-35B-A3B-FP8"
+        | "Qwen/Qwen3.5-9B"
+        | "Qwen/Qwen3-VL-8B-Instruct"
+        | "allenai/Molmo2-8B" => REQUIRED_MEDIUM_MODELS,
         _ => REQUIRED_SMALL_MODELS,
     }
 }

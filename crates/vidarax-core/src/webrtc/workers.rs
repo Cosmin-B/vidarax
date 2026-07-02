@@ -87,8 +87,7 @@ pub fn jpeg_pool_slots(analysis_workers: usize, vlm_workers: usize) -> usize {
     let analysis_workers = per_stream_analysis_workers(analysis_workers);
     let vlm_workers = per_stream_vlm_workers(vlm_workers);
     let decode_to_analysis = STREAM_FRAME_QUEUE_CAPACITY + analysis_workers + 1;
-    let normal_path =
-        VLM_WORK_QUEUE_CAPACITY + vlm_workers + JPEG_SINK_EVENT_POOL_ALLOWANCE + 1;
+    let normal_path = VLM_WORK_QUEUE_CAPACITY + vlm_workers + JPEG_SINK_EVENT_POOL_ALLOWANCE + 1;
     let active_clip_workers = vlm_workers;
     let blocked_clip_sender = 1;
     let clip_path = CLIP_FRAME_QUEUE_CAPACITY
@@ -552,7 +551,9 @@ pub(super) fn token_budget_entry<'a>(
         }
         budget.insert(Arc::clone(session), (now, 0));
     }
-    budget.get_mut(session.as_ref()).expect("entry inserted above")
+    budget
+        .get_mut(session.as_ref())
+        .expect("entry inserted above")
 }
 
 /// Spawn VLM inference worker threads with 3-tier routing + training pair collection.
@@ -617,19 +618,40 @@ where
                 let emit_start = std::time::Instant::now();
                 match event {
                     SinkEvent::Emit {
-                        run_id, session_id, frame_index, pts_ms,
-                        event_type, confidence, description,
+                        run_id,
+                        session_id,
+                        frame_index,
+                        pts_ms,
+                        event_type,
+                        confidence,
+                        description,
                     } => {
                         let _ = stdb.emit_event_sync(
-                            &run_id, &session_id, frame_index, pts_ms,
-                            event_type, confidence, &description,
+                            &run_id,
+                            &session_id,
+                            frame_index,
+                            pts_ms,
+                            event_type,
+                            confidence,
+                            &description,
                         );
                     }
                     SinkEvent::StoreKeyframe {
-                        run_id, frame_index, pts_ms, event_type, description, jpeg_bytes, ..
+                        run_id,
+                        frame_index,
+                        pts_ms,
+                        event_type,
+                        description,
+                        jpeg_bytes,
+                        ..
                     } => {
                         let _ = stdb.store_keyframe_sync(
-                            &run_id, frame_index, pts_ms, event_type, &description, &jpeg_bytes,
+                            &run_id,
+                            frame_index,
+                            pts_ms,
+                            event_type,
+                            &description,
+                            &jpeg_bytes,
                         );
                     }
                 }
@@ -1091,20 +1113,19 @@ fn collect_training_pair(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_stream_frame_from_yuv, decode_output_pool_slots, jpeg_pool_slots,
-        token_budget_entry, EventSink, KeyframeWork, StreamFrame, CLIP_FRAME_QUEUE_CAPACITY,
-        CLIP_WORK_QUEUE_CAPACITY,
+        build_stream_frame_from_yuv, decode_output_pool_slots, jpeg_pool_slots, token_budget_entry,
+        EventSink, KeyframeWork, StreamFrame, CLIP_FRAME_QUEUE_CAPACITY, CLIP_WORK_QUEUE_CAPACITY,
         FFMPEG_YUV_READER_QUEUE_CAPACITY, JPEG_POOL_SLOT_CEILING, JPEG_SINK_EVENT_POOL_ALLOWANCE,
         SINK_EVENT_QUEUE_CAPACITY, STREAM_FRAME_QUEUE_CAPACITY, VLM_TOKEN_BUDGET_MAX_SESSIONS,
         VLM_WORK_QUEUE_CAPACITY,
     };
+    use crate::gate::FrameSignal;
     use crate::webrtc::clip::MAX_CLIP_FRAMES_PER_REQUEST;
     use crate::webrtc::decode::{
-        VideoCodec, YuvFrame, FFMPEG_YUV_PENDING_POOL_ALLOWANCE,
-        FFMPEG_YUV_READER_POOL_MIN_SLOTS, SOFTWARE_YUV_POOL_MIN_SLOTS,
+        VideoCodec, YuvFrame, FFMPEG_YUV_PENDING_POOL_ALLOWANCE, FFMPEG_YUV_READER_POOL_MIN_SLOTS,
+        SOFTWARE_YUV_POOL_MIN_SLOTS,
     };
     use crate::webrtc::recycle::VecPool;
-    use crate::gate::FrameSignal;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
@@ -1205,8 +1226,10 @@ mod tests {
     #[test]
     fn mock_sink_records_calls() {
         let sink = MockSink::new();
-        sink.emit_event_sync("r", "s", 0, 0, "vlm", 0.9, "hello").unwrap();
-        sink.store_keyframe_sync("r", 0, 0, "scene_cut", "hello", b"").unwrap();
+        sink.emit_event_sync("r", "s", 0, 0, "vlm", 0.9, "hello")
+            .unwrap();
+        sink.store_keyframe_sync("r", 0, 0, "scene_cut", "hello", b"")
+            .unwrap();
         assert_eq!(sink.events.lock().unwrap().as_slice(), ["vlm"]);
         assert_eq!(sink.keyframes.lock().unwrap().as_slice(), ["scene_cut"]);
     }
@@ -1299,7 +1322,10 @@ mod tests {
         let expected = decode_to_analysis + normal_path + clip_path;
 
         assert_eq!(expected, 484);
-        assert_eq!(super::jpeg_sink_event_backlog_capacity(), JPEG_SINK_EVENT_POOL_ALLOWANCE);
+        assert_eq!(
+            super::jpeg_sink_event_backlog_capacity(),
+            JPEG_SINK_EVENT_POOL_ALLOWANCE
+        );
         const _: () = assert!(JPEG_SINK_EVENT_POOL_ALLOWANCE < SINK_EVENT_QUEUE_CAPACITY);
         assert_eq!(jpeg_pool_slots(1, vlm_workers), expected);
         assert!(expected <= JPEG_POOL_SLOT_CEILING);

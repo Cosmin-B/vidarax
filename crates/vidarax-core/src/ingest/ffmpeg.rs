@@ -222,12 +222,7 @@ fn probe_source_fps_inner(source: &InputSource) -> Option<f32> {
     let source_uri = source.as_ffmpeg_input();
     let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
     let output = Command::new(ffprobe_path())
-        .args([
-            "-v",
-            "error",
-            "-protocol_whitelist",
-            protocol_whitelist,
-        ])
+        .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
         .args(ffmpeg_input_options_for_source(source))
         .args([
             "-select_streams",
@@ -251,10 +246,9 @@ pub fn decode_mp4_to_frame_signals(
     source: &InputSource,
     config: Mp4DecodeConfig,
 ) -> Result<DecodedMp4Batch, String> {
-    let mut decoded =
-        with_prefetched_downloadable_source(source, |source| {
-            decode_mp4_to_frame_signals_inner(source, config)
-        })??;
+    let mut decoded = with_prefetched_downloadable_source(source, |source| {
+        decode_mp4_to_frame_signals_inner(source, config)
+    })??;
     decoded.source_uri = source.as_ffmpeg_input().to_string();
     Ok(decoded)
 }
@@ -289,24 +283,10 @@ fn decode_mp4_to_frame_signals_inner(
     let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
     let fps_expr = format!("fps={:.3}", config.sample_fps);
     let output = Command::new(ffmpeg_path())
-        .args([
-            "-v",
-            "error",
-            "-protocol_whitelist",
-            protocol_whitelist,
-        ])
+        .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
         .args(ffmpeg_input_options_for_source(source))
         .args([
-            "-i",
-            source_uri,
-            "-an",
-            "-sn",
-            "-dn",
-            "-vf",
-            &fps_expr,
-            "-f",
-            "framemd5",
-            "-",
+            "-i", source_uri, "-an", "-sn", "-dn", "-vf", &fps_expr, "-f", "framemd5", "-",
         ])
         .output()
         .map_err(|_| "failed to run ffmpeg".to_string())?;
@@ -346,12 +326,7 @@ fn decode_mp4_to_jpeg_frames_inner(
     let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
     let fps_expr = format!("fps={:.3}", config.sample_fps);
     let output = Command::new(ffmpeg_path())
-        .args([
-            "-v",
-            "error",
-            "-protocol_whitelist",
-            protocol_whitelist,
-        ])
+        .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
         .args(ffmpeg_input_options_for_source(source))
         .args([
             "-i",
@@ -534,11 +509,13 @@ pub(crate) fn parse_jpeg_stream_to_frames(
                     }
                     cursor = pos + 1;
                 }
-                None => return if frames.is_empty() {
-                    Err("no jpeg frames decoded from source".to_string())
-                } else {
-                    Ok(frames)
-                },
+                None => {
+                    return if frames.is_empty() {
+                        Err("no jpeg frames decoded from source".to_string())
+                    } else {
+                        Ok(frames)
+                    }
+                }
             }
         };
         cursor = start + 2;
@@ -698,17 +675,19 @@ fn extract_video_clip_inner(
 
     let output = if use_stream_copy {
         Command::new(ffmpeg_path())
-            .args([
-                "-v", "error",
-                "-protocol_whitelist", protocol_whitelist,
-            ])
+            .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
             .args(ffmpeg_input_options_for_source(source))
             .args([
-                "-ss", &start_str,
-                "-t", &duration_str,
-                "-i", source_uri,
-                "-c", "copy",
-                "-movflags", "+faststart",
+                "-ss",
+                &start_str,
+                "-t",
+                &duration_str,
+                "-i",
+                source_uri,
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
                 "-y",
                 &tmp_str,
             ])
@@ -716,17 +695,19 @@ fn extract_video_clip_inner(
             .map_err(|_| "failed to run ffmpeg".to_string())?
     } else {
         Command::new(ffmpeg_path())
-            .args([
-                "-v", "error",
-                "-protocol_whitelist", protocol_whitelist,
-            ])
+            .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
             .args(ffmpeg_input_options_for_source(source))
             .args([
-                "-ss", &start_str,
-                "-t", &duration_str,
-                "-i", source_uri,
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
+                "-ss",
+                &start_str,
+                "-t",
+                &duration_str,
+                "-i",
+                source_uri,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
                 "-an",
                 "-y",
                 &tmp_str,
@@ -794,19 +775,24 @@ pub(crate) fn decode_selective_jpeg_frames_inner(
     let source_uri = source.as_ffmpeg_input();
     let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
     let output = Command::new(ffmpeg_path())
-        .args([
-            "-v", "error",
-            "-protocol_whitelist", protocol_whitelist,
-        ])
+        .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
         .args(ffmpeg_input_options_for_source(source))
         .args([
-            "-i", source_uri,
-            "-an", "-sn", "-dn",
-            "-vf", &vf_chain,
-            "-vsync", "vfr",
-            "-frames:v", &frames_cap,
-            "-f", "image2pipe",
-            "-vcodec", "mjpeg",
+            "-i",
+            source_uri,
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            &vf_chain,
+            "-vsync",
+            "vfr",
+            "-frames:v",
+            &frames_cap,
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
             "-",
         ])
         .output()
@@ -832,7 +818,6 @@ pub(crate) fn decode_selective_jpeg_frames_inner(
     Ok(parsed)
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -842,9 +827,9 @@ mod tests {
     use super::{
         ffmpeg_input_options_for_source, ffmpeg_protocol_whitelist_for_source,
         parse_ffprobe_frame_rate, parse_framemd5_to_signals, parse_jpeg_stream_to_frames,
-        Mp4DecodeConfig, TimestampNormalizer, FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST,
-        FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST, FFMPEG_HTTP_PROTOCOL_WHITELIST,
-        FFMPEG_HTTPS_PROTOCOL_WHITELIST, FFMPEG_LOCAL_PROTOCOL_WHITELIST,
+        Mp4DecodeConfig, TimestampNormalizer, FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST,
+        FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST, FFMPEG_HTTPS_PROTOCOL_WHITELIST,
+        FFMPEG_HTTP_PROTOCOL_WHITELIST, FFMPEG_LOCAL_PROTOCOL_WHITELIST,
         FFMPEG_RTSPS_PROTOCOL_WHITELIST,
     };
     use crate::ingest::InputSource;
@@ -1011,12 +996,10 @@ mod tests {
         ));
         assert_eq!(hls_options[0], "-max_redirects");
         assert_eq!(hls_options[1], "0");
-        assert!(
-            ffmpeg_input_options_for_source(&InputSource::FilePath(
-                "/tmp/video.mp4".to_string()
-            ))
-            .is_empty()
-        );
+        assert!(ffmpeg_input_options_for_source(&InputSource::FilePath(
+            "/tmp/video.mp4".to_string()
+        ))
+        .is_empty());
     }
 
     #[test]

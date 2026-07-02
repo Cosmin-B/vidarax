@@ -3,8 +3,8 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -64,12 +64,12 @@ fn prefetch_remote_media_with_limit_and_validator(
     max_bytes: u64,
     validate_url: FetchUrlValidator,
 ) -> Result<PrefetchedMedia, String> {
-    let parsed = reqwest::Url::parse(url).map_err(|err| format!("invalid remote media URL: {err}"))?;
+    let parsed =
+        reqwest::Url::parse(url).map_err(|err| format!("invalid remote media URL: {err}"))?;
     let validated_addrs = validate_url(&parsed)?;
     let started = Instant::now();
 
-    let mut response =
-        fetch_remote_media_response(parsed, validated_addrs, validate_url, started)?;
+    let mut response = fetch_remote_media_response(parsed, validated_addrs, validate_url, started)?;
     if !response.status().is_success() {
         return Err(format!(
             "remote media fetch failed with HTTP status {}",
@@ -617,10 +617,8 @@ mod tests {
 
     #[test]
     fn prefetched_media_probe_times_out_and_kills_slow_child() {
-        let path = std::env::temp_dir().join(format!(
-            "vidarax-prefetch-timeout-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("vidarax-prefetch-timeout-{}", std::process::id()));
         fs::write(&path, b"not used by fake ffprobe").unwrap();
         let started = Instant::now();
 
@@ -684,13 +682,13 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
-    use super::{FetchUrlValidator, validate_remote_fetch_url};
+    use super::{validate_remote_fetch_url, FetchUrlValidator};
     use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Sender};
+    use std::sync::Arc;
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
@@ -758,7 +756,9 @@ pub(crate) mod test_helpers {
                         }
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                             if Instant::now() >= deadline {
-                                return Err("mock HTTP server timed out waiting for request".to_string());
+                                return Err(
+                                    "mock HTTP server timed out waiting for request".to_string()
+                                );
                             }
                             thread::sleep(Duration::from_millis(5));
                         }
@@ -815,7 +815,9 @@ pub(crate) mod test_helpers {
     impl ProxyTrap {
         pub(crate) fn serve() -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind proxy trap");
-            listener.set_nonblocking(true).expect("configure proxy trap");
+            listener
+                .set_nonblocking(true)
+                .expect("configure proxy trap");
             let addr = listener.local_addr().expect("read proxy trap addr");
             let (shutdown_tx, shutdown_rx) = mpsc::channel();
             let saw_connection = Arc::new(AtomicBool::new(false));

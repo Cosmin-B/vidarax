@@ -61,7 +61,10 @@ impl GeminiProvider {
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /// Build the `generateContent` request body as a JSON string.
-    pub(crate) fn build_payload(&self, request: &InferenceRequest) -> Result<String, ProviderError> {
+    pub(crate) fn build_payload(
+        &self,
+        request: &InferenceRequest,
+    ) -> Result<String, ProviderError> {
         // Media parts first (Gemini best practice), text prompt last.
         let mut parts: Vec<Value> = Vec::new();
 
@@ -106,9 +109,7 @@ impl GeminiProvider {
 
         if let Some(schema_str) = &request.guided_json {
             let schema: Value = serde_json::from_str(schema_str).map_err(|e| {
-                ProviderError::InvalidResponse(
-                    format!("guided_json is not valid JSON: {e}").into(),
-                )
+                ProviderError::InvalidResponse(format!("guided_json is not valid JSON: {e}").into())
             })?;
             gen_config["responseMimeType"] = Value::String("application/json".to_string());
             gen_config["responseSchema"] = schema;
@@ -141,7 +142,10 @@ impl GeminiProvider {
             .post(&init_url)
             .header("X-Goog-Upload-Protocol", "resumable")
             .header("X-Goog-Upload-Command", "start")
-            .header("X-Goog-Upload-Header-Content-Length", byte_count.to_string())
+            .header(
+                "X-Goog-Upload-Header-Content-Length",
+                byte_count.to_string(),
+            )
             .header("X-Goog-Upload-Header-Content-Type", video.media_type)
             .header("content-type", "application/json")
             .body(r#"{"file":{"display_name":"vidarax_upload"}}"#)
@@ -352,8 +356,11 @@ mod tests {
     use std::sync::Arc;
 
     fn provider() -> GeminiProvider {
-        GeminiProvider::new("test-key".to_string(), "gemini-2.5-flash-preview-05-20".to_string())
-            .unwrap()
+        GeminiProvider::new(
+            "test-key".to_string(),
+            "gemini-2.5-flash-preview-05-20".to_string(),
+        )
+        .unwrap()
     }
 
     fn request() -> InferenceRequest {
@@ -395,7 +402,10 @@ mod tests {
         let parts = v["contents"][0]["parts"].as_array().unwrap();
         // Part 0 should be the image, part 1 should be the text.
         assert_eq!(parts.len(), 2);
-        assert!(parts[0].get("inlineData").is_some(), "first part must be inlineData");
+        assert!(
+            parts[0].get("inlineData").is_some(),
+            "first part must be inlineData"
+        );
         assert!(parts[1].get("text").is_some(), "last part must be text");
     }
 
@@ -431,7 +441,10 @@ mod tests {
             video_part.get("inlineData").is_some(),
             "small video must use inlineData, got: {video_part}"
         );
-        assert_eq!(video_part["inlineData"]["mimeType"].as_str(), Some("video/mp4"));
+        assert_eq!(
+            video_part["inlineData"]["mimeType"].as_str(),
+            Some("video/mp4")
+        );
     }
 
     #[test]
@@ -474,8 +487,14 @@ mod tests {
         let p = provider();
         let mut req = request();
         req.input_images = vec![
-            InferenceImage { media_type: "image/jpeg", data_base64: "YWJj".to_string() },
-            InferenceImage { media_type: "image/png", data_base64: "eHl6".to_string() },
+            InferenceImage {
+                media_type: "image/jpeg",
+                data_base64: "YWJj".to_string(),
+            },
+            InferenceImage {
+                media_type: "image/png",
+                data_base64: "eHl6".to_string(),
+            },
         ];
         let body = p.build_payload(&req).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
@@ -566,14 +585,18 @@ mod tests {
     #[test]
     fn parse_response_invalid_json_returns_error() {
         let p = provider();
-        assert!(p.parse_response("{{{{", "gemini-2.0-flash", Instant::now()).is_err());
+        assert!(p
+            .parse_response("{{{{", "gemini-2.0-flash", Instant::now())
+            .is_err());
     }
 
     #[test]
     fn parse_response_missing_candidates_returns_error() {
         let p = provider();
         let raw = r#"{"candidates":[]}"#;
-        assert!(p.parse_response(raw, "gemini-2.0-flash", Instant::now()).is_err());
+        assert!(p
+            .parse_response(raw, "gemini-2.0-flash", Instant::now())
+            .is_err());
     }
 
     // ── Live integration tests (require GEMINI_API_KEY) ─────────────────────
@@ -597,7 +620,10 @@ mod tests {
         let r = p.infer(&req).expect("text-only inference failed");
         assert_eq!(r.finish_reason.as_deref(), Some("stop"));
         assert!(!r.output_text.is_empty());
-        println!("text-only: {:?} ({}ms)", r.output_text, r.inference_latency_ms);
+        println!(
+            "text-only: {:?} ({}ms)",
+            r.output_text, r.inference_latency_ms
+        );
     }
 
     #[test]
@@ -610,7 +636,10 @@ mod tests {
         let req = InferenceRequest {
             model: std::sync::Arc::from("gemini-2.0-flash"),
             prompt: std::sync::Arc::from("What does this screenshot show? One sentence."),
-            input_images: vec![crate::provider::InferenceImage { media_type: "image/jpeg", data_base64: b64 }],
+            input_images: vec![crate::provider::InferenceImage {
+                media_type: "image/jpeg",
+                data_base64: b64,
+            }],
             input_videos: vec![],
             max_tokens: 100,
             temperature: 0.0,
@@ -634,7 +663,10 @@ mod tests {
             model: std::sync::Arc::from("gemini-2.0-flash"),
             prompt: std::sync::Arc::from("Describe what happens in this video in one sentence."),
             input_images: vec![],
-            input_videos: vec![crate::provider::InferenceVideo { media_type: "video/mp4", data_base64: b64 }],
+            input_videos: vec![crate::provider::InferenceVideo {
+                media_type: "video/mp4",
+                data_base64: b64,
+            }],
             max_tokens: 100,
             temperature: 0.0,
             timeout_ms: 30000,
@@ -656,8 +688,13 @@ mod tests {
         let schema = r#"{"type":"object","properties":{"title":{"type":"string"},"has_button":{"type":"boolean"}},"required":["title","has_button"]}"#;
         let req = InferenceRequest {
             model: std::sync::Arc::from("gemini-2.0-flash"),
-            prompt: std::sync::Arc::from("Extract the page title and whether there is a visible button."),
-            input_images: vec![crate::provider::InferenceImage { media_type: "image/jpeg", data_base64: b64 }],
+            prompt: std::sync::Arc::from(
+                "Extract the page title and whether there is a visible button.",
+            ),
+            input_images: vec![crate::provider::InferenceImage {
+                media_type: "image/jpeg",
+                data_base64: b64,
+            }],
             input_videos: vec![],
             max_tokens: 200,
             temperature: 0.0,
@@ -666,9 +703,16 @@ mod tests {
             guided_json: Some(std::sync::Arc::from(schema)),
         };
         let r = p.infer(&req).expect("structured json inference failed");
-        let parsed: serde_json::Value = serde_json::from_str(&r.output_text).expect("output not valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&r.output_text).expect("output not valid JSON");
         assert!(parsed.get("title").is_some(), "missing 'title' field");
-        assert!(parsed.get("has_button").is_some(), "missing 'has_button' field");
-        println!("structured: {} ({}ms)", r.output_text, r.inference_latency_ms);
+        assert!(
+            parsed.get("has_button").is_some(),
+            "missing 'has_button' field"
+        );
+        println!(
+            "structured: {} ({}ms)",
+            r.output_text, r.inference_latency_ms
+        );
     }
 }

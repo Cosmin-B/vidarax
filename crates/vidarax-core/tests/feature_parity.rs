@@ -17,9 +17,7 @@ use vidarax_core::webrtc::workers::StreamFrame;
 
 /// Returns JSON that will be parsed as a successful completion.
 fn completion_json(text: &str) -> String {
-    format!(
-        r#"{{"choices":[{{"message":{{"role":"assistant","content":"{text}"}}}}]}}"#
-    )
+    format!(r#"{{"choices":[{{"message":{{"role":"assistant","content":"{text}"}}}}]}}"#)
 }
 
 /// Returns a completion JSON with an explicit finish_reason field.
@@ -78,7 +76,12 @@ impl MockTransport {
 }
 
 impl Transport for MockTransport {
-    fn call(&self, _endpoint: &str, body: String, _timeout_ms: u64) -> Result<String, ProviderError> {
+    fn call(
+        &self,
+        _endpoint: &str,
+        body: String,
+        _timeout_ms: u64,
+    ) -> Result<String, ProviderError> {
         *self.captured_body.lock().unwrap() = Some(body);
         self.response.clone()
     }
@@ -91,7 +94,12 @@ struct DelayTransport {
 }
 
 impl Transport for DelayTransport {
-    fn call(&self, _endpoint: &str, _body: String, _timeout_ms: u64) -> Result<String, ProviderError> {
+    fn call(
+        &self,
+        _endpoint: &str,
+        _body: String,
+        _timeout_ms: u64,
+    ) -> Result<String, ProviderError> {
         thread::sleep(Duration::from_millis(self.delay_ms));
         Ok(self.response.clone())
     }
@@ -142,7 +150,11 @@ fn output_schema_adds_guided_json_to_payload() {
     let value: Value = serde_json::from_str(&raw).unwrap();
     // Provider writes the schema under response_format.json_schema.schema.
     let guided = &value["response_format"]["json_schema"]["schema"];
-    assert_eq!(guided["type"].as_str(), Some("object"), "schema.type should be object");
+    assert_eq!(
+        guided["type"].as_str(),
+        Some("object"),
+        "schema.type should be object"
+    );
     assert!(
         guided["properties"]["event_type"].is_object(),
         "event_type property should be present"
@@ -208,14 +220,20 @@ fn output_schema_with_nested_properties_round_trips() {
     let raw = captured.lock().unwrap().clone().expect("body captured");
     let value: Value = serde_json::from_str(&raw).unwrap();
     let guided = &value["response_format"]["json_schema"]["schema"];
-    assert_eq!(guided["properties"]["scene"]["type"].as_str(), Some("object"));
+    assert_eq!(
+        guided["properties"]["scene"]["type"].as_str(),
+        Some("object")
+    );
 }
 
 // ── 2. finish_reason parsing ──────────────────────────────────────────────────
 
 #[test]
 fn finish_reason_stop_is_parsed() {
-    let provider = OpenAiCompatProvider::new(MockTransport::ok(&completion_with_reason("done", "stop")), ProviderKind::Vllm);
+    let provider = OpenAiCompatProvider::new(
+        MockTransport::ok(&completion_with_reason("done", "stop")),
+        ProviderKind::Vllm,
+    );
     let result = provider.infer(&base_request()).unwrap();
     assert_eq!(result.finish_reason.as_deref(), Some("stop"));
     assert_eq!(result.output_text, "done");
@@ -223,15 +241,20 @@ fn finish_reason_stop_is_parsed() {
 
 #[test]
 fn finish_reason_length_is_parsed() {
-    let provider =
-        OpenAiCompatProvider::new(MockTransport::ok(&completion_with_reason("partial", "length")), ProviderKind::Vllm);
+    let provider = OpenAiCompatProvider::new(
+        MockTransport::ok(&completion_with_reason("partial", "length")),
+        ProviderKind::Vllm,
+    );
     let result = provider.infer(&base_request()).unwrap();
     assert_eq!(result.finish_reason.as_deref(), Some("length"));
 }
 
 #[test]
 fn finish_reason_absent_yields_none() {
-    let provider = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("ok")), ProviderKind::Vllm);
+    let provider = OpenAiCompatProvider::new(
+        MockTransport::ok(&completion_json("ok")),
+        ProviderKind::Vllm,
+    );
     let result = provider.infer(&base_request()).unwrap();
     assert_eq!(result.finish_reason, None);
 }
@@ -247,16 +270,20 @@ fn finish_reason_null_yields_none() {
 
 #[test]
 fn finish_reason_custom_value_is_preserved() {
-    let provider =
-        OpenAiCompatProvider::new(MockTransport::ok(&completion_with_reason("text", "content_filter")), ProviderKind::Vllm);
+    let provider = OpenAiCompatProvider::new(
+        MockTransport::ok(&completion_with_reason("text", "content_filter")),
+        ProviderKind::Vllm,
+    );
     let result = provider.infer(&base_request()).unwrap();
     assert_eq!(result.finish_reason.as_deref(), Some("content_filter"));
 }
 
 #[test]
 fn sglang_provider_also_parses_finish_reason() {
-    let provider =
-        OpenAiCompatProvider::new(MockTransport::ok(&completion_with_reason("sglang-out", "stop")), ProviderKind::Sglang);
+    let provider = OpenAiCompatProvider::new(
+        MockTransport::ok(&completion_with_reason("sglang-out", "stop")),
+        ProviderKind::Sglang,
+    );
     let result = provider.infer(&base_request()).unwrap();
     assert_eq!(result.finish_reason.as_deref(), Some("stop"));
 }
@@ -282,7 +309,10 @@ fn inference_latency_reflects_transport_duration() {
 
 #[test]
 fn fast_transport_yields_non_negative_latency() {
-    let provider = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("ok")), ProviderKind::Vllm);
+    let provider = OpenAiCompatProvider::new(
+        MockTransport::ok(&completion_json("ok")),
+        ProviderKind::Vllm,
+    );
     let result = provider.infer(&base_request()).unwrap();
     // u64 is always non-negative; this test documents the contract
     let _: u64 = result.inference_latency_ms;
@@ -292,7 +322,10 @@ fn fast_transport_yields_non_negative_latency() {
 fn latency_is_independent_of_output_content() {
     let delay_ms = 20u64;
     let long_response = completion_with_reason(&"x".repeat(4096), "stop");
-    let transport = DelayTransport { delay_ms, response: long_response };
+    let transport = DelayTransport {
+        delay_ms,
+        response: long_response,
+    };
     let provider = OpenAiCompatProvider::new(transport, ProviderKind::Vllm);
     let result = provider.infer(&base_request()).unwrap();
     assert!(
@@ -303,7 +336,10 @@ fn latency_is_independent_of_output_content() {
 
 #[test]
 fn fallback_result_also_carries_latency() {
-    let primary = OpenAiCompatProvider::new(MockTransport::err(ProviderError::HttpStatus(503)), ProviderKind::Vllm);
+    let primary = OpenAiCompatProvider::new(
+        MockTransport::err(ProviderError::HttpStatus(503)),
+        ProviderKind::Vllm,
+    );
     let fallback_transport = DelayTransport {
         delay_ms: 15,
         response: completion_with_reason("fallback", "stop"),
@@ -331,8 +367,7 @@ fn accumulator_emits_clip_after_window_fills() {
         clip_length_seconds: 0.5,
         delay_seconds: 0.0,
     };
-    let mut acc =
-        ClipAccumulator::new(cfg, "run-a".into(), "sess-a".into(), "describe".into());
+    let mut acc = ClipAccumulator::new(cfg, "run-a".into(), "sess-a".into(), "describe".into());
 
     // Feed frames at 100ms intervals; 500ms window requires 6 frames (pts 0..500).
     let mut emitted = None;
@@ -344,7 +379,10 @@ fn accumulator_emits_clip_after_window_fills() {
     }
 
     let clip = emitted.expect("a clip should have been emitted");
-    assert!(!clip.frames.is_empty(), "clip must contain at least one frame");
+    assert!(
+        !clip.frames.is_empty(),
+        "clip must contain at least one frame"
+    );
     assert!(clip.pts_end >= clip.pts_start, "pts must be ordered");
     assert_eq!(&*clip.run_id, "run-a");
     assert_eq!(&*clip.session_id, "sess-a");
@@ -363,7 +401,10 @@ fn accumulator_does_not_emit_before_window_is_full() {
     // Send 10 frames at 100ms each — only 1 second elapsed, below 2s window.
     for i in 0..10u64 {
         let result = acc.push(make_stream_frame(i, i * 100));
-        assert!(result.is_none(), "frame {i}: should not emit before window fills");
+        assert!(
+            result.is_none(),
+            "frame {i}: should not emit before window fills"
+        );
     }
 }
 
@@ -434,7 +475,10 @@ fn clip_config_min_frame_constraint_accepts_exact_boundary() {
         clip_length_seconds: 1.0,
         delay_seconds: 0.0,
     };
-    assert!(cfg.validate().is_ok(), "3 fps * 1s = 3 frames, exactly at minimum");
+    assert!(
+        cfg.validate().is_ok(),
+        "3 fps * 1s = 3 frames, exactly at minimum"
+    );
 }
 
 #[test]
@@ -532,8 +576,7 @@ fn clip_work_pts_span_covers_window() {
 #[test]
 fn https_m3u8_url_is_rejected_as_remote_hls_by_default() {
     let allowed = vec![std::env::temp_dir()];
-    let result =
-        InputSource::parse_and_validate("https://example.com/live/feed.m3u8", &allowed);
+    let result = InputSource::parse_and_validate("https://example.com/live/feed.m3u8", &allowed);
     assert!(
         result.is_err(),
         "remote https .m3u8 should require explicit opt-in"
@@ -543,8 +586,7 @@ fn https_m3u8_url_is_rejected_as_remote_hls_by_default() {
 #[test]
 fn http_m3u8_url_is_rejected_as_remote_hls_by_default() {
     let allowed = vec![std::env::temp_dir()];
-    let result =
-        InputSource::parse_and_validate("http://example.com/live/stream.m3u8", &allowed);
+    let result = InputSource::parse_and_validate("http://example.com/live/stream.m3u8", &allowed);
     assert!(
         result.is_err(),
         "remote http .m3u8 should require explicit opt-in"
@@ -554,8 +596,7 @@ fn http_m3u8_url_is_rejected_as_remote_hls_by_default() {
 #[test]
 fn non_m3u8_https_url_is_not_hls_stream() {
     let allowed = vec![std::env::temp_dir()];
-    let result =
-        InputSource::parse_and_validate("https://example.com/clip.mp4", &allowed).unwrap();
+    let result = InputSource::parse_and_validate("https://example.com/clip.mp4", &allowed).unwrap();
     assert!(
         !matches!(result, InputSource::HlsStream(_)),
         "non-.m3u8 URL should not be HlsStream"
@@ -566,11 +607,8 @@ fn non_m3u8_https_url_is_not_hls_stream() {
 fn hls_url_with_embedded_credentials_is_rejected() {
     let allowed = vec![std::env::temp_dir()];
     assert!(
-        InputSource::parse_and_validate(
-            "https://user:secret@example.com/feed.m3u8",
-            &allowed
-        )
-        .is_err(),
+        InputSource::parse_and_validate("https://user:secret@example.com/feed.m3u8", &allowed)
+            .is_err(),
         "credentials in HLS URL must be rejected"
     );
 }
@@ -613,8 +651,7 @@ fn hls_url_targeting_metadata_endpoint_is_rejected() {
 fn hls_scheme_url_is_rejected_as_remote_hls_by_default() {
     let allowed = vec![std::env::temp_dir()];
     // hls:// is a VidaraX alias and must still require remote-HLS opt-in.
-    let result =
-        InputSource::parse_and_validate("hls://example.com/live.m3u8", &allowed);
+    let result = InputSource::parse_and_validate("hls://example.com/live.m3u8", &allowed);
     assert!(
         result.is_err(),
         "remote hls:// URL should require explicit opt-in"
@@ -633,7 +670,10 @@ fn hls_ffmpeg_input_returns_original_url() {
 #[test]
 fn loop_not_triggered_on_first_occurrence() {
     let mut d = LoopDetector::new(6, 3);
-    assert!(!d.check(0xDEAD_BEEF_CAFE_BABE), "first occurrence must not trigger");
+    assert!(
+        !d.check(0xDEAD_BEEF_CAFE_BABE),
+        "first occurrence must not trigger"
+    );
 }
 
 #[test]
@@ -644,7 +684,10 @@ fn loop_triggered_after_repeat_trigger_count() {
     assert!(!d.check(hash));
     assert!(!d.check(hash));
     // Fourth identical hash: 3 slots now match → triggers.
-    assert!(d.check(hash), "should trigger after repeat_trigger identical hashes");
+    assert!(
+        d.check(hash),
+        "should trigger after repeat_trigger identical hashes"
+    );
 }
 
 #[test]
@@ -655,7 +698,10 @@ fn similar_hashes_within_threshold_trigger_loop() {
     assert!(!d.check(base));
     assert!(!d.check(base ^ 0x01));
     assert!(!d.check(base ^ 0x02));
-    assert!(d.check(base ^ 0x04), "near-duplicate hashes should trigger loop");
+    assert!(
+        d.check(base ^ 0x04),
+        "near-duplicate hashes should trigger loop"
+    );
 }
 
 #[test]
@@ -694,7 +740,10 @@ fn loop_detector_evicts_old_hashes_from_ring_buffer() {
         d.check(i.wrapping_mul(0x1111_1111_1111_1111));
     }
     // Old hashes are gone; a fresh occurrence should not trigger.
-    assert!(!d.check(loop_hash), "evicted hashes must not count toward trigger");
+    assert!(
+        !d.check(loop_hash),
+        "evicted hashes must not count toward trigger"
+    );
 }
 
 #[test]
@@ -704,13 +753,16 @@ fn loop_detector_high_threshold_allows_more_variation() {
     let base = 0x0000_0000_0000_0000u64;
     // Flip 16 bits — within threshold of 32.
     let _similar = 0x0000_0000_FFFF_FFFFu64; // 32 bits different — exactly 32 is not < threshold
-    // Actually (base ^ similar).count_ones() = 32, and threshold check is `< threshold`, so 32 < 32 is false.
-    // Use a variant with 16 bit flips to stay safely within threshold.
+                                             // Actually (base ^ similar).count_ones() = 32, and threshold check is `< threshold`, so 32 < 32 is false.
+                                             // Use a variant with 16 bit flips to stay safely within threshold.
     let within = 0x0000_FFFF_0000_0000u64; // 16 bits different
     assert!(!d.check(base));
     assert!(!d.check(within));
     assert!(!d.check(within ^ 0x01));
-    assert!(d.check(within ^ 0x02), "high threshold should match across moderate variation");
+    assert!(
+        d.check(within ^ 0x02),
+        "high threshold should match across moderate variation"
+    );
 }
 
 #[test]

@@ -492,15 +492,15 @@ async fn cmd_distill_train(opts: DistillOpts) {
     // Export a fresh JSONL snapshot before kicking off training.
     let jsonl_path = opts.data_dir.join(format!("{tenant_id}-training.jsonl"));
     match vidarax_core::training_data::TrainingStore::new(&opts.data_dir) {
-        Ok(store) => {
-            match store.export_training_jsonl(tenant_id, &jsonl_path) {
-                Ok(n) => tracing::info!(count = n, path = %jsonl_path.display(), "exported training pairs"),
-                Err(e) => {
-                    eprintln!("error exporting training data: {e}");
-                    std::process::exit(1);
-                }
+        Ok(store) => match store.export_training_jsonl(tenant_id, &jsonl_path) {
+            Ok(n) => {
+                tracing::info!(count = n, path = %jsonl_path.display(), "exported training pairs")
             }
-        }
+            Err(e) => {
+                eprintln!("error exporting training data: {e}");
+                std::process::exit(1);
+            }
+        },
         Err(e) => {
             eprintln!("error opening training store: {e}");
             std::process::exit(1);
