@@ -202,7 +202,9 @@ mod tests {
         sink.emit_event_sync(run_id, "sess-01", 42, 1400, "vlm", 0.92, "a dog is running")
             .expect("emit_event_sync should succeed");
 
-        let events = state.read_run_events(run_id).expect("read_run_events failed");
+        let events = state
+            .read_run_events(run_id)
+            .expect("read_run_events failed");
         assert_eq!(events.len(), 1, "expected exactly one WAL event");
         let ev = &events[0];
         assert_eq!(ev.kind, "vlm");
@@ -224,10 +226,19 @@ mod tests {
         let run_id = "run-deadbeef00000000";
 
         let sink = WalEventSink::new(state.clone(), run_id.to_string());
-        sink.store_keyframe_sync(run_id, 7, 231, "scene_cut", "a park scene", b"\xff\xd8\xff\xd9")
-            .expect("store_keyframe_sync should succeed");
+        sink.store_keyframe_sync(
+            run_id,
+            7,
+            231,
+            "scene_cut",
+            "a park scene",
+            b"\xff\xd8\xff\xd9",
+        )
+        .expect("store_keyframe_sync should succeed");
 
-        let events = state.read_run_events(run_id).expect("read_run_events failed");
+        let events = state
+            .read_run_events(run_id)
+            .expect("read_run_events failed");
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev.kind, "keyframe_stored");
@@ -258,7 +269,9 @@ mod tests {
         sink.store_keyframe_sync(run_id, 3, 99, "periodic_keepalive", "desc", b"")
             .unwrap();
 
-        let events = state.read_run_events(run_id).expect("read_run_events failed");
+        let events = state
+            .read_run_events(run_id)
+            .expect("read_run_events failed");
         assert_eq!(events.len(), 6);
         assert!(events.iter().any(|e| e.kind == "keyframe_stored"));
         assert_eq!(events.iter().filter(|e| e.kind == "vlm").count(), 5);

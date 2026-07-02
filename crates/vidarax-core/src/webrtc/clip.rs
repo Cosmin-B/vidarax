@@ -37,9 +37,7 @@ use crate::metrics::PipelineMetrics;
 use crate::provider::{InferenceImage, InferenceProvider, InferenceRequest};
 use crate::tiered_vlm::{run_tiered, TieredVlmConfig};
 use crate::webrtc::recycle::RecycledBytes;
-use crate::webrtc::workers::{
-    per_stream_vlm_workers, token_budget_entry, EventSink, StreamFrame,
-};
+use crate::webrtc::workers::{per_stream_vlm_workers, token_budget_entry, EventSink, StreamFrame};
 
 // ─── ClipConfig ───────────────────────────────────────────────────────────────
 
@@ -99,9 +97,7 @@ impl ClipConfig {
                 self.clip_length_seconds
             ));
         }
-        if !self.delay_seconds.is_finite()
-            || self.delay_seconds < 0.0
-            || self.delay_seconds > 60.0
+        if !self.delay_seconds.is_finite() || self.delay_seconds < 0.0 || self.delay_seconds > 60.0
         {
             return Err(format!(
                 "delay_seconds must be between 0 and 60, got {}",
@@ -183,7 +179,12 @@ impl ClipAccumulator {
     ///
     /// Does **not** panic; validation must be done by the caller via
     /// [`ClipConfig::validate`] before constructing.
-    pub fn new(config: ClipConfig, run_id: Arc<str>, session_id: Arc<str>, prompt: Arc<str>) -> Self {
+    pub fn new(
+        config: ClipConfig,
+        run_id: Arc<str>,
+        session_id: Arc<str>,
+        prompt: Arc<str>,
+    ) -> Self {
         let sample_interval_ms = 1000u64 / (config.target_fps as u64).max(1);
         Self {
             config,
@@ -372,7 +373,8 @@ pub fn spawn_clip_vlm_workers<I>(
                         .iter()
                         .map(|(_, jpeg_bytes)| InferenceImage {
                             media_type: "image/jpeg",
-                            data_base64: base64::engine::general_purpose::STANDARD.encode(jpeg_bytes),
+                            data_base64: base64::engine::general_purpose::STANDARD
+                                .encode(jpeg_bytes),
                         })
                         .collect();
 
@@ -393,16 +395,11 @@ pub fn spawn_clip_vlm_workers<I>(
                         guided_json: current_guided_json,
                     };
 
-                    let (description, used_second_pass) = match run_tiered(
-                        provider.as_ref(),
-                        &config,
-                        request,
-                        1024,
-                        20_000,
-                    ) {
-                        Ok(output) => (output.result.output_text, output.used_second_pass),
-                        Err(err) => (format!("clip_vlm_error: {:?}", err.error), false),
-                    };
+                    let (description, used_second_pass) =
+                        match run_tiered(provider.as_ref(), &config, request, 1024, 20_000) {
+                            Ok(output) => (output.result.output_text, output.used_second_pass),
+                            Err(err) => (format!("clip_vlm_error: {:?}", err.error), false),
+                        };
 
                     if max_output_tokens_per_second > 0 {
                         let token_count = (description.len() / 4).max(1) as u32;
@@ -418,20 +415,21 @@ pub fn spawn_clip_vlm_workers<I>(
                     };
 
                     // Use the last frame's signal for metadata.
-                    let (last_signal, last_jpeg) = work.frames.last().cloned().unwrap_or_else(|| {
-                        (
-                            FrameSignal {
-                                frame_index: 0,
-                                pts_ms: work.pts_end,
-                                perceptual_hash: 0,
-                                luma_mean: 0.0,
-                                flicker_score: 0.0,
-                                ghosting_score: 0.0,
-                                noise_variance_score: 0.0,
-                            },
-                            RecycledBytes::default(),
-                        )
-                    });
+                    let (last_signal, last_jpeg) =
+                        work.frames.last().cloned().unwrap_or_else(|| {
+                            (
+                                FrameSignal {
+                                    frame_index: 0,
+                                    pts_ms: work.pts_end,
+                                    perceptual_hash: 0,
+                                    luma_mean: 0.0,
+                                    flicker_score: 0.0,
+                                    ghosting_score: 0.0,
+                                    noise_variance_score: 0.0,
+                                },
+                                RecycledBytes::default(),
+                            )
+                        });
 
                     let _ = stdb.emit_event_sync(
                         &work.run_id,
@@ -484,7 +482,11 @@ fn downsample_clip_buffer(
             continue;
         }
 
-        let elapsed = frame.0.pts_ms.saturating_sub(window_start_pts).min(window_ms);
+        let elapsed = frame
+            .0
+            .pts_ms
+            .saturating_sub(window_start_pts)
+            .min(window_ms);
         let mut slot = if window_ms == 0 {
             0
         } else {
@@ -567,10 +569,7 @@ mod tests {
             buffer.push_back((frame.signal, frame.jpeg.take().unwrap()));
         }
         let mut near_window_end = make_frame(63, 60_000);
-        buffer.push_back((
-            near_window_end.signal,
-            near_window_end.jpeg.take().unwrap(),
-        ));
+        buffer.push_back((near_window_end.signal, near_window_end.jpeg.take().unwrap()));
         let mut triggering = make_frame(64, 60_900);
         buffer.push_back((triggering.signal, triggering.jpeg.take().unwrap()));
 
@@ -655,12 +654,7 @@ mod tests {
             clip_length_seconds: 0.5,
             delay_seconds: 0.0, // no delay so first window triggers immediately
         };
-        let mut acc = ClipAccumulator::new(
-            cfg,
-            "run1".into(),
-            "sess1".into(),
-            "describe".into(),
-        );
+        let mut acc = ClipAccumulator::new(cfg, "run1".into(), "sess1".into(), "describe".into());
 
         // Send frames at 10 fps (100ms apart), for 600ms → 7 frames.
         // Window requires 500ms elapsed since first frame.
@@ -704,7 +698,11 @@ mod tests {
         assert!(result.is_some(), "should emit after 5s of window at 1fps");
         let clip = result.unwrap();
         // Should have exactly the accepted frames: 0, 1000, 2000, 3000, 4000, 5100 → 6 frames
-        assert!(clip.frames.len() >= 5, "expected at least 5 frames, got {}", clip.frames.len());
+        assert!(
+            clip.frames.len() >= 5,
+            "expected at least 5 frames, got {}",
+            clip.frames.len()
+        );
     }
 
     #[test]

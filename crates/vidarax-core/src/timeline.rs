@@ -210,11 +210,22 @@ fn restore(s: &str) -> String {
             out.push_str(&s[start..i]);
             i += 1;
             match bytes.get(i).copied() {
-                Some(b't')  => { out.push('\t'); i += 1; }
-                Some(b'n')  => { out.push('\n'); i += 1; }
-                Some(b'\\') => { out.push('\\'); i += 1; }
-                Some(_)     => { out.push('\\'); /* leave i at the unrecognised byte */ }
-                None        => out.push('\\'),
+                Some(b't') => {
+                    out.push('\t');
+                    i += 1;
+                }
+                Some(b'n') => {
+                    out.push('\n');
+                    i += 1;
+                }
+                Some(b'\\') => {
+                    out.push('\\');
+                    i += 1;
+                }
+                Some(_) => {
+                    out.push('\\'); /* leave i at the unrecognised byte */
+                }
+                None => out.push('\\'),
             }
             start = i;
         } else {

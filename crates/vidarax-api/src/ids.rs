@@ -6,8 +6,7 @@
 /// choice -- callers must not silently fall back to sequential counters.
 pub fn random_run_id() -> String {
     let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes)
-        .expect("OS CSPRNG unavailable -- cannot generate secure run IDs");
+    getrandom::fill(&mut bytes).expect("OS CSPRNG unavailable -- cannot generate secure run IDs");
     let mut id = String::with_capacity(4 + 32);
     id.push_str("run-");
     for b in &bytes {

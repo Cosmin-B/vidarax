@@ -225,7 +225,10 @@ mod tests {
         assert_eq!(&*requests[1].model, "teacher");
         assert_eq!(requests[1].max_tokens, 512);
         assert_eq!(requests[0].guided_json.as_deref(), Some(&*schema));
-        assert_eq!(requests[1].guided_json.as_deref(), Some(teacher_label_schema()));
+        assert_eq!(
+            requests[1].guided_json.as_deref(),
+            Some(teacher_label_schema())
+        );
     }
 }
 

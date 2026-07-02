@@ -30,22 +30,22 @@
 use std::{
     net::SocketAddr,
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
 };
 
 use axum::{
-    Router,
     extract::State,
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
+    Router,
 };
 use rustrtc::{
-    RtcConfiguration, SdpType, SessionDescription,
     media::{MediaKind, MediaSample, MediaStreamTrack},
     peer_connection::{PeerConnection, PeerConnectionEvent},
+    RtcConfiguration, SdpType, SessionDescription,
 };
 use tokio::sync::RwLock;
 
@@ -232,10 +232,7 @@ async fn ingest_tracks(pc: PeerConnection, nal_counter: Arc<AtomicU64>) {
                     track.id(),
                     track.kind()
                 );
-                println!(
-                    "[spike] video track connected  id={}",
-                    track.id()
-                );
+                println!("[spike] video track connected  id={}", track.id());
 
                 let counter = Arc::clone(&nal_counter);
                 tokio::spawn(async move {
@@ -298,10 +295,7 @@ async fn receive_video(
 #[tokio::main]
 async fn main() {
     // rustls needs a crypto provider installed before any TLS handshake.
-    rustls::crypto::CryptoProvider::install_default(
-        rustls::crypto::ring::default_provider(),
-    )
-    .ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
 
     tracing_subscriber::fmt()
         .with_env_filter("info,rustrtc=debug")

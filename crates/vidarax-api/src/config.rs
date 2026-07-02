@@ -12,7 +12,9 @@ pub(crate) const UPLOAD_DIR_NAME: &str = "vidarax-uploads";
 /// unreadable the function synthesises a [`vidarax_core::backends::VidaraxConfig`]
 /// from the legacy `VIDARAX_VLLM_BASE_URL` / `VIDARAX_SGLANG_BASE_URL` env vars
 /// so that existing deployments continue to work unchanged.
-pub fn load_backend_config(config_path: &str) -> Result<vidarax_core::backends::VidaraxConfig, String> {
+pub fn load_backend_config(
+    config_path: &str,
+) -> Result<vidarax_core::backends::VidaraxConfig, String> {
     match std::fs::read_to_string(config_path) {
         Ok(contents) => vidarax_core::backends::parse_config(&contents),
         Err(_) => {
@@ -170,8 +172,9 @@ impl ServerConfig {
             parse_usize_env("VIDARAX_WEBRTC_MAX_OUTPUT_TOKENS_PER_SECOND", 128)? as u32;
         // One ordered stream is decoded by one stateful decoder. Keep the env
         // knob for compatibility but clamp above 1 at config load.
-        let webrtc_decode_workers =
-            parse_usize_env("VIDARAX_WEBRTC_DECODE_WORKERS", 1)?.clamp(1, 64).min(1);
+        let webrtc_decode_workers = parse_usize_env("VIDARAX_WEBRTC_DECODE_WORKERS", 1)?
+            .clamp(1, 64)
+            .min(1);
         // Analysis owns stream-order gate/loop state; more workers make one
         // shared stream's decisions nondeterministic.
         let webrtc_analysis_workers = parse_usize_env("VIDARAX_WEBRTC_ANALYSIS_WORKERS", 1)?
@@ -179,8 +182,9 @@ impl ServerConfig {
             .min(1);
         // VLM keyframe analysis carries temporal/dedup state; do not split one
         // stream across racing workers.
-        let webrtc_vlm_workers =
-            parse_usize_env("VIDARAX_WEBRTC_VLM_WORKERS", 1)?.clamp(1, 64).min(1);
+        let webrtc_vlm_workers = parse_usize_env("VIDARAX_WEBRTC_VLM_WORKERS", 1)?
+            .clamp(1, 64)
+            .min(1);
         let distillation = parse_distillation_config()?;
         Ok(Self {
             bind_addr,
@@ -334,10 +338,9 @@ fn parse_distillation_config() -> Result<DistillationConfig, String> {
         .unwrap_or_else(|_| "Qwen/Qwen3-VL-8B-Instruct".to_string());
     let max_pairs_per_tenant =
         parse_usize_env("VIDARAX_DISTILL_MAX_PAIRS", 10_000)?.clamp(100, 1_000_000);
-    let collection_rate = parse_f32_env("VIDARAX_DISTILL_COLLECTION_RATE", 0.1)?
-        .clamp(0.0, 1.0);
-    let distance_threshold = parse_f32_env("VIDARAX_DISTILL_DISTANCE_THRESHOLD", 0.2)?
-        .clamp(0.0, 2.0);
+    let collection_rate = parse_f32_env("VIDARAX_DISTILL_COLLECTION_RATE", 0.1)?.clamp(0.0, 1.0);
+    let distance_threshold =
+        parse_f32_env("VIDARAX_DISTILL_DISTANCE_THRESHOLD", 0.2)?.clamp(0.0, 2.0);
     let knn_k = parse_usize_env("VIDARAX_DISTILL_KNN_K", 7)?.clamp(1, 100);
 
     Ok(DistillationConfig {
@@ -512,10 +515,8 @@ mod tests {
     #[test]
     fn server_config_explicit_ingest_roots_are_canonicalized() {
         let _guard = env_guard();
-        let root = std::env::temp_dir().join(format!(
-            "vidarax-explicit-root-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("vidarax-explicit-root-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let _ingest_roots = set_env(
             "VIDARAX_INGEST_FILE_ROOTS",
@@ -607,7 +608,10 @@ mod tests {
         assert_eq!(cfg.webrtc_decode_workers, 2);
         assert_eq!(cfg.webrtc_analysis_workers, 1);
         assert_eq!(cfg.webrtc_vlm_workers, 2);
-        assert_eq!(cfg.webrtc_stun_servers, vec!["stun:custom.example.com:3478"]);
+        assert_eq!(
+            cfg.webrtc_stun_servers,
+            vec!["stun:custom.example.com:3478"]
+        );
     }
 
     #[test]

@@ -58,12 +58,7 @@ impl SecurityPolicy {
                 .map(|limit| Arc::new(GlobalRateLimiter::new(limit))),
             tenant_limiter: config
                 .security_tenant_rps
-                .map(|limit| {
-                    Arc::new(TenantRateLimiter::new(
-                        limit,
-                        config.security_tenant_slots,
-                    ))
-                }),
+                .map(|limit| Arc::new(TenantRateLimiter::new(limit, config.security_tenant_slots))),
             metrics_require_api_key: config.security_metrics_require_api_key,
             cors_allowed_origins: Arc::new(normalize_cors_origins(&config.cors_allowed_origins)),
         })
@@ -265,8 +260,7 @@ pub async fn enforce_security(
     // Note: global rate limiting is enforced at the top of this function
     // (before the preflight/health bypass) so it is not duplicated here.
 
-    if let Some(response) =
-        per_principal_rate_limit_response(policy, request.headers(), request_id)
+    if let Some(response) = per_principal_rate_limit_response(policy, request.headers(), request_id)
     {
         return finalize_response(policy, origin.as_deref(), response);
     }
@@ -518,16 +512,17 @@ impl TenantRateLimiter {
         self.limiter.retain_recent();
         self.limiter.shrink_to_fit();
         if let Ok(mut tenants) = self.tenants.lock() {
-            tenants.retain(|_, last_seen| {
-                now.duration_since(*last_seen) < IDLE_TENANT_RETENTION
-            });
+            tenants.retain(|_, last_seen| now.duration_since(*last_seen) < IDLE_TENANT_RETENTION);
             tenants.shrink_to_fit();
         }
     }
 
     #[cfg(test)]
     fn tracked_tenants(&self) -> usize {
-        self.tenants.lock().map(|tenants| tenants.len()).unwrap_or(0)
+        self.tenants
+            .lock()
+            .map(|tenants| tenants.len())
+            .unwrap_or(0)
     }
 }
 
@@ -668,7 +663,10 @@ mod tests {
 
         let fresh = "tenant-fresh".to_string();
         for _ in 0..LIMIT {
-            assert!(limiter.allow(&fresh), "fresh tenant should receive its full quota");
+            assert!(
+                limiter.allow(&fresh),
+                "fresh tenant should receive its full quota"
+            );
         }
         assert!(!limiter.allow(&fresh));
     }

@@ -43,12 +43,12 @@ use std::sync::{
 };
 
 use arc_swap::{ArcSwap, ArcSwapOption};
+pub use rustrtc::peer_connection::PeerConnectionState;
 use rustrtc::{
-    IceServer, RtcConfiguration, SdpType, SessionDescription,
     media::{MediaKind, MediaSample, MediaStreamTrack},
     peer_connection::{PeerConnection, PeerConnectionEvent},
+    IceServer, RtcConfiguration, SdpType, SessionDescription,
 };
-pub use rustrtc::peer_connection::PeerConnectionState;
 
 use crate::metrics::PipelineMetrics;
 use crate::webrtc::decode::VideoCodec;
@@ -213,10 +213,7 @@ impl WebRtcSession {
     ///     rustls::crypto::ring::default_provider()
     /// ).ok();
     /// ```
-    pub async fn new(
-        offer_sdp: &str,
-        config: &WebRtcConfig,
-    ) -> Result<(Self, String), String> {
+    pub async fn new(offer_sdp: &str, config: &WebRtcConfig) -> Result<(Self, String), String> {
         // Detect codec before handing the SDP to rustrtc so that even if the
         // peer connection transforms the SDP we still know what was offered.
         let codec = VideoCodec::from_sdp(offer_sdp);
@@ -246,11 +243,7 @@ impl WebRtcSession {
         // SDP contains usable host candidates.  Trickle ICE will add more.
         {
             let mut ice_rx = pc.subscribe_ice_candidates();
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                ice_rx.recv(),
-            )
-            .await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), ice_rx.recv()).await;
         }
 
         let answer = pc
@@ -261,7 +254,9 @@ impl WebRtcSession {
         pc.set_local_description(answer)
             .map_err(|e| format!("set_local_description: {e}"))?;
 
-        let local = pc.local_description().expect("local description was just set");
+        let local = pc
+            .local_description()
+            .expect("local description was just set");
         let answer_sdp = local.to_sdp_string();
 
         Ok((
@@ -365,7 +360,8 @@ impl WebRtcSession {
                                     Ok(MediaSample::Video(frame)) => {
                                         let nal_seq = seq.fetch_add(1, Ordering::Relaxed);
 
-                                        let nals = frame_payload_to_nals(codec, &frame.data, &nals_pool);
+                                        let nals =
+                                            frame_payload_to_nals(codec, &frame.data, &nals_pool);
 
                                         // RTP timestamp is on a 90 kHz clock → ms.
                                         let pts_ms = frame.rtp_timestamp as u64 / 90;
@@ -610,17 +606,19 @@ mod tests {
         let (tx, rx) = kanal::bounded::<RtpFrame>(1);
         let metrics = Arc::new(crate::metrics::PipelineMetrics::new());
 
-        assert!(enqueue_rtp_frame_lossless(
-            &tx,
-            RtpFrame {
-                nals: vec![0x30].into(),
-                pts_ms: 0,
-                seq: 0,
-                codec: VideoCodec::Vp8,
-            },
-            &metrics,
-        )
-        .await);
+        assert!(
+            enqueue_rtp_frame_lossless(
+                &tx,
+                RtpFrame {
+                    nals: vec![0x30].into(),
+                    pts_ms: 0,
+                    seq: 0,
+                    codec: VideoCodec::Vp8,
+                },
+                &metrics,
+            )
+            .await
+        );
 
         let tx_for_task = tx.clone();
         let metrics_for_task = Arc::clone(&metrics);

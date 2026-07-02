@@ -177,7 +177,12 @@ pub fn yuv_to_jpeg(
     let mut buf = output_pool.acquire();
     let encoder = jpeg_encoder::Encoder::new(&mut buf, quality);
     encoder
-        .encode(scratch, yuv.width as u16, yuv.height as u16, jpeg_encoder::ColorType::Ycbcr)
+        .encode(
+            scratch,
+            yuv.width as u16,
+            yuv.height as u16,
+            jpeg_encoder::ColorType::Ycbcr,
+        )
         .expect("JPEG encoding failed");
     output_pool.recycle(buf)
 }

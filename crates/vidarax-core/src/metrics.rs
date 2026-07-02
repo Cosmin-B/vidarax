@@ -15,8 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const DECODE_LATENCY_US_BUCKETS: [u64; 8] =
     [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 50_000];
 pub const GATE_LATENCY_US_BUCKETS: [u64; 8] = [1, 5, 10, 50, 100, 500, 1_000, 5_000];
-pub const VLM_LATENCY_MS_BUCKETS: [u64; 8] =
-    [50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000];
+pub const VLM_LATENCY_MS_BUCKETS: [u64; 8] = [50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000];
 pub const STDB_EMIT_LATENCY_MS_BUCKETS: [u64; 8] = [1, 5, 10, 25, 50, 100, 250, 1_000];
 
 /// Zero-alloc histogram with 8 fixed upper-bound buckets.
@@ -159,7 +158,8 @@ impl PipelineMetrics {
 
     #[inline]
     pub fn inc_frames_dropped_by(&self, count: u64) {
-        self.frames_dropped_total.fetch_add(count, Ordering::Relaxed);
+        self.frames_dropped_total
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     #[inline]
@@ -186,8 +186,7 @@ impl PipelineMetrics {
 
     #[inline]
     pub fn inc_keyframes_dropped(&self) {
-        self.keyframes_dropped_total
-            .fetch_add(1, Ordering::Relaxed);
+        self.keyframes_dropped_total.fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -223,9 +222,7 @@ impl PipelineMetrics {
 
     /// Render all counters and latency histograms as Prometheus-compatible text.
     pub fn render_prometheus(&self) -> String {
-        let rtp = self
-            .rtp_frames_received_total
-            .load(Ordering::Relaxed);
+        let rtp = self.rtp_frames_received_total.load(Ordering::Relaxed);
         let decoded = self.frames_decoded_total.load(Ordering::Relaxed);
         let dropped = self.frames_dropped_total.load(Ordering::Relaxed);
         let pending_sanity = self
@@ -313,9 +310,9 @@ mod tests {
     #[test]
     fn histogram_records_into_correct_bucket() {
         let h = LatencyHistogram::new([100, 250, 500, 1_000, 2_000, 5_000, 10_000, 50_000]);
-        h.record(80);   // → bucket[0] (≤100)
-        h.record(200);  // → bucket[1] (≤250)
-        h.record(200);  // → bucket[1] (≤250)
+        h.record(80); // → bucket[0] (≤100)
+        h.record(200); // → bucket[1] (≤250)
+        h.record(200); // → bucket[1] (≤250)
         h.record(60_000); // → +Inf (above 50 000)
 
         let text = h.render_prometheus("vidarax_pipeline_decode_latency_us", "us");
@@ -333,8 +330,8 @@ mod tests {
     fn histogram_renders_in_pipeline_metrics() {
         let m = PipelineMetrics::new();
         m.decode_latency_us.record(300); // → bucket ≤500 µs
-        m.gate_latency_us.record(8);     // → bucket ≤10 µs
-        m.vlm_latency_ms.record(180);    // → bucket ≤250 ms
+        m.gate_latency_us.record(8); // → bucket ≤10 µs
+        m.vlm_latency_ms.record(180); // → bucket ≤250 ms
         m.stdb_emit_latency_ms.record(3); // → bucket ≤5 ms
 
         let text = m.render_prometheus();

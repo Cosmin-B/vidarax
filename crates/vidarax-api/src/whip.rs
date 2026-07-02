@@ -27,23 +27,25 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
+use vidarax_core::provider::{
+    InferenceProvider, InferenceRequest, InferenceResult, ProviderError, ProviderKind,
+};
+use vidarax_core::tiered_vlm::TieredVlmConfig;
 use vidarax_core::webrtc::clip::{
     spawn_clip_accumulator, spawn_clip_vlm_workers, ClipConfig as CoreClipConfig,
 };
-use vidarax_core::provider::{InferenceProvider, InferenceRequest, InferenceResult, ProviderError, ProviderKind};
-use vidarax_core::tiered_vlm::TieredVlmConfig;
-use vidarax_core::webrtc::session::{PeerConnectionState, RTP_FRAME_QUEUE_CAPACITY, WebRtcSession};
+use vidarax_core::webrtc::session::{PeerConnectionState, WebRtcSession, RTP_FRAME_QUEUE_CAPACITY};
 use vidarax_core::webrtc::workers::{
-    decode_output_pool_slots, jpeg_pool_slots, EventSink, VlmWorkerParams,
-    CLIP_FRAME_QUEUE_CAPACITY, CLIP_WORK_QUEUE_CAPACITY, STREAM_FRAME_QUEUE_CAPACITY,
-    VLM_WORK_QUEUE_CAPACITY, spawn_analysis_workers, spawn_decode_workers, spawn_vlm_workers,
+    decode_output_pool_slots, jpeg_pool_slots, spawn_analysis_workers, spawn_decode_workers,
+    spawn_vlm_workers, EventSink, VlmWorkerParams, CLIP_FRAME_QUEUE_CAPACITY,
+    CLIP_WORK_QUEUE_CAPACITY, STREAM_FRAME_QUEUE_CAPACITY, VLM_WORK_QUEUE_CAPACITY,
 };
 
 use crate::models::AttachStreamRequest;
@@ -160,18 +162,18 @@ pub async fn whip_offer(
     };
 
     // Create the rustrtc PeerConnection and negotiate the SDP answer.
-    let (mut session, answer_sdp) =
-        match WebRtcSession::new(offer_sdp, state.webrtc_config()).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::warn!("WHIP offer negotiation failed: {e}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "WebRTC negotiation failed",
-                )
-                    .into_response();
-            }
-        };
+    let (mut session, answer_sdp) = match WebRtcSession::new(offer_sdp, state.webrtc_config()).await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!("WHIP offer negotiation failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "WebRTC negotiation failed",
+            )
+                .into_response();
+        }
+    };
 
     let clip_config = match apply_attach_config(&mut session, attach_config) {
         Ok(config) => config,
@@ -248,8 +250,7 @@ impl WhipSessionStarted {
             .header(header::CONTENT_TYPE, "application/sdp")
             .header(
                 header::LOCATION,
-                HeaderValue::from_str(&location)
-                    .unwrap_or_else(|_| HeaderValue::from_static("/")),
+                HeaderValue::from_str(&location).unwrap_or_else(|_| HeaderValue::from_static("/")),
             )
             .header(
                 RUN_ID_HEADER,
@@ -431,10 +432,9 @@ async fn start_whip_session_transaction(
         let guided_json = guided_json_for_workers;
 
         if let Some(clip_config) = clip_config_for_workers {
-            let (clip_frame_tx, clip_frame_rx) =
-                kanal::bounded::<vidarax_core::webrtc::workers::StreamFrame>(
-                    CLIP_FRAME_QUEUE_CAPACITY,
-                );
+            let (clip_frame_tx, clip_frame_rx) = kanal::bounded::<
+                vidarax_core::webrtc::workers::StreamFrame,
+            >(CLIP_FRAME_QUEUE_CAPACITY);
             let (clip_tx, clip_rx) =
                 kanal::bounded::<vidarax_core::webrtc::clip::ClipWork>(CLIP_WORK_QUEUE_CAPACITY);
 
@@ -506,9 +506,7 @@ async fn start_whip_session_transaction(
     })
 }
 
-fn parse_attach_config_header(
-    headers: &HeaderMap,
-) -> Result<Option<AttachStreamRequest>, String> {
+fn parse_attach_config_header(headers: &HeaderMap) -> Result<Option<AttachStreamRequest>, String> {
     let Some(value) = headers.get(ATTACH_CONFIG_HEADER) else {
         return Ok(None);
     };
@@ -593,9 +591,7 @@ pub async fn whip_ice(
     }
 
     // Strip optional "a=" prefix per trickle ICE fragment format.
-    let candidate_line = candidate_str
-        .strip_prefix("a=")
-        .unwrap_or(candidate_str);
+    let candidate_line = candidate_str.strip_prefix("a=").unwrap_or(candidate_str);
 
     if let Err(e) = session.add_remote_candidate(candidate_line) {
         tracing::warn!("WHIP ICE sess={sess_id} error: {e}");
@@ -636,8 +632,7 @@ pub async fn whip_terminate(
     } else {
         None
     };
-    let Some((owner_principal, run_id)) = live_session.or(reclaimed_session)
-    else {
+    let Some((owner_principal, run_id)) = live_session.or(reclaimed_session) else {
         tracing::debug!("WHIP terminate: unknown session {sess_id}");
         return StatusCode::NOT_FOUND;
     };
@@ -660,7 +655,9 @@ pub async fn whip_terminate(
 fn should_reclaim_peer_state(state: PeerConnectionState) -> bool {
     matches!(
         state,
-        PeerConnectionState::Disconnected | PeerConnectionState::Failed | PeerConnectionState::Closed
+        PeerConnectionState::Disconnected
+            | PeerConnectionState::Failed
+            | PeerConnectionState::Closed
     )
 }
 
@@ -708,9 +705,9 @@ async fn reclaim_whip_session(
     let run_id = run_id.to_string();
     let reason = reason.to_string();
 
-    tokio::spawn(async move {
-        reclaim_whip_session_transaction(state, sess_id, run_id, reason).await
-    })
+    tokio::spawn(
+        async move { reclaim_whip_session_transaction(state, sess_id, run_id, reason).await },
+    )
     .await
     .map_err(|err| format!("WHIP reclaim transaction join failure: {err}"))?
 }
@@ -837,9 +834,7 @@ async fn tombstone_created_whip_run_until_success(
                     backoff
                 );
                 tokio::time::sleep(backoff).await;
-                backoff = backoff
-                    .saturating_mul(2)
-                    .min(WHIP_RECLAIM_MAX_BACKOFF);
+                backoff = backoff.saturating_mul(2).min(WHIP_RECLAIM_MAX_BACKOFF);
             }
         }
     }
@@ -899,9 +894,7 @@ async fn tombstone_created_whip_run_with_request_bound_and_backoff(
                 );
                 if attempt + 1 < attempts {
                     tokio::time::sleep(backoff).await;
-                    backoff = backoff
-                        .saturating_mul(2)
-                        .min(max_backoff);
+                    backoff = backoff.saturating_mul(2).min(max_backoff);
                 }
             }
         }
@@ -917,13 +910,7 @@ fn spawn_created_whip_tombstone_retry(
     reason: String,
 ) {
     tokio::spawn(async move {
-        tombstone_created_whip_run_until_success(
-            &state,
-            &run_id,
-            &sess_id,
-            &reason,
-        )
-        .await;
+        tombstone_created_whip_run_until_success(&state, &run_id, &sess_id, &reason).await;
     });
 }
 
@@ -1024,7 +1011,10 @@ mod tests {
     #[test]
     fn session_id_has_sess_prefix() {
         let id = new_session_id();
-        assert!(id.starts_with("sess-"), "expected 'sess-' prefix, got: {id}");
+        assert!(
+            id.starts_with("sess-"),
+            "expected 'sess-' prefix, got: {id}"
+        );
     }
 
     #[test]
@@ -1092,10 +1082,8 @@ mod tests {
 
     #[tokio::test]
     async fn failed_run_created_append_does_not_expose_whip_session() {
-        let dir = std::env::temp_dir().join(format!(
-            "vidarax-whip-create-fail-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vidarax-whip-create-fail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let state = AppState::with_wal_for_tests(dir.join("timeline.wal"));
@@ -1141,16 +1129,16 @@ mod tests {
             .get(RUN_ID_HEADER)
             .and_then(|value| value.to_str().ok())
             .expect("WHIP offer should expose the server run_id");
-        assert!(run_id.starts_with("run-"), "unexpected run_id header: {run_id}");
+        assert!(
+            run_id.starts_with("run-"),
+            "unexpected run_id header: {run_id}"
+        );
     }
 
     #[tokio::test]
     async fn whip_creation_enforces_active_stream_limit_before_persisting() {
         let state = AppState::with_wal_for_tests_runtime(
-            std::env::temp_dir().join(format!(
-                "vidarax-whip-limit-{}.wal",
-                std::process::id()
-            )),
+            std::env::temp_dir().join(format!("vidarax-whip-limit-{}.wal", std::process::id())),
             None,
             SecurityPolicy::from_config_for_tests(),
             3600,
@@ -1347,7 +1335,9 @@ mod tests {
             Arc::clone(&run_id),
             peer_state_rx,
         );
-        peer_state_tx.send(PeerConnectionState::Disconnected).unwrap();
+        peer_state_tx
+            .send(PeerConnectionState::Disconnected)
+            .unwrap();
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
@@ -1469,7 +1459,10 @@ mod tests {
                 }),
             )
             .unwrap();
-        assert_eq!(state.count_active_runs_for_principal(principal, now_ms()), 1);
+        assert_eq!(
+            state.count_active_runs_for_principal(principal, now_ms()),
+            1
+        );
         assert!(
             state
                 .insert_session(
@@ -1494,7 +1487,10 @@ mod tests {
             .filter(|event| event.kind == "run_deleted")
             .count();
         assert_eq!(deleted, 1);
-        assert_eq!(state.count_active_runs_for_principal(principal, now_ms()), 0);
+        assert_eq!(
+            state.count_active_runs_for_principal(principal, now_ms()),
+            0
+        );
         assert!(state.run_runtime_snapshot(&run_id, now_ms()).is_none());
         assert!(state.get_session(sess_id).await.is_none());
     }
@@ -1588,10 +1584,9 @@ mod tests {
 
     #[tokio::test]
     async fn reclaim_on_delete_skips_duplicate_tombstone_when_run_already_deleted() {
-        let state = AppState::with_wal_for_tests(std::env::temp_dir().join(format!(
-            "vidarax-whip-delete-{}.wal",
-            std::process::id()
-        )));
+        let state = AppState::with_wal_for_tests(
+            std::env::temp_dir().join(format!("vidarax-whip-delete-{}.wal", std::process::id())),
+        );
         let sess_id = "sess-delete0000001";
         let run_id: Arc<str> = Arc::from("run-whip-delete");
         let principal = "tenant-a";
@@ -1610,7 +1605,10 @@ mod tests {
         state
             .append_run_event(&run_id, "run_deleted", serde_json::json!({}))
             .unwrap();
-        assert_eq!(state.count_active_runs_for_principal(principal, now_ms()), 0);
+        assert_eq!(
+            state.count_active_runs_for_principal(principal, now_ms()),
+            0
+        );
         assert!(
             state
                 .insert_session(
@@ -1632,7 +1630,10 @@ mod tests {
             .filter(|event| event.kind == "run_deleted")
             .count();
         assert_eq!(deleted, 1);
-        assert_eq!(state.count_active_runs_for_principal(principal, now_ms()), 0);
+        assert_eq!(
+            state.count_active_runs_for_principal(principal, now_ms()),
+            0
+        );
         assert!(state.run_runtime_snapshot(&run_id, now_ms()).is_none());
         assert!(state.get_session(sess_id).await.is_none());
     }
@@ -1682,7 +1683,10 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(state.count_active_runs_for_principal(principal, now_ms()), 0);
+        assert_eq!(
+            state.count_active_runs_for_principal(principal, now_ms()),
+            0
+        );
         assert!(state.get_session(sess_id).await.is_none());
     }
 
@@ -1728,7 +1732,10 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(state.count_active_runs_for_principal(principal, now_ms()), 0);
+        assert_eq!(
+            state.count_active_runs_for_principal(principal, now_ms()),
+            0
+        );
         assert!(state.get_session(sess_id).await.is_none());
     }
 
@@ -1799,21 +1806,23 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(state.count_active_runs_for_principal(principal, now_ms()), 0);
+        assert_eq!(
+            state.count_active_runs_for_principal(principal, now_ms()),
+            0
+        );
         assert!(state.run_runtime_snapshot(&run_id, now_ms()).is_none());
         assert!(state.get_session(sess_id).await.is_none());
-        assert!(state.pipeline_metrics().render_prometheus().contains(
-            "vidarax_pipeline_sessions_removed_total 1\n"
-        ));
+        assert!(state
+            .pipeline_metrics()
+            .render_prometheus()
+            .contains("vidarax_pipeline_sessions_removed_total 1\n"));
         assert_eq!(session.close_call_count_for_tests(), 1);
     }
 
     #[tokio::test]
     async fn reclaim_delete_surfaces_failed_tombstone_append() {
-        let dir = std::env::temp_dir().join(format!(
-            "vidarax-whip-delete-fail-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vidarax-whip-delete-fail-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let state = AppState::with_wal_for_tests(dir.join("timeline.wal"));
         let sess_id = "sess-deletefail001";
@@ -1846,7 +1855,10 @@ mod tests {
         let result = reclaim_whip_session(&state, sess_id, &run_id, "delete").await;
 
         assert!(result.is_err(), "DELETE must surface incomplete cleanup");
-        assert_eq!(state.count_active_runs_for_principal(principal, now_ms()), 1);
+        assert_eq!(
+            state.count_active_runs_for_principal(principal, now_ms()),
+            1
+        );
         assert!(
             state.get_session(sess_id).await.is_some(),
             "failed tombstone append must leave the session reachable for retry"
@@ -1855,10 +1867,8 @@ mod tests {
 
     #[tokio::test]
     async fn reclaim_watcher_retries_transient_tombstone_append_failure_until_cleanup_succeeds() {
-        let dir = std::env::temp_dir().join(format!(
-            "vidarax-whip-watch-retry-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("vidarax-whip-watch-retry-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let state = AppState::with_wal_for_tests(dir.join("timeline.wal"));
         let sess_id = "sess-watchretry01";
@@ -1917,7 +1927,10 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(state.count_active_runs_for_principal(principal, now_ms()), 0);
+        assert_eq!(
+            state.count_active_runs_for_principal(principal, now_ms()),
+            0
+        );
         assert!(state.run_runtime_snapshot(&run_id, now_ms()).is_none());
         assert!(state.get_session(sess_id).await.is_none());
     }

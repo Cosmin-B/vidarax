@@ -2,8 +2,8 @@
 
 use std::{io, sync::Arc};
 
-pub mod config;
 mod auth;
+pub mod config;
 mod handlers;
 mod ids;
 mod inference_metrics;
@@ -16,8 +16,8 @@ mod semantic_infer;
 mod server;
 pub mod spacetime_client;
 mod state;
-mod tenant_labels;
 pub mod telemetry;
+mod tenant_labels;
 mod validation;
 pub mod wal_sink;
 mod whip;
@@ -27,8 +27,8 @@ pub use models::AttachStreamRequest;
 pub use router::app_router;
 pub use state::{AppState, StreamSlotGuard};
 use vidarax_core::ingest::pipeline::{build_decode_pipeline, DecodePipeline, PipelineBackend};
-use vidarax_core::webrtc::workers::per_stream_analysis_workers;
 use vidarax_core::webrtc::session::{TurnServer, WebRtcConfig};
+use vidarax_core::webrtc::workers::per_stream_analysis_workers;
 
 pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     telemetry::init_telemetry();
@@ -37,10 +37,7 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
     // created.  rustrtc uses rustls for DTLS; it requires an installed
     // CryptoProvider.  `ok()` silences the error when a provider is already
     // installed (e.g. in tests).
-    rustls::crypto::CryptoProvider::install_default(
-        rustls::crypto::ring::default_provider(),
-    )
-    .ok();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
 
     let wal_path = resolve_wal_path(&config).map_err(invalid_input)?;
     let backend_config = if let Some(backends) = backend_entries_from_explicit_urls(&config) {
@@ -61,7 +58,7 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
             })
             .await
             .map_err(|e| invalid_input(format!("failed to build provider chain: {e}")))?
-                .map_err(|e| invalid_input(format!("failed to build provider chain: {e}")))?,
+            .map_err(|e| invalid_input(format!("failed to build provider chain: {e}")))?,
         )
     };
     let security_policy = security::SecurityPolicy::from_config(&config).map_err(invalid_input)?;
@@ -105,9 +102,7 @@ fn attach_spacetime_client(state: AppState, config: &ServerConfig) -> AppState {
                 spacetimedb_module = module,
                 "SpacetimeDB integration enabled"
             );
-            state.with_spacetime_client(
-                crate::spacetime_client::SpacetimeClient::new(url, module),
-            )
+            state.with_spacetime_client(crate::spacetime_client::SpacetimeClient::new(url, module))
         }
         None => {
             tracing::info!(
@@ -166,14 +161,8 @@ fn build_webrtc_config(config: &ServerConfig) -> WebRtcConfig {
     if let Some(url) = &config.webrtc_turn_url {
         turn_servers.push(TurnServer {
             url: url.clone(),
-            username: config
-                .webrtc_turn_username
-                .clone()
-                .unwrap_or_default(),
-            credential: config
-                .webrtc_turn_credential
-                .clone()
-                .unwrap_or_default(),
+            username: config.webrtc_turn_username.clone().unwrap_or_default(),
+            credential: config.webrtc_turn_credential.clone().unwrap_or_default(),
         });
     }
     WebRtcConfig {
@@ -186,12 +175,12 @@ fn build_webrtc_config(config: &ServerConfig) -> WebRtcConfig {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::{app_router, attach_spacetime_client, build_webrtc_config, AppState, ServerConfig, TransportMode};
-    use vidarax_core::ingest::pipeline::{register_decode_backend, CpuFfmpegPipeline, PipelineBackend};
-    use vidarax_core::tiered_vlm::DistillationConfig;
+    use super::{
+        app_router, attach_spacetime_client, build_webrtc_config, AppState, ServerConfig,
+        TransportMode,
+    };
     use crate::security::SecurityPolicy;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -202,11 +191,15 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::process::{Command, Stdio};
+    use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-    use std::sync::Arc;
     use tower::ServiceExt;
     use vidarax_core::backends::BackendEntry;
+    use vidarax_core::ingest::pipeline::{
+        register_decode_backend, CpuFfmpegPipeline, PipelineBackend,
+    };
+    use vidarax_core::tiered_vlm::DistillationConfig;
     use vidarax_core::webrtc::session::WebRtcConfig;
     #[cfg(feature = "h3-experimental")]
     use {
@@ -255,7 +248,9 @@ mod tests {
         }
     }
 
-    fn build_provider_from_url(base_url: &str) -> Arc<dyn vidarax_core::provider::InferenceProvider + Send + Sync> {
+    fn build_provider_from_url(
+        base_url: &str,
+    ) -> Arc<dyn vidarax_core::provider::InferenceProvider + Send + Sync> {
         let entry = BackendEntry {
             name: "test".to_string(),
             backend_type: "openai_compat".to_string(),
@@ -281,7 +276,9 @@ mod tests {
         test_state_with_provider_and_policy(provider, SecurityPolicy::from_config_for_tests())
     }
 
-    fn test_state_with_provider(provider: Option<Arc<dyn vidarax_core::provider::InferenceProvider + Send + Sync>>) -> AppState {
+    fn test_state_with_provider(
+        provider: Option<Arc<dyn vidarax_core::provider::InferenceProvider + Send + Sync>>,
+    ) -> AppState {
         test_state_with_provider_and_policy(provider, SecurityPolicy::from_config_for_tests())
     }
 
@@ -418,12 +415,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let disabled_wal_path = std::env::temp_dir().join(format!(
-            "vidarax-spacetime-client-disabled-{nanos}.wal"
-        ));
-        let enabled_wal_path = std::env::temp_dir().join(format!(
-            "vidarax-spacetime-client-enabled-{nanos}.wal"
-        ));
+        let disabled_wal_path =
+            std::env::temp_dir().join(format!("vidarax-spacetime-client-disabled-{nanos}.wal"));
+        let enabled_wal_path =
+            std::env::temp_dir().join(format!("vidarax-spacetime-client-enabled-{nanos}.wal"));
         let mut config = default_test_server_config();
 
         let state = AppState::with_wal_for_tests(disabled_wal_path);
@@ -478,11 +473,17 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "vllm");
         assert_eq!(entries[0].backend_type, "openai_compat");
-        assert_eq!(entries[0].base_url.as_deref(), Some("http://127.0.0.1:8081/v1"));
+        assert_eq!(
+            entries[0].base_url.as_deref(),
+            Some("http://127.0.0.1:8081/v1")
+        );
         assert_eq!(entries[0].priority, 1);
         assert_eq!(entries[1].name, "sglang");
         assert_eq!(entries[1].backend_type, "openai_compat");
-        assert_eq!(entries[1].base_url.as_deref(), Some("http://127.0.0.1:8082/v1"));
+        assert_eq!(
+            entries[1].base_url.as_deref(),
+            Some("http://127.0.0.1:8082/v1")
+        );
         assert_eq!(entries[1].priority, 2);
     }
 
@@ -629,8 +630,11 @@ mod tests {
             .header("x-tenant-id", "tenant-b")
             .body(Body::empty())
             .unwrap();
-        let allowed_with_forged_tenant_resp =
-            app.clone().oneshot(allowed_with_forged_tenant).await.unwrap();
+        let allowed_with_forged_tenant_resp = app
+            .clone()
+            .oneshot(allowed_with_forged_tenant)
+            .await
+            .unwrap();
         assert_eq!(allowed_with_forged_tenant_resp.status(), StatusCode::OK);
 
         let denied_other_key = Request::builder()
@@ -1023,10 +1027,7 @@ mod tests {
         assert!(
             details.iter().any(|d| {
                 d["field"].as_str() == Some("source_uri")
-                    && d["message"]
-                        .as_str()
-                        .unwrap_or("")
-                        .contains("not visible")
+                    && d["message"].as_str().unwrap_or("").contains("not visible")
             }),
             "expected upload alias visibility rejection, got: {details:?}"
         );
@@ -1723,7 +1724,10 @@ mod tests {
             .and_then(|v| v.as_array())
             .unwrap();
         // New config-driven backend system exposes a single chain entry (vllm).
-        assert!(!providers.is_empty(), "at least one provider must be reported");
+        assert!(
+            !providers.is_empty(),
+            "at least one provider must be reported"
+        );
         server.join().unwrap();
     }
 
@@ -1973,7 +1977,10 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_mp4_then_analyze_without_frames_uses_decoded_signals() {
-        assert!(ffmpeg_available(), "ffmpeg must be available for ingest tests");
+        assert!(
+            ffmpeg_available(),
+            "ffmpeg must be available for ingest tests"
+        );
         let video_path = create_test_mp4().expect("ffmpeg should generate fixture");
 
         let app = app_router(test_state());
@@ -2185,7 +2192,10 @@ mod tests {
 
     #[tokio::test]
     async fn realtime_reason_endpoint_generates_markers_and_lag_stats() {
-        assert!(ffmpeg_available(), "ffmpeg must be available for realtime tests");
+        assert!(
+            ffmpeg_available(),
+            "ffmpeg must be available for realtime tests"
+        );
         let video_path = create_test_mp4().expect("ffmpeg should generate fixture");
 
         let app = app_router(test_state());
@@ -2251,7 +2261,10 @@ mod tests {
 
     #[tokio::test]
     async fn realtime_reason_uses_provider_semantic_overlay_when_configured() {
-        assert!(ffmpeg_available(), "ffmpeg must be available for realtime provider tests");
+        assert!(
+            ffmpeg_available(),
+            "ffmpeg must be available for realtime provider tests"
+        );
         let video_path = create_test_mp4().expect("ffmpeg should generate fixture");
 
         let completion = "{\"choices\":[{\"message\":{\"content\":\"{\\\"event_type\\\":\\\"scene_cut\\\",\\\"object_label\\\":\\\"temple\\\",\\\"summary\\\":\\\"Temple visible\\\",\\\"description\\\":\\\"Temple appears in this chunk\\\",\\\"confidence\\\":0.91}\"}}]}".to_string();
@@ -2479,7 +2492,10 @@ mod tests {
             .header("x-tenant-id", "tenant-a")
             .body(Body::from(r#"{"mode":"balanced"}"#))
             .unwrap();
-        assert_eq!(app.clone().oneshot(first).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            app.clone().oneshot(first).await.unwrap().status(),
+            StatusCode::OK
+        );
 
         let rotated_tenant = Request::builder()
             .uri("/v1/runs")
@@ -2686,7 +2702,10 @@ mod tests {
             .header("x-api-key", "metrics-key")
             .body(Body::empty())
             .unwrap();
-        assert_eq!(app.clone().oneshot(first).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            app.clone().oneshot(first).await.unwrap().status(),
+            StatusCode::OK
+        );
 
         let second = Request::builder()
             .uri("/v1/metrics")
@@ -2828,7 +2847,6 @@ mod tests {
             Some("no-store")
         );
     }
-
 
     #[cfg(feature = "h3-experimental")]
     #[tokio::test]
@@ -3128,5 +3146,4 @@ mod tests {
         );
         assert!(TransportMode::parse(Some("bad-mode")).is_err());
     }
-
 }

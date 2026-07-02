@@ -53,11 +53,9 @@ impl InputSource {
                         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
                         .unwrap_or(false);
                     if !allow_plain {
-                        return Err(
-                            "unencrypted rtsp:// is not allowed; use rtsps:// or set \
+                        return Err("unencrypted rtsp:// is not allowed; use rtsps:// or set \
                              VIDARAX_ALLOW_UNENCRYPTED_RTSP=true"
-                                .to_string(),
-                        );
+                            .to_string());
                     }
                     validate_remote_url(url)
                 }
@@ -159,7 +157,11 @@ where
     F: FnMut(&str, u16) -> Result<R, String>,
 {
     let transport_url = if url.scheme() == "hls" {
-        let transport_scheme = if insecure_http_enabled() { "http" } else { "https" };
+        let transport_scheme = if insecure_http_enabled() {
+            "http"
+        } else {
+            "https"
+        };
         let transport_str = format!("{transport_scheme}{}", &url.as_str()["hls".len()..]);
         reqwest::Url::parse(&transport_str)
             .map_err(|_| "invalid hls:// source_uri host".to_string())?
@@ -167,10 +169,12 @@ where
         url.clone()
     };
     let host = validate_remote_host(&transport_url)?;
-    let port = transport_url.port_or_known_default().unwrap_or(match transport_url.scheme() {
-        "http" => 80,
-        _ => 443,
-    });
+    let port = transport_url
+        .port_or_known_default()
+        .unwrap_or(match transport_url.scheme() {
+            "http" => 80,
+            _ => 443,
+        });
     validate_resolved(host, port)?;
     // Remote HLS remains opt-in because ffmpeg may fetch absolute segment,
     // variant, key, and map URIs from a manifest that changes after this check.
@@ -356,10 +360,7 @@ mod tests {
     #[test]
     fn parses_url_and_file_sources() {
         let remote = validate_remote_without_dns("https://example.com/video.mp4", 443);
-        assert!(matches!(
-            InputSource::Url(remote),
-            InputSource::Url(_)
-        ));
+        assert!(matches!(InputSource::Url(remote), InputSource::Url(_)));
 
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -414,12 +415,7 @@ mod tests {
 
     #[test]
     fn rejects_non_global_ipv4_literals() {
-        let blocked = [
-            "224.0.0.1",
-            "240.0.0.1",
-            "100.64.0.1",
-            "255.255.255.255",
-        ];
+        let blocked = ["224.0.0.1", "240.0.0.1", "100.64.0.1", "255.255.255.255"];
         for host in blocked {
             let ip = host.parse().unwrap();
             assert!(super::blocked_ip(&ip), "{host} should be blocked");
@@ -433,25 +429,25 @@ mod tests {
 
     #[test]
     fn live_https_hostname_is_preserved_after_real_dns_validation() {
-        let source =
-            InputSource::parse_and_validate("https://example.com/video.mp4", &[std::env::temp_dir()])
-                .expect("public HTTPS hostname should pass real DNS validation");
+        let source = InputSource::parse_and_validate(
+            "https://example.com/video.mp4",
+            &[std::env::temp_dir()],
+        )
+        .expect("public HTTPS hostname should pass real DNS validation");
         let ffmpeg_input = reqwest::Url::parse(source.as_ffmpeg_input()).unwrap();
         assert_eq!(ffmpeg_input.host_str(), Some("example.com"));
     }
 
     #[test]
     fn live_public_hostname_that_resolves_is_accepted() {
-        let source =
-            InputSource::parse_and_validate("https://example.com/media/movie.mp4", &[])
-                .expect("public hostname with real DNS should be accepted");
+        let source = InputSource::parse_and_validate("https://example.com/media/movie.mp4", &[])
+            .expect("public hostname with real DNS should be accepted");
         assert!(matches!(source, InputSource::Url(_)));
     }
 
     #[test]
     fn live_ipv4_mapped_ipv6_loopback_is_rejected() {
-        let result =
-            InputSource::parse_and_validate("https://[::ffff:127.0.0.1]/video.mp4", &[]);
+        let result = InputSource::parse_and_validate("https://[::ffff:127.0.0.1]/video.mp4", &[]);
         assert!(result.is_err(), "IPv4-mapped IPv6 loopback must be blocked");
     }
 

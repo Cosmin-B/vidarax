@@ -71,7 +71,11 @@ impl VideoCodec {
             // a=rtpmap:<pt> <codec>/<clock>[/<channels>]
             if let Some(rest) = trimmed.strip_prefix("a=rtpmap:") {
                 let codec_part = rest.split_once(' ').map(|(_, v)| v).unwrap_or(rest);
-                let codec_name = codec_part.split('/').next().unwrap_or("").to_ascii_uppercase();
+                let codec_name = codec_part
+                    .split('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_uppercase();
                 match codec_name.as_str() {
                     "VP8" => return VideoCodec::Vp8,
                     "H264" => return VideoCodec::H264,
@@ -580,15 +584,7 @@ impl Decoder {
         let input_fmt = codec.ffmpeg_input_format();
         let mut child = Command::new(crate::ingest::ffmpeg_path())
             .args([
-                "-f",
-                input_fmt,
-                "-i",
-                "pipe:0",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                "yuv420p",
-                "pipe:1",
+                "-f", input_fmt, "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -700,14 +696,18 @@ impl Decoder {
         scratch.u.reserve(uv_width * uv_height);
         for row in 0..uv_height {
             let start = row * u_stride;
-            scratch.u.extend_from_slice(&yuv.u()[start..start + uv_width]);
+            scratch
+                .u
+                .extend_from_slice(&yuv.u()[start..start + uv_width]);
         }
 
         scratch.v.clear();
         scratch.v.reserve(uv_width * uv_height);
         for row in 0..uv_height {
             let start = row * v_stride;
-            scratch.v.extend_from_slice(&yuv.v()[start..start + uv_width]);
+            scratch
+                .v
+                .extend_from_slice(&yuv.v()[start..start + uv_width]);
         }
 
         Ok(YuvFrame {
@@ -746,8 +746,8 @@ mod tests {
 
     use super::{
         decode_ffmpeg_pipe, send_yuv_frame_lossless, try_receive_yuv_frame, DecodeError,
-        VideoCodec, YuvFrame, FFMPEG_YUV_PENDING_POOL_ALLOWANCE,
-        FFMPEG_YUV_READER_POOL_MIN_SLOTS, FFMPEG_YUV_READER_QUEUE_CAPACITY,
+        VideoCodec, YuvFrame, FFMPEG_YUV_PENDING_POOL_ALLOWANCE, FFMPEG_YUV_READER_POOL_MIN_SLOTS,
+        FFMPEG_YUV_READER_QUEUE_CAPACITY,
     };
 
     #[test]
@@ -841,13 +841,21 @@ mod tests {
     #[test]
     fn ffmpeg_decode_writes_input_then_returns_buffered_before_output() {
         let (_tx, rx) = test_frame_receiver();
-        let mut stdin = CountingWrite { writes: 0, flushes: 0 };
+        let mut stdin = CountingWrite {
+            writes: 0,
+            flushes: 0,
+        };
         let mut pending = test_pending_fifo();
         let mut pending_warned = false;
 
-        let err =
-            decode_for_test(&mut stdin, &rx, &mut pending, &mut pending_warned, b"encoded")
-                .unwrap_err();
+        let err = decode_for_test(
+            &mut stdin,
+            &rx,
+            &mut pending,
+            &mut pending_warned,
+            b"encoded",
+        )
+        .unwrap_err();
 
         assert!(matches!(err, DecodeError::Buffered));
         assert_eq!(stdin.writes, 1);
@@ -859,7 +867,10 @@ mod tests {
         let (tx, rx) = test_frame_receiver();
         tx.try_send(tiny_yuv_frame(7)).unwrap();
         tx.try_send(tiny_yuv_frame(8)).unwrap();
-        let mut stdin = CountingWrite { writes: 0, flushes: 0 };
+        let mut stdin = CountingWrite {
+            writes: 0,
+            flushes: 0,
+        };
         let mut pending = test_pending_fifo();
         let mut pending_warned = false;
         let metrics = PipelineMetrics::new();
@@ -894,13 +905,21 @@ mod tests {
     fn ffmpeg_decode_reports_reader_exited_after_writing_input() {
         let (tx, rx) = test_frame_receiver();
         drop(tx);
-        let mut stdin = CountingWrite { writes: 0, flushes: 0 };
+        let mut stdin = CountingWrite {
+            writes: 0,
+            flushes: 0,
+        };
         let mut pending = test_pending_fifo();
         let mut pending_warned = false;
 
-        let err =
-            decode_for_test(&mut stdin, &rx, &mut pending, &mut pending_warned, b"encoded")
-                .unwrap_err();
+        let err = decode_for_test(
+            &mut stdin,
+            &rx,
+            &mut pending,
+            &mut pending_warned,
+            b"encoded",
+        )
+        .unwrap_err();
 
         assert!(matches!(err, DecodeError::ReaderExited));
         assert_eq!(stdin.writes, 1);
@@ -913,7 +932,10 @@ mod tests {
         for i in 0..FFMPEG_YUV_READER_QUEUE_CAPACITY {
             tx.try_send(tiny_yuv_frame(i as u8)).unwrap();
         }
-        let mut stdin = CountingWrite { writes: 0, flushes: 0 };
+        let mut stdin = CountingWrite {
+            writes: 0,
+            flushes: 0,
+        };
         let mut pending = test_pending_fifo();
         let mut pending_warned = false;
         let metrics = PipelineMetrics::new();
@@ -950,14 +972,22 @@ mod tests {
         let mut pending = test_pending_fifo();
         let mut pending_warned = false;
 
-        let first =
-            decode_for_test(&mut stdin, &rx, &mut pending, &mut pending_warned, b"encoded")
-                .unwrap();
+        let first = decode_for_test(
+            &mut stdin,
+            &rx,
+            &mut pending,
+            &mut pending_warned,
+            b"encoded",
+        )
+        .unwrap();
 
         assert_eq!(first.y[0], (FFMPEG_YUV_READER_QUEUE_CAPACITY - 1) as u8);
         assert!(stdin.injected);
         let injected = decode_for_test(
-            &mut CountingWrite { writes: 0, flushes: 0 },
+            &mut CountingWrite {
+                writes: 0,
+                flushes: 0,
+            },
             &rx,
             &mut pending,
             &mut pending_warned,

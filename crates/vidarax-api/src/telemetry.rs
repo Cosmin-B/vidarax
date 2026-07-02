@@ -23,8 +23,7 @@ static OTEL_PROVIDER: std::sync::OnceLock<SdkTracerProvider> = std::sync::OnceLo
 /// - `VIDARAX_TRACES_ENDPOINT` — OTLP gRPC endpoint for trace export
 ///   (e.g. `http://localhost:4317`). When unset, spans are dropped.
 pub fn init_telemetry() {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(true)

@@ -164,14 +164,14 @@ impl GateEngine {
 
         // Confidence is data-dependent; compute per-slot and index in.
         let confidences: [f32; 8] = [
-            1.0,                                              // 0: initial_frame
-            (hash_distance as f32 / 64.0).clamp(0.0, 1.0),  // 1: scene_cut
-            1.0,                                              // 2: periodic_keepalive
-            luma_shift.clamp(0.0, 1.0),                      // 3: exposure_shift
-            s.flicker_score.clamp(0.0, 1.0),                 // 4: flicker_suspected
-            s.ghosting_score.clamp(0.0, 1.0),                // 5: ghosting_suspected
-            s.noise_variance_score.clamp(0.0, 1.0),          // 6: noise_variance_spike
-            0.0,                                              // 7: no_trigger
+            1.0,                                           // 0: initial_frame
+            (hash_distance as f32 / 64.0).clamp(0.0, 1.0), // 1: scene_cut
+            1.0,                                           // 2: periodic_keepalive
+            luma_shift.clamp(0.0, 1.0),                    // 3: exposure_shift
+            s.flicker_score.clamp(0.0, 1.0),               // 4: flicker_suspected
+            s.ghosting_score.clamp(0.0, 1.0),              // 5: ghosting_suspected
+            s.noise_variance_score.clamp(0.0, 1.0),        // 6: noise_variance_spike
+            0.0,                                           // 7: no_trigger
         ];
 
         // Capture keyframe for the three KeepKeyframe conditions (indices 0–2).
@@ -361,21 +361,53 @@ mod tests {
         // tuples fed to both engines.  The last signal in each sequence exercises the
         // named trigger path.
         let sequences: &[GateSequenceCase] = &[
-            ("InitialFrame",       &[(0, 0, 0.5, 0.0, 0.0, 0.0)]),
-            ("NoTrigger",          &[(0, 0, 0.5, 0.0, 0.0, 0.0), (1, 0, 0.5, 0.0, 0.0, 0.0)]),
-            ("SceneCut",           &[(0, 0, 0.5, 0.0, 0.0, 0.0), (1, u64::MAX, 0.5, 0.0, 0.0, 0.0)]),
-            ("PeriodicKeepalive",  &[(0, 0, 0.5, 0.0, 0.0, 0.0), (3, 0, 0.5, 0.0, 0.0, 0.0)]),
-            ("ExposureShift",      &[(0, 0, 0.5, 0.0, 0.0, 0.0), (1, 0, 0.8, 0.0, 0.0, 0.0)]),
-            ("FlickerSuspected",   &[(0, 0, 0.5, 0.0, 0.0, 0.0), (1, 0, 0.5, 0.9, 0.0, 0.0)]),
-            ("GhostingSuspected",  &[(0, 0, 0.5, 0.0, 0.0, 0.0), (1, 0, 0.5, 0.0, 0.9, 0.0)]),
-            ("NoiseVarianceSpike", &[(0, 0, 0.5, 0.0, 0.0, 0.0), (1, 0, 0.5, 0.0, 0.0, 0.7)]),
+            ("InitialFrame", &[(0, 0, 0.5, 0.0, 0.0, 0.0)]),
+            (
+                "NoTrigger",
+                &[(0, 0, 0.5, 0.0, 0.0, 0.0), (1, 0, 0.5, 0.0, 0.0, 0.0)],
+            ),
+            (
+                "SceneCut",
+                &[
+                    (0, 0, 0.5, 0.0, 0.0, 0.0),
+                    (1, u64::MAX, 0.5, 0.0, 0.0, 0.0),
+                ],
+            ),
+            (
+                "PeriodicKeepalive",
+                &[(0, 0, 0.5, 0.0, 0.0, 0.0), (3, 0, 0.5, 0.0, 0.0, 0.0)],
+            ),
+            (
+                "ExposureShift",
+                &[(0, 0, 0.5, 0.0, 0.0, 0.0), (1, 0, 0.8, 0.0, 0.0, 0.0)],
+            ),
+            (
+                "FlickerSuspected",
+                &[(0, 0, 0.5, 0.0, 0.0, 0.0), (1, 0, 0.5, 0.9, 0.0, 0.0)],
+            ),
+            (
+                "GhostingSuspected",
+                &[(0, 0, 0.5, 0.0, 0.0, 0.0), (1, 0, 0.5, 0.0, 0.9, 0.0)],
+            ),
+            (
+                "NoiseVarianceSpike",
+                &[(0, 0, 0.5, 0.0, 0.0, 0.0), (1, 0, 0.5, 0.0, 0.0, 0.7)],
+            ),
         ];
 
         for (label, seq) in sequences {
             let mut branchless = GateEngine::new(cfg.clone());
             let mut reference = GateEngine::new(cfg.clone());
 
-            for &(frame_index, hash, luma_mean, flicker_score, ghosting_score, noise_variance_score) in *seq {
+            for &(
+                frame_index,
+                hash,
+                luma_mean,
+                flicker_score,
+                ghosting_score,
+                noise_variance_score,
+            ) in *seq
+            {
                 let sig = FrameSignal {
                     frame_index,
                     pts_ms: frame_index * 33,

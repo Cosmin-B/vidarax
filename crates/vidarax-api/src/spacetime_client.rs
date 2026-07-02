@@ -183,7 +183,10 @@ impl SpacetimeClient {
     }
 
     fn read_token(&self) -> Option<Arc<str>> {
-        self.inner.token.load_full().map(|token| Arc::clone(&*token))
+        self.inner
+            .token
+            .load_full()
+            .map(|token| Arc::clone(&*token))
     }
 
     fn store_token_from_headers(&self, headers: &reqwest::header::HeaderMap) {
@@ -397,9 +400,7 @@ impl SpacetimeClient {
         if let Some(auth) = self.auth_header() {
             rb = rb.header("Authorization", auth);
         }
-        let resp = rb
-            .send()
-            .map_err(|e| SpacetimeError::Http(e.to_string()))?;
+        let resp = rb.send().map_err(|e| SpacetimeError::Http(e.to_string()))?;
         self.store_token_from_headers_blocking(resp.headers());
         let status = resp.status().as_u16();
         if status != 200 {
@@ -427,9 +428,7 @@ impl SpacetimeClient {
         if let Some(auth) = self.auth_header() {
             rb = rb.header("Authorization", auth);
         }
-        let resp = rb
-            .send()
-            .map_err(|e| SpacetimeError::Http(e.to_string()))?;
+        let resp = rb.send().map_err(|e| SpacetimeError::Http(e.to_string()))?;
         self.store_token_from_headers_blocking(resp.headers());
         let status = resp.status().as_u16();
         if status != 200 {
@@ -472,9 +471,7 @@ impl SpacetimeClient {
         if let Some(auth) = self.auth_header() {
             rb = rb.header("Authorization", auth);
         }
-        let resp = rb
-            .send()
-            .map_err(|e| SpacetimeError::Http(e.to_string()))?;
+        let resp = rb.send().map_err(|e| SpacetimeError::Http(e.to_string()))?;
         let status = resp.status().as_u16();
         if status != 200 {
             let text = resp.text().unwrap_or_default();
@@ -495,7 +492,9 @@ impl SpacetimeClient {
 /// (`[a-zA-Z0-9_-]`) to prevent SQL injection (C-2).
 fn build_select(table: &str, run_id: Option<&str>) -> String {
     fn is_safe_identifier(s: &str) -> bool {
-        !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     }
 
     // Table names are compile-time constants, but validate defensively.
@@ -695,11 +694,17 @@ mod tests {
     fn token_reader_observes_latest_stored_header_value() {
         let client = SpacetimeClient::new("http://localhost:3000", "vidarax");
         let mut headers = HeaderMap::new();
-        headers.insert("spacetime-identity-token", HeaderValue::from_static("tok-a"));
+        headers.insert(
+            "spacetime-identity-token",
+            HeaderValue::from_static("tok-a"),
+        );
         client.store_token_from_headers(&headers);
         assert_eq!(client.auth_header().as_deref(), Some("Bearer tok-a"));
 
-        headers.insert("spacetime-identity-token", HeaderValue::from_static("tok-b"));
+        headers.insert(
+            "spacetime-identity-token",
+            HeaderValue::from_static("tok-b"),
+        );
         client.store_token_from_headers(&headers);
         assert_eq!(client.auth_header().as_deref(), Some("Bearer tok-b"));
     }

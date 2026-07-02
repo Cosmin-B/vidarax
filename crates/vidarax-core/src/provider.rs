@@ -392,22 +392,28 @@ struct CompletionMessage {
 
 /// Returns `(output_text, finish_reason)`.
 fn parse_completion(raw: &str) -> Result<(String, Option<String>), ProviderError> {
-    let resp: CompletionResponse = serde_json::from_str(raw)
-        .map_err(|e| ProviderError::InvalidResponse(format!("invalid json response: {e}").into()))?;
+    let resp: CompletionResponse = serde_json::from_str(raw).map_err(|e| {
+        ProviderError::InvalidResponse(format!("invalid json response: {e}").into())
+    })?;
 
     let first = resp
         .choices
         .into_iter()
         .next()
-        .ok_or(ProviderError::InvalidResponse("choices array is empty".into()))?;
+        .ok_or(ProviderError::InvalidResponse(
+            "choices array is empty".into(),
+        ))?;
 
     let finish_reason = first.finish_reason;
 
-    let content = first
-        .message
-        .map(|m| m.content)
-        .or(first.text)
-        .ok_or(ProviderError::InvalidResponse("missing choices[0].message.content".into()))?;
+    let content =
+        first
+            .message
+            .map(|m| m.content)
+            .or(first.text)
+            .ok_or(ProviderError::InvalidResponse(
+                "missing choices[0].message.content".into(),
+            ))?;
 
     parse_content_value(content).map(|text| (text, finish_reason))
 }
@@ -430,12 +436,16 @@ fn parse_content_value(value: Value) -> Result<String, ProviderError> {
             }
 
             if out.is_empty() {
-                Err(ProviderError::InvalidResponse("content array does not contain text".into()))
+                Err(ProviderError::InvalidResponse(
+                    "content array does not contain text".into(),
+                ))
             } else {
                 Ok(out)
             }
         }
-        _ => Err(ProviderError::InvalidResponse("unsupported content shape".into())),
+        _ => Err(ProviderError::InvalidResponse(
+            "unsupported content shape".into(),
+        )),
     }
 }
 
@@ -449,7 +459,10 @@ mod tests {
     use serde_json::Value;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use std::thread;
 
     struct MockTransport {
@@ -507,7 +520,10 @@ mod tests {
 
     #[test]
     fn normalizes_model_alias_before_call() {
-        let provider = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("ok")), ProviderKind::Vllm);
+        let provider = OpenAiCompatProvider::new(
+            MockTransport::ok(&completion_json("ok")),
+            ProviderKind::Vllm,
+        );
         let result = provider.infer(&request()).expect("inference");
         assert_eq!(&*result.model, "openbmb/MiniCPM-V-4_5");
         assert_eq!(result.output_text, "ok");
@@ -515,8 +531,10 @@ mod tests {
 
     #[test]
     fn repeated_same_model_results_reuse_cached_arc() {
-        let provider =
-            OpenAiCompatProvider::new(MockTransport::ok(&completion_json("ok")), ProviderKind::Vllm);
+        let provider = OpenAiCompatProvider::new(
+            MockTransport::ok(&completion_json("ok")),
+            ProviderKind::Vllm,
+        );
 
         let first = provider.infer(&request()).expect("first inference");
         let second = provider.infer(&request()).expect("second inference");
@@ -526,8 +544,14 @@ mod tests {
 
     #[test]
     fn uses_fallback_on_retryable_error() {
-        let primary = OpenAiCompatProvider::new(MockTransport::err(ProviderError::HttpStatus(503)), ProviderKind::Vllm);
-        let fallback = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("fallback")), ProviderKind::Sglang);
+        let primary = OpenAiCompatProvider::new(
+            MockTransport::err(ProviderError::HttpStatus(503)),
+            ProviderKind::Vllm,
+        );
+        let fallback = OpenAiCompatProvider::new(
+            MockTransport::ok(&completion_json("fallback")),
+            ProviderKind::Sglang,
+        );
         let router = ProviderRouter::new(primary, fallback);
 
         let result = router.infer(&request()).expect("fallback");
@@ -538,8 +562,14 @@ mod tests {
     #[test]
     fn uses_fallback_on_http_timeout_statuses() {
         for code in [408, 504] {
-            let primary = OpenAiCompatProvider::new(MockTransport::err(ProviderError::HttpStatus(code)), ProviderKind::Vllm);
-            let fallback = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("fallback")), ProviderKind::Sglang);
+            let primary = OpenAiCompatProvider::new(
+                MockTransport::err(ProviderError::HttpStatus(code)),
+                ProviderKind::Vllm,
+            );
+            let fallback = OpenAiCompatProvider::new(
+                MockTransport::ok(&completion_json("fallback")),
+                ProviderKind::Sglang,
+            );
             let router = ProviderRouter::new(primary, fallback);
 
             let result = router.infer(&request()).expect("fallback");
@@ -550,8 +580,14 @@ mod tests {
 
     #[test]
     fn does_not_fallback_on_non_retryable_4xx() {
-        let primary = OpenAiCompatProvider::new(MockTransport::err(ProviderError::HttpStatus(400)), ProviderKind::Vllm);
-        let fallback = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("fallback")), ProviderKind::Sglang);
+        let primary = OpenAiCompatProvider::new(
+            MockTransport::err(ProviderError::HttpStatus(400)),
+            ProviderKind::Vllm,
+        );
+        let fallback = OpenAiCompatProvider::new(
+            MockTransport::ok(&completion_json("fallback")),
+            ProviderKind::Sglang,
+        );
         let router = ProviderRouter::new(primary, fallback);
 
         let err = router.infer(&request()).unwrap_err();
@@ -560,8 +596,14 @@ mod tests {
 
     #[test]
     fn uses_fallback_on_transport_error() {
-        let primary = OpenAiCompatProvider::new(MockTransport::err(ProviderError::Transport("connection reset".to_string())), ProviderKind::Vllm);
-        let fallback = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("fallback")), ProviderKind::Sglang);
+        let primary = OpenAiCompatProvider::new(
+            MockTransport::err(ProviderError::Transport("connection reset".to_string())),
+            ProviderKind::Vllm,
+        );
+        let fallback = OpenAiCompatProvider::new(
+            MockTransport::ok(&completion_json("fallback")),
+            ProviderKind::Sglang,
+        );
         let router = ProviderRouter::new(primary, fallback);
 
         let result = router.infer(&request()).expect("fallback");
@@ -571,7 +613,10 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_model() {
-        let provider = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("ok")), ProviderKind::Vllm);
+        let provider = OpenAiCompatProvider::new(
+            MockTransport::ok(&completion_json("ok")),
+            ProviderKind::Vllm,
+        );
         let mut req = request();
         req.model = Arc::from("unknown/model");
         let err = provider.infer(&req).unwrap_err();
@@ -682,7 +727,9 @@ mod tests {
     #[test]
     fn payload_includes_guided_json_when_set() {
         let mut req = request();
-        req.guided_json = Some(Arc::from(r#"{"type":"object","properties":{"event_type":{"type":"string"}}}"#));
+        req.guided_json = Some(Arc::from(
+            r#"{"type":"object","properties":{"event_type":{"type":"string"}}}"#,
+        ));
         let body = build_payload("openbmb/MiniCPM-V-4_5", &req);
         let value: Value = serde_json::from_str(&body).unwrap();
         let schema = &value["response_format"]["json_schema"]["schema"];
@@ -700,14 +747,20 @@ mod tests {
 
     #[test]
     fn finish_reason_is_none_when_absent() {
-        let provider = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("ok")), ProviderKind::Vllm);
+        let provider = OpenAiCompatProvider::new(
+            MockTransport::ok(&completion_json("ok")),
+            ProviderKind::Vllm,
+        );
         let result = provider.infer(&request()).unwrap();
         assert_eq!(result.finish_reason, None);
     }
 
     #[test]
     fn inference_latency_ms_is_non_negative() {
-        let provider = OpenAiCompatProvider::new(MockTransport::ok(&completion_json("ok")), ProviderKind::Vllm);
+        let provider = OpenAiCompatProvider::new(
+            MockTransport::ok(&completion_json("ok")),
+            ProviderKind::Vllm,
+        );
         let result = provider.infer(&request()).unwrap();
         // MockTransport returns instantly; just verify the field is present and >= 0.
         let _ = result.inference_latency_ms; // u64, always >= 0

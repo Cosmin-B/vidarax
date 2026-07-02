@@ -400,16 +400,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test requires loopback bind");
-        let addr = listener.local_addr().expect("listener should have local addr");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have local addr");
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
-        let serve_task = tokio::spawn(serve_h1h2_with_shutdown(
-            listener,
-            app,
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        let serve_task = tokio::spawn(serve_h1h2_with_shutdown(listener, app, async move {
+            let _ = shutdown_rx.await;
+        }));
 
         let mut stream = tokio::net::TcpStream::connect(addr)
             .await
@@ -425,16 +423,27 @@ mod tests {
             .expect("health response timed out")
             .expect("health response should read");
         let response = String::from_utf8_lossy(&response);
-        assert!(response.contains("200 OK"), "unexpected response: {response}");
-        assert!(response.contains("ok"), "unexpected response body: {response}");
+        assert!(
+            response.contains("200 OK"),
+            "unexpected response: {response}"
+        );
+        assert!(
+            response.contains("ok"),
+            "unexpected response body: {response}"
+        );
 
-        shutdown_tx.send(()).expect("server task should still be live");
+        shutdown_tx
+            .send(())
+            .expect("server task should still be live");
         let serve_result = tokio::time::timeout(Duration::from_secs(2), serve_task)
             .await
             .expect("server did not stop after injected shutdown")
             .expect("server task panicked");
 
-        assert!(serve_result.is_ok(), "server returned error: {serve_result:?}");
+        assert!(
+            serve_result.is_ok(),
+            "server returned error: {serve_result:?}"
+        );
     }
 
     #[tokio::test]
@@ -473,16 +482,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test requires loopback bind");
-        let addr = listener.local_addr().expect("listener should have local addr");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have local addr");
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
-        let serve_task = tokio::spawn(serve_h1h2_with_shutdown(
-            listener,
-            app,
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        let serve_task = tokio::spawn(serve_h1h2_with_shutdown(listener, app, async move {
+            let _ = shutdown_rx.await;
+        }));
 
         let mut stream = tokio::net::TcpStream::connect(addr)
             .await
@@ -497,7 +504,9 @@ mod tests {
             .expect("slow handler did not start")
             .expect("slow handler start channel closed");
 
-        shutdown_tx.send(()).expect("server task should still be live");
+        shutdown_tx
+            .send(())
+            .expect("server task should still be live");
 
         // Graceful shutdown must stop accepting new work without resolving the
         // serve future until the already-running handler has completed.
@@ -519,7 +528,10 @@ mod tests {
             .expect("slow response timed out")
             .expect("slow response should read");
         let response = String::from_utf8_lossy(&response);
-        assert!(response.contains("200 OK"), "unexpected response: {response}");
+        assert!(
+            response.contains("200 OK"),
+            "unexpected response: {response}"
+        );
         assert!(
             response.contains("slow-ok"),
             "unexpected response body: {response}"
@@ -530,6 +542,9 @@ mod tests {
             .expect("server did not stop after in-flight request drained")
             .expect("server task panicked");
 
-        assert!(serve_result.is_ok(), "server returned error: {serve_result:?}");
+        assert!(
+            serve_result.is_ok(),
+            "server returned error: {serve_result:?}"
+        );
     }
 }

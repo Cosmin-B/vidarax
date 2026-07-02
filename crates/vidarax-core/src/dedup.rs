@@ -109,7 +109,7 @@ impl Default for DedupFilter {
 
 #[cfg(test)]
 mod tests {
-    use super::{DedupFilter, fnv_hash};
+    use super::{fnv_hash, DedupFilter};
 
     #[test]
     fn first_call_always_emits() {
