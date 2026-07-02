@@ -40,7 +40,7 @@ pub const CLIP_FRAME_QUEUE_CAPACITY: usize = STREAM_FRAME_QUEUE_CAPACITY;
 /// 1 active worker plus 1 accumulator-owned request that may block in send.
 /// That keeps the full JPEG pool worst case at 484 slots: 66 decode→analysis
 /// + 162 normal VLM/sink + 64 clip-frame queue + 64 accumulator + 128
-/// active/blocked clip work.
+///   active/blocked clip work.
 pub const CLIP_WORK_QUEUE_CAPACITY: usize = 0;
 pub const SINK_EVENT_QUEUE_CAPACITY: usize = 512;
 pub const JPEG_POOL_SLOT_CEILING: usize = 512;
@@ -110,6 +110,8 @@ pub fn jpeg_pool_slots(analysis_workers: usize, vlm_workers: usize) -> usize {
 /// implementation must be safe to call from multiple threads simultaneously.
 pub trait EventSink: Send + Sync {
     /// Emit a real-time agent event (blocking; must not hold locks indefinitely).
+    // Event sinks receive distinct event fields from worker threads without an intermediate event object.
+    #[allow(clippy::too_many_arguments)]
     fn emit_event_sync(
         &self,
         run_id: &str,
@@ -209,6 +211,8 @@ fn build_stream_frame_from_yuv(
 /// frame, and the decoder is rebuilt if a later session uses another codec on
 /// the same worker.
 /// `cores` is API-compatible only; one ordered stream gets one stateful decoder, so parallelism is across sessions, not within it.
+// Spawns decode workers; each channel, pool size, metrics handle, and span is configured separately.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_decode_workers(
     cores: usize,
     rtp_rx: kanal::Receiver<RtpFrame>,
@@ -295,6 +299,8 @@ pub fn spawn_decode_workers(
 /// Normal mode runs the gate engine and forwards kept keyframes to the VLM
 /// queue with `try_send`. Clip mode bypasses the gate and forwards accepted
 /// frames to the clip accumulator with `try_send`, dropping if its queue is full.
+// Spawns analysis workers; the worker owns separate queue, sink, prompt, metrics, and span handles.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_analysis_workers(
     cores: usize,
     frame_rx: kanal::Receiver<StreamFrame>,
@@ -453,6 +459,8 @@ impl Drop for SinkJpegPermit {
     }
 }
 
+// Builds sink events while preserving separate backlog, metric, metadata, and JPEG ownership inputs.
+#[allow(clippy::too_many_arguments)]
 fn store_keyframe_event_with_backlog(
     backlog: &JpegSinkBacklog,
     metrics: &PipelineMetrics,
@@ -621,7 +629,7 @@ where
                         run_id, frame_index, pts_ms, event_type, description, jpeg_bytes, ..
                     } => {
                         let _ = stdb.store_keyframe_sync(
-                            &run_id, frame_index, pts_ms, &event_type, &description, &jpeg_bytes,
+                            &run_id, frame_index, pts_ms, event_type, &description, &jpeg_bytes,
                         );
                     }
                 }
@@ -1175,7 +1183,7 @@ mod tests {
     fn stream_frame_and_keyframe_work_are_clone_debug() {
         let sf = make_stream_frame(0);
         let _ = sf.clone();
-        let _ = format!("{:?}", sf);
+        let _ = format!("{sf:?}");
 
         let kw = KeyframeWork {
             run_id: "r1".into(),
@@ -1191,7 +1199,7 @@ mod tests {
             loop_active: false,
         };
         let _ = kw.clone();
-        let _ = format!("{:?}", kw);
+        let _ = format!("{kw:?}");
     }
 
     #[test]
@@ -1238,7 +1246,7 @@ mod tests {
             decode_output_pool_slots(false, VideoCodec::H264),
             SOFTWARE_YUV_POOL_MIN_SLOTS
         );
-        assert!(SOFTWARE_YUV_POOL_MIN_SLOTS < FFMPEG_YUV_READER_POOL_MIN_SLOTS);
+        const _: () = assert!(SOFTWARE_YUV_POOL_MIN_SLOTS < FFMPEG_YUV_READER_POOL_MIN_SLOTS);
     }
 
     #[test]
@@ -1292,7 +1300,7 @@ mod tests {
 
         assert_eq!(expected, 484);
         assert_eq!(super::jpeg_sink_event_backlog_capacity(), JPEG_SINK_EVENT_POOL_ALLOWANCE);
-        assert!(JPEG_SINK_EVENT_POOL_ALLOWANCE < SINK_EVENT_QUEUE_CAPACITY);
+        const _: () = assert!(JPEG_SINK_EVENT_POOL_ALLOWANCE < SINK_EVENT_QUEUE_CAPACITY);
         assert_eq!(jpeg_pool_slots(1, vlm_workers), expected);
         assert!(expected <= JPEG_POOL_SLOT_CEILING);
     }

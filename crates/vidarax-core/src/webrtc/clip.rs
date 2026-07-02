@@ -314,6 +314,8 @@ pub fn spawn_clip_accumulator(
 /// identically to [`crate::webrtc::workers::spawn_vlm_workers`].
 ///
 /// Workers exit when `clip_rx` is closed.
+// Spawns clip VLM workers; each borrowed handle is distinct, a params struct would only add indirection.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_clip_vlm_workers<I>(
     n: usize,
     clip_rx: kanal::Receiver<ClipWork>,
@@ -370,7 +372,7 @@ pub fn spawn_clip_vlm_workers<I>(
                         .iter()
                         .map(|(_, jpeg_bytes)| InferenceImage {
                             media_type: "image/jpeg",
-                            data_base64: base64::engine::general_purpose::STANDARD.encode(&jpeg_bytes),
+                            data_base64: base64::engine::general_purpose::STANDARD.encode(jpeg_bytes),
                         })
                         .collect();
 

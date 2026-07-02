@@ -598,7 +598,7 @@ pub fn compute_semantic_frame_indices(
         return Vec::new();
     }
 
-    let n_chunks = (total_frames + chunk_size - 1) / chunk_size;
+    let n_chunks = total_frames.div_ceil(chunk_size);
     let mut indices = Vec::with_capacity(n_chunks * frames_per_chunk);
 
     for chunk_idx in 0..n_chunks {

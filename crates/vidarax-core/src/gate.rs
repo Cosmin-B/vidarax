@@ -200,6 +200,8 @@ impl GateEngine {
 mod tests {
     use super::{FrameSignal, GateConfig, GateEngine, GateEventType, GateReasonCode};
 
+    type GateSequenceCase<'a> = (&'a str, &'a [(u64, u64, f32, f32, f32, f32)]);
+
     fn s(frame: u64, hash: u64) -> FrameSignal {
         FrameSignal {
             frame_index: frame,
@@ -358,7 +360,7 @@ mod tests {
         // Each entry is a sequence of (frame_index, hash, luma, flicker, ghosting, noise)
         // tuples fed to both engines.  The last signal in each sequence exercises the
         // named trigger path.
-        let sequences: &[(&str, &[(u64, u64, f32, f32, f32, f32)])] = &[
+        let sequences: &[GateSequenceCase] = &[
             ("InitialFrame",       &[(0, 0, 0.5, 0.0, 0.0, 0.0)]),
             ("NoTrigger",          &[(0, 0, 0.5, 0.0, 0.0, 0.0), (1, 0, 0.5, 0.0, 0.0, 0.0)]),
             ("SceneCut",           &[(0, 0, 0.5, 0.0, 0.0, 0.0), (1, u64::MAX, 0.5, 0.0, 0.0, 0.0)]),

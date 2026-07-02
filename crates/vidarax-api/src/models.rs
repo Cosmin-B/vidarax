@@ -109,6 +109,8 @@ pub struct RealtimeReasonRequest {
     pub semantic_inference: Option<bool>,
     pub semantic_frames_per_chunk: Option<usize>,
     pub semantic_timeout_ms: Option<u64>,
+    // Deserialized for request-shape compatibility; not consumed on the realtime path.
+    #[allow(dead_code)]
     pub primary_provider: Option<String>,
     pub semantic_prompt: Option<String>,
     pub first_pass_model: Option<String>,
@@ -119,6 +121,8 @@ pub struct RealtimeReasonRequest {
     pub output_schema: Option<Value>,
     /// Optional clip-mode config. When set, frames are accumulated into
     /// temporal windows for multi-image VLM inference.
+    // Deserialized for request-shape compatibility; not consumed on the realtime path.
+    #[allow(dead_code)]
     pub clip_mode: Option<ClipConfig>,
     /// Optional index name for this analysis pass.
     ///
@@ -145,6 +149,8 @@ pub struct RealtimeReasonRequest {
     /// When true, only chunks containing a gate-detected scene cut are sent
     /// to VLM. Skips static chunks entirely. Default: false.
     #[serde(default)]
+    // Deserialized for request-shape compatibility; not consumed on the realtime path.
+    #[allow(dead_code)]
     pub gate_filter: Option<bool>,
     /// When true, extract short MP4 clips instead of JPEG frames for VLM
     /// input.  Each chunk becomes one video segment sent via `input_videos`.

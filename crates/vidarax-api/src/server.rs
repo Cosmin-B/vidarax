@@ -282,7 +282,7 @@ async fn read_h3_request_body(
     let mut body = Vec::with_capacity(1024);
     while let Some(frame) = recv.recv().await {
         if let InboundFrame::Body(chunk, fin) = frame {
-            let bytes = chunk.as_ref();
+            let bytes: &[u8] = chunk.as_ref();
             if body.len().saturating_add(bytes.len()) > MAX_H3_BODY_BYTES {
                 return Err(format!("request body exceeds {} bytes", MAX_H3_BODY_BYTES));
             }

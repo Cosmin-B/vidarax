@@ -272,6 +272,8 @@ impl WhipSessionStartError {
     }
 }
 
+// Session startup passes distinct transaction handles and config.
+#[allow(clippy::too_many_arguments)]
 async fn start_whip_session_transaction(
     state: AppState,
     sess_id: String,

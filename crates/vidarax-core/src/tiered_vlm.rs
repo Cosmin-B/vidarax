@@ -87,6 +87,8 @@ pub struct TieredVlmError {
     pub request: InferenceRequest,
 }
 
+// Both Result variants carry InferenceRequest; boxing the error adds a cold-path allocation without shrinking the Result.
+#[allow(clippy::result_large_err)]
 pub fn run_tiered<I>(
     provider: &I,
     config: &TieredVlmConfig,

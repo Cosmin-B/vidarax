@@ -94,8 +94,7 @@ impl TwoPassPipeline {
         // Index-based loop avoids holding a borrow on pass1_buf across mutable
         // calls to window_metrics / push_window.
         self.out_buf.clear();
-        for i in 0..frames.len() {
-            let frame = &frames[i];
+        for (i, frame) in frames.iter().enumerate() {
             // Both fields are Copy enums — no reference retained.
             let event_type = self.pass1_buf[i].event_type;
             let reason_code = self.pass1_buf[i].reason_code;
