@@ -7,7 +7,6 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -25,7 +24,10 @@ fn tmp_wal(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("vidarax-fp-{tag}-{pid}-{n}.wal"))
 }
 
+#[cfg(feature = "live-tests")]
 fn api_key_principal(api_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+
     let digest = Sha256::digest(api_key.as_bytes());
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
@@ -132,6 +134,7 @@ async fn test_submit_feedback_validates_category() {
 }
 
 /// POST with valid data → 200 against a live SpacetimeDB instance.
+#[cfg(feature = "live-tests")]
 #[tokio::test]
 async fn test_submit_feedback_success() {
     let stdb_url = std::env::var("VIDARAX_SPACETIMEDB_URL")

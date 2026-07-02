@@ -1,3 +1,5 @@
+#![cfg(feature = "live-tests")]
+
 use std::time::Duration;
 
 use reqwest::StatusCode;
