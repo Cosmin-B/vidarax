@@ -372,6 +372,12 @@ export class InferResult {
   /** The prompt that was submitted to the model. */
   readonly prompt: string;
 
+  /** Whether the provider chain fell back from the primary provider. */
+  readonly fallback_used: boolean;
+
+  /** Associated run ID when the inference was tied to a run, otherwise `null`. */
+  readonly run_id: string | null;
+
   constructor(fields: {
     result: string;
     ok: boolean;
@@ -383,6 +389,8 @@ export class InferResult {
     model_name: string;
     provider: string;
     prompt: string;
+    fallback_used: boolean;
+    run_id: string | null;
   }) {
     this.result = fields.result;
     this.ok = fields.ok;
@@ -395,6 +403,8 @@ export class InferResult {
     this.provider = fields.provider;
     this.model_backend = fields.provider;
     this.prompt = fields.prompt;
+    this.fallback_used = fields.fallback_used;
+    this.run_id = fields.run_id;
   }
 
   /**
@@ -560,12 +570,18 @@ export interface InferOptions {
   model: string;
   /** Prompt text to send to the model. */
   prompt: string;
+  /** Optional run context to associate with this inference. */
+  run_id?: string;
   /** Maximum number of tokens to generate. */
   max_tokens?: number;
   /** Sampling temperature (0–2). */
   temperature?: number;
   /** Request timeout override in milliseconds. */
   timeout_ms?: number;
+  /** Whether the server may fall back to a secondary provider. */
+  allow_fallback?: boolean;
+  /** Preferred primary provider for the request. */
+  primary_provider?: string;
   /**
    * JSON Schema for structured output.
    *
@@ -585,12 +601,27 @@ export interface InferOptions {
 /** Options accepted by `Vidarax.inferBatch()`. */
 export type InferBatchOptions = Pick<InferBatchRequest, "max_parallel">;
 
-/** Search result placeholder for future search endpoint. */
-export interface SearchResult {
+/** A single hit returned by `POST /v1/search`. */
+export interface SearchHit {
+  seq: number;
   run_id: string;
-  score: number;
-  description: string;
   pts_ms: EpochMs;
+  kind: string;
+  description: string;
+  index_name: string | null;
+}
+
+/**
+ * @deprecated Use `SearchHit` for individual hits. `Vidarax.search()` now returns `SearchResponse`.
+ */
+export type SearchResult = SearchHit;
+
+/** Response body from `POST /v1/search`. */
+export interface SearchResponse {
+  request_id: string;
+  scanned: number;
+  total_hits: number;
+  hits: SearchHit[];
 }
 
 /** SDK constructor options. */

@@ -24,13 +24,15 @@ import type {
   Run,
   Model,
   CreateRunResponse,
-  InferResponse,
+  InferResult,
   InferBatchResponse,
   AgentEvent,
   Marker,
   IngestResponse,
   AnalyzeFramesResponse,
 } from "../src/types.js";
+
+declare const process: { env: Record<string, string | undefined> };
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -85,7 +87,7 @@ interface SuiteState {
   lifecycleRun: CreateRunResponse;
 
   /** Inference result cached from beforeAll. */
-  inferResult: InferResponse;
+  inferResult: InferResult;
 
   /** Batch inference result cached from beforeAll. */
   inferBatchResult: InferBatchResponse;
@@ -122,7 +124,10 @@ beforeAll(async () => {
   const lifecycleRun = await client.createRun({ mode: "balanced" });
 
   // 2. Start inference (does not need a run object).
-  const inferResult = await client.infer("Say hello", { model: SMALL_MODEL });
+  const inferResult = await client.infer({
+    prompt: "Say hello",
+    model: SMALL_MODEL,
+  });
 
   // 3. Batch inference.
   const inferBatchResult = await client.inferBatch(
@@ -523,18 +528,18 @@ describe("analyze() high-level helper", () => {
 // ─── 8. Inference ─────────────────────────────────────────────────────────────
 
 describe("infer()", () => {
-  it("returns an InferResponse with a non-empty output_text", () => {
-    expect(typeof state.inferResult.output_text).toBe("string");
-    expect(state.inferResult.output_text.length).toBeGreaterThan(0);
+  it("returns an InferResult with a non-empty result", () => {
+    expect(typeof state.inferResult.result).toBe("string");
+    expect(state.inferResult.result.length).toBeGreaterThan(0);
   });
 
-  it("returns a request_id string", () => {
-    expect(typeof state.inferResult.request_id).toBe("string");
-    expect(state.inferResult.request_id.length).toBeGreaterThan(0);
+  it("returns an id string", () => {
+    expect(typeof state.inferResult.id).toBe("string");
+    expect(state.inferResult.id.length).toBeGreaterThan(0);
   });
 
-  it("returns the model that was requested", () => {
-    expect(state.inferResult.model).toBe(SMALL_MODEL);
+  it("returns the requested served model", () => {
+    expect(state.inferResult.model_name).toBe(SMALL_MODEL);
   });
 
   it("returns a non-empty provider string", () => {
@@ -627,16 +632,12 @@ describe("query()", () => {
 // ─── 10. Search ──────────────────────────────────────────────────────────────
 
 describe("search()", () => {
-  it("does not throw a NetworkError (server is reachable)", async () => {
-    // The search endpoint returns { hits, scanned, total_hits, request_id }.
-    // We only verify connectivity here; any HttpError is acceptable.
-    let threwNetworkError = false;
-    try {
-      await client.search("test video");
-    } catch (e: unknown) {
-      if (isNetworkError(e)) threwNetworkError = true;
-    }
-    expect(threwNetworkError).toBe(false);
+  it("returns the live search response shape", async () => {
+    const res = await client.search("test video");
+    expect(Array.isArray(res.hits)).toBe(true);
+    expect(typeof res.request_id).toBe("string");
+    expect(typeof res.scanned).toBe("number");
+    expect(typeof res.total_hits).toBe("number");
   });
 });
 
@@ -688,7 +689,7 @@ describe("Error handling", () => {
 
   it("infer() throws HttpError(422) for an unsupported model", async () => {
     const error = await client
-      .infer("hello", { model: "totally-invalid-model-xyz" })
+      .infer({ prompt: "hello", model: "totally-invalid-model-xyz" })
       .catch((e: unknown) => e);
 
     expect(isHttpError(error)).toBe(true);
