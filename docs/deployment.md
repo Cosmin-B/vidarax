@@ -52,12 +52,15 @@ paths. Values below come from the current Rust source, mainly
 | `VIDARAX_ALLOW_UNENCRYPTED_RTSP` | `false` | Allow `rtsp://` camera sources. |
 | `VIDARAX_ALLOW_INSECURE_TLS` | `false` | Omit ffmpeg TLS verification arguments for supported live sources. |
 | `VIDARAX_TENANT_LABEL_MAPS_PATH` | unset | Optional JSON file for event and object label mapping by tenant metadata. |
+| `VIDARAX_SPACETIMEDB_URL` | unset | SpacetimeDB base URL (for example `http://127.0.0.1:3000`). When set, the feedback endpoints are enabled and WHIP stream events are written to SpacetimeDB; when unset, stream events use the local WAL and the feedback endpoints return an error. |
+| `VIDARAX_SPACETIMEDB_MODULE` | `vidarax` | SpacetimeDB database/module name. Only used when `VIDARAX_SPACETIMEDB_URL` is set. |
 | `RUST_LOG` | `info` | Tracing filter used by `tracing_subscriber`. |
 | `VIDARAX_TRACES_ENDPOINT` | unset | Optional OTLP gRPC endpoint for trace export. |
 
 The `VIDARAX_STAGING_*` names in the repository are live-test fixtures, not
-server deployment configuration. `VIDARAX_SPACETIMEDB_URL` is also test-only
-in the current source.
+server deployment configuration. Set `VIDARAX_SPACETIMEDB_URL` to enable the
+SpacetimeDB feedback endpoints and route WHIP stream events to SpacetimeDB;
+leave it unset to keep events in the local WAL.
 
 ## Build and run
 
@@ -130,9 +133,10 @@ A useful deployment needs:
 - Optional HTTP/3 TLS certificate and key when `VIDARAX_TRANSPORT=h3`. The
   binary must be built with `--features h3-experimental`; otherwise the server
   rejects H3 transport at startup.
-- Optional SpacetimeDB components if you are developing the module or tests.
-  The production `run()` path currently uses the WAL as the primary event store
-  and does not attach a `SpacetimeClient`.
+- Optional SpacetimeDB. Set `VIDARAX_SPACETIMEDB_URL` to attach a client at
+  startup: feedback endpoints are enabled and WHIP stream events go to
+  SpacetimeDB. Leave it unset and `run()` keeps events in the local WAL with the
+  feedback endpoints disabled.
 
 ## Docker and compose
 
