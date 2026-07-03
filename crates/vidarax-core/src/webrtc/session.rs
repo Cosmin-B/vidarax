@@ -221,6 +221,14 @@ impl WebRtcSession {
         // Select before handing SDP to rustrtc so the answer, depacketizer,
         // and decode routing use the same codec.
         let selected = select_answer_video_codec_for_offer(offer_sdp);
+        // An offer that advertised a recognized video codec we cannot serve (a
+        // DON-signaling H.265, or VP8 without the `vp8` feature) must be rejected:
+        // otherwise `new` would build a session whose answerer video receiver uses
+        // rustrtc's default H.264 depacketizer, and a peer that sends video RTP
+        // regardless would be depacketized and decode-routed as the wrong codec.
+        if selected.is_none() && !VideoCodec::offered_video_codecs(offer_sdp).is_empty() {
+            return Err("offer advertised video but no live-serveable codec".to_string());
+        }
         let codec = match selected {
             Some(sel) => sel.codec,
             None => VideoCodec::from_sdp(offer_sdp),
@@ -633,6 +641,69 @@ a=rtpmap:96 H265/90000\r\n";
             data,
             vec![0x40, 0x01, 0xaa, 0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0xbb],
         );
+    }
+
+    #[tokio::test]
+    async fn new_rejects_h265_offer_with_don() {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        );
+
+        let offer = "v=0\r\n\
+o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0\r\n\
+a=msid-semantic: WMS\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:96 H265/90000\r\n\
+a=fmtp:96 sprop-max-don-diff=1\r\n";
+
+        let err = match WebRtcSession::new(offer, &WebRtcConfig::default()).await {
+            Ok(_) => panic!("DON-signaling H.265 should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err, "offer advertised video but no live-serveable codec");
+    }
+
+    #[tokio::test]
+    async fn new_accepts_audio_only_offer() {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        );
+
+        let offer = "v=0\r\n\
+o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0\r\n\
+a=msid-semantic: WMS\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:111 opus/48000/2\r\n";
+
+        WebRtcSession::new(offer, &WebRtcConfig::default())
+            .await
+            .expect("audio-only offer should not be rejected");
     }
 
     #[test]
