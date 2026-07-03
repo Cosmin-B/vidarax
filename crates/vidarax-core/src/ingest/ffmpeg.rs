@@ -607,21 +607,128 @@ pub fn compute_semantic_frame_indices(
 
 /// Build an ffmpeg `select` filter expression for the given frame indices.
 ///
-/// For `[12, 37, 74]` produces: `"select='eq(n\\,12)+eq(n\\,37)+eq(n\\,74)'"`
-/// Commas are escaped for ffmpeg's filter parser.
+/// Callers normally pass sorted, de-duplicated indices (the semantic path does);
+/// anything else is normalized to sorted-unique first, so the selected frame set
+/// never depends on input order — it always equals the set of distinct indices.
+///
+/// A naive `eq(n,a)+eq(n,b)+...` with one term per frame blows up ffmpeg's
+/// filter-graph parser on dense cadences: a few hundred `eq()` terms exhaust
+/// the expression evaluator's allocation ("Error initializing filters /
+/// Cannot allocate memory") and the whole selective decode fails. Since the
+/// semantic selection is structured — either evenly-strided single frames
+/// (1 frame/chunk) or equal-length clusters (N frames/chunk) — we can pick the
+/// exact same frames with a constant-size expression.
+///
+/// We coalesce indices into consecutive runs, then greedily collapse any
+/// maximal arithmetic *block* (equal-length runs at a constant stride) of at
+/// least three runs into ONE `mod`-based term. Shorter or irregular groups
+/// stay as literal per-run `eq`/`between` terms. Crucially this survives a
+/// partial final chunk: a clip whose frame count isn't a multiple of
+/// `chunk_size` puts its last midpoint off-stride, and only that stray frame
+/// falls out of the collapse — the dense bulk stays O(1).
+///
+/// - `[42]`               → `select='eq(n\,42)'`
+/// - `[12, 37, 74]`       → `select='eq(n\,12)+eq(n\,37)+eq(n\,74)'` (sparse: one term each)
+/// - `[2, 7, .., 832]`    → `select='between(n\,2\,832)*eq(mod(n-2\,5)\,0)'` (strided: O(1))
+/// - `[2, 7, .., 827, 831]`→ `select='between(n\,2\,827)*eq(mod(n-2\,5)\,0)+eq(n\,831)'` (partial tail)
+/// - `[0,1, 5,6, 10,11]`  → `select='between(n\,0\,11)*lt(mod(n\,5)\,2)'` (clusters: O(1))
+///
+/// Commas are escaped (`\,`) for ffmpeg's filter parser, matching the
+/// established quoting convention.
 pub fn build_select_expr(indices: &[u64]) -> String {
-    use std::fmt::Write;
     if indices.is_empty() {
         return "select='0'".to_string();
     }
-    let mut expr = String::with_capacity(indices.len() * 16 + 12);
+
+    // Block-peeling below assumes strictly-ascending, unique indices — the sole
+    // production caller (compute_semantic_frame_indices) always passes them that
+    // way. Honor the "defensive" promise without taxing that hot path: normalize
+    // (sort + dedup) ONLY when the input isn't already strictly ascending, so the
+    // common case stays zero-alloc. Normalizing also removes the one u64 overflow
+    // risk — the `*hi + 1` extend check can only run when a strictly-larger index
+    // follows, so hi < u64::MAX there and the add can't wrap.
+    let normalized: Vec<u64>;
+    let indices: &[u64] = if indices.windows(2).all(|w| w[0] < w[1]) {
+        indices
+    } else {
+        let mut v = indices.to_vec();
+        v.sort_unstable();
+        v.dedup();
+        normalized = v;
+        &normalized
+    };
+
+    // Coalesce into maximal consecutive runs [lo, hi].
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for &idx in indices {
+        match runs.last_mut() {
+            Some((_, hi)) if idx == *hi + 1 => *hi = idx,
+            _ => runs.push((idx, idx)),
+        }
+    }
+
+    // Greedily emit terms. A maximal arithmetic *block* — runs of equal length
+    // L whose starts are separated by a constant stride S — is exactly
+    //   { n in [first, last] : (n - first) mod S < L }
+    // and collapses to ONE O(1) term (separate runs imply S > L, so they never
+    // overlap). We only collapse blocks of >= COLLAPSE runs: that bounds the
+    // output no matter the frame count, while short/irregular groups stay as
+    // literal per-run terms (preserving historical output for sparse sets).
+    //
+    // Peeling blocks greedily — instead of demanding the whole set be regular —
+    // is what survives a partial final chunk: the dense stride-S bulk collapses
+    // and only the stray off-stride tail frame(s) spill into cheap `eq` terms.
+    const COLLAPSE: usize = 3;
+    let mut terms: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < runs.len() {
+        let (lo, hi) = runs[i];
+        let l = hi - lo + 1;
+        // Extend a regular block [i..=j] sharing the stride of its first gap.
+        let mut j = i;
+        if i + 1 < runs.len() {
+            let s = runs[i + 1].0 - runs[i].0;
+            while j + 1 < runs.len()
+                && runs[j + 1].0 - runs[j].0 == s
+                && runs[j + 1].1 - runs[j + 1].0 + 1 == l
+            {
+                j += 1;
+            }
+            if j - i + 1 >= COLLAPSE {
+                let first = runs[i].0;
+                let last = runs[j].1;
+                let modarg = if first == 0 {
+                    "n".to_string()
+                } else {
+                    format!("n-{first}")
+                };
+                terms.push(if l == 1 {
+                    format!("between(n\\,{first}\\,{last})*eq(mod({modarg}\\,{s})\\,0)")
+                } else {
+                    format!("between(n\\,{first}\\,{last})*lt(mod({modarg}\\,{s})\\,{l})")
+                });
+                i = j + 1;
+                continue;
+            }
+        }
+        // Not a collapsible block: emit this single run literally and advance
+        // by one so the next run gets its own chance to start a block.
+        terms.push(if lo == hi {
+            format!("eq(n\\,{lo})")
+        } else {
+            format!("between(n\\,{lo}\\,{hi})")
+        });
+        i += 1;
+    }
+
+    let cap = terms.iter().map(|t| t.len() + 1).sum::<usize>() + 10;
+    let mut expr = String::with_capacity(cap);
     expr.push_str("select='");
-    for (i, &idx) in indices.iter().enumerate() {
-        if i > 0 {
+    for (k, t) in terms.iter().enumerate() {
+        if k > 0 {
             expr.push('+');
         }
-        // Escape the comma inside eq(n,X) for ffmpeg filter graph parsing
-        write!(expr, "eq(n\\,{idx})").unwrap();
+        expr.push_str(t);
     }
     expr.push('\'');
     expr
