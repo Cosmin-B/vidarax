@@ -1,12 +1,22 @@
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use clap::{Args, Parser, Subcommand};
+use comfy_table::{presets, Cell, Table};
+use owo_colors::OwoColorize;
 use reqwest::Method;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use vidarax_contracts::lifecycle::StreamState;
+
+const DEFAULT_API_URL: &str = "http://127.0.0.1:8080";
+const API_TIMEOUT_SECS: u64 = 10;
 
 #[tokio::main]
 async fn main() {
@@ -19,252 +29,478 @@ async fn main() {
         .without_time()
         .init();
 
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("run-create") => {
-            cmd_run_create(RunCreateOpts::parse(args)).await;
+    let cli = Cli::parse();
+    let global = cli.global.clone();
+    let color = !global.json && should_use_color(&global);
+    let output = OutputMode {
+        json: global.json,
+        color,
+    };
+
+    let config = match RuntimeConfig::from_global_args(&global) {
+        Ok(config) => config,
+        Err(e) => exit_with_error(e),
+    };
+
+    if let Err(e) = dispatch(cli.command, &global, config, output).await {
+        exit_with_error(e);
+    }
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "vidarax",
+    about = "Inspect and manage Vidarax API runs",
+    after_long_help = "Examples:
+  vidarax health --url http://127.0.0.1:8080
+  vidarax runs list --tenant-id demo
+  vidarax search \"person entering lobby\" --run run_01 --limit 10
+"
+)]
+struct Cli {
+    #[command(flatten)]
+    global: GlobalArgs,
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Args, Debug, Clone)]
+struct GlobalArgs {
+    /// API base URL.
+    #[arg(long, value_name = "URL", global = true)]
+    url: Option<String>,
+    /// API key sent as x-api-key.
+    #[arg(long, value_name = "KEY", global = true)]
+    api_key: Option<String>,
+    /// Tenant ID sent as x-tenant-id.
+    #[arg(long, value_name = "ID", global = true)]
+    tenant_id: Option<String>,
+    /// Print raw API JSON responses.
+    #[arg(long, global = true)]
+    json: bool,
+    /// Disable ANSI color.
+    #[arg(long, global = true)]
+    no_color: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Work with analysis runs.
+    #[command(subcommand)]
+    Runs(RunsCommands),
+    /// List events for a run.
+    Events(EventsArgs),
+    /// List markers for a run.
+    Markers(MarkersArgs),
+    /// Search indexed run events.
+    #[command(after_long_help = "Examples:
+  vidarax search \"red car turning\" --limit 5
+  vidarax search \"door opened\" --run run_01 --json
+")]
+    Search(SearchArgs),
+    /// Submit and list feedback.
+    #[command(subcommand)]
+    Feedback(FeedbackCommands),
+    /// List model availability.
+    Models,
+    /// Check API health.
+    Health,
+    /// Check local config and API readiness.
+    #[command(after_long_help = "Examples:
+  vidarax doctor
+  vidarax doctor --url http://127.0.0.1:8080
+")]
+    Doctor,
+    /// Show resolved CLI configuration.
+    #[command(subcommand)]
+    Config(ConfigCommands),
+    /// List stream states and terminal status.
+    States,
+    /// Run local distillation helpers.
+    #[command(subcommand)]
+    Distill(DistillCommands),
+    /// Create a run.
+    #[command(name = "run-create", hide = true)]
+    RunCreate(RunCreateArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum RunsCommands {
+    /// List runs.
+    List,
+    /// Show one run.
+    Show { run_id: String },
+    /// Create a run.
+    Create(RunCreateArgs),
+    /// Delete a run.
+    Rm { run_id: String },
+}
+
+#[derive(Args, Debug, Clone)]
+struct RunCreateArgs {
+    /// Run mode.
+    #[arg(long, value_name = "MODE")]
+    mode: Option<String>,
+    /// Model ID.
+    #[arg(long, value_name = "MODEL")]
+    model: Option<String>,
+}
+
+impl RunCreateArgs {
+    fn request_body(&self) -> Value {
+        let mut body = Map::new();
+        if let Some(mode) = self.mode.as_deref().and_then(non_empty_opt) {
+            body.insert("mode".to_string(), Value::String(mode.to_string()));
         }
-        Some("health") => {
-            cmd_health(ApiOpts::from_env(args)).await;
+        if let Some(model) = self.model.as_deref().and_then(non_empty_opt) {
+            body.insert("model".to_string(), Value::String(model.to_string()));
         }
-        Some("models") => {
-            cmd_models(ApiOpts::from_env(args)).await;
-        }
-        Some("states") => {
-            let states = [
-                StreamState::Pending,
-                StreamState::Processing,
-                StreamState::Completed,
-                StreamState::Failed,
-                StreamState::Cancelled,
-                StreamState::Expired,
-            ];
-            for state in states {
-                println!("{state:?}\tterminal={}", state.is_terminal());
-            }
-        }
-        Some("distill") => {
-            let sub = args.next();
-            let opts = DistillOpts::parse(args);
-            match sub.as_deref() {
-                Some("status") => cmd_distill_status(opts).await,
-                Some("train") => cmd_distill_train(opts).await,
-                Some("export") => cmd_distill_export(opts).await,
-                Some("deploy") => cmd_distill_deploy(opts).await,
-                _ => {
-                    eprintln!("Usage:");
-                    eprintln!("  vidarax-cli distill status  --tenant-id <id> [--data-dir <dir>]");
-                    eprintln!("  vidarax-cli distill train   --tenant-id <id> [--data-dir <dir>] [--mlx] [--resume]");
-                    eprintln!("  vidarax-cli distill export  --tenant-id <id> [--data-dir <dir>] [--format gguf|onnx|mlx]");
-                    eprintln!("  vidarax-cli distill deploy  --tenant-id <id> [--data-dir <dir>]");
-                    std::process::exit(1);
-                }
-            }
-        }
-        _ => {
-            eprintln!("Usage:");
-            eprintln!("  vidarax-cli run-create [--url <base>] [--api-key <key>] [--tenant-id <id>] [--mode <mode>] [--model <model>]");
-            eprintln!("  vidarax-cli health [--url <base>] [--api-key <key>] [--tenant-id <id>]");
-            eprintln!("  vidarax-cli models [--url <base>] [--api-key <key>] [--tenant-id <id>]");
-            eprintln!("  vidarax-cli states");
-            eprintln!("  vidarax-cli distill <status|train|export|deploy> ...");
+        Value::Object(body)
+    }
+}
+
+#[derive(Args, Debug)]
+struct EventsArgs {
+    /// Run ID.
+    run_id: String,
+    /// Filter events by kind after fetching.
+    #[arg(long, value_name = "KIND")]
+    kind: Option<String>,
+    /// Event index name.
+    #[arg(long, value_name = "NAME")]
+    index: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct MarkersArgs {
+    /// Run ID.
+    run_id: String,
+    /// Marker status filter.
+    #[arg(long, value_name = "S")]
+    status: Option<String>,
+    /// Event type filter.
+    #[arg(long, value_name = "T")]
+    event_type: Option<String>,
+    /// Start frame filter.
+    #[arg(long, value_name = "N")]
+    from_frame: Option<u64>,
+    /// End frame filter.
+    #[arg(long, value_name = "N")]
+    to_frame: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+struct SearchArgs {
+    /// Search query.
+    query: String,
+    /// Limit results to one run.
+    #[arg(long, value_name = "RUN_ID")]
+    run: Option<String>,
+    /// Maximum number of results.
+    #[arg(long, value_name = "N")]
+    limit: Option<usize>,
+}
+
+#[derive(Subcommand, Debug)]
+enum FeedbackCommands {
+    /// Submit feedback for a run.
+    #[command(after_long_help = "Examples:
+  vidarax feedback submit run_01 --rating 8 --category useful
+  vidarax feedback submit run_01 --rating 3 --category miss --note \"missed the doorway event\"
+")]
+    Submit(FeedbackSubmitArgs),
+    /// List submitted feedback.
+    List,
+}
+
+#[derive(Args, Debug)]
+struct FeedbackSubmitArgs {
+    /// Run ID.
+    run_id: String,
+    /// Rating from 0 to 10.
+    #[arg(long, value_name = "0-10")]
+    rating: u32,
+    /// Feedback category.
+    #[arg(long, value_name = "CATEGORY")]
+    category: String,
+    /// Optional feedback note.
+    #[arg(long, value_name = "TEXT")]
+    note: Option<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommands {
+    /// Show resolved configuration.
+    Show,
+}
+
+#[derive(Subcommand, Debug)]
+enum DistillCommands {
+    /// Show stored training data status.
+    Status(DistillCliArgs),
+    /// Train a local specialist model.
+    Train(DistillCliArgs),
+    /// Export a local specialist model.
+    Export(DistillCliArgs),
+    /// Ask the API to reload specialist weights.
+    Deploy(DistillCliArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct DistillCliArgs {
+    /// Training data directory.
+    #[arg(long, value_name = "DIR", default_value = ".vidarax-data")]
+    data_dir: PathBuf,
+    /// Use the MLX training script.
+    #[arg(long)]
+    mlx: bool,
+    /// Resume training.
+    #[arg(long)]
+    resume: bool,
+    /// Export format.
+    #[arg(long, value_name = "gguf|onnx|mlx", default_value = "gguf")]
+    format: String,
+}
+
+impl DistillCliArgs {
+    fn to_opts(&self, tenant_id: Option<String>) -> DistillOpts {
+        DistillOpts {
+            tenant_id,
+            data_dir: self.data_dir.clone(),
+            mlx: self.mlx,
+            resume: self.resume,
+            format: self.format.clone(),
         }
     }
 }
 
-// ─── Options ──────────────────────────────────────────────────────────────────
+#[derive(Clone, Copy)]
+struct OutputMode {
+    json: bool,
+    color: bool,
+}
 
-const DEFAULT_API_URL: &str = "http://127.0.0.1:8080";
-const API_TIMEOUT_SECS: u64 = 10;
+async fn dispatch(
+    command: Commands,
+    global: &GlobalArgs,
+    config: RuntimeConfig,
+    output: OutputMode,
+) -> Result<(), String> {
+    match command {
+        Commands::Runs(command) => match command {
+            RunsCommands::List => cmd_runs_list(config, output).await,
+            RunsCommands::Show { run_id } => cmd_runs_show(config, output, &run_id).await,
+            RunsCommands::Create(args) => cmd_run_create(config, output, &args).await,
+            RunsCommands::Rm { run_id } => cmd_runs_rm(config, output, &run_id).await,
+        },
+        Commands::Events(args) => cmd_events(config, output, &args).await,
+        Commands::Markers(args) => cmd_markers(config, output, &args).await,
+        Commands::Search(args) => cmd_search(config, output, &args).await,
+        Commands::Feedback(command) => match command {
+            FeedbackCommands::Submit(args) => cmd_feedback_submit(config, output, &args).await,
+            FeedbackCommands::List => cmd_feedback_list(config, output).await,
+        },
+        Commands::Models => cmd_models(config, output).await,
+        Commands::Health => cmd_health(config, output).await,
+        Commands::Doctor => cmd_doctor(config, output).await,
+        Commands::Config(ConfigCommands::Show) => cmd_config_show(config, output),
+        Commands::States => cmd_states(output),
+        Commands::Distill(command) => {
+            let tenant_id = global.tenant_id.clone();
+            match command {
+                DistillCommands::Status(args) => cmd_distill_status(args.to_opts(tenant_id)).await,
+                DistillCommands::Train(args) => cmd_distill_train(args.to_opts(tenant_id)).await,
+                DistillCommands::Export(args) => cmd_distill_export(args.to_opts(tenant_id)).await,
+                DistillCommands::Deploy(args) => cmd_distill_deploy(args.to_opts(tenant_id)).await,
+            }
+            Ok(())
+        }
+        Commands::RunCreate(args) => cmd_run_create(config, output, &args).await,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimeConfig {
+    base_url: ResolvedValue,
+    api_key: ResolvedValue,
+    tenant_id: ResolvedValue,
+}
+
+impl RuntimeConfig {
+    fn from_global_args(global: &GlobalArgs) -> Result<Self, String> {
+        let file = load_config_file()?;
+        let env_url = env::var("VIDARAX_API_URL").ok();
+        let env_api_key = env::var("VIDARAX_API_KEY").ok();
+        let env_tenant_id = env::var("VIDARAX_TENANT_ID").ok();
+
+        let base_url = resolve_config_value(
+            global.url.as_deref(),
+            env_url.as_deref(),
+            file.get("api_url").map(String::as_str),
+            Some(DEFAULT_API_URL),
+        )
+        .trim_trailing_slash();
+        let api_key = resolve_config_value(
+            global.api_key.as_deref(),
+            env_api_key.as_deref(),
+            file.get("api_key").map(String::as_str),
+            None,
+        );
+        let tenant_id = resolve_config_value(
+            global.tenant_id.as_deref(),
+            env_tenant_id.as_deref(),
+            file.get("tenant_id").map(String::as_str),
+            None,
+        );
+
+        Ok(Self {
+            base_url,
+            api_key,
+            tenant_id,
+        })
+    }
+
+    fn api_opts(&self) -> ApiOpts {
+        ApiOpts {
+            base_url: self
+                .base_url
+                .value
+                .clone()
+                .unwrap_or_else(|| DEFAULT_API_URL.to_string()),
+            api_key: self.api_key.value.clone(),
+            tenant_id: self.tenant_id.value.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedValue {
+    value: Option<String>,
+    source: ConfigSource,
+}
+
+impl ResolvedValue {
+    fn trim_trailing_slash(mut self) -> Self {
+        if let Some(value) = &mut self.value {
+            *value = value.trim_end_matches('/').to_string();
+        }
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigSource {
+    Flag,
+    Env,
+    File,
+    Default,
+}
+
+impl ConfigSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            ConfigSource::Flag => "flag",
+            ConfigSource::Env => "env",
+            ConfigSource::File => "file",
+            ConfigSource::Default => "default",
+        }
+    }
+}
+
+fn resolve_config_value(
+    flag: Option<&str>,
+    env: Option<&str>,
+    file: Option<&str>,
+    default: Option<&str>,
+) -> ResolvedValue {
+    for (source, value) in [
+        (ConfigSource::Flag, flag),
+        (ConfigSource::Env, env),
+        (ConfigSource::File, file),
+        (ConfigSource::Default, default),
+    ] {
+        if let Some(value) = value.and_then(non_empty_opt) {
+            return ResolvedValue {
+                value: Some(value.to_string()),
+                source,
+            };
+        }
+    }
+
+    ResolvedValue {
+        value: None,
+        source: ConfigSource::Default,
+    }
+}
+
+fn parse_config_file(contents: &str) -> HashMap<String, String> {
+    let mut values = HashMap::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        if matches!(key.as_str(), "api_url" | "api_key" | "tenant_id") {
+            values.insert(key, value.trim().to_string());
+        }
+    }
+    values
+}
+
+fn load_config_file() -> Result<HashMap<String, String>, String> {
+    let Some(path) = config_file_path() else {
+        return Ok(HashMap::new());
+    };
+
+    match fs::read_to_string(&path) {
+        Ok(contents) => Ok(parse_config_file(&contents)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(e) => Err(format!("failed to read {}: {e}", path.display())),
+    }
+}
+
+fn config_file_path() -> Option<PathBuf> {
+    env::var_os("VIDARAX_CONFIG")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join(".config")
+                    .join("vidarax")
+                    .join("config")
+            })
+        })
+}
+
+fn non_empty_opt(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn should_use_color(global: &GlobalArgs) -> bool {
+    !global.no_color && env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+}
+
+fn fmt_pts(pts_ms: u64) -> String {
+    let minutes = pts_ms / 60_000;
+    let seconds = (pts_ms / 1_000) % 60;
+    let millis = pts_ms % 1_000;
+    format!("{minutes}:{seconds:02}.{millis:03}")
+}
 
 struct ApiOpts {
     base_url: String,
     api_key: Option<String>,
     tenant_id: Option<String>,
 }
-
-impl ApiOpts {
-    fn from_env(args: impl Iterator<Item = String>) -> Self {
-        Self::parse(
-            args,
-            std::env::var("VIDARAX_API_URL").ok(),
-            std::env::var("VIDARAX_API_KEY").ok(),
-            std::env::var("VIDARAX_TENANT_ID").ok(),
-        )
-    }
-
-    fn parse(
-        args: impl Iterator<Item = String>,
-        env_url: Option<String>,
-        env_api_key: Option<String>,
-        env_tenant_id: Option<String>,
-    ) -> Self {
-        let args: Vec<String> = args.collect();
-        let mut flag_url = None;
-        let mut flag_api_key = None;
-        let mut flag_tenant_id = None;
-        let mut i = 0;
-        while i < args.len() {
-            match args[i].as_str() {
-                "--url" => {
-                    flag_url = non_empty(flag_value_or_exit(&args, i, "--url"));
-                    i += 2;
-                }
-                "--api-key" => {
-                    flag_api_key = non_empty(flag_value_or_exit(&args, i, "--api-key"));
-                    i += 2;
-                }
-                "--tenant-id" => {
-                    flag_tenant_id = non_empty(flag_value_or_exit(&args, i, "--tenant-id"));
-                    i += 2;
-                }
-                _ => {
-                    i += 1;
-                }
-            }
-        }
-
-        let base_url = choose_config_value(flag_url, env_url)
-            .unwrap_or_else(|| DEFAULT_API_URL.to_string())
-            .trim_end_matches('/')
-            .to_string();
-
-        Self {
-            base_url,
-            api_key: choose_config_value(flag_api_key, env_api_key),
-            tenant_id: choose_config_value(flag_tenant_id, env_tenant_id),
-        }
-    }
-}
-
-struct RunCreateOpts {
-    api: ApiOpts,
-    mode: Option<String>,
-    model: Option<String>,
-}
-
-impl RunCreateOpts {
-    fn parse(args: impl Iterator<Item = String>) -> Self {
-        let args: Vec<String> = args.collect();
-        let api = ApiOpts::from_env(args.clone().into_iter());
-        let mut mode = None;
-        let mut model = None;
-        let mut i = 0;
-        while i < args.len() {
-            match args[i].as_str() {
-                "--mode" => {
-                    mode = non_empty(flag_value_or_exit(&args, i, "--mode"));
-                    i += 2;
-                }
-                "--model" => {
-                    model = non_empty(flag_value_or_exit(&args, i, "--model"));
-                    i += 2;
-                }
-                _ => {
-                    i += 1;
-                }
-            }
-        }
-
-        Self { api, mode, model }
-    }
-
-    fn request_body(&self) -> Value {
-        let mut body = Map::new();
-        if let Some(mode) = &self.mode {
-            body.insert("mode".to_string(), Value::String(mode.clone()));
-        }
-        if let Some(model) = &self.model {
-            body.insert("model".to_string(), Value::String(model.clone()));
-        }
-        Value::Object(body)
-    }
-}
-
-fn choose_config_value(flag: Option<String>, env: Option<String>) -> Option<String> {
-    flag.or_else(|| env.and_then(non_empty))
-}
-
-fn flag_value(args: &[String], i: usize, flag: &str) -> Result<String, String> {
-    match args.get(i + 1) {
-        Some(value) if !value.starts_with("--") => Ok(value.clone()),
-        _ => Err(format!("{flag} requires a value")),
-    }
-}
-
-fn flag_value_or_exit(args: &[String], i: usize, flag: &str) -> String {
-    flag_value(args, i, flag).unwrap_or_else(|e| {
-        exit_with_error(e);
-    })
-}
-
-fn non_empty(value: String) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
-struct DistillOpts {
-    tenant_id: Option<String>,
-    data_dir: PathBuf,
-    mlx: bool,
-    resume: bool,
-    format: String,
-}
-
-impl DistillOpts {
-    fn parse(args: impl Iterator<Item = String>) -> Self {
-        let mut opts = Self {
-            tenant_id: None,
-            data_dir: PathBuf::from(".vidarax-data"),
-            mlx: false,
-            resume: false,
-            format: "gguf".to_string(),
-        };
-        let args: Vec<String> = args.collect();
-        let mut i = 0;
-        while i < args.len() {
-            match args[i].as_str() {
-                "--tenant-id" if i + 1 < args.len() => {
-                    opts.tenant_id = Some(args[i + 1].clone());
-                    i += 2;
-                }
-                "--data-dir" if i + 1 < args.len() => {
-                    opts.data_dir = PathBuf::from(&args[i + 1]);
-                    i += 2;
-                }
-                "--mlx" => {
-                    opts.mlx = true;
-                    i += 1;
-                }
-                "--resume" => {
-                    opts.resume = true;
-                    i += 1;
-                }
-                "--format" if i + 1 < args.len() => {
-                    opts.format = args[i + 1].clone();
-                    i += 2;
-                }
-                _ => {
-                    i += 1;
-                }
-            }
-        }
-        opts
-    }
-
-    fn require_tenant_id(&self) -> &str {
-        self.tenant_id.as_deref().unwrap_or_else(|| {
-            eprintln!("error: --tenant-id is required");
-            std::process::exit(1);
-        })
-    }
-}
-
-// ─── API commands ─────────────────────────────────────────────────────────────
 
 struct ApiClient {
     opts: ApiOpts,
@@ -280,22 +516,34 @@ impl ApiClient {
         Ok(Self { opts, http })
     }
 
-    async fn get_json(&self, path: &str) -> Result<Value, String> {
-        self.request_json(Method::GET, path, None).await
+    async fn get(&self, path: &str) -> Result<Value, String> {
+        self.request_json(Method::GET, path, &[], None).await
+    }
+
+    async fn get_with_query(&self, path: &str, query: &[(&str, String)]) -> Result<Value, String> {
+        self.request_json(Method::GET, path, query, None).await
     }
 
     async fn post_json(&self, path: &str, body: &Value) -> Result<Value, String> {
-        self.request_json(Method::POST, path, Some(body)).await
+        self.request_json(Method::POST, path, &[], Some(body)).await
+    }
+
+    async fn delete(&self, path: &str) -> Result<Value, String> {
+        self.request_json(Method::DELETE, path, &[], None).await
     }
 
     async fn request_json(
         &self,
         method: Method,
         path: &str,
+        query: &[(&str, String)],
         body: Option<&Value>,
     ) -> Result<Value, String> {
         let url = format!("{}{}", self.opts.base_url, path);
         let mut request = self.http.request(method, &url);
+        if !query.is_empty() {
+            request = request.query(query);
+        }
         if let Some(api_key) = &self.opts.api_key {
             request = request.header("x-api-key", api_key);
         }
@@ -320,7 +568,7 @@ impl ApiClient {
             let message = serde_json::from_str::<Value>(&text)
                 .ok()
                 .and_then(|body| extract_error_message(&body))
-                .or_else(|| non_empty(text.clone()))
+                .or_else(|| non_empty_opt(&text).map(str::to_string))
                 .unwrap_or_else(|| "empty response body".to_string());
             return Err(format!("request to {url} returned {status}: {message}"));
         }
@@ -330,64 +578,750 @@ impl ApiClient {
     }
 }
 
-async fn cmd_health(opts: ApiOpts) {
+async fn cmd_health(config: RuntimeConfig, output: OutputMode) -> Result<(), String> {
+    let opts = config.api_opts();
     let base_url = opts.base_url.clone();
-    let client = api_client_or_exit(opts);
-    let body = client.get_json("/v1/health").await.unwrap_or_else(|e| {
-        exit_with_error(e);
-    });
-
-    if body.get("status").and_then(Value::as_str).is_none() {
-        exit_with_error(format!(
-            "response from {base_url}/v1/health is missing string field status"
-        ));
+    let client = ApiClient::new(opts)?;
+    match client.get("/v1/health").await {
+        Ok(body) => {
+            if body.get("status").and_then(Value::as_str).is_none() {
+                return Err(format!(
+                    "response from {base_url}/v1/health is missing string field status"
+                ));
+            }
+            if output.json {
+                print_json(&body)?;
+            } else {
+                println!(
+                    "{} at {base_url}",
+                    colorize("API OK", "green", output.color)
+                );
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let message = format!("API unreachable at {base_url}: {e}");
+            if output.color {
+                eprintln!("{}", message.red());
+            } else {
+                eprintln!("{message}");
+            }
+            std::process::exit(1);
+        }
     }
-
-    println!("{body}");
 }
 
-async fn cmd_models(opts: ApiOpts) {
-    let base_url = opts.base_url.clone();
-    let client = api_client_or_exit(opts);
-    let body = client.get_json("/v1/models").await.unwrap_or_else(|e| {
-        exit_with_error(e);
-    });
-    let model_ids = extract_model_ids(&body).unwrap_or_else(|e| {
-        exit_with_error(format!("response from {base_url}/v1/models {e}"));
-    });
-
-    for model_id in model_ids {
-        println!("{model_id}");
+async fn cmd_models(config: RuntimeConfig, output: OutputMode) -> Result<(), String> {
+    let client = ApiClient::new(config.api_opts())?;
+    let body = client.get("/v1/models").await?;
+    if output.json {
+        return print_json(&body);
     }
+
+    let models = body
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "response from /v1/models is missing array field models".to_string())?;
+    let mut table = table(output.color);
+    table.set_header(["ID", "TIER", "AVAILABILITY", "PROVIDERS"]);
+    for model in models {
+        let id = string_field(model, "id").unwrap_or("-");
+        let tier = string_field(model, "tier").unwrap_or("-");
+        let availability = string_field(model, "availability").unwrap_or("-");
+        let providers = string_array_field(model, "providers_available");
+        let providers = if providers.is_empty() {
+            "-".to_string()
+        } else {
+            providers.join(",")
+        };
+        table.add_row([
+            Cell::new(id),
+            Cell::new(tier),
+            Cell::new(color_availability(availability, output.color)),
+            Cell::new(providers),
+        ]);
+    }
+    println!("{table}");
+    Ok(())
 }
 
-async fn cmd_run_create(opts: RunCreateOpts) {
-    let base_url = opts.api.base_url.clone();
-    let body = opts.request_body();
-    let client = api_client_or_exit(opts.api);
+async fn cmd_runs_list(config: RuntimeConfig, output: OutputMode) -> Result<(), String> {
+    let client = ApiClient::new(config.api_opts())?;
+    let body = client.get("/v1/runs").await?;
+    if output.json {
+        return print_json(&body);
+    }
+
+    let rows = parse_run_list_rows(&body)?;
+    if rows.is_empty() {
+        println!("{}", colorize("no runs", "dim", output.color));
+        return Ok(());
+    }
+
+    let mut table = table(output.color);
+    table.set_header(["RUN ID", "STATUS", "MODE", "MODEL", "SOURCE", "CREATED"]);
+    for row in rows {
+        table.add_row([
+            Cell::new(row.run_id),
+            Cell::new(color_status(&row.status, output.color)),
+            Cell::new(row.mode),
+            Cell::new(row.model),
+            Cell::new(row.source),
+            Cell::new(row.created),
+        ]);
+    }
+    println!("{table}");
+    Ok(())
+}
+
+async fn cmd_runs_show(
+    config: RuntimeConfig,
+    output: OutputMode,
+    run_id: &str,
+) -> Result<(), String> {
+    let client = ApiClient::new(config.api_opts())?;
+    let body = client.get(&format!("/v1/runs/{run_id}")).await?;
+    if output.json {
+        return print_json(&body);
+    }
+
+    let shown_id = string_field(&body, "run_id").unwrap_or(run_id);
+    println!("Run {shown_id}");
+    print_kv(
+        "Status",
+        &color_status(string_field(&body, "status").unwrap_or("-"), output.color),
+    );
+    print_kv("Mode", string_field(&body, "mode").unwrap_or("-"));
+    print_kv("Model", string_field(&body, "model").unwrap_or("-"));
+    print_kv("Source", string_field(&body, "source_uri").unwrap_or("-"));
+    print_kv("Created", string_field(&body, "created_at").unwrap_or("-"));
+    print_kv("Updated", string_field(&body, "updated_at").unwrap_or("-"));
+    Ok(())
+}
+
+async fn cmd_run_create(
+    config: RuntimeConfig,
+    output: OutputMode,
+    args: &RunCreateArgs,
+) -> Result<(), String> {
+    let base_url = config
+        .base_url
+        .value
+        .clone()
+        .unwrap_or_else(|| DEFAULT_API_URL.to_string());
+    let body = args.request_body();
+    let client = ApiClient::new(config.api_opts())?;
+    let response = client.post_json("/v1/runs", &body).await?;
+    validate_run_create_response(&response)
+        .map_err(|e| format!("response from {base_url}/v1/runs {e}"))?;
+
+    if output.json {
+        return print_json(&response);
+    }
+
+    let run_id = string_field(&response, "run_id").unwrap_or("-");
+    let status = string_field(&response, "status").unwrap_or("-");
+    let mode = string_field(&response, "mode").unwrap_or("-");
+    let model = response.get("model").and_then(Value::as_str).unwrap_or("-");
+    println!(
+        "created run {run_id} status={} mode={mode} model={model}",
+        color_status(status, output.color)
+    );
+    Ok(())
+}
+
+async fn cmd_runs_rm(
+    config: RuntimeConfig,
+    output: OutputMode,
+    run_id: &str,
+) -> Result<(), String> {
+    let client = ApiClient::new(config.api_opts())?;
+    let body = client.delete(&format!("/v1/runs/{run_id}")).await?;
+    if output.json {
+        return print_json(&body);
+    }
+    let deleted = string_field(&body, "run_id").unwrap_or(run_id);
+    println!("deleted run {deleted}");
+    Ok(())
+}
+
+async fn cmd_events(
+    config: RuntimeConfig,
+    output: OutputMode,
+    args: &EventsArgs,
+) -> Result<(), String> {
+    let client = ApiClient::new(config.api_opts())?;
+    let mut query = Vec::new();
+    if let Some(index) = &args.index {
+        query.push(("index", index.clone()));
+    }
+    let body = client
+        .get_with_query(&format!("/v1/runs/{}/events", args.run_id), &query)
+        .await?;
+    if output.json {
+        return print_json(&body);
+    }
+
+    let events = body
+        .get("events")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "response from events route is missing array field events".to_string())?;
+    let mut table = table(output.color);
+    table.set_header(["SEQ", "PTS", "KIND", "DETAIL"]);
+    let mut shown = 0usize;
+    for event in events {
+        let kind = string_field(event, "kind").unwrap_or("-");
+        if args.kind.as_deref().is_some_and(|wanted| wanted != kind) {
+            continue;
+        }
+        let payload = event.get("payload").unwrap_or(&Value::Null);
+        table.add_row([
+            Cell::new(u64_field(event, "seq").unwrap_or(0)),
+            Cell::new(fmt_pts(u64_field(event, "pts_ms").unwrap_or(0))),
+            Cell::new(kind),
+            Cell::new(event_detail(payload)),
+        ]);
+        shown += 1;
+    }
+    if shown == 0 {
+        println!("{}", colorize("no events", "dim", output.color));
+    } else {
+        println!("{table}");
+    }
+    Ok(())
+}
+
+async fn cmd_markers(
+    config: RuntimeConfig,
+    output: OutputMode,
+    args: &MarkersArgs,
+) -> Result<(), String> {
+    let client = ApiClient::new(config.api_opts())?;
+    let mut query = Vec::new();
+    if let Some(status) = &args.status {
+        query.push(("status", status.clone()));
+    }
+    if let Some(event_type) = &args.event_type {
+        query.push(("event_type", event_type.clone()));
+    }
+    if let Some(from_frame) = args.from_frame {
+        query.push(("from_frame", from_frame.to_string()));
+    }
+    if let Some(to_frame) = args.to_frame {
+        query.push(("to_frame", to_frame.to_string()));
+    }
+    let body = client
+        .get_with_query(&format!("/v1/runs/{}/markers", args.run_id), &query)
+        .await?;
+    if output.json {
+        return print_json(&body);
+    }
+
+    let markers = body
+        .get("markers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "response from markers route is missing array field markers".to_string())?;
+    if markers.is_empty() {
+        println!("{}", colorize("no markers", "dim", output.color));
+        return Ok(());
+    }
+
+    let mut table = table(output.color);
+    table.set_header(["MARKER", "EVENT TYPE", "STATUS", "FRAMES", "PTS", "CONF"]);
+    for marker in markers {
+        let marker_id = string_field(marker, "marker_id").unwrap_or("-");
+        let start_frame = u64_field(marker, "start_frame").unwrap_or(0);
+        let end_frame = u64_field(marker, "end_frame").unwrap_or(0);
+        let start_pts = u64_field(marker, "start_pts_ms").unwrap_or(0);
+        let end_pts = u64_field(marker, "end_pts_ms").unwrap_or(0);
+        let confidence = marker
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        table.add_row([
+            Cell::new(short_id(marker_id, 8)),
+            Cell::new(string_field(marker, "event_type").unwrap_or("-")),
+            Cell::new(color_status(
+                string_field(marker, "status").unwrap_or("-"),
+                output.color,
+            )),
+            Cell::new(format!("{start_frame}-{end_frame}")),
+            Cell::new(format!("{}-{}", fmt_pts(start_pts), fmt_pts(end_pts))),
+            Cell::new(format!("{confidence:.2}")),
+        ]);
+    }
+    println!("{table}");
+    Ok(())
+}
+
+async fn cmd_search(
+    config: RuntimeConfig,
+    output: OutputMode,
+    args: &SearchArgs,
+) -> Result<(), String> {
+    let client = ApiClient::new(config.api_opts())?;
+    let mut body = Map::new();
+    body.insert("query".to_string(), Value::String(args.query.clone()));
+    if let Some(run_id) = &args.run {
+        body.insert("run_id".to_string(), Value::String(run_id.clone()));
+    }
+    if let Some(limit) = args.limit {
+        body.insert("limit".to_string(), json!(limit));
+    }
+    let response = client.post_json("/v1/search", &Value::Object(body)).await?;
+    if output.json {
+        return print_json(&response);
+    }
+
+    let hits = response
+        .get("hits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "response from /v1/search is missing array field hits".to_string())?;
+    if hits.is_empty() {
+        println!("{}", colorize("no matches", "dim", output.color));
+    } else {
+        let mut table = table(output.color);
+        table.set_header(["SEQ", "RUN", "PTS", "KIND", "DESCRIPTION"]);
+        for hit in hits {
+            table.add_row([
+                Cell::new(u64_field(hit, "seq").unwrap_or(0)),
+                Cell::new(string_field(hit, "run_id").unwrap_or("-")),
+                Cell::new(fmt_pts(u64_field(hit, "pts_ms").unwrap_or(0))),
+                Cell::new(string_field(hit, "kind").unwrap_or("-")),
+                Cell::new(truncate(
+                    string_field(hit, "description").unwrap_or("-"),
+                    70,
+                )),
+            ]);
+        }
+        println!("{table}");
+    }
+    let scanned = u64_field(&response, "scanned").unwrap_or(0);
+    let total_hits = u64_field(&response, "total_hits").unwrap_or(hits.len() as u64);
+    println!(
+        "{}",
+        colorize(
+            &format!(
+                "scanned {scanned}, {total_hits} hits (showing {})",
+                hits.len()
+            ),
+            "dim",
+            output.color,
+        )
+    );
+    Ok(())
+}
+
+async fn cmd_feedback_submit(
+    config: RuntimeConfig,
+    output: OutputMode,
+    args: &FeedbackSubmitArgs,
+) -> Result<(), String> {
+    if args.rating > 10 {
+        return Err("--rating must be between 0 and 10".to_string());
+    }
+    if non_empty_opt(&args.category).is_none() {
+        return Err("--category must not be empty".to_string());
+    }
+
+    let client = ApiClient::new(config.api_opts())?;
     let response = client
-        .post_json("/v1/runs", &body)
-        .await
-        .unwrap_or_else(|e| {
-            exit_with_error(e);
-        });
-
-    validate_run_create_response(&response).unwrap_or_else(|e| {
-        exit_with_error(format!("response from {base_url}/v1/runs {e}"));
-    });
-
-    println!("{response}");
+        .post_json(
+            &format!("/v1/runs/{}/feedback", args.run_id),
+            &json!({
+                "rating": args.rating,
+                "category": args.category,
+                "feedback": args.note.clone().unwrap_or_default(),
+            }),
+        )
+        .await?;
+    if output.json {
+        return print_json(&response);
+    }
+    let run_id = string_field(&response, "run_id").unwrap_or(&args.run_id);
+    println!("feedback submitted for run {run_id}");
+    Ok(())
 }
 
-fn api_client_or_exit(opts: ApiOpts) -> ApiClient {
-    ApiClient::new(opts).unwrap_or_else(|e| {
-        exit_with_error(e);
-    })
+async fn cmd_feedback_list(config: RuntimeConfig, output: OutputMode) -> Result<(), String> {
+    let client = ApiClient::new(config.api_opts())?;
+    let body = client.get("/v1/feedback").await?;
+    if output.json {
+        return print_json(&body);
+    }
+
+    let feedback = body
+        .get("feedback")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "response from /v1/feedback is missing array field feedback".to_string())?;
+    if feedback.is_empty() {
+        println!("{}", colorize("no feedback", "dim", output.color));
+        return Ok(());
+    }
+
+    let mut table = table(output.color);
+    table.set_header(["ID", "RUN", "RATING", "CATEGORY", "FEEDBACK"]);
+    for item in feedback {
+        table.add_row([
+            Cell::new(string_field(item, "id").unwrap_or("-")),
+            Cell::new(string_field(item, "run_id").unwrap_or("-")),
+            Cell::new(u64_field(item, "rating").unwrap_or(0)),
+            Cell::new(string_field(item, "category").unwrap_or("-")),
+            Cell::new(truncate(string_field(item, "feedback").unwrap_or(""), 50)),
+        ]);
+    }
+    println!("{table}");
+    Ok(())
 }
 
-fn exit_with_error(message: String) -> ! {
-    eprintln!("error: {message}");
-    std::process::exit(1);
+async fn cmd_doctor(config: RuntimeConfig, output: OutputMode) -> Result<(), String> {
+    let client = ApiClient::new(config.api_opts())?;
+    let mut hard_failed = false;
+    let mut checks = Map::new();
+
+    let api_key_status = mask_key(config.api_key.value.as_deref());
+    checks.insert(
+        "config".to_string(),
+        json!({
+            "base_url": config.base_url.value.as_deref().unwrap_or(DEFAULT_API_URL),
+            "api_key": api_key_status.clone(),
+        }),
+    );
+
+    if !output.json {
+        println!(
+            "{} base_url={} api_key={}",
+            colorize("config", "green", output.color),
+            config.base_url.value.as_deref().unwrap_or(DEFAULT_API_URL),
+            api_key_status,
+        );
+    }
+
+    match client.get("/v1/health").await {
+        Ok(_) => {
+            checks.insert("api_reachable".to_string(), json!({"status": "ok"}));
+            if !output.json {
+                println!("{} API reachable", colorize("ok", "green", output.color));
+            }
+        }
+        Err(e) => {
+            hard_failed = true;
+            checks.insert(
+                "api_reachable".to_string(),
+                json!({"status": "unreachable", "error": e}),
+            );
+            if !output.json {
+                println!("{} API unreachable", colorize("fail", "red", output.color));
+            }
+        }
+    }
+
+    match client.get("/v1/models").await {
+        Ok(body) => {
+            let models = body
+                .get("models")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    "response from /v1/models is missing array field models".to_string()
+                })?;
+            let mut ready = 0usize;
+            let mut saturated = 0usize;
+            let mut unavailable = 0usize;
+            let mut unavailable_ids = Vec::new();
+            for model in models {
+                match string_field(model, "availability").unwrap_or("") {
+                    "ready" => ready += 1,
+                    "saturated" => saturated += 1,
+                    "unavailable" => {
+                        unavailable += 1;
+                        unavailable_ids.push(string_field(model, "id").unwrap_or("-").to_string());
+                    }
+                    _ => {}
+                }
+            }
+            checks.insert(
+                "models".to_string(),
+                json!({
+                    "ready": ready,
+                    "saturated": saturated,
+                    "unavailable": unavailable,
+                    "unavailable_ids": unavailable_ids.clone(),
+                    "warning": if ready == 0 {
+                        Some("analyze/reason need a ready VLM")
+                    } else {
+                        None
+                    },
+                }),
+            );
+            if !output.json {
+                println!(
+                    "{} models ready={ready} saturated={saturated} unavailable={unavailable}",
+                    colorize("ok", "green", output.color)
+                );
+                if !unavailable_ids.is_empty() {
+                    println!(
+                        "{} unavailable: {}",
+                        colorize("warn", "yellow", output.color),
+                        unavailable_ids.join(", ")
+                    );
+                }
+                if ready == 0 {
+                    println!(
+                        "{} analyze/reason need a ready VLM",
+                        colorize("warn", "yellow", output.color)
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            let warning = e;
+            checks.insert("models".to_string(), json!({"warning": warning.clone()}));
+            if !output.json {
+                println!(
+                    "{} models check failed: {}",
+                    colorize("warn", "yellow", output.color),
+                    warning
+                );
+            }
+        }
+    }
+
+    if output.json {
+        print_json(&Value::Object(checks))?;
+    }
+    if hard_failed {
+        Err("doctor found failing checks".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn cmd_config_show(config: RuntimeConfig, output: OutputMode) -> Result<(), String> {
+    if output.json {
+        return print_json(&json!({
+            "base_url": {
+                "value": config.base_url.value.as_deref().unwrap_or(DEFAULT_API_URL),
+                "source": config.base_url.source.as_str(),
+            },
+            "api_key": {
+                "value": mask_key(config.api_key.value.as_deref()),
+                "source": config.api_key.source.as_str(),
+            },
+            "tenant_id": {
+                "value": config.tenant_id.value.as_deref(),
+                "source": config.tenant_id.source.as_str(),
+            },
+        }));
+    }
+
+    println!(
+        "base_url  : {} ({})",
+        config.base_url.value.as_deref().unwrap_or(DEFAULT_API_URL),
+        config.base_url.source.as_str()
+    );
+    println!(
+        "api_key   : {} ({})",
+        mask_key(config.api_key.value.as_deref()),
+        config.api_key.source.as_str()
+    );
+    println!(
+        "tenant_id : {} ({})",
+        config.tenant_id.value.as_deref().unwrap_or("not set"),
+        config.tenant_id.source.as_str()
+    );
+    Ok(())
+}
+
+fn cmd_states(output: OutputMode) -> Result<(), String> {
+    let states = [
+        StreamState::Pending,
+        StreamState::Processing,
+        StreamState::Completed,
+        StreamState::Failed,
+        StreamState::Cancelled,
+        StreamState::Expired,
+    ];
+
+    if output.json {
+        let body = Value::Array(
+            states
+                .iter()
+                .map(|state| {
+                    json!({
+                        "state": format!("{state:?}"),
+                        "terminal": state.is_terminal(),
+                    })
+                })
+                .collect(),
+        );
+        return print_json(&body);
+    }
+
+    let mut table = table(output.color);
+    table.set_header(["STATE", "TERMINAL"]);
+    for state in states {
+        table.add_row([
+            Cell::new(format!("{state:?}")),
+            Cell::new(state.is_terminal()),
+        ]);
+    }
+    println!("{table}");
+    Ok(())
+}
+
+fn table(color: bool) -> Table {
+    let mut table = Table::new();
+    if color {
+        table.load_preset(presets::UTF8_FULL);
+    } else {
+        table.load_preset(presets::ASCII_MARKDOWN);
+    }
+    table
+}
+
+fn print_json(value: &Value) -> Result<(), String> {
+    let text =
+        serde_json::to_string_pretty(value).map_err(|e| format!("failed to render JSON: {e}"))?;
+    println!("{text}");
+    Ok(())
+}
+
+fn print_kv(label: &str, value: &str) {
+    println!("{label:<8} {value}");
+}
+
+fn string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
+    value.get(field).and_then(Value::as_str)
+}
+
+fn string_array_field(value: &Value, field: &str) -> Vec<String> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn u64_field(value: &Value, field: &str) -> Option<u64> {
+    value.get(field).and_then(Value::as_u64)
+}
+
+fn color_status(status: &str, color: bool) -> String {
+    match status {
+        "completed" => colorize(status, "green", color),
+        "processing" | "pending" => colorize(status, "yellow", color),
+        "failed" | "cancelled" | "expired" => colorize(status, "red", color),
+        _ => status.to_string(),
+    }
+}
+
+fn color_availability(availability: &str, color: bool) -> String {
+    match availability {
+        "ready" => colorize(availability, "green", color),
+        "saturated" => colorize(availability, "yellow", color),
+        "unavailable" => colorize(availability, "red_dim", color),
+        _ => availability.to_string(),
+    }
+}
+
+fn colorize(text: &str, style: &str, enabled: bool) -> String {
+    if !enabled {
+        return text.to_string();
+    }
+    match style {
+        "green" => text.green().to_string(),
+        "yellow" => text.yellow().to_string(),
+        "red" => text.red().to_string(),
+        "red_dim" => text.red().dimmed().to_string(),
+        "dim" => text.dimmed().to_string(),
+        _ => text.to_string(),
+    }
+}
+
+fn truncate(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let take = max_chars.saturating_sub(3);
+    format!("{}...", value.chars().take(take).collect::<String>())
+}
+
+fn event_detail(payload: &Value) -> String {
+    for field in ["summary", "description"] {
+        if let Some(value) = payload.get(field).and_then(Value::as_str) {
+            return truncate(value, 80);
+        }
+    }
+    let compact = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
+    truncate(&compact, 80)
+}
+
+fn basename_uri(uri: &str) -> String {
+    if uri.is_empty() {
+        return "-".to_string();
+    }
+    Path::new(uri)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .or_else(|| uri.split('/').filter(|part| !part.is_empty()).next_back())
+        .unwrap_or(uri)
+        .to_string()
+}
+
+fn short_id(id: &str, len: usize) -> String {
+    let count = id.chars().count();
+    if count <= len {
+        id.to_string()
+    } else {
+        id.chars().skip(count - len).collect()
+    }
+}
+
+fn mask_key(key: Option<&str>) -> String {
+    let Some(key) = key.and_then(non_empty_opt) else {
+        return "not set".to_string();
+    };
+    let count = key.chars().count();
+    if count < 4 {
+        "set (…)".to_string()
+    } else {
+        format!("set (…{})", key.chars().skip(count - 4).collect::<String>())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RunListRow {
+    run_id: String,
+    status: String,
+    mode: String,
+    model: String,
+    source: String,
+    created: String,
+}
+
+fn parse_run_list_rows(body: &Value) -> Result<Vec<RunListRow>, String> {
+    let runs = body
+        .as_array()
+        .ok_or_else(|| "response from /v1/runs must be a JSON array".to_string())?;
+    Ok(runs
+        .iter()
+        .map(|run| RunListRow {
+            run_id: string_field(run, "run_id").unwrap_or("-").to_string(),
+            status: string_field(run, "status").unwrap_or("-").to_string(),
+            mode: string_field(run, "mode").unwrap_or("-").to_string(),
+            model: string_field(run, "model").unwrap_or("-").to_string(),
+            source: string_field(run, "source_uri")
+                .map(basename_uri)
+                .unwrap_or_else(|| "-".to_string()),
+            created: string_field(run, "created_at").unwrap_or("-").to_string(),
+        })
+        .collect())
 }
 
 fn validate_run_create_response(response: &Value) -> Result<(), String> {
@@ -405,25 +1339,6 @@ fn validate_run_create_response(response: &Value) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-fn extract_model_ids(body: &Value) -> Result<Vec<String>, String> {
-    let models = body
-        .get("models")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "is missing array field models".to_string())?;
-
-    models
-        .iter()
-        .enumerate()
-        .map(|(i, model)| {
-            model
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| format!("is missing string field models[{i}].id"))
-        })
-        .collect()
 }
 
 fn extract_error_message(body: &Value) -> Option<String> {
@@ -455,7 +1370,27 @@ fn extract_error_message(body: &Value) -> Option<String> {
     }
 }
 
-// ─── distill status ───────────────────────────────────────────────────────────
+fn exit_with_error(message: String) -> ! {
+    eprintln!("error: {message}");
+    std::process::exit(1);
+}
+
+struct DistillOpts {
+    tenant_id: Option<String>,
+    data_dir: PathBuf,
+    mlx: bool,
+    resume: bool,
+    format: String,
+}
+
+impl DistillOpts {
+    fn require_tenant_id(&self) -> &str {
+        self.tenant_id.as_deref().unwrap_or_else(|| {
+            eprintln!("error: --tenant-id is required");
+            std::process::exit(1);
+        })
+    }
+}
 
 /// Show the number of stored training pairs and database location.
 #[cfg(feature = "training")]
@@ -482,14 +1417,11 @@ async fn cmd_distill_status(_opts: DistillOpts) {
     std::process::exit(1);
 }
 
-// ─── distill train ────────────────────────────────────────────────────────────
-
 /// Spawn the Python training script and stream its output.
 #[cfg(feature = "training")]
 async fn cmd_distill_train(opts: DistillOpts) {
     let tenant_id = opts.require_tenant_id();
 
-    // Export a fresh JSONL snapshot before kicking off training.
     let jsonl_path = opts.data_dir.join(format!("{tenant_id}-training.jsonl"));
     match vidarax_core::training_data::TrainingStore::new(&opts.data_dir) {
         Ok(store) => match store.export_training_jsonl(tenant_id, &jsonl_path) {
@@ -529,12 +1461,11 @@ async fn cmd_distill_train(opts: DistillOpts) {
 }
 
 #[cfg(not(feature = "training"))]
-async fn cmd_distill_train(_opts: DistillOpts) {
+async fn cmd_distill_train(opts: DistillOpts) {
+    let _ = (opts.mlx, opts.resume);
     eprintln!("error: training support is not compiled in (rebuild with --features training)");
     std::process::exit(1);
 }
-
-// ─── distill export ───────────────────────────────────────────────────────────
 
 /// Spawn the Python export script to convert the fine-tuned model.
 async fn cmd_distill_export(opts: DistillOpts) {
@@ -559,10 +1490,7 @@ async fn cmd_distill_export(opts: DistillOpts) {
     run_subprocess(cmd).await;
 }
 
-// ─── distill deploy ───────────────────────────────────────────────────────────
-
-/// Write a `.reload-specialist` sentinel file that the running API polls to
-/// trigger a hot-reload of the specialist model weights.
+/// Write a `.reload-specialist` sentinel file for the running API.
 async fn cmd_distill_deploy(opts: DistillOpts) {
     let tenant_id = opts.require_tenant_id();
 
@@ -583,9 +1511,7 @@ async fn cmd_distill_deploy(opts: DistillOpts) {
     }
 }
 
-// ─── Subprocess runner ────────────────────────────────────────────────────────
-
-/// Spawn the command, stream its stdout/stderr via tracing, then wait for exit.
+/// Spawn the command, stream stdout and stderr, then wait for exit.
 async fn run_subprocess(mut cmd: tokio::process::Command) {
     use tokio::io::AsyncBufReadExt as _;
 
@@ -597,7 +1523,6 @@ async fn run_subprocess(mut cmd: tokio::process::Command) {
         }
     };
 
-    // Stream stdout
     if let Some(stdout) = child.stdout.take() {
         tokio::spawn(async move {
             let mut lines = tokio::io::BufReader::new(stdout).lines();
@@ -607,7 +1532,6 @@ async fn run_subprocess(mut cmd: tokio::process::Command) {
         });
     }
 
-    // Stream stderr
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(async move {
             let mut lines = tokio::io::BufReader::new(stderr).lines();
@@ -635,73 +1559,69 @@ async fn run_subprocess(mut cmd: tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
-    fn api_opts_prefers_non_empty_flags_over_env_and_defaults() {
-        let opts = ApiOpts::parse(
-            [
-                "--url",
-                "http://localhost:9000/",
-                "--api-key",
-                "flag-key",
-                "--tenant-id",
-                "tenant-a",
-            ]
-            .into_iter()
-            .map(String::from),
-            Some("http://env.example".to_string()),
-            Some("env-key".to_string()),
-            Some("env-tenant".to_string()),
-        );
-
-        assert_eq!(opts.base_url, "http://localhost:9000");
-        assert_eq!(opts.api_key.as_deref(), Some("flag-key"));
-        assert_eq!(opts.tenant_id.as_deref(), Some("tenant-a"));
+    fn fmt_pts_formats_expected_values() {
+        assert_eq!(fmt_pts(0), "0:00.000");
+        assert_eq!(fmt_pts(3_723), "0:03.723");
+        assert_eq!(fmt_pts(65_000), "1:05.000");
+        assert_eq!(fmt_pts(3_600_000), "60:00.000");
     }
 
     #[test]
-    fn api_opts_uses_env_when_flags_are_empty() {
-        let opts = ApiOpts::parse(
-            ["--url", "", "--api-key", "", "--tenant-id", ""]
-                .into_iter()
-                .map(String::from),
-            Some("http://env.example/".to_string()),
-            Some("env-key".to_string()),
-            Some("env-tenant".to_string()),
-        );
+    fn config_precedence_reports_source() {
+        let resolved =
+            resolve_config_value(Some("flag"), Some("env"), Some("file"), Some("default"));
+        assert_eq!(resolved.value.as_deref(), Some("flag"));
+        assert_eq!(resolved.source, ConfigSource::Flag);
 
-        assert_eq!(opts.base_url, "http://env.example");
-        assert_eq!(opts.api_key.as_deref(), Some("env-key"));
-        assert_eq!(opts.tenant_id.as_deref(), Some("env-tenant"));
+        let resolved = resolve_config_value(None, Some("env"), Some("file"), Some("default"));
+        assert_eq!(resolved.value.as_deref(), Some("env"));
+        assert_eq!(resolved.source, ConfigSource::Env);
+
+        let resolved = resolve_config_value(None, None, Some("file"), Some("default"));
+        assert_eq!(resolved.value.as_deref(), Some("file"));
+        assert_eq!(resolved.source, ConfigSource::File);
+
+        let resolved = resolve_config_value(None, None, None, Some("default"));
+        assert_eq!(resolved.value.as_deref(), Some("default"));
+        assert_eq!(resolved.source, ConfigSource::Default);
     }
 
     #[test]
-    fn flag_value_rejects_flag_shaped_value() {
-        let good = ["--url", "http://localhost:9000"]
-            .into_iter()
-            .map(String::from)
-            .collect::<Vec<_>>();
-        let flag_shaped = ["--url", "--api-key", "k"]
-            .into_iter()
-            .map(String::from)
-            .collect::<Vec<_>>();
+    fn config_file_parser_trims_and_filters_keys() {
+        let parsed = parse_config_file(
+            "
+            # comment
+            API_URL = http://localhost:9000/
+            api_key = key-1
+
+            Tenant_ID = tenant-a
+            ignored = value
+            malformed
+            ",
+        );
 
         assert_eq!(
-            flag_value(&good, 0, "--url").unwrap(),
-            "http://localhost:9000"
+            parsed.get("api_url").map(String::as_str),
+            Some("http://localhost:9000/")
         );
+        assert_eq!(parsed.get("api_key").map(String::as_str), Some("key-1"));
         assert_eq!(
-            flag_value(&flag_shaped, 0, "--url").unwrap_err(),
-            "--url requires a value"
+            parsed.get("tenant_id").map(String::as_str),
+            Some("tenant-a")
         );
+        assert!(!parsed.contains_key("ignored"));
     }
 
     #[test]
-    fn run_create_opts_omits_absent_mode_and_model() {
-        let opts = RunCreateOpts::parse(std::iter::empty::<String>());
+    fn run_create_args_omits_absent_mode_and_model() {
+        let opts = RunCreateArgs {
+            mode: None,
+            model: None,
+        };
 
-        assert_eq!(opts.mode, None);
-        assert_eq!(opts.model, None);
         assert_eq!(opts.request_body(), serde_json::json!({}));
     }
 
@@ -757,19 +1677,41 @@ mod tests {
     }
 
     #[test]
-    fn live_models_extracts_ids_in_order() {
-        let body = serde_json::json!({
-            "request_id": "req-1",
-            "models": [
-                {"id": "model-a", "tier": "fast"},
-                {"id": "model-b", "tier": "balanced"}
-            ]
-        });
+    fn clap_tree_is_valid() {
+        Cli::command().debug_assert();
+    }
 
-        assert_eq!(
-            extract_model_ids(&body).unwrap(),
-            vec!["model-a".to_string(), "model-b".to_string()]
-        );
+    #[test]
+    fn run_list_rows_parse_bare_array() {
+        let body = serde_json::json!([
+            {
+                "run_id": "run-1",
+                "status": "completed",
+                "mode": "fast",
+                "model": "vlm-a",
+                "source_uri": "file:///tmp/video-a.mp4",
+                "created_at": "2026-01-01T00:00:00Z"
+            },
+            {
+                "run_id": "run-2",
+                "status": "pending",
+                "mode": "balanced",
+                "created_at": "2026-01-02T00:00:00Z"
+            }
+        ]);
+
+        let rows = parse_run_list_rows(&body).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].run_id, "run-1");
+        assert_eq!(rows[0].source, "video-a.mp4");
+        assert_eq!(rows[1].model, "-");
+        assert_eq!(rows[1].source, "-");
+    }
+
+    #[test]
+    fn run_list_rows_parse_empty_array() {
+        let rows = parse_run_list_rows(&serde_json::json!([])).unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]
