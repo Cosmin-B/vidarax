@@ -45,6 +45,7 @@ use crate::semantic_infer::{
 use crate::state::AppState;
 
 const UPLOAD_MEDIA_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const SPACETIME_MARKER_MIRROR_TIMEOUT: Duration = Duration::from_secs(2);
 use crate::validation::{normalize_mode, normalize_model};
 
 #[derive(Debug, serde::Deserialize)]
@@ -1206,6 +1207,27 @@ struct RealtimeAssemblyOutput {
     lag_p99_ms: u64,
 }
 
+fn marker_to_emit_event_request(
+    marker: &AnalyzeMarker,
+) -> crate::spacetime_client::EmitEventRequest {
+    crate::spacetime_client::EmitEventRequest {
+        run_id: marker.run_id.clone(),
+        session_id: marker.stream_id.clone(),
+        frame_index: marker.start_frame,
+        pts_ms: marker.start_pts_ms,
+        event_type: marker.event_type.clone(),
+        confidence: marker.confidence,
+        description: format!(
+            "{} ({}..{} frames, {}..{} ms)",
+            marker.status.as_str(),
+            marker.start_frame,
+            marker.end_frame,
+            marker.start_pts_ms,
+            marker.end_pts_ms
+        ),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn assemble_realtime_reason_response(
     state: &AppState,
@@ -1323,6 +1345,26 @@ async fn assemble_realtime_reason_response(
                 state,
                 format!("failed to append marker_emitted event: {err}"),
             ));
+        }
+        if let Some(stdb) = state.spacetime_client() {
+            let req = marker_to_emit_event_request(marker);
+            match tokio::time::timeout(SPACETIME_MARKER_MIRROR_TIMEOUT, stdb.emit_event_async(&req))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => tracing::warn!(
+                    run_id = %run_id,
+                    marker_id = %marker.marker_id.as_str(),
+                    error = %err,
+                    "spacetimedb marker mirror failed; continuing (WAL is authoritative)"
+                ),
+                Err(_elapsed) => tracing::warn!(
+                    run_id = %run_id,
+                    marker_id = %marker.marker_id.as_str(),
+                    timeout_ms = SPACETIME_MARKER_MIRROR_TIMEOUT.as_millis() as u64,
+                    "spacetimedb marker mirror timed out; continuing (WAL is authoritative)"
+                ),
+            }
         }
     }
 
@@ -2286,8 +2328,9 @@ fn infer_execution_error_to_response(state: &AppState, err: InferExecutionError)
 #[cfg(test)]
 mod tests {
     use super::{
-        feedback_rows_to_json_for_owned_runs, owned_run_ids_from_events, run_command_with_timeout,
-        validate_infer_request, InferRequest,
+        feedback_rows_to_json_for_owned_runs, marker_to_emit_event_request,
+        owned_run_ids_from_events, run_command_with_timeout, validate_infer_request, AnalyzeMarker,
+        InferRequest,
     };
     use crate::spacetime_client::FeedbackRow;
     use crate::state::AppState;
@@ -2318,6 +2361,33 @@ mod tests {
             primary_provider: Some("vllm".to_string()),
             output_schema: Some(schema),
         }
+    }
+
+    #[test]
+    fn marker_to_emit_event_request_maps_marker_fields() {
+        let marker = AnalyzeMarker {
+            marker_id: "marker-1".to_string(),
+            run_id: "run-00000000000000aa".to_string(),
+            stream_id: "stream-primary".to_string(),
+            event_type: "goal_reached".to_string(),
+            status: "active".to_string(),
+            start_frame: 42,
+            end_frame: 64,
+            start_pts_ms: 1400,
+            end_pts_ms: 2133,
+            confidence: 0.875,
+            supersedes_marker_id: Some("marker-0".to_string()),
+        };
+
+        let req = marker_to_emit_event_request(&marker);
+
+        assert_eq!(req.run_id, "run-00000000000000aa");
+        assert_eq!(req.session_id, "stream-primary");
+        assert_eq!(req.frame_index, 42);
+        assert_eq!(req.pts_ms, 1400);
+        assert_eq!(req.event_type, "goal_reached");
+        assert_eq!(req.confidence, 0.875);
+        assert_eq!(req.description, "active (42..64 frames, 1400..2133 ms)");
     }
 
     #[tokio::test]
