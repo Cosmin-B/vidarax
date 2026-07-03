@@ -69,38 +69,108 @@ pub enum VideoCodec {
     Vp8,
 }
 
+/// A video codec advertised in an SDP offer's video m-section, with the
+/// payload type and clock rate the offer assigned to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OfferedVideoCodec {
+    pub payload_type: u8,
+    pub codec: VideoCodec,
+    pub clock_rate: u32,
+}
+
 impl VideoCodec {
     /// Parse the first video codec from the SDP offer.
     pub fn from_sdp(sdp: &str) -> Self {
-        // Walk the SDP looking for video m= sections, then scan rtpmap lines.
+        Self::offered_video_codecs(sdp)
+            .first()
+            .map(|offered| offered.codec)
+            // Compatibility fallback for sessions without explicit codec info.
+            .unwrap_or(VideoCodec::H264)
+    }
+
+    /// Canonical codec token for SDP rtpmap lines.
+    pub fn rtpmap_name(self) -> &'static str {
+        match self {
+            VideoCodec::H264 => "H264",
+            VideoCodec::H265 => "H265",
+            VideoCodec::Vp8 => "VP8",
+        }
+    }
+
+    /// Parse recognized video codecs from the SDP offer's video sections.
+    pub fn offered_video_codecs(sdp: &str) -> Vec<OfferedVideoCodec> {
+        let mut offered = Vec::new();
         let mut in_video = false;
+        let mut video_payload_types = Vec::new();
+
         for line in sdp.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("m=") {
+                video_payload_types.clear();
                 in_video = trimmed.starts_with("m=video");
+                if in_video {
+                    video_payload_types.extend(
+                        trimmed
+                            .split_whitespace()
+                            .skip(3)
+                            .filter_map(|pt| pt.parse::<u8>().ok()),
+                    );
+                }
                 continue;
             }
             if !in_video {
                 continue;
             }
-            // a=rtpmap:<pt> <codec>/<clock>[/<channels>]
+
             if let Some(rest) = trimmed.strip_prefix("a=rtpmap:") {
-                let codec_part = rest.split_once(' ').map(|(_, v)| v).unwrap_or(rest);
-                let codec_name = codec_part
-                    .split('/')
-                    .next()
-                    .unwrap_or("")
-                    .to_ascii_uppercase();
-                match codec_name.as_str() {
-                    "VP8" => return VideoCodec::Vp8,
-                    "H264" => return VideoCodec::H264,
-                    "H265" | "HEVC" => return VideoCodec::H265,
-                    _ => {}
+                let mut fields = rest.split_whitespace();
+                let Some(payload_type) = fields.next().and_then(|pt| pt.parse::<u8>().ok()) else {
+                    continue;
+                };
+                if payload_type > 127 || !video_payload_types.contains(&payload_type) {
+                    continue;
                 }
+                let Some(codec_part) = fields.next() else {
+                    continue;
+                };
+
+                let mut codec_fields = codec_part.split('/');
+                let codec_name = codec_fields.next().unwrap_or("").to_ascii_uppercase();
+                let codec = match codec_name.as_str() {
+                    "VP8" => VideoCodec::Vp8,
+                    "H264" => VideoCodec::H264,
+                    "H265" | "HEVC" => VideoCodec::H265,
+                    _ => continue,
+                };
+                let clock_rate = codec_fields
+                    .next()
+                    .and_then(|clock| clock.parse::<u32>().ok())
+                    .unwrap_or(90000);
+
+                offered.push(OfferedVideoCodec {
+                    payload_type,
+                    codec,
+                    clock_rate,
+                });
             }
         }
-        // Compatibility fallback for sessions without explicit codec info.
-        VideoCodec::H264
+
+        offered
+    }
+
+    /// Whether Vidarax can both depacketize and decode this codec on the live
+    /// WebRTC path. H.264 always has rustrtc depacketization plus openh264 or
+    /// nvdec decode. VP8 is serveable only with the `vp8` feature. H.265 is
+    /// excluded until live HEVC RTP depacketization exists.
+    fn is_live_serveable(self) -> bool {
+        match self {
+            VideoCodec::H264 => true,
+            #[cfg(feature = "vp8")]
+            VideoCodec::Vp8 => true,
+            #[cfg(not(feature = "vp8"))]
+            VideoCodec::Vp8 => false,
+            VideoCodec::H265 => false,
+        }
     }
 
     /// ffmpeg input format flag for codecs with a live sidecar input path.
@@ -111,6 +181,25 @@ impl VideoCodec {
             VideoCodec::Vp8 => None,
         }
     }
+}
+
+/// Pick the one video codec to answer with from the offer's advertised codecs,
+/// restricted to what Vidarax can serve live. VP8 is preferred when it is
+/// offered and serveable because it has a complete in-crate pipeline and needs
+/// no fmtp negotiation; otherwise the first serveable codec in offer order is
+/// used. Returns `None` when no advertised codec is serveable, leaving rustrtc's
+/// default negotiation unchanged.
+pub fn select_answer_video_codec(offered: &[OfferedVideoCodec]) -> Option<OfferedVideoCodec> {
+    offered
+        .iter()
+        .copied()
+        .find(|o| o.codec == VideoCodec::Vp8 && o.codec.is_live_serveable())
+        .or_else(|| {
+            offered
+                .iter()
+                .copied()
+                .find(|o| o.codec.is_live_serveable())
+        })
 }
 
 /// Concrete decoder backend selected from GPU availability and negotiated codec.
@@ -1009,10 +1098,219 @@ mod tests {
     use crate::metrics::PipelineMetrics;
 
     use super::{
-        decode_ffmpeg_pipe, send_yuv_frame_lossless, try_receive_yuv_frame, DecodeError,
-        DecoderBackend, VideoCodec, YuvFrame, FFMPEG_YUV_PENDING_POOL_ALLOWANCE,
-        FFMPEG_YUV_READER_POOL_MIN_SLOTS, FFMPEG_YUV_READER_QUEUE_CAPACITY,
+        decode_ffmpeg_pipe, select_answer_video_codec, send_yuv_frame_lossless,
+        try_receive_yuv_frame, DecodeError, DecoderBackend, OfferedVideoCodec, VideoCodec,
+        YuvFrame, FFMPEG_YUV_PENDING_POOL_ALLOWANCE, FFMPEG_YUV_READER_POOL_MIN_SLOTS,
+        FFMPEG_YUV_READER_QUEUE_CAPACITY,
     };
+
+    #[test]
+    fn offered_video_codecs_parses_multi_codec_offer() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98\r\n",
+            "a=rtpmap:96 VP8/90000\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+            "a=rtpmap:98 rtx/90000\r\n",
+        );
+
+        assert_eq!(
+            VideoCodec::offered_video_codecs(sdp),
+            vec![
+                OfferedVideoCodec {
+                    payload_type: 96,
+                    codec: VideoCodec::Vp8,
+                    clock_rate: 90000,
+                },
+                OfferedVideoCodec {
+                    payload_type: 97,
+                    codec: VideoCodec::H264,
+                    clock_rate: 90000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn offered_video_codecs_ignores_audio_section_and_unknowns() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+            "a=rtpmap:111 opus/48000/2\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 99 97\r\n",
+            "a=rtpmap:99 AV1/90000\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+        );
+
+        assert_eq!(
+            VideoCodec::offered_video_codecs(sdp),
+            vec![OfferedVideoCodec {
+                payload_type: 97,
+                codec: VideoCodec::H264,
+                clock_rate: 90000,
+            }]
+        );
+    }
+
+    #[test]
+    fn offered_video_codecs_defaults_missing_clock_rate() {
+        let sdp = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP8\r\n";
+
+        assert_eq!(
+            VideoCodec::offered_video_codecs(sdp),
+            vec![OfferedVideoCodec {
+                payload_type: 96,
+                codec: VideoCodec::Vp8,
+                clock_rate: 90000,
+            }]
+        );
+    }
+
+    #[test]
+    fn offered_video_codecs_rejects_pt_above_127() {
+        let sdp = concat!(
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=rtpmap:200 H264/90000\r\n",
+            "a=rtpmap:96 VP8/90000\r\n",
+        );
+
+        assert_eq!(
+            VideoCodec::offered_video_codecs(sdp),
+            vec![OfferedVideoCodec {
+                payload_type: 96,
+                codec: VideoCodec::Vp8,
+                clock_rate: 90000,
+            }]
+        );
+    }
+
+    #[test]
+    fn offered_video_codecs_rejects_pt_absent_from_m_line() {
+        let sdp = concat!(
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=rtpmap:50 H264/90000\r\n",
+            "a=rtpmap:96 VP8/90000\r\n",
+        );
+
+        assert_eq!(
+            VideoCodec::offered_video_codecs(sdp),
+            vec![OfferedVideoCodec {
+                payload_type: 96,
+                codec: VideoCodec::Vp8,
+                clock_rate: 90000,
+            }]
+        );
+    }
+
+    #[test]
+    fn offered_video_codecs_format_set_resets_between_sections() {
+        let sdp = concat!(
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=rtpmap:96 VP8/90000\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 97\r\n",
+            "a=rtpmap:96 H264/90000\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+        );
+
+        assert_eq!(
+            VideoCodec::offered_video_codecs(sdp),
+            vec![
+                OfferedVideoCodec {
+                    payload_type: 96,
+                    codec: VideoCodec::Vp8,
+                    clock_rate: 90000,
+                },
+                OfferedVideoCodec {
+                    payload_type: 97,
+                    codec: VideoCodec::H264,
+                    clock_rate: 90000,
+                },
+            ]
+        );
+    }
+
+    #[cfg(feature = "vp8")]
+    #[test]
+    fn select_prefers_vp8_when_serveable() {
+        let offered = [
+            OfferedVideoCodec {
+                payload_type: 97,
+                codec: VideoCodec::H264,
+                clock_rate: 90000,
+            },
+            OfferedVideoCodec {
+                payload_type: 96,
+                codec: VideoCodec::Vp8,
+                clock_rate: 90000,
+            },
+        ];
+
+        assert_eq!(select_answer_video_codec(&offered), Some(offered[1]));
+    }
+
+    #[cfg(not(feature = "vp8"))]
+    #[test]
+    fn select_falls_back_to_h264_without_vp8() {
+        let offered = [
+            OfferedVideoCodec {
+                payload_type: 96,
+                codec: VideoCodec::Vp8,
+                clock_rate: 90000,
+            },
+            OfferedVideoCodec {
+                payload_type: 97,
+                codec: VideoCodec::H264,
+                clock_rate: 90000,
+            },
+        ];
+
+        assert_eq!(select_answer_video_codec(&offered), Some(offered[1]));
+    }
+
+    #[test]
+    fn select_returns_none_for_hevc_only_offer() {
+        let offered = [OfferedVideoCodec {
+            payload_type: 96,
+            codec: VideoCodec::H265,
+            clock_rate: 90000,
+        }];
+
+        assert_eq!(select_answer_video_codec(&offered), None);
+    }
+
+    #[test]
+    fn select_returns_none_for_empty_offer() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+            "a=rtpmap:111 opus/48000/2\r\n",
+        );
+        let offered = VideoCodec::offered_video_codecs(sdp);
+
+        assert!(offered.is_empty());
+        assert_eq!(select_answer_video_codec(&[]), None);
+        assert_eq!(select_answer_video_codec(&offered), None);
+    }
+
+    #[test]
+    fn rtpmap_name_round_trips() {
+        assert_eq!(VideoCodec::H264.rtpmap_name(), "H264");
+        assert_eq!(VideoCodec::H265.rtpmap_name(), "H265");
+        assert_eq!(VideoCodec::Vp8.rtpmap_name(), "VP8");
+    }
+
+    #[test]
+    fn from_sdp_still_returns_first_recognized_codec() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 99 97 96\r\n",
+            "a=rtpmap:99 AV1/90000\r\n",
+            "a=rtpmap:97 H265/90000\r\n",
+            "a=rtpmap:96 H264/90000\r\n",
+        );
+
+        assert_eq!(VideoCodec::from_sdp(sdp), VideoCodec::H265);
+    }
 
     #[test]
     fn detects_vp8_from_sdp_rtpmap() {

@@ -3,9 +3,8 @@
 //! [`WebRtcSession`] manages the full lifecycle of a single WebRTC peer
 //! connection: SDP offer/answer negotiation, trickle ICE, and media ingestion.
 //! Video payload bytes are forwarded through a [`kanal`] channel to the
-//! downstream decode workers. H.264, H.265 / HEVC, and VP8 codec selection is
-//! detected from the SDP offer and tagged on every [`RtpFrame`] so the correct
-//! decode backend is chosen automatically.
+//! downstream decode workers. The answer advertises one selected video codec
+//! from the offer, and the same codec drives depacketization and decode.
 //!
 //! # Example
 //!
@@ -51,7 +50,7 @@ use rustrtc::{
 };
 
 use crate::metrics::PipelineMetrics;
-use crate::webrtc::decode::VideoCodec;
+use crate::webrtc::decode::{select_answer_video_codec, VideoCodec};
 use crate::webrtc::recycle::{RecycledBytes, VecPool};
 
 /// Annex B start code prepended to every H.264 or H.265 NAL unit.
@@ -198,6 +197,11 @@ impl WebRtcSession {
     ///    candidates are embedded in the answer).
     /// 3. Creates and applies the local answer.
     ///
+    /// The answer is pinned to one live-serveable video codec selected from
+    /// the offer: H.264, or VP8 when built. H.265 is excluded until live HEVC
+    /// RTP depacketization exists. The selected codec also drives the
+    /// depacketizer factory and decode routing.
+    ///
     /// Returns `(session, answer_sdp)`.  The caller must send `answer_sdp`
     /// back to the browser to complete the signalling exchange.
     ///
@@ -215,9 +219,14 @@ impl WebRtcSession {
     /// ).ok();
     /// ```
     pub async fn new(offer_sdp: &str, config: &WebRtcConfig) -> Result<(Self, String), String> {
-        // Detect codec before handing the SDP to rustrtc so that even if the
-        // peer connection transforms the SDP we still know what was offered.
-        let codec = VideoCodec::from_sdp(offer_sdp);
+        // Select before handing SDP to rustrtc so the answer, depacketizer,
+        // and decode routing use the same codec.
+        let offered = VideoCodec::offered_video_codecs(offer_sdp);
+        let selected = select_answer_video_codec(&offered);
+        let codec = match selected {
+            Some(sel) => sel.codec,
+            None => VideoCodec::from_sdp(offer_sdp),
+        };
 
         let mut rtc_config = RtcConfiguration::default();
         for url in &config.stun_servers {
@@ -230,6 +239,22 @@ impl WebRtcSession {
                 IceServer::new(vec![turn.url.clone()])
                     .with_credential(turn.username.clone(), turn.credential.clone()),
             );
+        }
+        if let Some(sel) = selected {
+            // rustrtc cannot carry H.264 fmtp here. Its depacketizer accepts
+            // single-NAL, STAP-A, and FU-A, then we add Annex B before decode.
+            rtc_config.media_capabilities = Some(rustrtc::config::MediaCapabilities {
+                video: vec![rustrtc::config::VideoCapability {
+                    payload_type: sel.payload_type,
+                    codec_name: codec.rtpmap_name().to_string(),
+                    clock_rate: sel.clock_rate,
+                    rtcp_fbs: rustrtc::config::VideoCapability::default().rtcp_fbs,
+                }],
+                // Keep audio as one default capability to match the prior None
+                // answer and avoid advertising a codec missing from the offer.
+                audio: vec![rustrtc::config::AudioCapability::default()],
+                application: rustrtc::config::MediaCapabilities::default().application,
+            });
         }
         rtc_config.depacketizer_strategy = rustrtc::config::DepacketizerStrategy {
             factory: Arc::new(crate::webrtc::depacketize::VidaraxDepacketizerFactory::new(
@@ -304,10 +329,11 @@ impl WebRtcSession {
     /// `PeerConnection` handle so the caller may store `WebRtcSession` in a
     /// shared structure while the task runs concurrently.
     ///
-    /// - H.264 is depacketized by rustrtc. VP8 is depacketized in-crate.
+    /// - The codec selected for the answer is also used here. H.264 is
+    ///   depacketized by rustrtc. VP8 is depacketized in-crate when built.
+    ///   H.265 is not selected until live HEVC RTP depacketization exists.
     ///   Annex B start codes (`00 00 00 01`) are **prepended** to H.264 and
     ///   H.265 / HEVC payloads before sending. VP8 payloads are passed through.
-    ///   Live HEVC still needs a dedicated HEVC RTP depacketizer.
     /// - Audio tracks are silently ignored.
     /// - For each video track a Tokio task is spawned; all share the same
     ///   atomic sequence counter.
