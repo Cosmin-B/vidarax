@@ -50,7 +50,7 @@ use rustrtc::{
 };
 
 use crate::metrics::PipelineMetrics;
-use crate::webrtc::decode::{select_answer_video_codec, VideoCodec};
+use crate::webrtc::decode::{select_answer_video_codec_for_offer, VideoCodec};
 use crate::webrtc::recycle::{RecycledBytes, VecPool};
 
 /// Annex B start code prepended to every H.264 or H.265 NAL unit.
@@ -220,8 +220,7 @@ impl WebRtcSession {
     pub async fn new(offer_sdp: &str, config: &WebRtcConfig) -> Result<(Self, String), String> {
         // Select before handing SDP to rustrtc so the answer, depacketizer,
         // and decode routing use the same codec.
-        let offered = VideoCodec::offered_video_codecs(offer_sdp);
-        let selected = select_answer_video_codec(&offered);
+        let selected = select_answer_video_codec_for_offer(offer_sdp);
         let codec = match selected {
             Some(sel) => sel.codec,
             None => VideoCodec::from_sdp(offer_sdp),

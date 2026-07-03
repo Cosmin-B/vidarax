@@ -203,6 +203,68 @@ pub fn select_answer_video_codec(offered: &[OfferedVideoCodec]) -> Option<Offere
         })
 }
 
+fn h265_offer_signals_don(sdp: &str, payload_type: u8) -> bool {
+    let mut in_video = false;
+
+    for line in sdp.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("m=") {
+            in_video = trimmed.starts_with("m=video");
+            continue;
+        }
+        if !in_video {
+            continue;
+        }
+
+        let Some(rest) = trimmed.strip_prefix("a=fmtp:") else {
+            continue;
+        };
+        let mut fields = rest.splitn(2, char::is_whitespace);
+        let Some(fmtp_payload_type) = fields.next().and_then(|pt| pt.parse::<u8>().ok()) else {
+            continue;
+        };
+        if fmtp_payload_type != payload_type {
+            continue;
+        }
+
+        let Some(params) = fields.next() else {
+            continue;
+        };
+        for param in params.split(';') {
+            let Some((key, value)) = param.trim().split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            if !key.eq_ignore_ascii_case("sprop-max-don-diff")
+                && !key.eq_ignore_ascii_case("sprop-depack-buf-nalus")
+            {
+                continue;
+            }
+            if value.trim().parse::<u32>().is_ok_and(|value| value > 0) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Select the answer video codec directly from the offer SDP, excluding
+/// H.265 payload types whose fmtp signals RFC 7798 decoding-order use
+/// (`sprop-max-don-diff > 0` or `sprop-depack-buf-nalus > 0`). The
+/// in-crate HEVC depacketizer assumes no DONL/DOND fields, so such an
+/// offer would be depacketized into corrupt access units. Filtering
+/// lets selection fall back to another serveable codec, or return
+/// `None` (no video pinned) for a DON-only H.265 offer.
+pub fn select_answer_video_codec_for_offer(sdp: &str) -> Option<OfferedVideoCodec> {
+    let offered = VideoCodec::offered_video_codecs(sdp);
+    let serveable: Vec<OfferedVideoCodec> = offered
+        .into_iter()
+        .filter(|o| o.codec != VideoCodec::H265 || !h265_offer_signals_don(sdp, o.payload_type))
+        .collect();
+    select_answer_video_codec(&serveable)
+}
+
 /// Concrete decoder backend selected from GPU availability and negotiated codec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecoderBackend {
@@ -1099,9 +1161,10 @@ mod tests {
     use crate::metrics::PipelineMetrics;
 
     use super::{
-        decode_ffmpeg_pipe, select_answer_video_codec, send_yuv_frame_lossless,
-        try_receive_yuv_frame, DecodeError, DecoderBackend, OfferedVideoCodec, VideoCodec,
-        YuvFrame, FFMPEG_YUV_PENDING_POOL_ALLOWANCE, FFMPEG_YUV_READER_POOL_MIN_SLOTS,
+        decode_ffmpeg_pipe, h265_offer_signals_don, select_answer_video_codec,
+        select_answer_video_codec_for_offer, send_yuv_frame_lossless, try_receive_yuv_frame,
+        DecodeError, DecoderBackend, OfferedVideoCodec, VideoCodec, YuvFrame,
+        FFMPEG_YUV_PENDING_POOL_ALLOWANCE, FFMPEG_YUV_READER_POOL_MIN_SLOTS,
         FFMPEG_YUV_READER_QUEUE_CAPACITY,
     };
 
@@ -1277,6 +1340,139 @@ mod tests {
         }];
 
         assert_eq!(select_answer_video_codec(&offered), Some(offered[0]));
+    }
+
+    #[test]
+    fn select_for_offer_rejects_don_only_h265() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=rtpmap:96 H265/90000\r\n",
+            "a=fmtp:96 sprop-max-don-diff=1\r\n",
+        );
+
+        assert_eq!(select_answer_video_codec_for_offer(sdp), None);
+    }
+
+    #[test]
+    fn select_for_offer_falls_back_from_don_h265_to_h264() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n",
+            "a=rtpmap:96 H265/90000\r\n",
+            "a=fmtp:96 sprop-max-don-diff=1\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+        );
+
+        assert_eq!(
+            select_answer_video_codec_for_offer(sdp),
+            Some(OfferedVideoCodec {
+                payload_type: 97,
+                codec: VideoCodec::H264,
+                clock_rate: 90000,
+            })
+        );
+    }
+
+    #[test]
+    fn select_for_offer_allows_h265_with_zero_don_diff() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=rtpmap:96 H265/90000\r\n",
+            "a=fmtp:96 sprop-max-don-diff=0\r\n",
+        );
+
+        assert_eq!(
+            select_answer_video_codec_for_offer(sdp),
+            Some(OfferedVideoCodec {
+                payload_type: 96,
+                codec: VideoCodec::H265,
+                clock_rate: 90000,
+            })
+        );
+    }
+
+    #[test]
+    fn select_for_offer_allows_h265_without_fmtp() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=rtpmap:96 H265/90000\r\n",
+        );
+
+        assert_eq!(
+            select_answer_video_codec_for_offer(sdp),
+            Some(OfferedVideoCodec {
+                payload_type: 96,
+                codec: VideoCodec::H265,
+                clock_rate: 90000,
+            })
+        );
+    }
+
+    #[test]
+    fn select_for_offer_rejects_h265_when_depack_buf_nalus_forces_donl() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=rtpmap:96 H265/90000\r\n",
+            "a=fmtp:96 sprop-max-don-diff=0; sprop-depack-buf-nalus=2\r\n",
+        );
+
+        assert_eq!(select_answer_video_codec_for_offer(sdp), None);
+    }
+
+    #[test]
+    fn select_for_offer_ignores_don_fmtp_in_audio_section() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=rtpmap:96 opus/48000/2\r\n",
+            "a=fmtp:96 sprop-max-don-diff=1\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=rtpmap:96 H265/90000\r\n",
+        );
+
+        assert_eq!(
+            select_answer_video_codec_for_offer(sdp),
+            Some(OfferedVideoCodec {
+                payload_type: 96,
+                codec: VideoCodec::H265,
+                clock_rate: 90000,
+            })
+        );
+    }
+
+    #[test]
+    fn h265_offer_signals_don_from_video_fmtp_params() {
+        let present = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=fmtp:96 profile-id=1; SPROP-MAX-DON-DIFF = 3 ; tx-mode=SRST\r\n",
+        );
+        let zero = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=fmtp:96 sprop-max-don-diff=0\r\n",
+        );
+        let absent = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n";
+        let depack_buf = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=fmtp:96 sprop-max-don-diff=0; sprop-depack-buf-nalus=2\r\n",
+        );
+        let malformed = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=fmtp:96 sprop-max-don-diff=x\r\n",
+        );
+
+        assert!(h265_offer_signals_don(present, 96));
+        assert!(!h265_offer_signals_don(zero, 96));
+        assert!(!h265_offer_signals_don(absent, 96));
+        assert!(h265_offer_signals_don(depack_buf, 96));
+        assert!(!h265_offer_signals_don(malformed, 96));
     }
 
     #[test]
