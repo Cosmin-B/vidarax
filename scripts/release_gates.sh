@@ -14,13 +14,13 @@ max_gate_p95_ns="${VIDARAX_MAX_GATE_P95_NS:-50000}"
 echo "[gate] building release artifacts"
 cargo build --release -p vidarax-cli -p vidarax-api
 
-cli_size="$(wc -c < "$ROOT_DIR/target/release/vidarax-cli" | tr -d ' ')"
+cli_size="$(wc -c < "$ROOT_DIR/target/release/vidarax" | tr -d ' ')"
 api_size="$(wc -c < "$ROOT_DIR/target/release/vidarax-api" | tr -d ' ')"
 
 echo "[gate] binary sizes cli=${cli_size} api=${api_size}"
 
 if (( cli_size > max_cli_size )); then
-  echo "FAIL: vidarax-cli binary size ${cli_size} > ${max_cli_size}" >&2
+  echo "FAIL: vidarax binary size ${cli_size} > ${max_cli_size}" >&2
   exit 1
 fi
 
