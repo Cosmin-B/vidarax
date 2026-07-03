@@ -299,7 +299,76 @@ fn decode_mp4_to_frame_signals_inner(
     }
     let text = String::from_utf8(output.stdout)
         .map_err(|_| "invalid output from video decoder".to_string())?;
-    parse_framemd5_to_signals(&text, source_uri, config.max_frames)
+
+    // A real perceptual hash needs real pixels, which the framemd5 pass doesn't
+    // expose: MD5 avalanches, so the Hamming distance between two *different*
+    // frames is ~50% noise and the hash only reliably flags byte-identical
+    // frames. Run one cheap extra pass that emits an 8×8 grayscale grid per
+    // frame and average-hash it. Both passes use the same `fps` sampler, so
+    // hash[i] lines up with framemd5 frame i. Degrade to the (weak) checksum
+    // hash per-frame if the pass fails, so ingest never regresses to an error.
+    let ahashes = compute_ahashes_from_source(source, config.sample_fps, config.max_frames)
+        .unwrap_or_else(|err| {
+            tracing::warn!(%err, "perceptual-hash pass failed; falling back to checksum hash");
+            Vec::new()
+        });
+    parse_framemd5_to_signals(&text, source_uri, config.max_frames, &ahashes)
+}
+
+/// Compute a real 64-bit average-hash per sampled frame by decoding the source a
+/// second time into an 8×8 grayscale grid (ffmpeg's `area` scaler is a box
+/// average, the same idea as [`crate::webrtc::signals`]'s luma downscale) and
+/// hashing each grid. Frames are produced by the same `fps={sample_fps}` sampler
+/// as the framemd5 pass, so the returned hashes align index-for-index.
+fn compute_ahashes_from_source(
+    source: &InputSource,
+    sample_fps: f32,
+    max_frames: usize,
+) -> Result<Vec<u64>, String> {
+    let source_uri = source.as_ffmpeg_input();
+    let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
+    // fps first (same frame set as framemd5), then squash to 8×8 luma. `area`
+    // box-averages on downscale; `format=gray` makes it one byte per cell.
+    let vf_expr = format!("fps={sample_fps:.3},scale=8:8:flags=area,format=gray");
+    let output = Command::new(ffmpeg_path())
+        .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
+        .args(ffmpeg_input_options_for_source(source))
+        .args([
+            "-i", source_uri, "-an", "-sn", "-dn", "-vf", &vf_expr, "-frames:v",
+            &max_frames.to_string(), "-f", "rawvideo", "-pix_fmt", "gray", "-",
+        ])
+        .output()
+        .map_err(|_| "failed to run ffmpeg".to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffmpeg perceptual-hash pass failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(ahashes_from_gray_grid(&output.stdout))
+}
+
+/// Pack a stream of 8×8 (= 64-byte) grayscale grids into average-hashes, one per
+/// complete grid. A trailing partial grid (should not happen for `-pix_fmt
+/// gray` output) is ignored.
+fn ahashes_from_gray_grid(raw: &[u8]) -> Vec<u64> {
+    raw.chunks_exact(64).map(ahash_cell_grid).collect()
+}
+
+/// Average-hash one 8×8 grayscale grid (64 bytes, row-major): bit `i` is set iff
+/// cell `i` is strictly brighter than the 64-cell mean. This is the same bit
+/// convention as [`crate::webrtc::signals`]'s `perceptual_hash_y`, so hashes
+/// from the file-ingest and live-stream paths are directly Hamming-comparable.
+fn ahash_cell_grid(cells: &[u8]) -> u64 {
+    debug_assert_eq!(cells.len(), 64, "average-hash grid must be 8x8");
+    let mean = cells.iter().map(|&c| c as u32).sum::<u32>() / 64;
+    let mut hash = 0u64;
+    for (i, &c) in cells.iter().enumerate() {
+        if c as u32 > mean {
+            hash |= 1u64 << i;
+        }
+    }
+    hash
 }
 
 pub fn decode_mp4_to_jpeg_frames(
@@ -360,6 +429,7 @@ fn parse_framemd5_to_signals(
     framemd5: &str,
     source_uri: &str,
     max_frames: usize,
+    ahashes: &[u64],
 ) -> Result<DecodedMp4Batch, String> {
     let mut tb_num = 1u32;
     let mut tb_den = 1000u32;
@@ -409,9 +479,17 @@ fn parse_framemd5_to_signals(
             .parse::<i64>()
             .map_err(|_| format!("invalid pts in framemd5 row: {line}"))?;
         let checksum = fields[5];
-        let perceptual_hash = parse_hex_u64_prefix(checksum, 0, 16)?;
-        // We intentionally derive fast proxy features from checksum bits so ingest stays deterministic
-        // without introducing per-frame decode-side pixel scans.
+        // Prefer the real average-hash from the pixel pass (aligned by frame
+        // index); fall back to the checksum slice only when that pass produced
+        // fewer frames — e.g. it failed and returned an empty vec. The checksum
+        // hash is a weak signal (MD5 avalanches) but keeps ingest working.
+        let perceptual_hash = ahashes
+            .get(frame_signals.len())
+            .copied()
+            .map_or_else(|| parse_hex_u64_prefix(checksum, 0, 16), Ok)?;
+        // luma/noise stay checksum-derived proxies so ingest stays deterministic
+        // without a per-frame pixel scan; only the perceptual hash (the n_phash /
+        // ghosting signal) is made real above.
         let luma_seed = parse_hex_u64_prefix(checksum, 16, 8).unwrap_or(0) as u32;
         let noise_seed = parse_hex_u64_prefix(checksum, 24, 8).unwrap_or(0) as u32;
         let luma_mean = (luma_seed as f64 / u32::MAX as f64) as f32;
@@ -932,9 +1010,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        ffmpeg_input_options_for_source, ffmpeg_protocol_whitelist_for_source,
-        parse_ffprobe_frame_rate, parse_framemd5_to_signals, parse_jpeg_stream_to_frames,
-        Mp4DecodeConfig, TimestampNormalizer, FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST,
+        ahash_cell_grid, ahashes_from_gray_grid, ffmpeg_input_options_for_source,
+        ffmpeg_protocol_whitelist_for_source, parse_ffprobe_frame_rate, parse_framemd5_to_signals,
+        parse_jpeg_stream_to_frames, Mp4DecodeConfig, TimestampNormalizer,
+        FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST,
         FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST, FFMPEG_HTTPS_PROTOCOL_WHITELIST,
         FFMPEG_HTTP_PROTOCOL_WHITELIST, FFMPEG_LOCAL_PROTOCOL_WHITELIST,
         FFMPEG_RTSPS_PROTOCOL_WHITELIST,
@@ -986,13 +1065,60 @@ mod tests {
 0,          0,          0,        1,   230400, 0123456789abcdeffedcba9876543210
 0,          1,          1,        1,   230400, fedcba98765432100123456789abcdef
 "#;
-        let decoded = parse_framemd5_to_signals(framemd5, "/tmp/test.mp4", 8).unwrap();
+        // Empty ahashes → per-frame fallback to the checksum-derived hash, which
+        // is exactly the legacy behavior this test pins.
+        let decoded = parse_framemd5_to_signals(framemd5, "/tmp/test.mp4", 8, &[]).unwrap();
         assert_eq!(decoded.width, 320);
         assert_eq!(decoded.height, 240);
         assert_eq!(decoded.frame_signals.len(), 2);
         assert_eq!(decoded.frame_signals[0].pts_ms, 0);
         assert!(decoded.frame_signals[1].pts_ms >= decoded.frame_signals[0].pts_ms);
         assert!((0.0..=1.0).contains(&decoded.frame_signals[1].flicker_score));
+    }
+
+    #[test]
+    fn real_ahashes_override_checksum_hash() {
+        // When the pixel pass supplies hashes, they must land in perceptual_hash
+        // verbatim (aligned by frame index), not the checksum slice.
+        let framemd5 = r#"
+#format: frame checksums
+#tb 0: 1/25
+#dimensions 0: 320x240
+0,          0,          0,        1,   230400, 0123456789abcdeffedcba9876543210
+0,          1,          1,        1,   230400, fedcba98765432100123456789abcdef
+"#;
+        let real = [0xDEAD_BEEF_0000_0001u64, 0x0000_0000_0000_00F0];
+        let decoded = parse_framemd5_to_signals(framemd5, "/tmp/test.mp4", 8, &real).unwrap();
+        assert_eq!(decoded.frame_signals[0].perceptual_hash, real[0]);
+        assert_eq!(decoded.frame_signals[1].perceptual_hash, real[1]);
+        // Ghosting is now the real-hash Hamming similarity: hd(real[0],real[1]).
+        let hd = (real[0] ^ real[1]).count_ones() as f32;
+        let expect = (1.0 - hd / 64.0).clamp(0.0, 1.0);
+        assert!((decoded.frame_signals[1].ghosting_score - expect).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ahash_cell_grid_sets_bits_above_mean() {
+        // Mean of 0..64 (bytes 0,1,..,63) is 31 (integer div). Cells strictly
+        // above 31 are indices 32..=63 → the high 32 bits set, low 32 clear.
+        let cells: Vec<u8> = (0..64u8).collect();
+        let h = ahash_cell_grid(&cells);
+        assert_eq!(h, 0xFFFF_FFFF_0000_0000);
+        // A flat grid has no cell above the mean → all-zero hash.
+        assert_eq!(ahash_cell_grid(&[128u8; 64]), 0);
+    }
+
+    #[test]
+    fn ahashes_from_gray_grid_splits_per_frame() {
+        // Two 64-byte grids back to back → two hashes; a trailing partial grid
+        // (not 64 bytes) is dropped by chunks_exact.
+        let mut buf = vec![200u8; 64]; // frame 0: flat → hash 0
+        buf.extend((0..64u8).collect::<Vec<_>>()); // frame 1: ramp
+        buf.extend([1u8, 2, 3]); // stray partial grid, ignored
+        let hashes = ahashes_from_gray_grid(&buf);
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(hashes[0], 0);
+        assert_eq!(hashes[1], 0xFFFF_FFFF_0000_0000);
     }
 
     #[test]
