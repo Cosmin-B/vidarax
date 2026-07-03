@@ -133,6 +133,29 @@ pub struct WebRtcConfig {
     pub vlm_workers: usize,
 }
 
+/// Failure from [`WebRtcSession::new`].
+#[derive(Debug)]
+pub enum WebRtcSetupError {
+    /// The offer cannot be served as-is: it advertises video with no
+    /// live-serveable codec, or it has more than one video m-section.
+    /// A client error — the peer must change its offer.
+    UnsupportedVideo(String),
+    /// SDP parse, ICE, or answer-generation failure inside the stack.
+    Negotiation(String),
+}
+
+impl std::fmt::Display for WebRtcSetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WebRtcSetupError::UnsupportedVideo(m) | WebRtcSetupError::Negotiation(m) => {
+                f.write_str(m)
+            }
+        }
+    }
+}
+
+impl std::error::Error for WebRtcSetupError {}
+
 impl Default for WebRtcConfig {
     fn default() -> Self {
         Self {
@@ -208,8 +231,10 @@ impl WebRtcSession {
     ///
     /// # Errors
     ///
-    /// Returns a human-readable error string on SDP parse failure, ICE
-    /// negotiation error, or answer-generation failure.
+    /// Returns [`WebRtcSetupError::UnsupportedVideo`] for offers whose video
+    /// cannot be served: no live-serveable codec, or multiple video m-sections.
+    /// Returns [`WebRtcSetupError::Negotiation`] for SDP parse, ICE, or
+    /// answer-generation failures.
     ///
     /// # Prerequisites
     ///
@@ -219,7 +244,10 @@ impl WebRtcSession {
     ///     rustls::crypto::ring::default_provider()
     /// ).ok();
     /// ```
-    pub async fn new(offer_sdp: &str, config: &WebRtcConfig) -> Result<(Self, String), String> {
+    pub async fn new(
+        offer_sdp: &str,
+        config: &WebRtcConfig,
+    ) -> Result<(Self, String), WebRtcSetupError> {
         // Select before handing SDP to rustrtc so the answer, depacketizer,
         // and decode routing use the same codec.
         let selected = select_answer_video_codec_for_offer(offer_sdp);
@@ -229,7 +257,9 @@ impl WebRtcSession {
         // one capability to a section that did not offer that codec). WHIP ingest is
         // single-stream; reject multi-video offers rather than emit an invalid answer.
         if video_sections > 1 {
-            return Err("offer has multiple video m-sections, which are not supported".to_string());
+            return Err(WebRtcSetupError::UnsupportedVideo(
+                "offer has multiple video m-sections, which are not supported".to_string(),
+            ));
         }
         // A video m-section we cannot serve (an unsupported/unrecognized codec such as
         // AV1, a DON-signaling H.265, or VP8 without the `vp8` feature) must be
@@ -237,7 +267,9 @@ impl WebRtcSession {
         // uses rustrtc's default H.264 depacketizer, and a peer that sent video RTP
         // regardless would be depacketized and decode-routed as the wrong codec.
         if selected.is_none() && video_sections > 0 {
-            return Err("offer advertised video but no live-serveable codec".to_string());
+            return Err(WebRtcSetupError::UnsupportedVideo(
+                "offer advertised video but no live-serveable codec".to_string(),
+            ));
         }
         let codec = match selected {
             Some(sel) => sel.codec,
@@ -294,11 +326,11 @@ impl WebRtcSession {
         }
 
         let offer = SessionDescription::parse(SdpType::Offer, offer_sdp)
-            .map_err(|e| format!("SDP parse: {e}"))?;
+            .map_err(|e| WebRtcSetupError::Negotiation(format!("SDP parse: {e}")))?;
 
         pc.set_remote_description(offer)
             .await
-            .map_err(|e| format!("set_remote_description: {e}"))?;
+            .map_err(|e| WebRtcSetupError::Negotiation(format!("set_remote_description: {e}")))?;
 
         // Wait briefly for the first local ICE candidate so that the answer
         // SDP contains usable host candidates.  Trickle ICE will add more.
@@ -310,10 +342,10 @@ impl WebRtcSession {
         let answer = pc
             .create_answer()
             .await
-            .map_err(|e| format!("create_answer: {e}"))?;
+            .map_err(|e| WebRtcSetupError::Negotiation(format!("create_answer: {e}")))?;
 
         pc.set_local_description(answer)
-            .map_err(|e| format!("set_local_description: {e}"))?;
+            .map_err(|e| WebRtcSetupError::Negotiation(format!("set_local_description: {e}")))?;
 
         let local = pc
             .local_description()
@@ -556,7 +588,7 @@ fn frame_payload_to_nals(codec: VideoCodec, payload: &[u8], pool: &VecPool) -> R
 mod tests {
     use super::{
         enqueue_rtp_frame_lossless, frame_payload_to_nals, rtp_nal_pool_slots, RtpFrame,
-        WebRtcConfig, WebRtcSession, ANNEX_B_START, RTP_FRAME_QUEUE_CAPACITY,
+        WebRtcConfig, WebRtcSession, WebRtcSetupError, ANNEX_B_START, RTP_FRAME_QUEUE_CAPACITY,
     };
     use crate::webrtc::decode::VideoCodec;
     use crate::webrtc::recycle::{RecycledBytes, VecPool};
@@ -683,7 +715,14 @@ a=fmtp:96 sprop-max-don-diff=1\r\n";
             Ok(_) => panic!("DON-signaling H.265 should be rejected"),
             Err(err) => err,
         };
-        assert_eq!(err, "offer advertised video but no live-serveable codec");
+        assert!(
+            matches!(
+                err,
+                WebRtcSetupError::UnsupportedVideo(ref m)
+                    if m == "offer advertised video but no live-serveable codec"
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -715,7 +754,14 @@ a=rtpmap:96 AV1/90000\r\n";
             Ok(_) => panic!("AV1-only video should be rejected"),
             Err(err) => err,
         };
-        assert_eq!(err, "offer advertised video but no live-serveable codec");
+        assert!(
+            matches!(
+                err,
+                WebRtcSetupError::UnsupportedVideo(ref m)
+                    if m == "offer advertised video but no live-serveable codec"
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -759,9 +805,13 @@ a=rtpmap:97 H264/90000\r\n";
             Ok(_) => panic!("multiple video m-sections should be rejected"),
             Err(err) => err,
         };
-        assert_eq!(
-            err,
-            "offer has multiple video m-sections, which are not supported"
+        assert!(
+            matches!(
+                err,
+                WebRtcSetupError::UnsupportedVideo(ref m)
+                    if m == "offer has multiple video m-sections, which are not supported"
+            ),
+            "unexpected error: {err:?}"
         );
     }
 
@@ -806,7 +856,14 @@ a=rtpmap:96 AV1/90000\r\n";
             Ok(_) => panic!("audio plus AV1-only video should be rejected"),
             Err(err) => err,
         };
-        assert_eq!(err, "offer advertised video but no live-serveable codec");
+        assert!(
+            matches!(
+                err,
+                WebRtcSetupError::UnsupportedVideo(ref m)
+                    if m == "offer advertised video but no live-serveable codec"
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[tokio::test]

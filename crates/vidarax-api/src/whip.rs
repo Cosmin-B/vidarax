@@ -41,7 +41,9 @@ use vidarax_core::tiered_vlm::TieredVlmConfig;
 use vidarax_core::webrtc::clip::{
     spawn_clip_accumulator, spawn_clip_vlm_workers, ClipConfig as CoreClipConfig,
 };
-use vidarax_core::webrtc::session::{PeerConnectionState, WebRtcSession, RTP_FRAME_QUEUE_CAPACITY};
+use vidarax_core::webrtc::session::{
+    PeerConnectionState, WebRtcSession, WebRtcSetupError, RTP_FRAME_QUEUE_CAPACITY,
+};
 use vidarax_core::webrtc::workers::{
     decode_output_pool_slots, jpeg_pool_slots, spawn_analysis_workers, spawn_decode_workers,
     spawn_vlm_workers, EventSink, VlmWorkerParams, CLIP_FRAME_QUEUE_CAPACITY,
@@ -120,6 +122,21 @@ fn hex_char(v: u8) -> char {
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// Map a WebRtcSession setup failure to a WHIP HTTP response.
+/// Unserveable-video offers are client errors (415); negotiation failures are 500.
+fn whip_setup_error_response(err: &WebRtcSetupError) -> (StatusCode, &'static str) {
+    match err {
+        WebRtcSetupError::UnsupportedVideo(_) => (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "offer video cannot be served",
+        ),
+        WebRtcSetupError::Negotiation(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "WebRTC negotiation failed",
+        ),
+    }
+}
+
 /// `POST /v1/stream/whip`
 ///
 /// Accepts a WebRTC SDP offer (`Content-Type: application/sdp`), negotiates
@@ -130,8 +147,9 @@ fn hex_char(v: u8) -> char {
 /// - `Location: /v1/stream/whip/{sess_id}` header
 ///
 /// Errors:
-/// - `400` — empty or unparseable SDP offer
-/// - `500` — internal rustrtc or ICE failure
+/// - `400` — empty or non-UTF-8 SDP offer body
+/// - `415` — offer video cannot be served (no live-serveable codec, or multiple video m-sections)
+/// - `500` — malformed SDP, rustrtc, or ICE negotiation failure
 #[tracing::instrument(name = "whip.offer", skip_all)]
 pub async fn whip_offer(
     State(state): State<AppState>,
@@ -167,11 +185,8 @@ pub async fn whip_offer(
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!("WHIP offer negotiation failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "WebRTC negotiation failed",
-            )
-                .into_response();
+            let (status, body) = whip_setup_error_response(&e);
+            return (status, body).into_response();
         }
     };
 
@@ -994,8 +1009,9 @@ mod tests {
         reclaim_whip_session, reclaim_whip_session_from_watcher,
         reclaim_whip_session_from_watcher_with_backoff, should_reclaim_peer_state,
         spawn_session_reclaimer, start_whip_session,
-        tombstone_created_whip_run_with_request_bound_and_backoff, whip_terminate,
-        PeerConnectionState, WebRtcSession, ATTACH_CONFIG_HEADER, RUN_ID_HEADER,
+        tombstone_created_whip_run_with_request_bound_and_backoff, whip_setup_error_response,
+        whip_terminate, PeerConnectionState, WebRtcSession, WebRtcSetupError, ATTACH_CONFIG_HEADER,
+        RUN_ID_HEADER,
     };
     use axum::body::Body;
     use axum::extract::{Path, State};
@@ -1007,6 +1023,18 @@ mod tests {
 
     use crate::security::SecurityPolicy;
     use crate::state::AppState;
+
+    #[test]
+    fn whip_setup_error_response_classifies_client_vs_server() {
+        let (client_status, _) = whip_setup_error_response(&WebRtcSetupError::UnsupportedVideo(
+            "offer advertised video but no live-serveable codec".to_string(),
+        ));
+        assert_eq!(client_status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let (server_status, _) = whip_setup_error_response(&WebRtcSetupError::Negotiation(
+            "create_answer: boom".to_string(),
+        ));
+        assert_eq!(server_status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     #[test]
     fn session_id_has_sess_prefix() {
