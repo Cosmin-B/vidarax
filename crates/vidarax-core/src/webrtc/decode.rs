@@ -277,6 +277,13 @@ fn h265_offer_signals_don(sdp: &str, payload_type: u8) -> bool {
     false
 }
 
+/// Count the video media sections (`m=video ...` lines) in an SDP offer.
+pub fn count_video_media_sections(sdp: &str) -> usize {
+    sdp.lines()
+        .filter(|line| line.trim_start().starts_with("m=video"))
+        .count()
+}
+
 /// Select the answer video codec directly from the offer SDP, excluding
 /// H.265 payload types whose fmtp signals RFC 7798 decoding-order use
 /// (`sprop-max-don-diff > 0` or `sprop-depack-buf-nalus > 0`). The
@@ -1189,12 +1196,60 @@ mod tests {
     use crate::metrics::PipelineMetrics;
 
     use super::{
-        decode_ffmpeg_pipe, h265_offer_signals_don, select_answer_video_codec,
-        select_answer_video_codec_for_offer, send_yuv_frame_lossless, try_receive_yuv_frame,
-        DecodeError, DecoderBackend, OfferedVideoCodec, VideoCodec, YuvFrame,
-        FFMPEG_YUV_PENDING_POOL_ALLOWANCE, FFMPEG_YUV_READER_POOL_MIN_SLOTS,
+        count_video_media_sections, decode_ffmpeg_pipe, h265_offer_signals_don,
+        select_answer_video_codec, select_answer_video_codec_for_offer, send_yuv_frame_lossless,
+        try_receive_yuv_frame, DecodeError, DecoderBackend, OfferedVideoCodec, VideoCodec,
+        YuvFrame, FFMPEG_YUV_PENDING_POOL_ALLOWANCE, FFMPEG_YUV_READER_POOL_MIN_SLOTS,
         FFMPEG_YUV_READER_QUEUE_CAPACITY,
     };
+
+    #[test]
+    fn count_video_media_sections_returns_zero_for_audio_only_offer() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+            "a=rtpmap:111 opus/48000/2\r\n",
+        );
+
+        assert_eq!(count_video_media_sections(sdp), 0);
+    }
+
+    #[test]
+    fn count_video_media_sections_returns_one_for_single_video_section() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=rtpmap:96 H264/90000\r\n",
+        );
+
+        assert_eq!(count_video_media_sections(sdp), 1);
+    }
+
+    #[test]
+    fn count_video_media_sections_returns_two_for_two_video_sections() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+            "a=rtpmap:96 H264/90000\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 97\r\n",
+            "a=rtpmap:97 H265/90000\r\n",
+        );
+
+        assert_eq!(count_video_media_sections(sdp), 2);
+    }
+
+    #[test]
+    fn count_video_media_sections_does_not_count_audio_or_application_sections() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+            "a=rtpmap:111 opus/48000/2\r\n",
+            "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n",
+            "a=sctp-port:5000\r\n",
+        );
+
+        assert_eq!(count_video_media_sections(sdp), 0);
+    }
 
     #[test]
     fn offered_video_codecs_parses_multi_codec_offer() {

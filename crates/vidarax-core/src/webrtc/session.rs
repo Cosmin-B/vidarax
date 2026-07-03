@@ -50,7 +50,9 @@ use rustrtc::{
 };
 
 use crate::metrics::PipelineMetrics;
-use crate::webrtc::decode::{select_answer_video_codec_for_offer, VideoCodec};
+use crate::webrtc::decode::{
+    count_video_media_sections, select_answer_video_codec_for_offer, VideoCodec,
+};
 use crate::webrtc::recycle::{RecycledBytes, VecPool};
 
 /// Annex B start code prepended to every H.264 or H.265 NAL unit.
@@ -221,12 +223,20 @@ impl WebRtcSession {
         // Select before handing SDP to rustrtc so the answer, depacketizer,
         // and decode routing use the same codec.
         let selected = select_answer_video_codec_for_offer(offer_sdp);
-        // An offer that advertised a recognized video codec we cannot serve (a
-        // DON-signaling H.265, or VP8 without the `vp8` feature) must be rejected:
-        // otherwise `new` would build a session whose answerer video receiver uses
-        // rustrtc's default H.264 depacketizer, and a peer that sends video RTP
+        let video_sections = count_video_media_sections(offer_sdp);
+        // A single global answer video capability is installed below, so more than
+        // one video m-section cannot be answered correctly (rustrtc would apply that
+        // one capability to a section that did not offer that codec). WHIP ingest is
+        // single-stream; reject multi-video offers rather than emit an invalid answer.
+        if video_sections > 1 {
+            return Err("offer has multiple video m-sections, which are not supported".to_string());
+        }
+        // A video m-section we cannot serve (an unsupported/unrecognized codec such as
+        // AV1, a DON-signaling H.265, or VP8 without the `vp8` feature) must be
+        // rejected: otherwise `new` would build a session whose answerer video receiver
+        // uses rustrtc's default H.264 depacketizer, and a peer that sent video RTP
         // regardless would be depacketized and decode-routed as the wrong codec.
-        if selected.is_none() && !VideoCodec::offered_video_codecs(offer_sdp).is_empty() {
+        if selected.is_none() && video_sections > 0 {
             return Err("offer advertised video but no live-serveable codec".to_string());
         }
         let codec = match selected {
@@ -671,6 +681,129 @@ a=fmtp:96 sprop-max-don-diff=1\r\n";
 
         let err = match WebRtcSession::new(offer, &WebRtcConfig::default()).await {
             Ok(_) => panic!("DON-signaling H.265 should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err, "offer advertised video but no live-serveable codec");
+    }
+
+    #[tokio::test]
+    async fn new_rejects_av1_only_offer() {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        );
+
+        let offer = "v=0\r\n\
+o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0\r\n\
+a=msid-semantic: WMS\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:96 AV1/90000\r\n";
+
+        let err = match WebRtcSession::new(offer, &WebRtcConfig::default()).await {
+            Ok(_) => panic!("AV1-only video should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err, "offer advertised video but no live-serveable codec");
+    }
+
+    #[tokio::test]
+    async fn new_rejects_multiple_video_sections() {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        );
+
+        let offer = "v=0\r\n\
+o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0 1\r\n\
+a=msid-semantic: WMS\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:96 H264/90000\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 97\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n\
+a=setup:actpass\r\n\
+a=mid:1\r\n\
+a=sendonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:97 H264/90000\r\n";
+
+        let err = match WebRtcSession::new(offer, &WebRtcConfig::default()).await {
+            Ok(_) => panic!("multiple video m-sections should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            "offer has multiple video m-sections, which are not supported"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_rejects_audio_plus_av1_video() {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        );
+
+        let offer = "v=0\r\n\
+o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0 1\r\n\
+a=msid-semantic: WMS\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n\
+a=setup:actpass\r\n\
+a=mid:1\r\n\
+a=sendonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:96 AV1/90000\r\n";
+
+        let err = match WebRtcSession::new(offer, &WebRtcConfig::default()).await {
+            Ok(_) => panic!("audio plus AV1-only video should be rejected"),
             Err(err) => err,
         };
         assert_eq!(err, "offer advertised video but no live-serveable codec");
