@@ -99,14 +99,39 @@ impl VideoCodec {
 
     /// Parse recognized video codecs from the SDP offer's video sections.
     pub fn offered_video_codecs(sdp: &str) -> Vec<OfferedVideoCodec> {
+        fn flush_video_section(
+            offered: &mut Vec<OfferedVideoCodec>,
+            video_payload_types: &[u8],
+            section_codecs: &[OfferedVideoCodec],
+        ) {
+            let mut pushed_payload_types = Vec::new();
+            for payload_type in video_payload_types {
+                if pushed_payload_types.contains(payload_type) {
+                    continue;
+                }
+                if let Some(codec) = section_codecs
+                    .iter()
+                    .find(|codec| codec.payload_type == *payload_type)
+                {
+                    offered.push(*codec);
+                    pushed_payload_types.push(*payload_type);
+                }
+            }
+        }
+
         let mut offered = Vec::new();
         let mut in_video = false;
         let mut video_payload_types = Vec::new();
+        let mut section_codecs = Vec::new();
 
         for line in sdp.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with("m=") {
+                if in_video {
+                    flush_video_section(&mut offered, &video_payload_types, &section_codecs);
+                }
                 video_payload_types.clear();
+                section_codecs.clear();
                 in_video = trimmed.starts_with("m=video");
                 if in_video {
                     video_payload_types.extend(
@@ -147,12 +172,15 @@ impl VideoCodec {
                     .and_then(|clock| clock.parse::<u32>().ok())
                     .unwrap_or(90000);
 
-                offered.push(OfferedVideoCodec {
+                section_codecs.push(OfferedVideoCodec {
                     payload_type,
                     codec,
                     clock_rate,
                 });
             }
+        }
+        if in_video {
+            flush_video_section(&mut offered, &video_payload_types, &section_codecs);
         }
 
         offered
@@ -1293,6 +1321,149 @@ mod tests {
         );
     }
 
+    #[test]
+    fn offered_video_codecs_uses_m_line_order_over_rtpmap_order() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 97 96\r\n",
+            "a=rtpmap:96 H265/90000\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+        );
+        let offered = VideoCodec::offered_video_codecs(sdp);
+
+        assert_eq!(
+            offered,
+            vec![
+                OfferedVideoCodec {
+                    payload_type: 97,
+                    codec: VideoCodec::H264,
+                    clock_rate: 90000,
+                },
+                OfferedVideoCodec {
+                    payload_type: 96,
+                    codec: VideoCodec::H265,
+                    clock_rate: 90000,
+                },
+            ]
+        );
+        assert_eq!(select_answer_video_codec(&offered), Some(offered[0]));
+    }
+
+    #[test]
+    fn offered_video_codecs_dedupes_repeated_m_line_payload() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 97 96 97\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+            "a=rtpmap:96 H265/90000\r\n",
+        );
+
+        assert_eq!(
+            VideoCodec::offered_video_codecs(sdp),
+            vec![
+                OfferedVideoCodec {
+                    payload_type: 97,
+                    codec: VideoCodec::H264,
+                    clock_rate: 90000,
+                },
+                OfferedVideoCodec {
+                    payload_type: 96,
+                    codec: VideoCodec::H265,
+                    clock_rate: 90000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn offered_video_codecs_omits_m_line_payload_without_rtpmap() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+        );
+
+        assert_eq!(
+            VideoCodec::offered_video_codecs(sdp),
+            vec![OfferedVideoCodec {
+                payload_type: 97,
+                codec: VideoCodec::H264,
+                clock_rate: 90000,
+            }]
+        );
+    }
+
+    #[test]
+    fn offered_video_codecs_keeps_order_when_m_line_matches_rtpmap_order() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98\r\n",
+            "a=rtpmap:96 VP8/90000\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+            "a=rtpmap:98 H265/90000\r\n",
+        );
+
+        assert_eq!(
+            VideoCodec::offered_video_codecs(sdp),
+            vec![
+                OfferedVideoCodec {
+                    payload_type: 96,
+                    codec: VideoCodec::Vp8,
+                    clock_rate: 90000,
+                },
+                OfferedVideoCodec {
+                    payload_type: 97,
+                    codec: VideoCodec::H264,
+                    clock_rate: 90000,
+                },
+                OfferedVideoCodec {
+                    payload_type: 98,
+                    codec: VideoCodec::H265,
+                    clock_rate: 90000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn offered_video_codecs_orders_each_video_section_by_its_m_line() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 97 96\r\n",
+            "a=rtpmap:96 H265/90000\r\n",
+            "a=rtpmap:97 H264/90000\r\n",
+            "m=video 9 UDP/TLS/RTP/SAVPF 100 99\r\n",
+            "a=rtpmap:99 H264/90000\r\n",
+            "a=rtpmap:100 VP8/90000\r\n",
+        );
+
+        assert_eq!(
+            VideoCodec::offered_video_codecs(sdp),
+            vec![
+                OfferedVideoCodec {
+                    payload_type: 97,
+                    codec: VideoCodec::H264,
+                    clock_rate: 90000,
+                },
+                OfferedVideoCodec {
+                    payload_type: 96,
+                    codec: VideoCodec::H265,
+                    clock_rate: 90000,
+                },
+                OfferedVideoCodec {
+                    payload_type: 100,
+                    codec: VideoCodec::Vp8,
+                    clock_rate: 90000,
+                },
+                OfferedVideoCodec {
+                    payload_type: 99,
+                    codec: VideoCodec::H264,
+                    clock_rate: 90000,
+                },
+            ]
+        );
+    }
+
     #[cfg(feature = "vp8")]
     #[test]
     fn select_prefers_vp8_when_serveable() {
@@ -1557,7 +1728,7 @@ mod tests {
             "a=rtpmap:96 VP8/90000\r\n",
             "a=rtpmap:97 H264/90000\r\n",
         );
-        // first rtpmap wins
+        // First codec in the video m-line wins.
         assert_eq!(VideoCodec::from_sdp(sdp), VideoCodec::Vp8);
     }
 
