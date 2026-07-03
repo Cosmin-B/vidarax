@@ -51,7 +51,8 @@ use rustrtc::{
 
 use crate::metrics::PipelineMetrics;
 use crate::webrtc::decode::{
-    count_video_media_sections, select_answer_video_codec_for_offer, VideoCodec,
+    count_audio_media_sections, count_video_media_sections, select_answer_video_codec_for_offer,
+    VideoCodec,
 };
 use crate::webrtc::recycle::{RecycledBytes, VecPool};
 
@@ -321,6 +322,22 @@ impl WebRtcSession {
         if selected.is_some() {
             pc.add_transceiver(
                 rustrtc::MediaKind::Video,
+                rustrtc::TransceiverDirection::RecvOnly,
+            );
+        }
+
+        // rustrtc's answerer matches each offered audio m-section to a local
+        // audio transceiver. With none, it falls through to an implicit
+        // transceiver that mirrors the offered `sendonly` back as `sendonly` —
+        // an answer RFC 3264 disallows for a sendonly offer. Pre-create one
+        // recvonly audio transceiver per offered audio section so each is
+        // matched and answered `recvonly`. The count is zero for an audio-less
+        // offer, so none is added. vidarax does not consume audio: the default
+        // audio depacketizer handles any audio RTP and `run` forwards only
+        // video frames.
+        for _ in 0..count_audio_media_sections(offer_sdp) {
+            pc.add_transceiver(
+                rustrtc::MediaKind::Audio,
                 rustrtc::TransceiverDirection::RecvOnly,
             );
         }
@@ -683,6 +700,145 @@ a=rtpmap:96 H265/90000\r\n";
             data,
             vec![0x40, 0x01, 0xaa, 0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0xbb],
         );
+    }
+
+    #[tokio::test]
+    async fn answer_audio_section_is_recvonly_not_sendonly() {
+        // create_answer needs a rustls crypto provider; idempotent install.
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        );
+
+        // A WHIP-style offer with audio (mid:0) and H.264 video (mid:1), both
+        // a=sendonly (browser -> us).
+        let offer = "v=0\r\n\
+o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0 1\r\n\
+a=msid-semantic: WMS\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n\
+a=setup:actpass\r\n\
+a=mid:1\r\n\
+a=sendonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:96 H264/90000\r\n";
+
+        let (_session, answer) = WebRtcSession::new(offer, &WebRtcConfig::default())
+            .await
+            .expect("video+audio offer should be accepted");
+
+        // BUNDLE requires every offered m-line be answered, so the audio
+        // m-section must remain. Extract its block and assert its direction is
+        // recvonly. Before the audio transceiver existed, rustrtc mirrored the
+        // offered sendonly back as sendonly here, an RFC 3264 violation.
+        let audio_block = answer
+            .split("m=")
+            .find(|section| section.starts_with("audio"))
+            .expect("answer retains the audio m-section");
+        assert!(
+            audio_block.contains("a=recvonly"),
+            "audio m-section should be answered recvonly, got:\n{audio_block}"
+        );
+        assert!(
+            !audio_block.contains("a=sendonly"),
+            "audio m-section must not be answered sendonly, got:\n{audio_block}"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_multiple_audio_sections_all_recvonly() {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        );
+
+        // Two audio sections (mid:0, mid:1) then H.264 video (mid:2), all sendonly.
+        let offer = "v=0\r\n\
+o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0 1 2\r\n\
+a=msid-semantic: WMS\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 110\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n\
+a=setup:actpass\r\n\
+a=mid:1\r\n\
+a=sendonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:110 opus/48000/2\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n\
+a=setup:actpass\r\n\
+a=mid:2\r\n\
+a=sendonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:96 H264/90000\r\n";
+
+        let (_session, answer) = WebRtcSession::new(offer, &WebRtcConfig::default())
+            .await
+            .expect("two-audio + video offer should be accepted");
+
+        // Both audio sections must be answered recvonly; no section may be
+        // answered sendonly.
+        let audio_blocks: Vec<&str> = answer
+            .split("m=")
+            .filter(|section| section.starts_with("audio"))
+            .collect();
+        assert_eq!(
+            audio_blocks.len(),
+            2,
+            "answer should retain both audio m-sections"
+        );
+        for block in &audio_blocks {
+            assert!(
+                block.contains("a=recvonly"),
+                "each audio m-section should be answered recvonly, got:\n{block}"
+            );
+            assert!(
+                !block.contains("a=sendonly"),
+                "no audio m-section may be answered sendonly, got:\n{block}"
+            );
+        }
     }
 
     #[tokio::test]
