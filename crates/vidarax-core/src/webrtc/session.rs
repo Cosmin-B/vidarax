@@ -198,9 +198,8 @@ impl WebRtcSession {
     /// 3. Creates and applies the local answer.
     ///
     /// The answer is pinned to one live-serveable video codec selected from
-    /// the offer: H.264, or VP8 when built. H.265 is excluded until live HEVC
-    /// RTP depacketization exists. The selected codec also drives the
-    /// depacketizer factory and decode routing.
+    /// the offer: H.264, H.265, or VP8 when built. The selected codec also
+    /// drives the depacketizer factory and decode routing.
     ///
     /// Returns `(session, answer_sdp)`.  The caller must send `answer_sdp`
     /// back to the browser to complete the signalling exchange.
@@ -262,6 +261,20 @@ impl WebRtcSession {
             )),
         };
         let pc = PeerConnection::new(rtc_config);
+
+        // rustrtc's answerer path builds the inbound receiver from the remote
+        // offer without attaching our depacketizer factory, so it would fall back
+        // to rustrtc's default H.264 depacketizer and mis-parse H.265 (and VP8)
+        // RTP. Pre-creating a recvonly video transceiver makes the offer's video
+        // m-section reuse this receiver, which `add_transceiver` builds with the
+        // configured factory. Only add it when a video codec was selected, so an
+        // audio-only offer does not gain a spurious unmatched video m-line.
+        if selected.is_some() {
+            pc.add_transceiver(
+                rustrtc::MediaKind::Video,
+                rustrtc::TransceiverDirection::RecvOnly,
+            );
+        }
 
         let offer = SessionDescription::parse(SdpType::Offer, offer_sdp)
             .map_err(|e| format!("SDP parse: {e}"))?;
@@ -330,10 +343,10 @@ impl WebRtcSession {
     /// shared structure while the task runs concurrently.
     ///
     /// - The codec selected for the answer is also used here. H.264 is
-    ///   depacketized by rustrtc. VP8 is depacketized in-crate when built.
-    ///   H.265 is not selected until live HEVC RTP depacketization exists.
-    ///   Annex B start codes (`00 00 00 01`) are **prepended** to H.264 and
-    ///   H.265 / HEVC payloads before sending. VP8 payloads are passed through.
+    ///   depacketized by rustrtc. VP8 is depacketized in-crate when built, and
+    ///   H.265 by the in-crate HEVC RTP depacketizer. Annex B start codes
+    ///   (`00 00 00 01`) are **prepended** to H.264 and H.265 / HEVC payloads
+    ///   before sending. VP8 payloads are passed through.
     /// - Audio tracks are silently ignored.
     /// - For each video track a Tokio task is spawned; all share the same
     ///   atomic sequence counter.
@@ -504,8 +517,8 @@ fn frame_payload_to_nals(codec: VideoCodec, payload: &[u8], pool: &VecPool) -> R
     let mut nals = pool.acquire();
     match codec {
         VideoCodec::H264 | VideoCodec::H265 => {
-            // ffmpeg h264/hevc demuxers expect Annex B start codes.
-            // Live HEVC still needs an HEVC RTP depacketizer; rustrtc's default video depacketizer is H.264-only.
+            // ffmpeg h264/hevc demuxers expect Annex B start codes. H.264 is
+            // depacketized by rustrtc; H.265 by the in-crate HEVC RTP depacketizer.
             nals.reserve(ANNEX_B_START.len() + payload.len());
             nals.extend_from_slice(&ANNEX_B_START);
             nals.extend_from_slice(payload);
@@ -536,6 +549,91 @@ mod tests {
     fn rtp_nal_pool_covers_queue_workers_and_blocked_sender() {
         assert_eq!(rtp_nal_pool_slots(2), RTP_FRAME_QUEUE_CAPACITY + 1 + 1);
         assert_eq!(rtp_nal_pool_slots(0), RTP_FRAME_QUEUE_CAPACITY + 1 + 1);
+    }
+
+    /// The WHIP answerer receive path must depacketize with the codec-selected
+    /// in-crate depacketizer, not rustrtc's default H.264 one. Drives
+    /// `WebRtcSession::new` with an H.265 offer, then feeds an HEVC Aggregation
+    /// Packet through the accepted video receiver's depacketizer and asserts it
+    /// is un-aggregated into an HEVC access unit. rustrtc's default H.264
+    /// depacketizer would pass the raw packet bytes through unchanged.
+    #[tokio::test]
+    async fn answerer_video_receiver_uses_selected_depacketizer() {
+        // create_answer generates a DTLS certificate, which needs a rustls
+        // crypto provider. Idempotent; ignore the error if already installed.
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        );
+
+        // A minimal but complete WHIP-style offer advertising H.265 only.
+        let offer = "v=0\r\n\
+o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0\r\n\
+a=msid-semantic: WMS\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:96 H265/90000\r\n";
+
+        let (session, _answer) = WebRtcSession::new(offer, &WebRtcConfig::default())
+            .await
+            .expect("WebRtcSession::new should accept the H.265 offer");
+
+        // The pre-created recvonly video transceiver carries the receiver built
+        // with our depacketizer factory.
+        let video = session
+            .pc
+            .get_transceivers()
+            .into_iter()
+            .find(|t| t.kind() == rustrtc::MediaKind::Video)
+            .expect("a video transceiver");
+        let receiver = video.receiver().expect("a video receiver");
+        let mut depacketizer = receiver
+            .depacketizer_factory
+            .create(rustrtc::media::MediaKind::Video);
+
+        // HEVC Aggregation Packet (RFC 7798 nal_type 48) carrying two NALs:
+        // VPS (type 32) = 0x40,0x01,0xaa and SPS (type 33) = 0x42,0x01,0xbb,
+        // each prefixed with its 16-bit big-endian size (3).
+        let ap = vec![
+            0x60, 0x01, // AP payload header
+            0x00, 0x03, 0x40, 0x01, 0xaa, // VPS NAL
+            0x00, 0x03, 0x42, 0x01, 0xbb, // SPS NAL
+        ];
+        let mut header = rustrtc::rtp::RtpHeader::new(96, 1, 100, 12345);
+        header.marker = true; // end of access unit -> emit a sample
+        let packet = rustrtc::rtp::RtpPacket::new(header, ap);
+        let addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            1234,
+        );
+
+        let samples = depacketizer
+            .push(packet, 90_000, addr, rustrtc::media::MediaKind::Video)
+            .expect("push should not error");
+        assert_eq!(samples.len(), 1, "one access unit expected");
+        let data = match samples.into_iter().next().unwrap() {
+            rustrtc::media::MediaSample::Video(frame) => frame.data.to_vec(),
+            rustrtc::media::MediaSample::Audio(_) => panic!("expected a video sample"),
+        };
+
+        // H265Depacketizer un-aggregates the AP into the two NALs joined by an
+        // Annex B start code. The default H.264 depacketizer would instead emit
+        // the raw AP bytes [0x60,0x01,0x00,0x03,...] unchanged.
+        assert_eq!(
+            data,
+            vec![0x40, 0x01, 0xaa, 0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0xbb],
+        );
     }
 
     #[test]

@@ -159,9 +159,10 @@ impl VideoCodec {
     }
 
     /// Whether Vidarax can both depacketize and decode this codec on the live
-    /// WebRTC path. H.264 always has rustrtc depacketization plus openh264 or
-    /// nvdec decode. VP8 is serveable only with the `vp8` feature. H.265 is
-    /// excluded until live HEVC RTP depacketization exists.
+    /// WebRTC path. H.264 uses rustrtc depacketization plus openh264 or nvdec
+    /// decode. VP8 is serveable only with the `vp8` feature. H.265 uses the
+    /// in-crate HEVC RTP depacketizer (RFC 7798) plus nvdec or the ffmpeg hevc
+    /// software sidecar.
     fn is_live_serveable(self) -> bool {
         match self {
             VideoCodec::H264 => true,
@@ -169,7 +170,7 @@ impl VideoCodec {
             VideoCodec::Vp8 => true,
             #[cfg(not(feature = "vp8"))]
             VideoCodec::Vp8 => false,
-            VideoCodec::H265 => false,
+            VideoCodec::H265 => true,
         }
     }
 
@@ -1268,14 +1269,14 @@ mod tests {
     }
 
     #[test]
-    fn select_returns_none_for_hevc_only_offer() {
+    fn select_returns_hevc_for_hevc_only_offer() {
         let offered = [OfferedVideoCodec {
             payload_type: 96,
             codec: VideoCodec::H265,
             clock_rate: 90000,
         }];
 
-        assert_eq!(select_answer_video_codec(&offered), None);
+        assert_eq!(select_answer_video_codec(&offered), Some(offered[0]));
     }
 
     #[test]
