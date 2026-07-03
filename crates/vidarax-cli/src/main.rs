@@ -1,15 +1,20 @@
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use comfy_table::{presets, Cell, Table};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use owo_colors::OwoColorize;
 use reqwest::Method;
 use serde_json::{json, Map, Value};
@@ -17,6 +22,8 @@ use vidarax_contracts::lifecycle::StreamState;
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8080";
 const API_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_ANALYZE_MODEL: &str = "vidarax-medium";
+const ANALYZE_PROGRESS_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() {
@@ -98,6 +105,8 @@ enum Commands {
   vidarax search \"door opened\" --run run_01 --json
 ")]
     Search(SearchArgs),
+    /// Upload a local video and run the full analysis pipeline.
+    Analyze(AnalyzeArgs),
     /// Submit and list feedback.
     #[command(subcommand)]
     Feedback(FeedbackCommands),
@@ -201,6 +210,103 @@ struct SearchArgs {
     limit: Option<usize>,
 }
 
+#[derive(Args, Debug, Clone)]
+struct AnalyzeArgs {
+    /// Local video file to analyze.
+    file: PathBuf,
+    /// Optional semantic prompt.
+    #[arg(long, value_name = "TEXT")]
+    prompt: Option<String>,
+    /// Model ID.
+    #[arg(long, value_name = "ID", default_value = DEFAULT_ANALYZE_MODEL)]
+    model: String,
+    /// Optional run mode.
+    #[arg(long, value_name = "MODE")]
+    mode: Option<String>,
+    /// Reason decode FPS.
+    #[arg(long, value_name = "F", default_value_t = 1.0)]
+    fixed_fps: f32,
+    /// Reason chunk size.
+    #[arg(long, value_name = "N", default_value_t = 25)]
+    chunk_size: usize,
+    /// Cap frames for ingest and reason.
+    #[arg(long, value_name = "N")]
+    max_frames: Option<u64>,
+    /// Reason index name and events poll filter.
+    #[arg(long, value_name = "NAME")]
+    index_name: Option<String>,
+    /// Optional ingest sampling policy.
+    #[arg(long, value_name = "P")]
+    sampling_policy: Option<String>,
+}
+
+impl AnalyzeArgs {
+    fn create_run_body(&self) -> Value {
+        let mut body = Map::new();
+        if let Some(mode) = self.mode.as_deref().and_then(non_empty_opt) {
+            body.insert("mode".to_string(), Value::String(mode.to_string()));
+        }
+        body.insert("model".to_string(), Value::String(self.model.clone()));
+        Value::Object(body)
+    }
+
+    fn ingest_body(&self, source_uri: &str) -> Value {
+        let mut body = Map::new();
+        body.insert(
+            "source_uri".to_string(),
+            Value::String(source_uri.to_string()),
+        );
+        if let Some(policy) = self.sampling_policy.as_deref().and_then(non_empty_opt) {
+            body.insert(
+                "sampling_policy".to_string(),
+                Value::String(policy.to_string()),
+            );
+            if policy.eq_ignore_ascii_case("fixed") {
+                body.insert("fixed_fps".to_string(), json!(self.fixed_fps));
+            }
+        }
+        if let Some(max_frames) = self.max_frames {
+            body.insert("max_frames".to_string(), json!(max_frames));
+        }
+        Value::Object(body)
+    }
+
+    fn reason_body(&self, source_uri: &str) -> Value {
+        let mut body = Map::new();
+        body.insert(
+            "source_uri".to_string(),
+            Value::String(source_uri.to_string()),
+        );
+        body.insert("model".to_string(), Value::String(self.model.clone()));
+        if let Some(mode) = self.mode.as_deref().and_then(non_empty_opt) {
+            body.insert("mode".to_string(), Value::String(mode.to_string()));
+        }
+        body.insert(
+            "sampling_policy".to_string(),
+            Value::String("fixed".to_string()),
+        );
+        body.insert("fixed_fps".to_string(), json!(self.fixed_fps));
+        body.insert("chunk_size".to_string(), json!(self.chunk_size));
+        body.insert("semantic_inference".to_string(), Value::Bool(true));
+        if let Some(max_frames) = self.max_frames {
+            body.insert("max_frames".to_string(), json!(max_frames));
+        }
+        if let Some(index_name) = self.index_name.as_deref().and_then(non_empty_opt) {
+            body.insert(
+                "index_name".to_string(),
+                Value::String(index_name.to_string()),
+            );
+        }
+        if let Some(prompt) = self.prompt.as_deref().and_then(non_empty_opt) {
+            body.insert(
+                "semantic_prompt".to_string(),
+                Value::String(prompt.to_string()),
+            );
+        }
+        Value::Object(body)
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum FeedbackCommands {
     /// Submit feedback for a run.
@@ -296,6 +402,7 @@ async fn dispatch(
         Commands::Events(args) => cmd_events(config, output, &args).await,
         Commands::Markers(args) => cmd_markers(config, output, &args).await,
         Commands::Search(args) => cmd_search(config, output, &args).await,
+        Commands::Analyze(args) => cmd_analyze(config, output, &args).await,
         Commands::Feedback(command) => match command {
             FeedbackCommands::Submit(args) => cmd_feedback_submit(config, output, &args).await,
             FeedbackCommands::List => cmd_feedback_list(config, output).await,
@@ -496,12 +603,14 @@ fn fmt_pts(pts_ms: u64) -> String {
     format!("{minutes}:{seconds:02}.{millis:03}")
 }
 
+#[derive(Clone)]
 struct ApiOpts {
     base_url: String,
     api_key: Option<String>,
     tenant_id: Option<String>,
 }
 
+#[derive(Clone)]
 struct ApiClient {
     opts: ApiOpts,
     http: reqwest::Client,
@@ -509,8 +618,19 @@ struct ApiClient {
 
 impl ApiClient {
     fn new(opts: ApiOpts) -> Result<Self, String> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(API_TIMEOUT_SECS))
+        Self::new_with_timeout(opts, Some(Duration::from_secs(API_TIMEOUT_SECS)))
+    }
+
+    fn new_without_timeout(opts: ApiOpts) -> Result<Self, String> {
+        Self::new_with_timeout(opts, None)
+    }
+
+    fn new_with_timeout(opts: ApiOpts, timeout: Option<Duration>) -> Result<Self, String> {
+        let mut builder = reqwest::Client::builder();
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
+        let http = builder
             .build()
             .map_err(|e| format!("failed to create HTTP client: {e}"))?;
         Ok(Self { opts, http })
@@ -526,6 +646,26 @@ impl ApiClient {
 
     async fn post_json(&self, path: &str, body: &Value) -> Result<Value, String> {
         self.request_json(Method::POST, path, &[], Some(body)).await
+    }
+
+    async fn post_multipart(
+        &self,
+        path: &str,
+        form: reqwest::multipart::Form,
+    ) -> Result<Value, String> {
+        let url = format!("{}{}", self.opts.base_url, path);
+        let mut request = self.http.post(&url).multipart(form);
+        if let Some(api_key) = &self.opts.api_key {
+            request = request.header("x-api-key", api_key);
+        }
+        if let Some(tenant_id) = &self.opts.tenant_id {
+            request = request.header("x-tenant-id", tenant_id);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("request to {url} failed: {e}"))?;
+        decode_json_response(&url, response).await
     }
 
     async fn delete(&self, path: &str) -> Result<Value, String> {
@@ -558,24 +698,28 @@ impl ApiClient {
             .send()
             .await
             .map_err(|e| format!("request to {url} failed: {e}"))?;
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|e| format!("request to {url} failed while reading response body: {e}"))?;
-
-        if !status.is_success() {
-            let message = serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|body| extract_error_message(&body))
-                .or_else(|| non_empty_opt(&text).map(str::to_string))
-                .unwrap_or_else(|| "empty response body".to_string());
-            return Err(format!("request to {url} returned {status}: {message}"));
-        }
-
-        serde_json::from_str::<Value>(&text)
-            .map_err(|e| format!("request to {url} returned invalid JSON: {e}"))
+        decode_json_response(&url, response).await
     }
+}
+
+async fn decode_json_response(url: &str, response: reqwest::Response) -> Result<Value, String> {
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("request to {url} failed while reading response body: {e}"))?;
+
+    if !status.is_success() {
+        let message = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|body| extract_error_message(&body))
+            .or_else(|| non_empty_opt(&text).map(str::to_string))
+            .unwrap_or_else(|| "empty response body".to_string());
+        return Err(format!("request to {url} returned {status}: {message}"));
+    }
+
+    serde_json::from_str::<Value>(&text)
+        .map_err(|e| format!("request to {url} returned invalid JSON: {e}"))
 }
 
 async fn cmd_health(config: RuntimeConfig, output: OutputMode) -> Result<(), String> {
@@ -910,6 +1054,404 @@ async fn cmd_search(
         )
     );
     Ok(())
+}
+
+async fn cmd_analyze(
+    config: RuntimeConfig,
+    output: OutputMode,
+    args: &AnalyzeArgs,
+) -> Result<(), String> {
+    validate_analyze_args(args)?;
+    let client = ApiClient::new_without_timeout(config.api_opts())?;
+
+    status_line(output, "uploading...");
+    let file_path = upload_analyze_file(&client, &args.file)
+        .await
+        .map_err(|e| format!("upload failed: {e}"))?;
+
+    status_line(output, "creating run...");
+    let run_response = client
+        .post_json("/v1/runs", &args.create_run_body())
+        .await
+        .map_err(|e| format!("create run failed: {e}"))?;
+    let run_id = string_field(&run_response, "run_id")
+        .ok_or_else(|| "create run failed: response missing string field run_id".to_string())?
+        .to_string();
+
+    status_line(output, "ingesting...");
+    let ingest_response = client
+        .post_json(
+            &format!("/v1/runs/{run_id}/ingest"),
+            &args.ingest_body(&file_path),
+        )
+        .await
+        .map_err(|e| format!("ingest failed: {e}"))?;
+    let decoded_frames = u64_field(&ingest_response, "decoded_frames");
+    let source_fps = ingest_response.get("source_fps").and_then(Value::as_f64);
+    let estimated_chunks =
+        estimate_reason_chunks(decoded_frames, source_fps, args.fixed_fps, args.chunk_size);
+
+    status_line(output, "reasoning...");
+    let progress = AnalyzeProgress::new(output, estimated_chunks);
+    let stop_polling = Arc::new(AtomicBool::new(false));
+    let poller = {
+        let client = client.clone();
+        let run_id = run_id.clone();
+        let index_name = args.index_name.clone();
+        let progress = progress.clone();
+        let stop_polling = Arc::clone(&stop_polling);
+        tokio::spawn(async move {
+            poll_reason_progress(client, run_id, index_name, progress, stop_polling).await
+        })
+    };
+    let reason = {
+        let client = client.clone();
+        let path = format!("/v1/runs/{run_id}/reason");
+        let body = args.reason_body(&file_path);
+        tokio::spawn(async move { client.post_json(&path, &body).await })
+    };
+
+    let reason_result = match reason.await {
+        Ok(result) => result,
+        Err(e) => Err(format!("reason task failed: {e}")),
+    };
+    stop_polling.store(true, Ordering::Release);
+    let polled_chunks = poller.await.unwrap_or(0);
+    let reason_response = match reason_result {
+        Ok(response) => response,
+        Err(e) => {
+            progress.clear();
+            return Err(format!("reason failed: {e}"));
+        }
+    };
+    let generated = u64_field(&reason_response, "generated").unwrap_or(polled_chunks as u64);
+    progress.finish(generated);
+
+    if output.json {
+        return print_json(&reason_response);
+    }
+
+    print_analyze_human(&reason_response, output, generated, polled_chunks as u64);
+    Ok(())
+}
+
+fn validate_analyze_args(args: &AnalyzeArgs) -> Result<(), String> {
+    if !args.file.is_file() {
+        return Err(format!("{} is not a file", args.file.display()));
+    }
+    if args.fixed_fps <= 0.0 {
+        return Err("--fixed-fps must be greater than 0".to_string());
+    }
+    if args.chunk_size == 0 {
+        return Err("--chunk-size must be greater than 0".to_string());
+    }
+    if non_empty_opt(&args.model).is_none() {
+        return Err("--model must not be empty".to_string());
+    }
+    Ok(())
+}
+
+async fn upload_analyze_file(client: &ApiClient, file: &Path) -> Result<String, String> {
+    let bytes = fs::read(file).map_err(|e| format!("failed to read {}: {e}", file.display()))?;
+    let file_name = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("upload")
+        .to_string();
+    let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name);
+    let form = reqwest::multipart::Form::new().part("file", part);
+    let response = client.post_multipart("/v1/upload", form).await?;
+    string_field(&response, "file_path")
+        .map(str::to_string)
+        .ok_or_else(|| "response missing string field file_path".to_string())
+}
+
+#[derive(Clone)]
+enum AnalyzeProgress {
+    Hidden,
+    Determinate { bar: ProgressBar, len: u64 },
+    Spinner { bar: ProgressBar },
+}
+
+impl AnalyzeProgress {
+    fn new(output: OutputMode, estimated_chunks: Option<u64>) -> Self {
+        if output.json || !output.color {
+            return Self::Hidden;
+        }
+
+        match estimated_chunks {
+            Some(len) => {
+                let bar = ProgressBar::new(len);
+                bar.set_draw_target(ProgressDrawTarget::stderr());
+                let template = "{bar:40.cyan/blue} {pos}/{len} chunks {elapsed}";
+                if let Ok(style) = ProgressStyle::with_template(template) {
+                    bar.set_style(style.progress_chars("=>-"));
+                }
+                Self::Determinate { bar, len }
+            }
+            None => {
+                let bar = ProgressBar::new_spinner();
+                bar.set_draw_target(ProgressDrawTarget::stderr());
+                if let Ok(style) = ProgressStyle::with_template("{spinner} {msg} {elapsed}") {
+                    bar.set_style(style);
+                }
+                bar.enable_steady_tick(Duration::from_millis(120));
+                bar.set_message("reasoning - 0 chunks");
+                Self::Spinner { bar }
+            }
+        }
+    }
+
+    fn update(&self, chunks: u64) {
+        match self {
+            Self::Hidden => {}
+            Self::Determinate { bar, len } => {
+                let max_before_done = len.saturating_sub(1);
+                bar.set_position(chunks.min(max_before_done));
+            }
+            Self::Spinner { bar } => {
+                bar.set_message(format!("reasoning - {chunks} chunks"));
+            }
+        }
+    }
+
+    fn finish(&self, _generated: u64) {
+        match self {
+            Self::Hidden => {}
+            Self::Determinate { bar, len } => {
+                bar.set_position(*len);
+                bar.finish_and_clear();
+            }
+            Self::Spinner { bar } => {
+                bar.finish_and_clear();
+            }
+        }
+    }
+
+    fn clear(&self) {
+        match self {
+            Self::Hidden => {}
+            Self::Determinate { bar, .. } | Self::Spinner { bar } => {
+                bar.finish_and_clear();
+            }
+        }
+    }
+}
+
+async fn poll_reason_progress(
+    client: ApiClient,
+    run_id: String,
+    index_name: Option<String>,
+    progress: AnalyzeProgress,
+    stop: Arc<AtomicBool>,
+) -> usize {
+    let mut max_chunks = 0usize;
+    while !stop.load(Ordering::Acquire) {
+        if let Some(chunks) =
+            poll_semantic_chunk_count_bounded(&client, &run_id, index_name.as_deref()).await
+        {
+            max_chunks = max_chunks.max(chunks);
+            progress.update(max_chunks as u64);
+        }
+        tokio::time::sleep(Duration::from_millis(750)).await;
+    }
+    if let Some(chunks) =
+        poll_semantic_chunk_count_bounded(&client, &run_id, index_name.as_deref()).await
+    {
+        max_chunks = max_chunks.max(chunks);
+        progress.update(max_chunks as u64);
+    }
+    max_chunks
+}
+
+async fn poll_semantic_chunk_count_bounded(
+    client: &ApiClient,
+    run_id: &str,
+    index_name: Option<&str>,
+) -> Option<usize> {
+    match tokio::time::timeout(
+        ANALYZE_PROGRESS_POLL_TIMEOUT,
+        poll_semantic_chunk_count(client, run_id, index_name),
+    )
+    .await
+    {
+        Ok(Ok(chunks)) => Some(chunks),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+async fn poll_semantic_chunk_count(
+    client: &ApiClient,
+    run_id: &str,
+    index_name: Option<&str>,
+) -> Result<usize, String> {
+    let mut query = Vec::new();
+    if let Some(index_name) = index_name {
+        query.push(("index", index_name.to_string()));
+    }
+    let response = client
+        .get_with_query(&format!("/v1/runs/{run_id}/events"), &query)
+        .await?;
+    Ok(count_semantic_chunks(&response, index_name))
+}
+
+fn count_semantic_chunks(body: &Value, index_name: Option<&str>) -> usize {
+    let Some(events) = body.get("events").and_then(Value::as_array) else {
+        return 0;
+    };
+    let mut chunk_indexes = HashSet::new();
+    let mut without_index = 0usize;
+    for event in events {
+        if string_field(event, "kind") != Some("semantic_chunk_generated") {
+            continue;
+        }
+        let payload = event.get("payload").unwrap_or(&Value::Null);
+        if let Some(index_name) = index_name {
+            if payload.get("index_name").and_then(Value::as_str) != Some(index_name) {
+                continue;
+            }
+        }
+        if let Some(chunk_index) = u64_field(payload, "chunk_index") {
+            chunk_indexes.insert(chunk_index);
+        } else {
+            without_index += 1;
+        }
+    }
+    chunk_indexes.len() + without_index
+}
+
+fn estimate_reason_chunks(
+    decoded_frames: Option<u64>,
+    source_fps: Option<f64>,
+    fixed_fps: f32,
+    chunk_size: usize,
+) -> Option<u64> {
+    let decoded_frames = decoded_frames?;
+    let source_fps = source_fps?;
+    if decoded_frames == 0 || source_fps <= 0.0 || fixed_fps <= 0.0 || chunk_size == 0 {
+        return None;
+    }
+    let duration_s = decoded_frames as f64 / source_fps;
+    let est_reason_frames = duration_s * f64::from(fixed_fps);
+    let chunks = (est_reason_frames / chunk_size as f64).ceil() as u64;
+    Some(chunks.max(1))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TimelineEntry {
+    start_pts: u64,
+    end_pts: u64,
+    summary: String,
+}
+
+fn collapse_semantic_timeline(metadata: &[Value]) -> Vec<TimelineEntry> {
+    let mut entries: Vec<TimelineEntry> = Vec::new();
+    let mut previous_had_summary = false;
+    for frame in metadata {
+        let Some(summary) = frame
+            .get("annotations")
+            .and_then(|annotations| annotations.get("summary"))
+            .and_then(Value::as_str)
+            .and_then(non_empty_opt)
+        else {
+            previous_had_summary = false;
+            continue;
+        };
+        let pts_ms = u64_field(frame, "pts_ms").unwrap_or(0);
+        if let Some(last) = entries.last_mut() {
+            if previous_had_summary && last.summary == summary {
+                last.end_pts = pts_ms;
+                previous_had_summary = true;
+                continue;
+            }
+        }
+        entries.push(TimelineEntry {
+            start_pts: pts_ms,
+            end_pts: pts_ms,
+            summary: summary.to_string(),
+        });
+        previous_had_summary = true;
+    }
+    entries
+}
+
+fn print_analyze_human(response: &Value, output: OutputMode, generated: u64, chunks: u64) {
+    let decoded_frames = u64_field(response, "decoded_frames").unwrap_or(0);
+    let markers_emitted = u64_field(response, "markers_emitted").unwrap_or(0);
+    let sample_fps = response
+        .get("sample_fps")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    println!(
+        "decoded_frames={decoded_frames} frames={generated} chunks={chunks} markers_emitted={markers_emitted} sample_fps={sample_fps:.2}"
+    );
+
+    let metadata = response
+        .get("metadata")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let timeline = collapse_semantic_timeline(metadata);
+    if timeline.is_empty() {
+        println!(
+            "{}",
+            colorize("no semantic annotations were produced", "dim", output.color)
+        );
+    } else {
+        println!();
+        println!("{}", colorize("SEMANTIC TIMELINE", "green", output.color));
+        for entry in timeline {
+            println!(
+                "{}-{}  {}",
+                fmt_pts(entry.start_pts),
+                fmt_pts(entry.end_pts),
+                truncate(&entry.summary, 100)
+            );
+        }
+    }
+
+    let markers = response
+        .get("markers")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if markers.is_empty() {
+        println!();
+        println!("{}", colorize("no markers", "dim", output.color));
+        return;
+    }
+
+    println!();
+    let mut table = table(output.color);
+    table.set_header(["EVENT TYPE", "STATUS", "START->END", "CONFIDENCE"]);
+    for marker in markers {
+        let start_pts = u64_field(marker, "start_pts_ms")
+            .or_else(|| u64_field(marker, "start_pts"))
+            .unwrap_or(0);
+        let end_pts = u64_field(marker, "end_pts_ms")
+            .or_else(|| u64_field(marker, "end_pts"))
+            .unwrap_or(0);
+        let confidence = marker
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        table.add_row([
+            Cell::new(string_field(marker, "event_type").unwrap_or("-")),
+            Cell::new(color_status(
+                string_field(marker, "status").unwrap_or("-"),
+                output.color,
+            )),
+            Cell::new(format!("{}->{}", fmt_pts(start_pts), fmt_pts(end_pts))),
+            Cell::new(format!("{confidence:.2}")),
+        ]);
+    }
+    println!("{table}");
+}
+
+fn status_line(output: OutputMode, message: &str) {
+    if !output.json {
+        eprintln!("{}", colorize(message, "dim", output.color));
+    }
 }
 
 async fn cmd_feedback_submit(
@@ -1673,6 +2215,156 @@ mod tests {
         assert_eq!(
             validate_run_create_response(&non_string_model).unwrap_err(),
             "has non-string field model"
+        );
+    }
+
+    #[test]
+    fn estimate_reason_chunks_uses_duration_and_reason_sampling() {
+        assert_eq!(
+            estimate_reason_chunks(Some(300), Some(30.0), 1.0, 25),
+            Some(1)
+        );
+        assert_eq!(
+            estimate_reason_chunks(Some(3_000), Some(30.0), 1.0, 25),
+            Some(4)
+        );
+        assert_eq!(
+            estimate_reason_chunks(Some(3_600), Some(30.0), 2.0, 25),
+            Some(10)
+        );
+        assert_eq!(estimate_reason_chunks(Some(300), Some(0.0), 1.0, 25), None);
+        assert_eq!(estimate_reason_chunks(Some(0), Some(30.0), 1.0, 25), None);
+    }
+
+    #[test]
+    fn semantic_timeline_collapses_consecutive_identical_summaries() {
+        let empty = collapse_semantic_timeline(&[]);
+        assert!(empty.is_empty());
+
+        let all_identical = serde_json::json!([
+            {"pts_ms": 0, "annotations": {"summary": "same"}},
+            {"pts_ms": 1_000, "annotations": {"summary": "same"}},
+            {"pts_ms": 2_000, "annotations": {"summary": "same"}}
+        ]);
+        let rows =
+            collapse_semantic_timeline(all_identical.as_array().map(Vec::as_slice).unwrap_or(&[]));
+        assert_eq!(
+            rows,
+            vec![TimelineEntry {
+                start_pts: 0,
+                end_pts: 2_000,
+                summary: "same".to_string()
+            }]
+        );
+
+        let alternating = serde_json::json!([
+            {"pts_ms": 0, "annotations": {"summary": "a"}},
+            {"pts_ms": 1_000, "annotations": {"summary": "a"}},
+            {"pts_ms": 2_000, "annotations": {"summary": ""}},
+            {"pts_ms": 3_000, "annotations": {"summary": "a"}},
+            {"pts_ms": 4_000, "annotations": {"summary": "b"}},
+            {"pts_ms": 5_000, "annotations": {"summary": "a"}}
+        ]);
+        let rows =
+            collapse_semantic_timeline(alternating.as_array().map(Vec::as_slice).unwrap_or(&[]));
+        assert_eq!(
+            rows,
+            vec![
+                TimelineEntry {
+                    start_pts: 0,
+                    end_pts: 1_000,
+                    summary: "a".to_string()
+                },
+                TimelineEntry {
+                    start_pts: 3_000,
+                    end_pts: 3_000,
+                    summary: "a".to_string()
+                },
+                TimelineEntry {
+                    start_pts: 4_000,
+                    end_pts: 4_000,
+                    summary: "b".to_string()
+                },
+                TimelineEntry {
+                    start_pts: 5_000,
+                    end_pts: 5_000,
+                    summary: "a".to_string()
+                }
+            ]
+        );
+    }
+
+    fn analyze_args() -> AnalyzeArgs {
+        AnalyzeArgs {
+            file: PathBuf::from("clip.mp4"),
+            prompt: None,
+            model: "vidarax-medium".to_string(),
+            mode: None,
+            fixed_fps: 1.0,
+            chunk_size: 25,
+            max_frames: None,
+            index_name: None,
+            sampling_policy: None,
+        }
+    }
+
+    #[test]
+    fn ingest_body_adds_fixed_fps_only_for_explicit_fixed_sampling() {
+        let mut args = analyze_args();
+
+        let default_body = args.ingest_body("/tmp/uploaded.mp4");
+        assert!(default_body.get("sampling_policy").is_none());
+        assert!(default_body.get("fixed_fps").is_none());
+
+        args.sampling_policy = Some("fixed".to_string());
+        args.fixed_fps = 2.5;
+        let fixed_body = args.ingest_body("/tmp/uploaded.mp4");
+        assert_eq!(
+            fixed_body.get("sampling_policy").and_then(Value::as_str),
+            Some("fixed")
+        );
+        assert_eq!(
+            fixed_body.get("fixed_fps").and_then(Value::as_f64),
+            Some(2.5)
+        );
+
+        args.sampling_policy = Some("adaptive".to_string());
+        let adaptive_body = args.ingest_body("/tmp/uploaded.mp4");
+        assert_eq!(
+            adaptive_body.get("sampling_policy").and_then(Value::as_str),
+            Some("adaptive")
+        );
+        assert!(adaptive_body.get("fixed_fps").is_none());
+    }
+
+    #[test]
+    fn reason_body_omits_absent_semantic_prompt_and_includes_supplied_prompt() {
+        let mut args = analyze_args();
+
+        let without_prompt = args.reason_body("/tmp/uploaded.mp4");
+        assert!(without_prompt.get("semantic_prompt").is_none());
+        assert_eq!(
+            without_prompt
+                .get("sampling_policy")
+                .and_then(Value::as_str),
+            Some("fixed")
+        );
+        assert_eq!(
+            without_prompt.get("fixed_fps").and_then(Value::as_f64),
+            Some(1.0)
+        );
+        assert_eq!(
+            without_prompt
+                .get("semantic_inference")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        args.prompt = Some("custom semantic prompt".to_string());
+        let with_prompt = args.reason_body("/tmp/uploaded.mp4");
+        assert_eq!(
+            with_prompt.get("semantic_prompt").and_then(Value::as_str),
+            Some("custom semantic prompt")
         );
     }
 
