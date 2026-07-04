@@ -495,7 +495,7 @@ fn parse_framemd5_to_signals(
         let luma_mean = (luma_seed as f64 / u32::MAX as f64) as f32;
         let flicker_score = normalize_unit((luma_mean - prev_luma).abs());
         let ghosting_score = prev_hash
-            .map(|prev| normalize_unit(1.0 - ((prev ^ perceptual_hash).count_ones() as f32 / 64.0)))
+            .map(|prev| normalize_unit((prev ^ perceptual_hash).count_ones() as f32 / 64.0))
             .unwrap_or(0.0);
         let noise_variance_score = (noise_seed as f64 / u32::MAX as f64) as f32;
         let pts_ms = normalizer.normalize_pts_ms(pts, tb_num, tb_den);
@@ -537,6 +537,10 @@ fn parse_ffprobe_frame_rate(raw: &str) -> Option<f32> {
         return None;
     }
     if let Some((num, den)) = raw.split_once('/') {
+        // Normalised Hamming *distance* (hd/64), same polarity as the live
+        // webrtc path (signals.rs): a bigger hash delta = higher score. The old
+        // `1.0 - hd/64` (similarity) was inverted — a static screen scored 1.0
+        // and tripped the gate's ghosting threshold on every frame.
         let num = num.trim().parse::<f32>().ok()?;
         let den = den.trim().parse::<f32>().ok()?;
         if den <= 0.0 {
@@ -1091,9 +1095,11 @@ mod tests {
         let decoded = parse_framemd5_to_signals(framemd5, "/tmp/test.mp4", 8, &real).unwrap();
         assert_eq!(decoded.frame_signals[0].perceptual_hash, real[0]);
         assert_eq!(decoded.frame_signals[1].perceptual_hash, real[1]);
-        // Ghosting is now the real-hash Hamming similarity: hd(real[0],real[1]).
+        // Ghosting is the normalised Hamming *distance* hd/64 — same polarity as
+        // the live webrtc path (signals.rs), where a bigger hash delta = higher
+        // score. Static frames score ~0 (not 1), matching the gate's artifact model.
         let hd = (real[0] ^ real[1]).count_ones() as f32;
-        let expect = (1.0 - hd / 64.0).clamp(0.0, 1.0);
+        let expect = (hd / 64.0).clamp(0.0, 1.0);
         assert!((decoded.frame_signals[1].ghosting_score - expect).abs() < 1e-6);
     }
 
