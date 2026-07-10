@@ -10,8 +10,8 @@ use std::sync::RwLock;
 use std::sync::{Arc, OnceLock};
 
 use crate::ingest::{
-    decode_mp4_to_frame_signals, decode_selective_jpeg_frames, DecodedJpegFrame, DecodedMp4Batch,
-    InputSource, Mp4DecodeConfig,
+    decode_mp4_to_frame_signals, decode_selective_jpeg_frames, extract_video_clip,
+    DecodedJpegFrame, DecodedMp4Batch, InputSource, Mp4DecodeConfig,
 };
 
 static DETECTED_BACKEND: OnceLock<PipelineBackend> = OnceLock::new();
@@ -23,10 +23,13 @@ static DECODE_REGISTRY: OnceLock<RwLock<HashMap<&'static str, DecodeFactory>>> =
 pub enum PipelineBackend {
     /// ffmpeg subprocess, CPU decode, CPU JPEG encode. Works everywhere.
     CpuFfmpeg,
-    /// ffmpeg `-hwaccel nvdec` for decode, CUDA for JPEG encode. Requires an NVIDIA GPU.
+    /// ffmpeg `-hwaccel nvdec` decodes on the GPU; frames are then downloaded and JPEG-encoded on
+    /// the CPU. Requires an NVIDIA GPU.
     NvdecCuda,
-    /// MLX framework for Apple Silicon. Requires macOS on an M-series chip.
-    Mlx,
+    /// ffmpeg `-hwaccel videotoolbox` decodes on Apple Silicon's media engine for the JPEG
+    /// phase; frames are JPEG-encoded on the CPU. Requires an ffmpeg build with VideoToolbox
+    /// support.
+    VideoToolbox,
 }
 
 impl PipelineBackend {
@@ -34,9 +37,9 @@ impl PipelineBackend {
         match s.to_ascii_lowercase().as_str() {
             "cpu" | "ffmpeg" | "cpu-ffmpeg" => Ok(Self::CpuFfmpeg),
             "nvdec" | "cuda" | "nvdec-cuda" | "gpu" => Ok(Self::NvdecCuda),
-            "mlx" | "apple" | "metal" => Ok(Self::Mlx),
+            "mlx" | "apple" | "metal" | "videotoolbox" => Ok(Self::VideoToolbox),
             other => Err(format!(
-                "unknown decode backend '{other}', expected one of: cpu, nvdec, mlx"
+                "unknown decode backend '{other}', expected one of: cpu, nvdec, videotoolbox"
             )),
         }
     }
@@ -53,25 +56,7 @@ impl PipelineBackend {
             {
                 Self::NvdecCuda
             } else {
-                #[cfg(target_os = "macos")]
-                {
-                    if std::process::Command::new("python3")
-                        .args(["-c", "import mlx.core"])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false)
-                    {
-                        Self::Mlx
-                    } else {
-                        Self::CpuFfmpeg
-                    }
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    Self::CpuFfmpeg
-                }
+                Self::CpuFfmpeg
             };
             if decode_registry()
                 .read()
@@ -89,7 +74,7 @@ impl PipelineBackend {
         match self {
             Self::CpuFfmpeg => "cpu-ffmpeg",
             Self::NvdecCuda => "nvdec-cuda",
-            Self::Mlx => "mlx",
+            Self::VideoToolbox => "videotoolbox",
         }
     }
 }
@@ -111,13 +96,28 @@ pub trait DecodePipeline: Send + Sync {
     ) -> Result<DecodedMp4Batch, String>;
 
     /// An empty `frame_indices` returns no frames without invoking ffmpeg.
+    ///
+    /// `max_edge` optionally caps the longest edge of each emitted frame (see
+    /// [`Mp4DecodeConfig::max_edge`]) — the "fewer pixels" lever for VLM token cost.
     fn decode_jpegs(
         &self,
         source: &InputSource,
         sample_fps: f32,
         frame_indices: &[u64],
         max_frames: usize,
+        max_edge: Option<u32>,
     ) -> Result<Vec<DecodedJpegFrame>, String>;
+
+    /// Extract a short self-contained MP4 clip beginning at `start_s` and
+    /// running for `duration_s` seconds. Clip-mode realtime analysis hands the
+    /// VLM this moving window instead of stills, so it rides the same swappable
+    /// backend as the two decode phases.
+    fn extract_clip(
+        &self,
+        source: &InputSource,
+        start_s: f32,
+        duration_s: f32,
+    ) -> Result<Vec<u8>, String>;
 
     fn backend(&self) -> PipelineBackend;
 
@@ -152,11 +152,21 @@ impl DecodePipeline for CpuFfmpegPipeline {
         sample_fps: f32,
         frame_indices: &[u64],
         max_frames: usize,
+        max_edge: Option<u32>,
     ) -> Result<Vec<DecodedJpegFrame>, String> {
         if frame_indices.is_empty() {
             return Ok(Vec::new());
         }
-        decode_selective_jpeg_frames(source, sample_fps, frame_indices, max_frames)
+        decode_selective_jpeg_frames(source, sample_fps, frame_indices, max_frames, max_edge)
+    }
+
+    fn extract_clip(
+        &self,
+        source: &InputSource,
+        start_s: f32,
+        duration_s: f32,
+    ) -> Result<Vec<u8>, String> {
+        extract_video_clip(source, start_s, duration_s)
     }
 
     fn backend(&self) -> PipelineBackend {
@@ -193,11 +203,23 @@ impl DecodePipeline for NvdecCudaPipeline {
         sample_fps: f32,
         frame_indices: &[u64],
         max_frames: usize,
+        max_edge: Option<u32>,
     ) -> Result<Vec<DecodedJpegFrame>, String> {
         if frame_indices.is_empty() {
             return Ok(Vec::new());
         }
-        decode_selective_jpeg_frames_nvdec(source, sample_fps, frame_indices, max_frames)
+        decode_selective_jpeg_frames_nvdec(source, sample_fps, frame_indices, max_frames, max_edge)
+    }
+
+    fn extract_clip(
+        &self,
+        source: &InputSource,
+        start_s: f32,
+        duration_s: f32,
+    ) -> Result<Vec<u8>, String> {
+        // Local clips are a stream copy and remote ones a short segment re-encode,
+        // so NVDEC buys no decode win here. Reuse the CPU extractor.
+        extract_video_clip(source, start_s, duration_s)
     }
 
     fn backend(&self) -> PipelineBackend {
@@ -217,9 +239,16 @@ fn decode_selective_jpeg_frames_nvdec(
     sample_fps: f32,
     frame_indices: &[u64],
     max_frames: usize,
+    max_edge: Option<u32>,
 ) -> Result<Vec<DecodedJpegFrame>, String> {
     super::fetch::with_prefetched_downloadable_source(source, |source| {
-        decode_selective_jpeg_frames_nvdec_inner(source, sample_fps, frame_indices, max_frames)
+        decode_selective_jpeg_frames_nvdec_inner(
+            source,
+            sample_fps,
+            frame_indices,
+            max_frames,
+            max_edge,
+        )
     })?
 }
 
@@ -228,6 +257,7 @@ fn decode_selective_jpeg_frames_nvdec_inner(
     sample_fps: f32,
     frame_indices: &[u64],
     max_frames: usize,
+    max_edge: Option<u32>,
 ) -> Result<Vec<DecodedJpegFrame>, String> {
     use crate::ingest::{
         build_select_expr, ffmpeg_input_options_for_source, ffmpeg_protocol_whitelist_for_source,
@@ -235,8 +265,12 @@ fn decode_selective_jpeg_frames_nvdec_inner(
     use std::process::Command;
 
     let select_expr = build_select_expr(frame_indices);
-    let vf_chain =
-        format!("fps={sample_fps:.3},hwdownload,format=nv12,{select_expr},format=yuv420p");
+    let vf_chain = match super::ffmpeg::longest_edge_scale_filter(max_edge) {
+        Some(scale) => format!(
+            "fps={sample_fps:.3},hwdownload,format=nv12,{select_expr},format=yuv420p,{scale}"
+        ),
+        None => format!("fps={sample_fps:.3},hwdownload,format=nv12,{select_expr},format=yuv420p"),
+    };
     let frames_cap = frame_indices.len().min(max_frames).to_string();
 
     let output = Command::new(super::ffmpeg_path())
@@ -291,18 +325,20 @@ fn decode_selective_jpeg_frames_nvdec_inner(
 }
 
 // ---------------------------------------------------------------------------
-// MLX backend (Apple Silicon)
+// VideoToolbox (Apple Silicon) backend
 // ---------------------------------------------------------------------------
 
-pub struct MlxPipeline;
+pub struct MlxVideoToolboxPipeline;
 
-impl DecodePipeline for MlxPipeline {
+impl DecodePipeline for MlxVideoToolboxPipeline {
     fn decode_signals(
         &self,
         source: &InputSource,
         config: Mp4DecodeConfig,
     ) -> Result<DecodedMp4Batch, String> {
-        CpuFfmpegPipeline.decode_signals(source, config)
+        // framemd5 is text output with no hardware-decode benefit, same reasoning
+        // as NvdecCudaPipeline above.
+        decode_mp4_to_frame_signals(source, config)
     }
 
     fn decode_jpegs(
@@ -311,20 +347,131 @@ impl DecodePipeline for MlxPipeline {
         sample_fps: f32,
         frame_indices: &[u64],
         max_frames: usize,
+        max_edge: Option<u32>,
     ) -> Result<Vec<DecodedJpegFrame>, String> {
-        CpuFfmpegPipeline.decode_jpegs(source, sample_fps, frame_indices, max_frames)
+        if frame_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        decode_selective_jpeg_frames_videotoolbox(
+            source,
+            sample_fps,
+            frame_indices,
+            max_frames,
+            max_edge,
+        )
+    }
+
+    fn extract_clip(
+        &self,
+        source: &InputSource,
+        start_s: f32,
+        duration_s: f32,
+    ) -> Result<Vec<u8>, String> {
+        // Local clips are a stream copy and remote ones a short segment re-encode,
+        // so VideoToolbox buys no decode win here either. Reuse the CPU extractor.
+        extract_video_clip(source, start_s, duration_s)
     }
 
     fn backend(&self) -> PipelineBackend {
-        PipelineBackend::Mlx
+        PipelineBackend::VideoToolbox
     }
 
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities {
-            hardware_decode: false,
-            notes: "MLX backend not yet implemented; falls back to CPU ffmpeg",
+            hardware_decode: true,
+            notes: "VideoToolbox hardware decode (Apple Silicon); signals phase runs on CPU",
         }
     }
+}
+
+fn decode_selective_jpeg_frames_videotoolbox(
+    source: &InputSource,
+    sample_fps: f32,
+    frame_indices: &[u64],
+    max_frames: usize,
+    max_edge: Option<u32>,
+) -> Result<Vec<DecodedJpegFrame>, String> {
+    super::fetch::with_prefetched_downloadable_source(source, |source| {
+        decode_selective_jpeg_frames_videotoolbox_inner(
+            source,
+            sample_fps,
+            frame_indices,
+            max_frames,
+            max_edge,
+        )
+    })?
+}
+
+fn decode_selective_jpeg_frames_videotoolbox_inner(
+    source: &InputSource,
+    sample_fps: f32,
+    frame_indices: &[u64],
+    max_frames: usize,
+    max_edge: Option<u32>,
+) -> Result<Vec<DecodedJpegFrame>, String> {
+    use crate::ingest::{
+        build_select_expr, ffmpeg_input_options_for_source, ffmpeg_protocol_whitelist_for_source,
+    };
+    use std::process::Command;
+
+    let select_expr = build_select_expr(frame_indices);
+    // Unlike the nvdec path, this leaves -hwaccel_output_format unset, so
+    // VideoToolbox hands decoded frames back in a normal software pixel format
+    // and the filter chain here is the same fps+select+scale chain the CPU path
+    // uses. No hwdownload/format step is needed before the mjpeg encoder.
+    let vf_chain = match super::ffmpeg::longest_edge_scale_filter(max_edge) {
+        Some(scale) => format!("fps={sample_fps:.3},{select_expr},{scale}"),
+        None => format!("fps={sample_fps:.3},{select_expr}"),
+    };
+    let frames_cap = frame_indices.len().min(max_frames).to_string();
+
+    let output = Command::new(super::ffmpeg_path())
+        .args([
+            "-hwaccel",
+            "videotoolbox",
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            ffmpeg_protocol_whitelist_for_source(source),
+        ])
+        .args(ffmpeg_input_options_for_source(source))
+        .args([
+            "-i",
+            source.as_ffmpeg_input(),
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            &vf_chain,
+            "-vsync",
+            "vfr",
+            "-frames:v",
+            &frames_cap,
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "-",
+        ])
+        .output()
+        .map_err(|_| "failed to run ffmpeg with VideoToolbox".to_string())?;
+
+    if !output.status.success() {
+        tracing::warn!(
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "ffmpeg videotoolbox decode failed"
+        );
+        return Err("GPU video decode failed".to_string());
+    }
+
+    let mut parsed =
+        crate::ingest::parse_jpeg_stream_to_frames(&output.stdout, frame_indices.len())?;
+    let usable = parsed.len().min(frame_indices.len());
+    parsed.truncate(usable);
+    for (frame, &idx) in parsed.iter_mut().zip(frame_indices.iter()) {
+        frame.frame_index = idx;
+    }
+    Ok(parsed)
 }
 
 // ---------------------------------------------------------------------------
@@ -339,8 +486,8 @@ fn nvdec_pipeline() -> Arc<dyn DecodePipeline> {
     Arc::new(NvdecCudaPipeline)
 }
 
-fn mlx_pipeline() -> Arc<dyn DecodePipeline> {
-    Arc::new(MlxPipeline)
+fn videotoolbox_pipeline() -> Arc<dyn DecodePipeline> {
+    Arc::new(MlxVideoToolboxPipeline)
 }
 
 fn decode_registry() -> &'static RwLock<HashMap<&'static str, DecodeFactory>> {
@@ -352,8 +499,8 @@ fn decode_registry() -> &'static RwLock<HashMap<&'static str, DecodeFactory>> {
         for name in ["nvdec", "cuda", "nvdec-cuda", "gpu"] {
             registry.insert(name, nvdec_pipeline as DecodeFactory);
         }
-        for name in ["mlx", "apple", "metal"] {
-            registry.insert(name, mlx_pipeline as DecodeFactory);
+        for name in ["mlx", "apple", "metal", "videotoolbox"] {
+            registry.insert(name, videotoolbox_pipeline as DecodeFactory);
         }
         RwLock::new(registry)
     })
@@ -380,15 +527,5 @@ pub fn build_decode_pipeline(name: &str) -> Result<Arc<dyn DecodePipeline>, Stri
 
 /// Build the decode pipeline for `backend`.
 pub fn create_pipeline(backend: PipelineBackend) -> Arc<dyn DecodePipeline> {
-    let pipeline = build_decode_pipeline(backend.label()).expect("built-in decode backend missing");
-
-    let caps = pipeline.capabilities();
-    if backend != PipelineBackend::CpuFfmpeg && !caps.hardware_decode {
-        tracing::warn!(
-            backend = backend.label(),
-            notes = caps.notes,
-            "decode backend has no hardware acceleration; using CPU fallback"
-        );
-    }
-    pipeline
+    build_decode_pipeline(backend.label()).expect("built-in decode backend missing")
 }

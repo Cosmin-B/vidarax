@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use vidarax_core::ingest::pipeline::{
-    build_decode_pipeline, register_decode_backend, BackendCapabilities, DecodePipeline,
-    PipelineBackend,
+    build_decode_pipeline, create_pipeline, register_decode_backend, BackendCapabilities,
+    DecodePipeline, PipelineBackend,
 };
 use vidarax_core::ingest::{DecodedJpegFrame, DecodedMp4Batch, InputSource, Mp4DecodeConfig};
 
@@ -32,9 +32,38 @@ fn backend_from_env_string() {
     ));
     assert!(matches!(
         PipelineBackend::parse("mlx"),
-        Ok(PipelineBackend::Mlx)
+        Ok(PipelineBackend::VideoToolbox)
+    ));
+    assert!(matches!(
+        PipelineBackend::parse("apple"),
+        Ok(PipelineBackend::VideoToolbox)
+    ));
+    assert!(matches!(
+        PipelineBackend::parse("metal"),
+        Ok(PipelineBackend::VideoToolbox)
+    ));
+    assert!(matches!(
+        PipelineBackend::parse("videotoolbox"),
+        Ok(PipelineBackend::VideoToolbox)
     ));
     assert!(PipelineBackend::parse("invalid").is_err());
+}
+
+#[test]
+fn registry_builds_videotoolbox_backend_under_every_alias() {
+    for alias in ["mlx", "apple", "metal", "videotoolbox"] {
+        let pipeline =
+            build_decode_pipeline(alias).unwrap_or_else(|_| panic!("{alias} backend should build"));
+        assert!(matches!(pipeline.backend(), PipelineBackend::VideoToolbox));
+        assert!(pipeline.capabilities().hardware_decode);
+    }
+}
+
+#[test]
+fn create_pipeline_builds_videotoolbox_backend() {
+    let pipeline = create_pipeline(PipelineBackend::VideoToolbox);
+    assert!(matches!(pipeline.backend(), PipelineBackend::VideoToolbox));
+    assert_eq!(pipeline.backend().label(), "videotoolbox");
 }
 
 #[test]
@@ -85,7 +114,17 @@ impl DecodePipeline for CustomPipeline {
         _sample_fps: f32,
         _frame_indices: &[u64],
         _max_frames: usize,
+        _max_edge: Option<u32>,
     ) -> Result<Vec<DecodedJpegFrame>, String> {
+        unimplemented!("test backend is only built, not executed")
+    }
+
+    fn extract_clip(
+        &self,
+        _source: &InputSource,
+        _start_s: f32,
+        _duration_s: f32,
+    ) -> Result<Vec<u8>, String> {
         unimplemented!("test backend is only built, not executed")
     }
 
