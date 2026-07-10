@@ -89,11 +89,15 @@ fn deterministic_replay_hash_is_stable() {
 
     let run_once = || {
         let mut gate = GateEngine::new(config.clone());
-        signals
-            .iter()
-            .copied()
-            .map(|s| gate.process(s))
-            .collect::<Vec<_>>()
+        let mut events = Vec::with_capacity(signals.len());
+        for signal in signals.iter().copied() {
+            let event = gate.process(signal);
+            if event.event_type == vidarax_core::gate::GateEventType::KeepKeyframe {
+                gate.commit_keyframe(signal);
+            }
+            events.push(event);
+        }
+        events
     };
 
     let first = run_once();

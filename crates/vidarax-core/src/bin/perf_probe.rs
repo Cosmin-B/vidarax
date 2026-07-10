@@ -2,7 +2,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use vidarax_core::gate::{FrameSignal, GateConfig, GateEngine};
+use vidarax_core::gate::{FrameSignal, GateConfig, GateEngine, GateEventType};
 
 struct CountingAllocator;
 
@@ -70,8 +70,16 @@ fn bench_gate_path(samples: usize) -> GateStats {
             noise_variance_score: if i % 220 == 0 { 0.9 } else { 0.0 },
         };
         let start = Instant::now();
-        let _event = gate.process(signal);
-        durations.push(start.elapsed().as_nanos() as u64);
+        let event = gate.process(signal);
+        let elapsed = start.elapsed().as_nanos() as u64;
+        // Commit kept keyframes so the reference frame advances like a real
+        // stream. process() now only classifies; without this the gate would
+        // never gain a reference and every sample would hit the initial-frame
+        // branch instead of the steady-state comparison path we mean to time.
+        if event.event_type == GateEventType::KeepKeyframe {
+            gate.commit_keyframe(signal);
+        }
+        durations.push(elapsed);
     }
 
     durations.sort_unstable();
@@ -95,7 +103,10 @@ fn allocation_probe(frames: usize) -> AllocStats {
             ghosting_score: 0.0,
             noise_variance_score: 0.0,
         };
-        let _event = gate.process(signal);
+        let event = gate.process(signal);
+        if event.event_type == GateEventType::KeepKeyframe {
+            gate.commit_keyframe(signal);
+        }
     }
 
     let total = ALLOCATIONS.load(Ordering::Relaxed).saturating_sub(before);
