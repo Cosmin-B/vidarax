@@ -1,3 +1,7 @@
+# vidarax-api requires an x-api-key on /v1/metrics by default (see
+# docker-compose.local.yml), so this scrape sends the same local-dev
+# placeholder key VIDARAX_API_KEYS is set to there. Keep the two in sync:
+# if the compose key changes, update the header value below to match.
 scrape_configs:
   - job_name: vidarax-api
     scrape_interval: 10s
@@ -5,3 +9,5 @@ scrape_configs:
       - targets:
           - vidarax-api:8080
     metrics_path: /v1/metrics
+    headers:
+      - "x-api-key: local-dev-only-key-do-not-use-in-prod"

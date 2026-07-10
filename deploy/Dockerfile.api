@@ -11,13 +11,21 @@ COPY scripts ./scripts
 RUN cargo build --release -p vidarax-api
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/* \
+# ffmpeg (which also provides ffprobe) is required at runtime: the decode and
+# ingest path shells out to it rather than linking against it.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg && rm -rf /var/lib/apt/lists/* \
     && useradd --system --home /nonexistent --shell /usr/sbin/nologin vidarax \
     && mkdir -p /var/lib/vidarax \
     && chown -R vidarax:vidarax /var/lib/vidarax
 WORKDIR /app
 
 COPY --from=builder /build/target/release/vidarax-api /usr/local/bin/vidarax-api
+# The binary looks for a config file at the relative path "vidarax.toml"
+# (overridable with VIDARAX_CONFIG), resolved against its working directory.
+# Ship the repo's self-hosted default here, at WORKDIR /app, so it actually
+# applies in the container instead of silently falling back to the legacy
+# VIDARAX_VLLM_BASE_URL / VIDARAX_SGLANG_BASE_URL env vars.
+COPY vidarax.toml ./vidarax.toml
 EXPOSE 8080 8443/udp
 
 ENV VIDARAX_BIND_ADDR=0.0.0.0:8080
