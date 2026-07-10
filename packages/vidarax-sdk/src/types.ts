@@ -543,9 +543,15 @@ export interface WhipSession {
 
 // ─── SDK-level convenience types ─────────────────────────────────────────────
 
-/** Options accepted by `Vidarax.analyze()`. */
+/**
+ * Options accepted by `Vidarax.analyze()`.
+ *
+ * There is no `prompt` field here on purpose: `analyze()` drives the
+ * deterministic frame-signal pipeline (`AnalyzeFramesRequest` on the server),
+ * which has no prompt input to accept. For prompt-driven semantic analysis,
+ * use `Vidarax.reason()` and its `semantic_prompt` field instead.
+ */
 export interface AnalyzeOptions {
-  prompt?: string;
   model?: string;
   mode?: string;
   samplingPolicy?: SamplingPolicy;

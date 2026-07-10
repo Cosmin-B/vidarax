@@ -4,7 +4,7 @@
  * ```typescript
  * import { Vidarax } from 'vidarax'
  * const v = new Vidarax('http://localhost:8080')
- * const run = await v.analyze('video.mp4', { prompt: 'Describe what happens' })
+ * const run = await v.analyze('video.mp4', { mode: 'balanced' })
  * for await (const event of run.events()) {
  *   console.log(event.kind, event.payload)
  * }
@@ -372,7 +372,9 @@ export class Vidarax {
   /**
    * Retrieve all timeline events for a run as a plain array.
    *
-   * For a streaming/async-iterable version see `streamEvents()`.
+   * For an async-iterable version of this same snapshot see `streamEvents()`
+   * (it fetches a one-time snapshot, not a live stream and not repeated
+   * polling; the server has no SSE endpoint).
    */
   async getEvents(runId: string): Promise<AgentEvent[]> {
     const res = await this.get<EventsResponse>(
@@ -384,7 +386,9 @@ export class Vidarax {
   /**
    * Retrieve all markers for a run with optional filtering.
    *
-   * For a streaming version see `streamMarkers()`.
+   * For an async-iterable version of this same snapshot see `streamMarkers()`
+   * (it fetches a one-time snapshot, not a live stream and not repeated
+   * polling; the server has no SSE endpoint).
    */
   async getMarkers(runId: string, query: MarkerQuery = {}): Promise<Marker[]> {
     const params = new URLSearchParams();
@@ -421,13 +425,16 @@ export class Vidarax {
    * Returns an `AnalysisResult` handle with `.events()` and `.markers()`
    * async generators for iterating over results.
    *
+   * This runs the deterministic frame-signal pipeline and takes no prompt —
+   * for prompt-driven semantic analysis use `reason()` with `semantic_prompt`.
+   *
    * @param source  A file path / URI understood by the Vidarax server
    *                (e.g. `"file:///data/video.mp4"` or an HTTP URL), or a
    *                `File` object that is uploaded first via `uploadFile()`.
    * @param options Analysis configuration.
    *
    * @example
-   * const result = await v.analyze('video.mp4', { prompt: 'Describe what happens' })
+   * const result = await v.analyze('video.mp4', { mode: 'balanced' })
    * for await (const event of result.events()) {
    *   console.log(event.kind, event.payload)
    * }
@@ -588,13 +595,22 @@ export class Vidarax {
     return this.post<InferBatchResponse>("/v1/infer/batch", body);
   }
 
-  // ─── Streaming iterables ──────────────────────────────────────────────────
+  // ─── Polling iterables (not live streams) ─────────────────────────────────
+  //
+  // The server has no SSE / long-lived streaming route for events or markers
+  // — GET /v1/runs/{id}/events and GET /v1/runs/{id}/markers each return a
+  // full snapshot of current state. These two methods are async-iterable
+  // conveniences over that snapshot, not incremental push updates. Call them
+  // again (e.g. on a timer) to observe new events/markers as a run progresses.
 
   /**
-   * Yield all timeline events for a run.
+   * Fetch the current timeline events for a run and yield them as an
+   * async iterable, one call, one snapshot.
    *
-   * This fetches the current event list once and yields it in sequence order.
-   * Incremental live streaming is not yet implemented.
+   * This is NOT a live/incremental stream: it issues a single GET and yields
+   * whatever events exist at that moment, in sequence order. There is no
+   * server-side push endpoint (no SSE) for events. Poll by calling this
+   * again if you need to observe events emitted after the initial fetch.
    *
    * @example
    * for await (const event of v.streamEvents(runId)) {
@@ -609,10 +625,13 @@ export class Vidarax {
   }
 
   /**
-   * Yield all markers for a run.
+   * Fetch the current markers for a run and yield them as an async iterable,
+   * one call, one snapshot.
    *
-   * This fetches the current marker list once and yields it in response order.
-   * Incremental live streaming is not yet implemented.
+   * This is NOT a live/incremental stream: it issues a single GET and yields
+   * whatever markers exist at that moment, in response order. There is no
+   * server-side push endpoint (no SSE) for markers. Poll by calling this
+   * again if you need to observe markers emitted after the initial fetch.
    *
    * @example
    * for await (const marker of v.streamMarkers(runId)) {
