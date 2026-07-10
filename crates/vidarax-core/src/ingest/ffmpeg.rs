@@ -1,5 +1,5 @@
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::gate::FrameSignal;
 
@@ -119,6 +119,32 @@ pub struct FramePacket {
     pub source_uri: String,
 }
 
+/// A stream time base as a rational `num/den` seconds per PTS tick, with the two
+/// halves kept together so a caller cannot transpose them. A bare `(num, den)`
+/// pair of `u32`s is the classic way a PTS-to-milliseconds conversion silently
+/// corrupts a whole stream: the two arguments are adjacent, same-typed, and a
+/// swap compiles cleanly while turning, say, 1/1000 into 1000/1. Both halves are
+/// floored at 1 in the constructor — a zero from a malformed container header
+/// would otherwise make the ratio degenerate or divide by zero — so downstream
+/// arithmetic stays total and needs no second guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timebase {
+    num: u32,
+    den: u32,
+}
+
+impl Timebase {
+    /// Builds a time base, flooring each half at 1. Keeping that clamp here means
+    /// the "never zero" invariant lives in exactly one place rather than at every
+    /// site that parses a `num/den` out of a container.
+    pub fn new(num: u32, den: u32) -> Self {
+        Self {
+            num: num.max(1),
+            den: den.max(1),
+        }
+    }
+}
+
 pub struct TimestampNormalizer {
     base_pts: Option<i64>,
     last_ms: u64,
@@ -133,16 +159,19 @@ impl TimestampNormalizer {
     }
 
     /// Normalizes PTS to monotonic milliseconds from the first observed frame.
-    pub fn normalize_pts_ms(&mut self, pts: i64, timebase_num: u32, timebase_den: u32) -> u64 {
+    pub fn normalize_pts_ms(&mut self, pts: i64, timebase: Timebase) -> u64 {
         let base = *self.base_pts.get_or_insert(pts);
         let delta = pts.saturating_sub(base).max(0) as u128;
-        let num = (timebase_num as u128).saturating_mul(1000);
-        let den = (timebase_den as u128).max(1);
+        let num = (timebase.num as u128).saturating_mul(1000);
+        let den = timebase.den as u128;
         let mut ms = delta.saturating_mul(num) / den;
         if ms < self.last_ms as u128 {
             ms = self.last_ms as u128;
         }
-        let ms = ms as u64;
+        // Saturate rather than truncate: an absurd timebase can push the u128
+        // result past u64::MAX, and a plain cast would wrap it below last_ms and
+        // break the monotonic contract this function promises.
+        let ms = ms.min(u64::MAX as u128) as u64;
         self.last_ms = ms;
         ms
     }
@@ -182,6 +211,15 @@ pub fn make_frame_packet(input: FramePacketInput<'_>) -> FramePacket {
 pub struct Mp4DecodeConfig {
     pub sample_fps: f32,
     pub max_frames: usize,
+    /// Optional cap on the longest edge of each decoded frame, in pixels.
+    ///
+    /// When set, an ffmpeg `scale` filter downsamples every frame so its longer
+    /// side is at most this many pixels (aspect preserved, even dims, never
+    /// upscaled). This is the "fewer pixels" lever: a 1920x1080 frame costs ~4
+    /// Gemini image tiles, but capping the longest edge to 768 collapses it to a
+    /// single tile — roughly a 4x cut in per-image prompt tokens. `None` leaves
+    /// frames at source resolution.
+    pub max_edge: Option<u32>,
 }
 
 impl Default for Mp4DecodeConfig {
@@ -189,6 +227,7 @@ impl Default for Mp4DecodeConfig {
         Self {
             sample_fps: 2.0,
             max_frames: 512,
+            max_edge: None,
         }
     }
 }
@@ -205,7 +244,7 @@ pub struct DecodedMp4Batch {
 #[derive(Debug, Clone)]
 pub struct DecodedJpegFrame {
     pub frame_index: u64,
-    pub jpeg_bytes: Vec<u8>,
+    pub jpeg_bytes: Arc<[u8]>,
 }
 
 pub fn probe_source_fps(source: &InputSource) -> Option<f32> {
@@ -334,8 +373,20 @@ fn compute_ahashes_from_source(
         .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
         .args(ffmpeg_input_options_for_source(source))
         .args([
-            "-i", source_uri, "-an", "-sn", "-dn", "-vf", &vf_expr, "-frames:v",
-            &max_frames.to_string(), "-f", "rawvideo", "-pix_fmt", "gray", "-",
+            "-i",
+            source_uri,
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            &vf_expr,
+            "-frames:v",
+            &max_frames.to_string(),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
         ])
         .output()
         .map_err(|_| "failed to run ffmpeg".to_string())?;
@@ -371,6 +422,39 @@ fn ahash_cell_grid(cells: &[u8]) -> u64 {
     hash
 }
 
+/// An ffmpeg `scale` filter that caps the longest edge of a frame to `max_edge`
+/// pixels, or `None` when no cap is requested.
+///
+/// The expression preserves aspect ratio, forces even output dimensions
+/// (`-2`), and never upscales (`min(edge, source_dim)`). Landscape/square frames
+/// cap width; portrait caps height. This is the "fewer pixels" lever: a
+/// 1920x1080 frame costs ~4 Gemini image tiles, but capping the longest edge to
+/// 768 collapses it to a single tile — roughly a 4x cut in per-image tokens.
+pub(crate) fn longest_edge_scale_filter(max_edge: Option<u32>) -> Option<String> {
+    match max_edge {
+        Some(edge) if edge > 1 => {
+            // Force the cap even so the explicitly-sized side is even; the
+            // derived side uses `-2` (nearest even). Both even keeps the mjpeg /
+            // yuv420p (4:2:0) NVDEC path valid for any requested cap, e.g. 769.
+            let edge = edge & !1;
+            Some(format!(
+                "scale='if(gte(iw,ih),min(iw,{edge}),-2)':'if(gte(iw,ih),-2,min(ih,{edge}))'"
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Build the `-vf` chain for a full JPEG decode: `fps` sampler plus an optional
+/// longest-edge scale cap.
+fn build_decode_vf(sample_fps: f32, max_edge: Option<u32>) -> String {
+    let fps_expr = format!("fps={sample_fps:.3}");
+    match longest_edge_scale_filter(max_edge) {
+        Some(scale) => format!("{fps_expr},{scale}"),
+        None => fps_expr,
+    }
+}
+
 pub fn decode_mp4_to_jpeg_frames(
     source: &InputSource,
     config: Mp4DecodeConfig,
@@ -393,7 +477,7 @@ fn decode_mp4_to_jpeg_frames_inner(
 
     let source_uri = source.as_ffmpeg_input();
     let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
-    let fps_expr = format!("fps={:.3}", config.sample_fps);
+    let vf_expr = build_decode_vf(config.sample_fps, config.max_edge);
     let output = Command::new(ffmpeg_path())
         .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
         .args(ffmpeg_input_options_for_source(source))
@@ -404,7 +488,7 @@ fn decode_mp4_to_jpeg_frames_inner(
             "-sn",
             "-dn",
             "-vf",
-            &fps_expr,
+            &vf_expr,
             "-frames:v",
             &config.max_frames.to_string(),
             "-f",
@@ -431,8 +515,7 @@ fn parse_framemd5_to_signals(
     max_frames: usize,
     ahashes: &[u64],
 ) -> Result<DecodedMp4Batch, String> {
-    let mut tb_num = 1u32;
-    let mut tb_den = 1000u32;
+    let mut timebase = Timebase::new(1, 1000);
     let mut width = 0u32;
     let mut height = 0u32;
     let mut normalizer = TimestampNormalizer::new();
@@ -447,8 +530,7 @@ fn parse_framemd5_to_signals(
         }
         if let Some(rest) = line.strip_prefix("#tb ") {
             if let Some((num, den)) = parse_fraction_suffix(rest) {
-                tb_num = num.max(1);
-                tb_den = den.max(1);
+                timebase = Timebase::new(num, den);
             }
             continue;
         }
@@ -494,11 +576,15 @@ fn parse_framemd5_to_signals(
         let noise_seed = parse_hex_u64_prefix(checksum, 24, 8).unwrap_or(0) as u32;
         let luma_mean = (luma_seed as f64 / u32::MAX as f64) as f32;
         let flicker_score = normalize_unit((luma_mean - prev_luma).abs());
+        // Normalised Hamming *distance* (hd/64), same polarity as the live
+        // webrtc path (signals.rs): a bigger hash delta = higher score. The old
+        // `1.0 - hd/64` (similarity) was inverted — a static screen scored 1.0
+        // and tripped the gate's ghosting threshold on every frame.
         let ghosting_score = prev_hash
             .map(|prev| normalize_unit((prev ^ perceptual_hash).count_ones() as f32 / 64.0))
             .unwrap_or(0.0);
         let noise_variance_score = (noise_seed as f64 / u32::MAX as f64) as f32;
-        let pts_ms = normalizer.normalize_pts_ms(pts, tb_num, tb_den);
+        let pts_ms = normalizer.normalize_pts_ms(pts, timebase);
         let frame_index = frame_signals.len() as u64;
         frame_signals.push(FrameSignal {
             frame_index,
@@ -537,10 +623,6 @@ fn parse_ffprobe_frame_rate(raw: &str) -> Option<f32> {
         return None;
     }
     if let Some((num, den)) = raw.split_once('/') {
-        // Normalised Hamming *distance* (hd/64), same polarity as the live
-        // webrtc path (signals.rs): a bigger hash delta = higher score. The old
-        // `1.0 - hd/64` (similarity) was inverted — a static screen scored 1.0
-        // and tripped the gate's ghosting threshold on every frame.
         let num = num.trim().parse::<f32>().ok()?;
         let den = den.trim().parse::<f32>().ok()?;
         if den <= 0.0 {
@@ -619,7 +701,9 @@ pub(crate) fn parse_jpeg_stream_to_frames(
 
         frames.push(DecodedJpegFrame {
             frame_index: frames.len() as u64,
-            jpeg_bytes: raw[start..end].to_vec(),
+            // Store each decoded JPEG behind an Arc so chunk dispatch can copy
+            // frame descriptors without copying image payloads.
+            jpeg_bytes: raw[start..end].to_vec().into(),
         });
     }
 
@@ -938,9 +1022,10 @@ pub fn decode_selective_jpeg_frames(
     sample_fps: f32,
     frame_indices: &[u64],
     max_frames: usize,
+    max_edge: Option<u32>,
 ) -> Result<Vec<DecodedJpegFrame>, String> {
     with_prefetched_downloadable_source(source, |source| {
-        decode_selective_jpeg_frames_inner(source, sample_fps, frame_indices, max_frames)
+        decode_selective_jpeg_frames_inner(source, sample_fps, frame_indices, max_frames, max_edge)
     })?
 }
 
@@ -949,6 +1034,7 @@ pub(crate) fn decode_selective_jpeg_frames_inner(
     sample_fps: f32,
     frame_indices: &[u64],
     max_frames: usize,
+    max_edge: Option<u32>,
 ) -> Result<Vec<DecodedJpegFrame>, String> {
     if frame_indices.is_empty() {
         return Ok(Vec::new());
@@ -958,7 +1044,10 @@ pub(crate) fn decode_selective_jpeg_frames_inner(
     }
 
     let select_expr = build_select_expr(frame_indices);
-    let vf_chain = format!("fps={sample_fps:.3},{select_expr}");
+    let vf_chain = match longest_edge_scale_filter(max_edge) {
+        Some(scale) => format!("fps={sample_fps:.3},{select_expr},{scale}"),
+        None => format!("fps={sample_fps:.3},{select_expr}"),
+    };
     let frames_cap = frame_indices.len().min(max_frames).to_string();
 
     let source_uri = source.as_ffmpeg_input();
@@ -1014,10 +1103,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        ahash_cell_grid, ahashes_from_gray_grid, ffmpeg_input_options_for_source,
-        ffmpeg_protocol_whitelist_for_source, parse_ffprobe_frame_rate, parse_framemd5_to_signals,
-        parse_jpeg_stream_to_frames, Mp4DecodeConfig, TimestampNormalizer,
-        FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST,
+        ahash_cell_grid, ahashes_from_gray_grid, build_decode_vf, ffmpeg_input_options_for_source,
+        ffmpeg_protocol_whitelist_for_source, longest_edge_scale_filter, parse_ffprobe_frame_rate,
+        parse_framemd5_to_signals, parse_jpeg_stream_to_frames, Mp4DecodeConfig, Timebase,
+        TimestampNormalizer, FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST,
         FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST, FFMPEG_HTTPS_PROTOCOL_WHITELIST,
         FFMPEG_HTTP_PROTOCOL_WHITELIST, FFMPEG_LOCAL_PROTOCOL_WHITELIST,
         FFMPEG_RTSPS_PROTOCOL_WHITELIST,
@@ -1053,11 +1142,24 @@ mod tests {
 
     #[test]
     fn normalizes_pts_monotonically() {
+        let tb = Timebase::new(1, 30);
         let mut n = TimestampNormalizer::new();
-        assert_eq!(n.normalize_pts_ms(300, 1, 30), 0);
-        assert_eq!(n.normalize_pts_ms(330, 1, 30), 1000);
+        assert_eq!(n.normalize_pts_ms(300, tb), 0);
+        assert_eq!(n.normalize_pts_ms(330, tb), 1000);
         // Out-of-order sample should clamp to last_ms for deterministic monotonic output.
-        assert_eq!(n.normalize_pts_ms(320, 1, 30), 1000);
+        assert_eq!(n.normalize_pts_ms(320, tb), 1000);
+    }
+
+    #[test]
+    fn timebase_floors_each_half_at_one() {
+        // A zero denominator from a malformed header must not divide by zero. This
+        // guards the constructor's clamp now that `normalize_pts_ms` no longer
+        // re-guards the denominator itself.
+        let tb = Timebase::new(0, 0);
+        let mut n = TimestampNormalizer::new();
+        // Both halves floored to 1: one tick past the base is 1000 ms, no panic.
+        assert_eq!(n.normalize_pts_ms(5, tb), 0);
+        assert_eq!(n.normalize_pts_ms(6, tb), 1000);
     }
 
     #[test]
@@ -1076,7 +1178,12 @@ mod tests {
         assert_eq!(decoded.height, 240);
         assert_eq!(decoded.frame_signals.len(), 2);
         assert_eq!(decoded.frame_signals[0].pts_ms, 0);
-        assert!(decoded.frame_signals[1].pts_ms >= decoded.frame_signals[0].pts_ms);
+        // Pin the exact millisecond, not just monotonicity: at the parsed 1/25
+        // timebase one PTS tick is 40 ms. A `>=` here would still pass if the
+        // `#tb` line were ignored (falling back to the 1/1000 default → 1 ms) or
+        // the numerator/denominator were transposed, which is the whole thing the
+        // Timebase newtype guards.
+        assert_eq!(decoded.frame_signals[1].pts_ms, 40);
         assert!((0.0..=1.0).contains(&decoded.frame_signals[1].flicker_score));
     }
 
@@ -1132,6 +1239,47 @@ mod tests {
         let cfg = Mp4DecodeConfig::default();
         assert!(cfg.sample_fps > 0.0);
         assert!(cfg.max_frames > 0);
+        // The pixel lever is opt-in: default keeps source resolution.
+        assert!(cfg.max_edge.is_none());
+    }
+
+    #[test]
+    fn longest_edge_scale_filter_is_opt_in() {
+        assert!(longest_edge_scale_filter(None).is_none());
+        // Zero/one are treated as "no cap" so callers can't emit a degenerate
+        // (or after even-rounding, zero-width) scale.
+        assert!(longest_edge_scale_filter(Some(0)).is_none());
+        assert!(longest_edge_scale_filter(Some(1)).is_none());
+    }
+
+    #[test]
+    fn longest_edge_scale_filter_rounds_cap_down_to_even() {
+        // An odd cap must not produce an odd explicit dimension — that would
+        // break the 4:2:0 (yuv420p) NVDEC path. 769 -> 768.
+        let f = longest_edge_scale_filter(Some(769)).expect("cap requested");
+        assert!(f.contains("min(iw,768)"), "odd cap not rounded down: {f}");
+        assert!(!f.contains("769"), "raw odd cap leaked into filter: {f}");
+    }
+
+    #[test]
+    fn longest_edge_scale_filter_caps_longer_side_without_upscaling() {
+        let f = longest_edge_scale_filter(Some(768)).expect("cap requested");
+        // Landscape/square path caps width; portrait path caps height. Both use
+        // min(...) against the source dim so a smaller frame is never upscaled,
+        // and -2 keeps the free dimension even for mjpeg.
+        assert_eq!(
+            f,
+            "scale='if(gte(iw,ih),min(iw,768),-2)':'if(gte(iw,ih),-2,min(ih,768))'"
+        );
+    }
+
+    #[test]
+    fn build_decode_vf_appends_scale_only_when_capped() {
+        assert_eq!(build_decode_vf(4.0, None), "fps=4.000");
+        assert_eq!(
+            build_decode_vf(4.0, Some(768)),
+            "fps=4.000,scale='if(gte(iw,ih),min(iw,768),-2)':'if(gte(iw,ih),-2,min(ih,768))'"
+        );
     }
 
     #[test]
@@ -1301,6 +1449,7 @@ mod tests {
             Mp4DecodeConfig {
                 sample_fps: 1.0,
                 max_frames: 1,
+                max_edge: None,
             },
             server.allow_origin_validator(),
         )

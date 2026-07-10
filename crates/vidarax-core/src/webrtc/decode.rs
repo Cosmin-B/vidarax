@@ -361,24 +361,100 @@ pub struct YuvFrame {
     pub height: u32,
 }
 
+/// Ceiling on the Y-plane bytes the pool will pre-allocate per slot, ~8K 4:2:0
+/// luma. A malformed or hostile stream can declare an enormous resolution; this
+/// bounds the speculative pre-allocation. A real frame that genuinely exceeds it
+/// still decodes — the copy path grows that individual buffer — it just is not
+/// pre-sized for. Kept a power of two so bucketing never rounds above it.
+const MAX_POOL_Y_CAPACITY: usize = 1 << 25;
+
 #[derive(Clone, Debug)]
 pub struct YuvPlanePools {
     y: VecPool,
     u: VecPool,
     v: VecPool,
+    /// Bytes the Y free-list buffers are pre-sized for; the chroma free-lists are
+    /// a quarter of this. Tracked as capacity rather than a resolution so a
+    /// smaller frame is served from the existing buffers and the pool only
+    /// rebuilds when a frame genuinely needs more room (see `ensure_dims`).
+    y_capacity: usize,
+    slots: usize,
+    /// Whether a real decoded frame has reconciled the initial guess yet. The
+    /// first frame is allowed to resize the pool in either direction; after that
+    /// it only grows.
+    reconciled: bool,
 }
 
 impl YuvPlanePools {
     fn new(width: u32, height: u32, slots: usize) -> Self {
-        let w = width as usize;
-        let h = height as usize;
-        let y_size = w * h;
-        let uv_size = (w / 2) * (h / 2);
+        Self::with_capacity(Self::required_y_capacity(width, height), slots)
+    }
+
+    fn with_capacity(y_capacity: usize, slots: usize) -> Self {
+        let uv_capacity = y_capacity / 4;
         Self {
-            y: VecPool::with_capacity(slots, y_size),
-            u: VecPool::with_capacity(slots, uv_size),
-            v: VecPool::with_capacity(slots, uv_size),
+            y: VecPool::with_capacity(slots, y_capacity),
+            u: VecPool::with_capacity(slots, uv_capacity),
+            v: VecPool::with_capacity(slots, uv_capacity),
+            y_capacity,
+            slots,
+            reconciled: false,
         }
+    }
+
+    /// Y-plane bytes to pre-size the pool for a `width`x`height` frame.
+    ///
+    /// Rounded up to a power of two so a stream that steps up in resolution
+    /// rebuilds the free-lists a bounded number of times — once per bucket
+    /// crossing — rather than once per distinct size an untrusted sender might
+    /// send. The chroma requirement `(w/2)*(h/2)` per plane is folded in (times
+    /// four, expressed in Y-plane terms) so that, below the cap, the derived
+    /// chroma capacity `/4` covers odd dimensions, where truncated `(w/2)*(h/2)`
+    /// can exceed `w*h/4`. Capped at `MAX_POOL_Y_CAPACITY` so a bogus giant
+    /// resolution cannot force an unbounded pre-allocation; the cap also keeps
+    /// `next_power_of_two` from overflowing, and saturating arithmetic guards the
+    /// same overflow on the way in. At the cap the value is only a starting size:
+    /// a frame at or above it still decodes, with the copy path growing the
+    /// individual plane buffer if it needs more than the capped capacity.
+    fn required_y_capacity(width: u32, height: u32) -> usize {
+        let luma = (width as usize).saturating_mul(height as usize);
+        let chroma_as_luma = ((width as usize) / 2)
+            .saturating_mul((height as usize) / 2)
+            .saturating_mul(4);
+        luma.max(chroma_as_luma)
+            .clamp(1, MAX_POOL_Y_CAPACITY)
+            .next_power_of_two()
+    }
+
+    /// Reconcile the pool with the resolution a frame actually decoded at.
+    ///
+    /// - The first real frame resizes the pool in either direction, correcting the
+    ///   default guess the WebRTC path opens with (a 720p stream stops carrying
+    ///   1080p buffers; a 4K stream stops regrowing an undersized one).
+    /// - After that, the pool only grows: a frame needing no more capacity than it
+    ///   already provides is served from the existing buffers. Because capacity is
+    ///   bucketed, a sender ramping resolution upward crosses only a handful of
+    ///   buckets, and one that flips resolution every frame settles at the peak —
+    ///   neither can force a per-frame rebuild.
+    ///
+    /// When a rebuild does happen, buffers still in flight hold the old
+    /// free-list's sender; its receiver is already gone, so on drop they free
+    /// rather than recycle — a one-time cost bounded by `slots`.
+    fn ensure_dims(&mut self, width: u32, height: u32) {
+        let needed = Self::required_y_capacity(width, height);
+        if self.reconciled && needed <= self.y_capacity {
+            return;
+        }
+        if needed == self.y_capacity {
+            // First frame, and the guess already fits it exactly — no rebuild,
+            // just record that the pool now reflects a real frame so a later
+            // smaller frame is not mistaken for another first frame.
+            self.reconciled = true;
+            return;
+        }
+        let slots = self.slots;
+        *self = Self::with_capacity(needed, slots);
+        self.reconciled = true;
     }
 }
 
@@ -394,13 +470,6 @@ impl YuvFrameReceiver {
             Err(err @ mpsc::TryRecvError::Disconnected) => Err(err),
         }
     }
-}
-
-#[derive(Debug, Default)]
-pub struct SoftwareScratch {
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
 }
 
 /// Controls which decode backend [`Decoder::new`] selects.
@@ -559,14 +628,12 @@ pub enum Decoder {
     /// In-process openh264 decoder.
     Software {
         decoder: openh264::decoder::Decoder,
-        scratch: SoftwareScratch,
         yuv_pools: YuvPlanePools,
     },
     /// In-process libvpx VP8 decoder.
     #[cfg(feature = "vp8")]
     Vp8 {
         ctx: Vp8DecoderCtx,
-        scratch: SoftwareScratch,
         yuv_pools: YuvPlanePools,
     },
     /// CPU: long-lived ffmpeg sidecar without hardware acceleration.
@@ -592,10 +659,12 @@ pub enum Decoder {
 /// writing more input to ffmpeg, so a full handoff channel cannot remain the
 /// reason `decode()` is blocked while writing stdin.
 ///
-/// Plane buffers (`y`, `u`, `v`) are allocated once before the loop and
-/// reused across frames, avoiding repeated heap allocation at 1080p/30 fps.
-/// The bounded output pools cover the full reader queue, a small steady-state
-/// pending FIFO allowance, one constructing frame, and one consumer-held frame.
+/// Plane buffers (`y`, `u`, `v`) come from the output pools: each frame is read
+/// straight into a pooled buffer that returns to the free-list once the consumer
+/// drops it, so the reuse happens through recycling rather than a pre-loop
+/// allocation, avoiding repeated heap allocation at 1080p/30 fps. The bounded
+/// output pools cover the full reader queue, a small steady-state pending FIFO
+/// allowance, one constructing frame, and one consumer-held frame.
 fn spawn_frame_reader(
     mut stdout: BufReader<ChildStdout>,
     width: u32,
@@ -610,24 +679,31 @@ fn spawn_frame_reader(
         let h = height as usize;
         let y_size = w * h;
         let uv_size = (w / 2) * (h / 2);
-        // Pre-allocate scratch buffers once; reused for every frame.
-        let mut y = vec![0u8; y_size];
-        let mut u = vec![0u8; uv_size];
-        let mut v = vec![0u8; uv_size];
+        // ffmpeg emits packed planar I420 with no row padding, so each plane is
+        // read straight into a buffer from the output pool. Sizing the pooled
+        // buffer and reading into it means the frame that goes downstream is the
+        // one ffmpeg wrote, with no intermediate copy. Recycled buffers keep their
+        // capacity, so after warm-up the resize does not reallocate.
         loop {
+            let mut y = pools.y.acquire();
+            y.resize(y_size, 0);
             if stdout.read_exact(&mut y).is_err() {
                 break; // ffmpeg closed stdout (process exited)
             }
+            let mut u = pools.u.acquire();
+            u.resize(uv_size, 0);
             if stdout.read_exact(&mut u).is_err() {
                 break;
             }
+            let mut v = pools.v.acquire();
+            v.resize(uv_size, 0);
             if stdout.read_exact(&mut v).is_err() {
                 break;
             }
             let frame = YuvFrame {
-                y: pools.y.copy_from_slice(&y),
-                u: pools.u.copy_from_slice(&u),
-                v: pools.v.copy_from_slice(&v),
+                y: pools.y.recycle(y),
+                u: pools.u.recycle(u),
+                v: pools.v.recycle(v),
                 width,
                 height,
             };
@@ -805,7 +881,6 @@ impl Decoder {
         let output_pool_slots = output_pool_slots.max(SOFTWARE_YUV_POOL_MIN_SLOTS);
         Decoder::Vp8 {
             ctx: Vp8DecoderCtx::new(),
-            scratch: SoftwareScratch::default(),
             yuv_pools: YuvPlanePools::new(width, height, output_pool_slots),
         }
     }
@@ -816,7 +891,6 @@ impl Decoder {
         let output_pool_slots = output_pool_slots.max(SOFTWARE_YUV_POOL_MIN_SLOTS);
         Decoder::Software {
             decoder,
-            scratch: SoftwareScratch::default(),
             yuv_pools: YuvPlanePools::new(width, height, output_pool_slots),
         }
     }
@@ -965,25 +1039,18 @@ impl Decoder {
                 *height,
                 payload,
             ),
-            Decoder::Software {
-                decoder,
-                scratch,
-                yuv_pools,
-            } => Self::decode_software(decoder, scratch, yuv_pools, payload),
+            Decoder::Software { decoder, yuv_pools } => {
+                Self::decode_software(decoder, yuv_pools, payload)
+            }
             #[cfg(feature = "vp8")]
-            Decoder::Vp8 {
-                ctx,
-                scratch,
-                yuv_pools,
-            } => Self::decode_vp8(ctx, scratch, yuv_pools, payload),
+            Decoder::Vp8 { ctx, yuv_pools } => Self::decode_vp8(ctx, yuv_pools, payload),
             Decoder::Unsupported { codec } => Err(DecodeError::UnsupportedCodec(*codec)),
         }
     }
 
     fn decode_software(
         decoder: &mut openh264::decoder::Decoder,
-        scratch: &mut SoftwareScratch,
-        yuv_pools: &YuvPlanePools,
+        yuv_pools: &mut YuvPlanePools,
         nals: &[u8],
     ) -> Result<YuvFrame, DecodeError> {
         let maybe_yuv = decoder
@@ -997,42 +1064,47 @@ impl Decoder {
 
         // dimensions() returns (width, height) in pixels.
         // strides() returns (y_stride, u_stride, v_stride) bytes-per-row.
-        // The plane slices may be padded; we copy only the active pixels.
+        // The plane slices may be padded, so we de-stride each row directly into
+        // a buffer taken from the output pool. Writing here instead of into a
+        // separate scratch buffer means the packed plane is built once and handed
+        // straight downstream, rather than built and then copied again.
         let (width, height) = yuv.dimensions();
         let (y_stride, u_stride, v_stride) = yuv.strides();
+
+        // The WebRTC path opens the pool at a default resolution because the true
+        // frame size is not known until the first frame decodes. Reconcile it to
+        // what actually decoded so the free-list is sized for this stream rather
+        // than a guess (see `ensure_dims` for the first-frame-then-grow policy).
+        yuv_pools.ensure_dims(width as u32, height as u32);
 
         let uv_width = width / 2;
         let uv_height = height / 2;
 
-        scratch.y.clear();
-        scratch.y.reserve(width * height);
+        let mut y = yuv_pools.y.acquire();
+        y.reserve(width * height);
         for row in 0..height {
             let start = row * y_stride;
-            scratch.y.extend_from_slice(&yuv.y()[start..start + width]);
+            y.extend_from_slice(&yuv.y()[start..start + width]);
         }
 
-        scratch.u.clear();
-        scratch.u.reserve(uv_width * uv_height);
+        let mut u = yuv_pools.u.acquire();
+        u.reserve(uv_width * uv_height);
         for row in 0..uv_height {
             let start = row * u_stride;
-            scratch
-                .u
-                .extend_from_slice(&yuv.u()[start..start + uv_width]);
+            u.extend_from_slice(&yuv.u()[start..start + uv_width]);
         }
 
-        scratch.v.clear();
-        scratch.v.reserve(uv_width * uv_height);
+        let mut v = yuv_pools.v.acquire();
+        v.reserve(uv_width * uv_height);
         for row in 0..uv_height {
             let start = row * v_stride;
-            scratch
-                .v
-                .extend_from_slice(&yuv.v()[start..start + uv_width]);
+            v.extend_from_slice(&yuv.v()[start..start + uv_width]);
         }
 
         Ok(YuvFrame {
-            y: yuv_pools.y.copy_from_slice(&scratch.y),
-            u: yuv_pools.u.copy_from_slice(&scratch.u),
-            v: yuv_pools.v.copy_from_slice(&scratch.v),
+            y: yuv_pools.y.recycle(y),
+            u: yuv_pools.u.recycle(u),
+            v: yuv_pools.v.recycle(v),
             width: width as u32,
             height: height as u32,
         })
@@ -1041,8 +1113,7 @@ impl Decoder {
     #[cfg(feature = "vp8")]
     fn decode_vp8(
         ctx: &mut Vp8DecoderCtx,
-        scratch: &mut SoftwareScratch,
-        yuv_pools: &YuvPlanePools,
+        yuv_pools: &mut YuvPlanePools,
         payload: &[u8],
     ) -> Result<YuvFrame, DecodeError> {
         let ctx_ptr = ctx.as_mut_ptr();
@@ -1100,29 +1171,28 @@ impl Decoder {
             ));
         }
 
-        copy_vpx_plane(&mut scratch.y, img.planes[0], img.stride[0], width, height)?;
+        // Match the pool to the frame's true resolution, which the WebRTC path
+        // only learns once the first frame decodes (see `ensure_dims` for the
+        // first-frame-then-grow policy).
+        yuv_pools.ensure_dims(img.d_w, img.d_h);
+
+        // De-stride each libvpx plane straight into a pooled buffer. copy_vpx_plane
+        // clears its destination first, so a freshly acquired buffer drops in and
+        // the packed plane is written once rather than staged in scratch and copied.
+        let mut y = yuv_pools.y.acquire();
+        copy_vpx_plane(&mut y, img.planes[0], img.stride[0], width, height)?;
 
         let uv_width = width / 2;
         let uv_height = height / 2;
-        copy_vpx_plane(
-            &mut scratch.u,
-            img.planes[1],
-            img.stride[1],
-            uv_width,
-            uv_height,
-        )?;
-        copy_vpx_plane(
-            &mut scratch.v,
-            img.planes[2],
-            img.stride[2],
-            uv_width,
-            uv_height,
-        )?;
+        let mut u = yuv_pools.u.acquire();
+        copy_vpx_plane(&mut u, img.planes[1], img.stride[1], uv_width, uv_height)?;
+        let mut v = yuv_pools.v.acquire();
+        copy_vpx_plane(&mut v, img.planes[2], img.stride[2], uv_width, uv_height)?;
 
         Ok(YuvFrame {
-            y: yuv_pools.y.copy_from_slice(&scratch.y),
-            u: yuv_pools.u.copy_from_slice(&scratch.u),
-            v: yuv_pools.v.copy_from_slice(&scratch.v),
+            y: yuv_pools.y.recycle(y),
+            u: yuv_pools.u.recycle(u),
+            v: yuv_pools.v.recycle(v),
             width: img.d_w,
             height: img.d_h,
         })
@@ -1206,9 +1276,181 @@ mod tests {
         count_audio_media_sections, count_video_media_sections, decode_ffmpeg_pipe,
         h265_offer_signals_don, select_answer_video_codec, select_answer_video_codec_for_offer,
         send_yuv_frame_lossless, try_receive_yuv_frame, DecodeError, DecoderBackend,
-        OfferedVideoCodec, VideoCodec, YuvFrame, FFMPEG_YUV_PENDING_POOL_ALLOWANCE,
+        OfferedVideoCodec, VideoCodec, YuvFrame, YuvPlanePools, FFMPEG_YUV_PENDING_POOL_ALLOWANCE,
         FFMPEG_YUV_READER_POOL_MIN_SLOTS, FFMPEG_YUV_READER_QUEUE_CAPACITY,
     };
+
+    #[test]
+    fn yuv_plane_pools_ensure_dims_rebuilds_on_resolution_change() {
+        // Two warm buffers per plane, sized for a small frame.
+        let mut pools = YuvPlanePools::new(640, 480, 2);
+
+        // Drain the warm free-list without recycling, so any buffer a later
+        // acquire hands back can only have come from a rebuild.
+        let _a = pools.y.acquire();
+        let _b = pools.y.acquire();
+        assert_eq!(
+            pools.y.acquire().capacity(),
+            0,
+            "free-list should be drained"
+        );
+
+        // A different resolution re-provisions the pool: the refilled free-list
+        // now serves buffers sized for the larger frame.
+        pools.ensure_dims(1920, 1080);
+        assert!(
+            pools.y.acquire().capacity() >= 1920 * 1080,
+            "rebuilt pool should serve buffers sized for the new resolution",
+        );
+    }
+
+    #[test]
+    fn yuv_plane_pools_ensure_dims_same_resolution_is_noop() {
+        let mut pools = YuvPlanePools::new(1920, 1080, 2);
+
+        // Drain the warm free-list.
+        let _a = pools.y.acquire();
+        let _b = pools.y.acquire();
+        assert_eq!(
+            pools.y.acquire().capacity(),
+            0,
+            "free-list should be drained"
+        );
+
+        // The same resolution must not rebuild, so the free-list stays drained
+        // and in-flight buffers keep their route home.
+        pools.ensure_dims(1920, 1080);
+        assert_eq!(
+            pools.y.acquire().capacity(),
+            0,
+            "unchanged resolution must not re-provision the pool",
+        );
+    }
+
+    #[test]
+    fn yuv_plane_pools_ensure_dims_reconciles_down_on_first_frame() {
+        // Pool opened at a 1080p default, but the stream turns out smaller.
+        let mut pools = YuvPlanePools::new(1920, 1080, 2);
+        let _a = pools.y.acquire();
+        let _b = pools.y.acquire();
+        assert_eq!(
+            pools.y.acquire().capacity(),
+            0,
+            "free-list should be drained"
+        );
+
+        // The first real frame reconciles the guess downward so the run does not
+        // carry 1080p buffers for a 480p stream.
+        pools.ensure_dims(640, 480);
+        let cap = pools.y.acquire().capacity();
+        assert!(cap >= 640 * 480, "rebuilt pool must fit the smaller frame");
+        assert!(
+            cap < 1920 * 1080,
+            "buffers must no longer be sized for 1080p"
+        );
+    }
+
+    #[test]
+    fn yuv_plane_pools_ensure_dims_is_grow_only_after_reconcile() {
+        // Reconcile at 1080p (equal to the opening size marks it reconciled).
+        let mut pools = YuvPlanePools::new(1920, 1080, 2);
+        pools.ensure_dims(1920, 1080);
+
+        // Drain the warm free-list.
+        let _a = pools.y.acquire();
+        let _b = pools.y.acquire();
+        assert_eq!(
+            pools.y.acquire().capacity(),
+            0,
+            "free-list should be drained"
+        );
+
+        // A smaller frame is served from the existing buffers, not a rebuild, so a
+        // sender flipping resolution every frame cannot force a per-frame realloc.
+        pools.ensure_dims(1280, 720);
+        assert_eq!(
+            pools.y.acquire().capacity(),
+            0,
+            "a smaller frame after reconcile must not re-provision the pool",
+        );
+
+        // Returning to a size that still fits is likewise a no-op.
+        pools.ensure_dims(1920, 1080);
+        assert_eq!(
+            pools.y.acquire().capacity(),
+            0,
+            "a frame that still fits must not re-provision the pool",
+        );
+    }
+
+    #[test]
+    fn yuv_plane_pools_ensure_dims_grows_beyond_current_size() {
+        // Reconcile at 720p.
+        let mut pools = YuvPlanePools::new(1280, 720, 2);
+        pools.ensure_dims(1280, 720);
+
+        let _a = pools.y.acquire();
+        let _b = pools.y.acquire();
+        assert_eq!(
+            pools.y.acquire().capacity(),
+            0,
+            "free-list should be drained"
+        );
+
+        // A frame with more pixels than the pool is sized for must rebuild, so the
+        // hot path stops regrowing an undersized buffer every cycle.
+        pools.ensure_dims(1920, 1080);
+        assert!(
+            pools.y.acquire().capacity() >= 1920 * 1080,
+            "a larger frame must grow the pool",
+        );
+    }
+
+    #[test]
+    fn yuv_plane_pools_ensure_dims_bounds_rebuilds_under_monotonic_growth() {
+        let mut pools = YuvPlanePools::new(16, 16, 2);
+        pools.ensure_dims(16, 16);
+
+        // Feed hundreds of strictly-increasing frames up to 1080p. Power-of-two
+        // capacity bucketing must let a sender ramp resolution upward without
+        // forcing a rebuild on every frame — only bucket crossings rebuild.
+        let mut rebuilds = 0usize;
+        let mut last_capacity = pools.y_capacity;
+        let mut w = 16u32;
+        let mut frames = 0usize;
+        while w <= 1920 {
+            pools.ensure_dims(w, w * 9 / 16);
+            if pools.y_capacity != last_capacity {
+                rebuilds += 1;
+                last_capacity = pools.y_capacity;
+            }
+            frames += 1;
+            w += 2;
+        }
+        assert!(frames > 900, "expected a long ramp, got {frames} frames");
+        assert!(
+            rebuilds <= 24,
+            "bucketing must bound rebuilds well below frame count: {rebuilds} rebuilds over {frames} frames",
+        );
+    }
+
+    #[test]
+    fn yuv_plane_pools_ensure_dims_sizes_chroma_for_odd_dimensions() {
+        // Reconcile at a degenerate near-1D resolution whose exact chroma size is
+        // zero, then hand it a squarer frame of *fewer* pixels but a real chroma
+        // plane. Folding the chroma requirement into the bucketed capacity means
+        // the U/V buffers still fit without a per-frame regrow.
+        let mut pools = YuvPlanePools::new(1, 1000, 2);
+        pools.ensure_dims(1, 1000);
+
+        pools.ensure_dims(31, 32);
+        let u = pools.u.acquire();
+        assert!(
+            u.capacity() >= (31 / 2) * (32 / 2),
+            "chroma buffer must fit odd-dimension frames, got capacity {}",
+            u.capacity(),
+        );
+    }
 
     #[test]
     fn count_video_media_sections_returns_zero_for_audio_only_offer() {

@@ -114,7 +114,10 @@ fn select_expr_two_singletons_stay_literal() {
     // A 2-run block is below the collapse threshold (3), so it stays as two
     // literal eq() terms — shorter than the mod form for so few frames and,
     // more to the point, still bounded.
-    assert_eq!(build_select_expr(&[10, 25]), "select='eq(n\\,10)+eq(n\\,25)'");
+    assert_eq!(
+        build_select_expr(&[10, 25]),
+        "select='eq(n\\,10)+eq(n\\,25)'"
+    );
 }
 
 #[test]

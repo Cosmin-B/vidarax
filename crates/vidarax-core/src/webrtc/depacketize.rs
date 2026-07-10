@@ -19,6 +19,18 @@ impl VidaraxDepacketizerFactory {
 }
 
 impl DepacketizerFactory for VidaraxDepacketizerFactory {
+    // The boxed trait object here is rustrtc's plugin shape, not a design choice
+    // of ours: its receiver owns the RTP loop and calls the depacketizer once per
+    // packet through this box, so the indirect dispatch happens inside the
+    // dependency. Handing back our two concrete depacketizers by value and letting
+    // the compiler dispatch them statically would only pay off if we also took over
+    // the receive loop, and the per-packet work is NAL splitting and payload
+    // copying — the dispatch sits next to that, it does not bound it. Reusing
+    // rustrtc's path is the better trade even though it costs the vtable hop.
+    //
+    // Audio, application, and any video codec other than the two below fall through
+    // to rustrtc's default factory on purpose; codec selection upstream only lets a
+    // negotiated video codec reach us, so the wildcard is delegation, not a gap.
     fn create(&self, kind: MediaKind) -> Box<dyn Depacketizer> {
         match (kind, self.codec) {
             (MediaKind::Video, VideoCodec::Vp8) => Box::new(Vp8Depacketizer::new()),
