@@ -140,6 +140,28 @@ impl EventSink for WalEventSink {
             .map(|_| ())
     }
 
+    fn emit_event_nonblocking(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        frame_index: u64,
+        pts_ms: u64,
+        event_type: &str,
+        confidence: f32,
+        description: &str,
+    ) -> Result<(), String> {
+        let payload = json!({
+            "session_id": session_id,
+            "frame_index": frame_index,
+            "pts_ms": pts_ms,
+            "confidence": confidence,
+            "description": description,
+        });
+
+        self.state
+            .append_run_event_nonblocking(run_id, event_type, payload)
+    }
+
     /// Append a keyframe metadata record to the WAL.
     ///
     /// JPEG bytes are not stored in the WAL (the WAL is a plain-text log).
@@ -216,6 +238,44 @@ mod tests {
             ev.payload.contains("\"frame_index\":42"),
             "payload should contain frame_index"
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn emit_event_nonblocking_hands_off_to_timeline_writer() {
+        let (state, path) = make_state();
+        let run_id = "run-feedface12345678";
+
+        let sink = WalEventSink::new(state.clone(), run_id.to_string());
+        let start = std::time::Instant::now();
+        sink.emit_event_nonblocking(
+            run_id,
+            "sess-01",
+            3,
+            99,
+            "loop_detected",
+            0.9,
+            "loop detected via perceptual-hash ring buffer",
+        )
+        .expect("emit_event_nonblocking should enqueue");
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(50),
+            "nonblocking emit should not wait for durable append"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let events = loop {
+            let events = state
+                .read_run_events(run_id)
+                .expect("read_run_events failed");
+            if !events.is_empty() || std::time::Instant::now() >= deadline {
+                break events;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "loop_detected");
 
         let _ = std::fs::remove_file(path);
     }
