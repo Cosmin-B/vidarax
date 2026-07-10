@@ -10,29 +10,28 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use base64::Engine as _;
 
 use crate::dedup::DedupFilter;
-use crate::gate::{GateConfig, GateEventType};
+use crate::gate::{FrameSignal, GateConfig, GateEventType};
 use crate::loop_detector::LoopDetector;
 use crate::metrics::PipelineMetrics;
 use crate::pipeline::{TwoPassConfig, TwoPassPipeline};
-use crate::provider::{InferenceImage, InferenceProvider, InferenceRequest};
+use crate::provider::{InferenceImage, InferenceObserver, InferenceProvider, InferenceRequest};
 use crate::tiered_vlm::{run_tiered, DistillationConfig, TieredVlmConfig};
 #[cfg(feature = "training")]
 use crate::training_data::TrainingStore;
 #[cfg(not(feature = "training"))]
 #[allow(dead_code)]
 pub struct TrainingStore;
+use crate::webrtc::clip::{
+    spawn_clip_accumulator, spawn_clip_vlm_workers, ClipConfig, ClipRateGate, ClipWork,
+};
 use crate::webrtc::decode::{
     DecodeError, Decoder, DecoderBackend, DecoderConfig, VideoCodec, YuvFrame,
     FFMPEG_YUV_PENDING_POOL_ALLOWANCE, FFMPEG_YUV_READER_QUEUE_CAPACITY,
 };
 use crate::webrtc::recycle::{RecycledBytes, VecPool};
-use crate::webrtc::session::RtpFrame;
-use crate::webrtc::signals::{yuv_to_frame_signal, yuv_to_jpeg};
+use crate::webrtc::session::{RtpFrame, WebRtcConfig};
+use crate::webrtc::signals::{check_frame, yuv_to_frame_signal, yuv_to_jpeg};
 
-const DEFAULT_DECODE_WIDTH: u32 = 1920;
-const DEFAULT_DECODE_HEIGHT: u32 = 1080;
-const DEFAULT_LOOP_WINDOW: u32 = 6;
-const DEFAULT_LOOP_REPEAT_THRESHOLD: usize = 3;
 pub const STREAM_FRAME_QUEUE_CAPACITY: usize = 64;
 pub const VLM_WORK_QUEUE_CAPACITY: usize = 32;
 pub const CLIP_FRAME_QUEUE_CAPACITY: usize = STREAM_FRAME_QUEUE_CAPACITY;
@@ -124,6 +123,29 @@ pub trait EventSink: Send + Sync {
         description: &str,
     ) -> Result<(), String>;
 
+    /// Emit a real-time agent event without waiting for durable storage.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_event_nonblocking(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        frame_index: u64,
+        pts_ms: u64,
+        event_type: &str,
+        confidence: f32,
+        description: &str,
+    ) -> Result<(), String> {
+        self.emit_event_sync(
+            run_id,
+            session_id,
+            frame_index,
+            pts_ms,
+            event_type,
+            confidence,
+            description,
+        )
+    }
+
     /// Persist a keyframe with its JPEG thumbnail (blocking).
     fn store_keyframe_sync(
         &self,
@@ -184,6 +206,7 @@ pub struct KeyframeWork {
     pub loop_active: bool,
 }
 
+#[cfg(test)]
 fn build_stream_frame_from_yuv(
     yuv: &YuvFrame,
     seq: u64,
@@ -191,139 +214,591 @@ fn build_stream_frame_from_yuv(
     prev_signal: &mut Option<crate::gate::FrameSignal>,
     ycbcr_scratch: &mut Vec<u8>,
     jpeg_pool: &VecPool,
-) -> StreamFrame {
+) -> Option<StreamFrame> {
+    // A frame whose planes don't match its dimensions can't be read safely, and
+    // its statistics would poison the temporal deltas of every frame after it.
+    // Drop it before it touches prev_signal; the next good frame recovers.
+    if let Err(err) = check_frame(yuv) {
+        tracing::warn!(seq, %err, "dropping malformed frame");
+        return None;
+    }
+
     let signal = yuv_to_frame_signal(yuv, seq, pts_ms, prev_signal.as_ref());
-    let jpeg = yuv_to_jpeg(yuv, 75, ycbcr_scratch, jpeg_pool);
+    // A frame the encoder rejects costs this one thumbnail, not the stream. Drop
+    // it to None and keep decoding; the signal still flows to the gate engine.
+    let jpeg = match yuv_to_jpeg(yuv, 75, ycbcr_scratch, jpeg_pool) {
+        Ok(bytes) => Some(bytes),
+        Err(err) => {
+            tracing::warn!(seq, %err, "dropping thumbnail for unencodable frame");
+            None
+        }
+    };
     *prev_signal = Some(signal);
 
-    StreamFrame {
+    Some(StreamFrame {
         signal,
-        jpeg: Some(jpeg),
+        jpeg,
         pts_ms,
         seq,
+    })
+}
+
+fn build_clip_stream_frame_from_yuv(
+    yuv: &YuvFrame,
+    seq: u64,
+    pts_ms: u64,
+    prev_signal: &mut Option<crate::gate::FrameSignal>,
+    clip_rate_gate: &mut ClipRateGate,
+    encode: impl FnOnce() -> Option<RecycledBytes>,
+) -> Option<StreamFrame> {
+    // Invalid planes must not update temporal deltas or clip sampling state.
+    if let Err(err) = check_frame(yuv) {
+        tracing::warn!(seq, %err, "dropping malformed frame");
+        return None;
+    }
+
+    let signal = yuv_to_frame_signal(yuv, seq, pts_ms, prev_signal.as_ref());
+    *prev_signal = Some(signal);
+
+    let jpeg = if clip_rate_gate.should_keep(pts_ms) {
+        let jpeg = encode().filter(|b| !b.is_empty());
+        if jpeg.is_some() {
+            clip_rate_gate.commit(pts_ms);
+        }
+        jpeg
+    } else {
+        None
+    };
+
+    Some(StreamFrame {
+        signal,
+        jpeg,
+        pts_ms,
+        seq,
+    })
+}
+
+/// Borrowed per-frame context the gate needs to emit events and build work.
+///
+/// Grouped so the gate signature stays readable and callers pass one struct
+/// instead of six loose arguments.
+struct KeyframeContext<'a> {
+    run_id: &'a Arc<str>,
+    session_id: &'a Arc<str>,
+    prompt: &'a Arc<ArcSwap<Arc<str>>>,
+    stdb: &'a Arc<dyn EventSink>,
+    metrics: &'a PipelineMetrics,
+}
+
+struct LoopDetectedEvent {
+    frame_index: u64,
+    pts_ms: u64,
+    confidence: f32,
+    description: &'static str,
+}
+
+/// Per-stream loop-detection and gate state, driven once per decoded frame.
+///
+/// Owns the two-pass gate and the loop detector for one ordered stream. The
+/// keyframe decision is split out here, away from any live decoder, so it stays
+/// unit-testable: [`on_frame`](GateStreamState::on_frame) takes the cheap frame
+/// signal plus a lazy `encode` closure and only runs the encoder when the gate
+/// actually keeps the frame. That is what lets the decode worker skip the JPEG
+/// for the ~95% of frames the gate drops.
+struct GateStreamState {
+    pipeline: TwoPassPipeline,
+    loop_det: LoopDetector,
+    /// True while the loop detector considers the stream stuck; cleared when the
+    /// detector no longer sees enough repeated hashes in its window.
+    loop_active: bool,
+}
+
+impl GateStreamState {
+    fn new(
+        gate_config: GateConfig,
+        loop_hamming_threshold: u32,
+        loop_repeat_threshold: usize,
+    ) -> Self {
+        Self {
+            pipeline: TwoPassPipeline::new(TwoPassConfig::default(), gate_config),
+            loop_det: LoopDetector::new(loop_hamming_threshold, loop_repeat_threshold),
+            loop_active: false,
+        }
+    }
+
+    /// Feed one frame's perceptual hash to the loop detector, returning the
+    /// `loop_detected` event once on entry so the caller can emit it off the
+    /// decode thread's blocking path.
+    fn observe_loop(
+        &mut self,
+        signal: &FrameSignal,
+        pts_ms: u64,
+        metrics: &PipelineMetrics,
+    ) -> Option<LoopDetectedEvent> {
+        if self.loop_det.check(signal.perceptual_hash) {
+            if !self.loop_active {
+                metrics.inc_loop_detected();
+                self.loop_active = true;
+                return Some(LoopDetectedEvent {
+                    frame_index: signal.frame_index,
+                    pts_ms,
+                    confidence: 0.9,
+                    description: "loop detected via perceptual-hash ring buffer",
+                });
+            }
+            self.loop_active = true;
+        } else {
+            self.loop_active = false;
+        }
+        None
+    }
+
+    /// Run loop detection and the gate on one frame, returning the keyframe work
+    /// to dispatch or `None` when the frame is dropped.
+    ///
+    /// `encode` is called at most once, only after the gate decides to keep the
+    /// frame, so a dropped frame never pays for a JPEG. A kept frame whose
+    /// `encode` yields nothing usable is also dropped: an empty payload would
+    /// waste a VLM call.
+    fn on_frame(
+        &mut self,
+        signal: FrameSignal,
+        pts_ms: u64,
+        ctx: &KeyframeContext<'_>,
+        encode: impl FnOnce() -> Option<RecycledBytes>,
+    ) -> Option<KeyframeWork> {
+        if let Some(event) = self.observe_loop(&signal, pts_ms, ctx.metrics) {
+            let _ = ctx.stdb.emit_event_nonblocking(
+                ctx.run_id,
+                ctx.session_id,
+                event.frame_index,
+                event.pts_ms,
+                "loop_detected",
+                event.confidence,
+                event.description,
+            );
+        }
+
+        let gate_start = std::time::Instant::now();
+        let metas = self.pipeline.analyze_batch_defer_gate_commit(&[signal]);
+        ctx.metrics
+            .gate_latency_us
+            .record(gate_start.elapsed().as_micros() as u64);
+        let meta = *metas.first()?;
+
+        if meta.gate_event != GateEventType::KeepKeyframe {
+            return None;
+        }
+
+        let jpeg_bytes = encode().filter(|b| !b.is_empty())?;
+        self.pipeline.commit_gate_keyframe(signal);
+
+        let event_type: &'static str = if meta.scene_cut {
+            "scene_cut"
+        } else {
+            "periodic_keepalive"
+        };
+
+        Some(KeyframeWork {
+            run_id: Arc::clone(ctx.run_id),
+            session_id: Arc::clone(ctx.session_id),
+            frame_index: signal.frame_index,
+            pts_ms,
+            event_type,
+            confidence: meta.confidence,
+            novelty_score: meta.novelty_score,
+            motion_score: meta.motion_score,
+            jpeg_bytes,
+            prompt: Arc::clone(&*ctx.prompt.load_full()),
+            loop_active: self.loop_active,
+        })
+    }
+}
+
+/// Live decode-worker state derived from a [`DecodeSink`].
+///
+/// `Keyframe` carries the running gate plus the dispatch handles. `Stream`
+/// carries clip sampling state so over-rate frames forward signals without JPEGs.
+//
+// One value of this lives per decode worker, on its stack, for the worker's
+// whole life, and the large `Keyframe` variant is the common case. Boxing it to
+// even out the variants would only add a pointer chase to every frame in the hot
+// loop for no gain, so the size gap is deliberate.
+#[allow(clippy::large_enum_variant)]
+enum SinkState {
+    Keyframe {
+        gate: GateStreamState,
+        vlm_tx: kanal::Sender<KeyframeWork>,
+        stdb: Arc<dyn EventSink>,
+        run_id: Arc<str>,
+        session_id: Arc<str>,
+        prompt: Arc<ArcSwap<Arc<str>>>,
+    },
+    Stream {
+        frame_tx: kanal::Sender<StreamFrame>,
+        clip_rate_gate: ClipRateGate,
+    },
+}
+
+// ─── Worker pool configuration ────────────────────────────────────────────────
+
+/// Per-session pipeline topology and tunables, derived from [`WebRtcConfig`].
+///
+/// Built once on the control path when a session starts, so cloning the gate
+/// config here never touches the frame hot path.
+#[derive(Debug, Clone)]
+pub struct WorkerPoolConfig {
+    /// Requested decode worker threads (clamped to one per stream at spawn).
+    pub decode_workers: usize,
+    /// Requested analysis worker threads (clamped to one per stream at spawn).
+    pub analysis_workers: usize,
+    /// Requested VLM worker threads (clamped to one per stream at spawn).
+    pub vlm_workers: usize,
+    /// Decode target width in pixels.
+    pub decode_width: u32,
+    /// Decode target height in pixels.
+    pub decode_height: u32,
+    /// Whether the decoder may use a hardware backend when available.
+    pub gpu_available: bool,
+    /// Gate-engine thresholds applied by analysis workers.
+    pub gate_config: GateConfig,
+    /// Perceptual-hash Hamming-distance threshold for treating frames as the same screen.
+    pub loop_hamming_threshold: u32,
+    /// Repeat count within the window that marks a stream as looping.
+    pub loop_repeat_threshold: usize,
+    /// VLM output token-rate cap; zero disables the limiter.
+    pub max_output_tokens_per_second: u32,
+}
+
+impl From<&WebRtcConfig> for WorkerPoolConfig {
+    fn from(cfg: &WebRtcConfig) -> Self {
+        Self {
+            decode_workers: cfg.decode_workers,
+            analysis_workers: cfg.analysis_workers,
+            vlm_workers: cfg.vlm_workers,
+            decode_width: cfg.decode_width,
+            decode_height: cfg.decode_height,
+            gpu_available: cfg.gpu_available,
+            gate_config: cfg.gate_config.clone(),
+            loop_hamming_threshold: cfg.loop_hamming_threshold,
+            loop_repeat_threshold: cfg.loop_repeat_threshold,
+            max_output_tokens_per_second: cfg.max_output_tokens_per_second,
+        }
     }
 }
 
 // ─── Decode workers ───────────────────────────────────────────────────────────
 
+/// Inputs for the decode worker pool: channels, pool sizing, decode target,
+/// and telemetry handles.
+pub struct DecodeWorkerParams {
+    /// Requested worker count; clamped to one stateful decoder per stream.
+    pub workers: usize,
+    /// Whether the decoder may use a hardware backend.
+    pub gpu_available: bool,
+    /// Decode target width in pixels.
+    pub decode_width: u32,
+    /// Decode target height in pixels.
+    pub decode_height: u32,
+    /// YUV output pool slots reserved for the decoder.
+    pub output_pool_slots: usize,
+    /// JPEG encode pool slots reserved for this worker.
+    pub jpeg_pool_slots: usize,
+    /// RTP frames in.
+    pub rtp_rx: kanal::Receiver<RtpFrame>,
+    /// Where decoded frames go, and whether the gate runs inline.
+    pub sink: DecodeSink,
+    pub metrics: Arc<PipelineMetrics>,
+    pub session_span: tracing::Span,
+}
+
+/// Downstream wiring for a decode worker.
+///
+/// `Keyframe` is the default path: the worker runs the gate inline and only
+/// JPEG-encodes the frames the gate keeps, dispatching them straight to the VLM
+/// queue. `Stream` is clip mode: the worker samples by PTS first, then encodes
+/// only frames the accumulator would keep.
+pub enum DecodeSink {
+    /// Gate inline and dispatch kept keyframes to the VLM queue.
+    Keyframe(KeyframeSink),
+    /// Forward clip signals, attaching JPEGs only to sampled frames.
+    Stream {
+        frame_tx: kanal::Sender<StreamFrame>,
+        clip_config: ClipConfig,
+    },
+}
+
+/// Everything a decode worker needs to run the gate and dispatch keyframes.
+pub struct KeyframeSink {
+    /// Gate-engine thresholds applied to each frame.
+    pub gate_config: GateConfig,
+    /// Perceptual-hash Hamming-distance threshold for treating frames as the same screen.
+    pub loop_hamming_threshold: u32,
+    /// Repeat count within the window that marks a stream as looping.
+    pub loop_repeat_threshold: usize,
+    /// Kept keyframes out to the VLM queue.
+    pub vlm_tx: kanal::Sender<KeyframeWork>,
+    /// Event sink for the loop-detected notice.
+    pub stdb: Arc<dyn EventSink>,
+    pub run_id: Arc<str>,
+    pub session_id: Arc<str>,
+    /// Live prompt handle, reloaded per keyframe.
+    pub prompt: Arc<ArcSwap<Arc<str>>>,
+}
+
 /// Spawn decode workers for one ordered media stream.
 ///
 /// One stream uses one stateful decoder. Codec detection is lazy on the first
 /// frame, and the decoder is rebuilt if a later session uses another codec on
-/// the same worker.
-/// `cores` is API-compatible only; one ordered stream gets one stateful decoder, so parallelism is across sessions, not within it.
-// Spawns decode workers; each channel, pool size, metrics handle, and span is configured separately.
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_decode_workers(
-    cores: usize,
-    rtp_rx: kanal::Receiver<RtpFrame>,
-    frame_tx: kanal::Sender<StreamFrame>,
-    gpu: bool,
-    output_pool_slots: usize,
-    jpeg_pool_slots: usize,
-    metrics: Arc<PipelineMetrics>,
-    session_span: tracing::Span,
-) {
-    for i in 0..per_stream_decode_workers(cores) {
-        let rtp_rx = rtp_rx.clone();
-        let frame_tx = frame_tx.clone();
-        let metrics = Arc::clone(&metrics);
-        let session_span = session_span.clone();
+/// the same worker. `params.workers` is API-compatible only; parallelism is
+/// across sessions, not within one ordered stream.
+pub fn spawn_decode_workers(params: DecodeWorkerParams) {
+    let DecodeWorkerParams {
+        workers,
+        gpu_available,
+        decode_width,
+        decode_height,
+        output_pool_slots,
+        jpeg_pool_slots,
+        rtp_rx,
+        sink,
+        metrics,
+        session_span,
+    } = params;
+    // One ordered stream is one stateful decoder, so this pool is always a single
+    // thread; the requested count only scales parallelism across sessions.
+    debug_assert_eq!(per_stream_decode_workers(workers), 1);
 
-        std::thread::Builder::new()
-            .name(format!("vx-decode-{i}"))
-            .spawn(move || {
-                use crate::webrtc::decode::VideoCodec;
+    // Resolve the wiring into the worker's running state once, up front. In the
+    // keyframe path this is where the gate lives, so the hot loop encodes a JPEG
+    // only for the frames the gate keeps instead of for every decoded frame.
+    let mut sink_state = match sink {
+        DecodeSink::Keyframe(KeyframeSink {
+            gate_config,
+            loop_hamming_threshold,
+            loop_repeat_threshold,
+            vlm_tx,
+            stdb,
+            run_id,
+            session_id,
+            prompt,
+        }) => SinkState::Keyframe {
+            gate: GateStreamState::new(gate_config, loop_hamming_threshold, loop_repeat_threshold),
+            vlm_tx,
+            stdb,
+            run_id,
+            session_id,
+            prompt,
+        },
+        DecodeSink::Stream {
+            frame_tx,
+            clip_config,
+        } => SinkState::Stream {
+            frame_tx,
+            clip_rate_gate: ClipRateGate::new(clip_config.target_fps),
+        },
+    };
 
-                // Lazy decoder: created on the first frame so we know the codec.
-                let mut decoder: Option<Decoder> = None;
-                let mut active_codec: Option<VideoCodec> = None;
-                let mut prev_signal: Option<crate::gate::FrameSignal> = None;
-                // Reused across frames to avoid per-frame 6MB YCbCr allocation.
-                let mut ycbcr_scratch: Vec<u8> = Vec::with_capacity(
-                    DEFAULT_DECODE_WIDTH as usize * DEFAULT_DECODE_HEIGHT as usize * 3,
-                );
-                let jpeg_pool = VecPool::with_slots(jpeg_pool_slots);
+    std::thread::Builder::new()
+        .name("vx-decode-0".to_string())
+        .spawn(move || {
+            use crate::webrtc::decode::VideoCodec;
 
-                'rtp_frames: while let Ok(frame) = rtp_rx.recv() {
-                    let _guard = session_span.enter();
-                    metrics.inc_rtp_received();
+            // Lazy decoder: created on the first frame so we know the codec.
+            // The codec travels with the decoder in one slot so "we have a
+            // decoder for this codec" is a single state the type enforces,
+            // rather than two fields that could drift apart.
+            let mut decoder: Option<(VideoCodec, Decoder)> = None;
+            let mut prev_signal: Option<FrameSignal> = None;
+            // Reused across frames to avoid per-frame 6MB YCbCr allocation.
+            let mut ycbcr_scratch: Vec<u8> =
+                Vec::with_capacity(decode_width as usize * decode_height as usize * 3);
+            let jpeg_pool = VecPool::with_slots(jpeg_pool_slots);
 
-                    // Re-initialise the decoder when the codec changes (e.g. a
-                    // new session with a different codec arrives on the same worker).
-                    if active_codec != Some(frame.codec) {
+            'rtp_frames: while let Ok(frame) = rtp_rx.recv() {
+                let _guard = session_span.enter();
+                metrics.inc_rtp_received();
+                let seq = frame.seq;
+                let pts_ms = frame.pts_ms;
+
+                // Re-initialise the decoder when the codec changes (e.g. a
+                // new session with a different codec arrives on the same worker).
+                // Matching on the slot yields the decoder directly, so there is
+                // no separate "it must be present" step that could fail.
+                let dec = match &mut decoder {
+                    Some((codec, dec)) if *codec == frame.codec => dec,
+                    slot => {
                         let config = DecoderConfig {
-                            gpu_available: gpu,
+                            gpu_available,
                             codec: frame.codec,
-                            width: DEFAULT_DECODE_WIDTH,
-                            height: DEFAULT_DECODE_HEIGHT,
+                            width: decode_width,
+                            height: decode_height,
                             output_pool_slots,
                         };
-                        decoder = Some(Decoder::new_with_metrics(&config, Arc::clone(&metrics)));
-                        active_codec = Some(frame.codec);
+                        let entry = (
+                            frame.codec,
+                            Decoder::new_with_metrics(&config, Arc::clone(&metrics)),
+                        );
+                        &mut slot.insert(entry).1
                     }
+                };
 
-                    let dec = decoder.as_mut().expect("decoder initialised above");
+                let decode_start = std::time::Instant::now();
+                let yuv = match dec.decode(&frame.nals) {
+                    Ok(yuv) => yuv,
+                    Err(DecodeError::UnsupportedCodec(codec)) => {
+                        tracing::error!(
+                            ?codec,
+                            "no supported WebRTC decoder for negotiated codec; VP8 software decode is unsupported in the live zero-dependency pipeline; configure the client to offer H.264"
+                        );
+                        return;
+                    }
+                    Err(_) => continue 'rtp_frames,
+                };
+                metrics
+                    .decode_latency_us
+                    .record(decode_start.elapsed().as_micros() as u64);
+                metrics.inc_frames_decoded();
 
-                    let decode_start = std::time::Instant::now();
-                    let yuv = match dec.decode(&frame.nals) {
-                        Ok(yuv) => yuv,
-                        Err(DecodeError::UnsupportedCodec(codec)) => {
-                            tracing::error!(
-                                ?codec,
-                                "no supported WebRTC decoder for negotiated codec; VP8 software decode is unsupported in the live zero-dependency pipeline; configure the client to offer H.264"
-                            );
-                            return;
+                match &mut sink_state {
+                    SinkState::Keyframe {
+                        gate,
+                        vlm_tx,
+                        stdb,
+                        run_id,
+                        session_id,
+                        prompt,
+                    } => {
+                        // A frame whose planes don't match its dimensions can't be
+                        // read safely, and its statistics would poison the temporal
+                        // deltas of every frame after it. Drop it before it touches
+                        // prev_signal; the next good frame recovers.
+                        if let Err(err) = check_frame(&yuv) {
+                            tracing::warn!(seq, %err, "dropping malformed frame");
+                            continue 'rtp_frames;
                         }
-                        Err(_) => continue 'rtp_frames,
-                    };
+                        let signal =
+                            yuv_to_frame_signal(&yuv, seq, pts_ms, prev_signal.as_ref());
+                        prev_signal = Some(signal);
 
-                    let sf = build_stream_frame_from_yuv(
-                        &yuv,
-                        frame.seq,
-                        frame.pts_ms,
-                        &mut prev_signal,
-                        &mut ycbcr_scratch,
-                        &jpeg_pool,
-                    );
+                        let ctx = KeyframeContext {
+                            run_id,
+                            session_id,
+                            prompt,
+                            stdb,
+                            metrics: &metrics,
+                        };
+                        // The encoder only runs if the gate keeps the frame. A
+                        // rejected thumbnail costs this one frame, not the stream.
+                        let work = gate.on_frame(signal, pts_ms, &ctx, || {
+                            match yuv_to_jpeg(&yuv, 75, &mut ycbcr_scratch, &jpeg_pool) {
+                                Ok(bytes) => Some(bytes),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        seq,
+                                        %err,
+                                        "dropping thumbnail for unencodable frame"
+                                    );
+                                    None
+                                }
+                            }
+                        });
+                        let Some(work) = work else {
+                            continue 'rtp_frames;
+                        };
 
-                    let decode_us = decode_start.elapsed().as_micros() as u64;
-                    metrics.decode_latency_us.record(decode_us);
-
-                    metrics.inc_frames_decoded();
-                    if frame_tx.send(sf).is_err() {
-                        return; // downstream dropped — shut down
+                        // Non-blocking: drop if the VLM queue is full rather than
+                        // stall the decode loop for the whole stream.
+                        // kanal try_send yields Ok(false) when the queue is full,
+                        // so only a real enqueue (Ok(true)) is a kept keyframe; a
+                        // full queue or a closed channel is a drop.
+                        if matches!(vlm_tx.try_send(work), Ok(true)) {
+                            metrics.inc_keyframes();
+                        } else {
+                            metrics.inc_keyframes_dropped();
+                        }
+                    }
+                    SinkState::Stream {
+                        frame_tx,
+                        clip_rate_gate,
+                    } => {
+                        // Clip mode uses the accumulator's PTS sampling rule
+                        // before encoding so over-rate frames stay cheap.
+                        let Some(sf) = build_clip_stream_frame_from_yuv(
+                            &yuv,
+                            seq,
+                            pts_ms,
+                            &mut prev_signal,
+                            clip_rate_gate,
+                            || match yuv_to_jpeg(&yuv, 75, &mut ycbcr_scratch, &jpeg_pool) {
+                                Ok(bytes) => Some(bytes),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        seq,
+                                        %err,
+                                        "dropping thumbnail for unencodable frame"
+                                    );
+                                    None
+                                }
+                            },
+                        ) else {
+                            continue 'rtp_frames;
+                        };
+                        if frame_tx.send(sf).is_err() {
+                            return; // downstream dropped — shut down
+                        }
                     }
                 }
-            })
-            .expect("decode thread spawn failed");
-    }
+            }
+        })
+        .expect("decode thread spawn failed");
 }
 
 // ─── Analysis workers ─────────────────────────────────────────────────────────
 
 /// Spawn analysis workers.
 ///
-/// Normal mode runs the gate engine and forwards kept keyframes to the VLM
-/// queue with `try_send`. Clip mode bypasses the gate and forwards accepted
-/// frames to the clip accumulator with `try_send`, dropping if its queue is full.
-// Spawns analysis workers; the worker owns separate queue, sink, prompt, metrics, and span handles.
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_analysis_workers(
-    cores: usize,
-    frame_rx: kanal::Receiver<StreamFrame>,
-    vlm_tx: kanal::Sender<KeyframeWork>,
-    clip_tx: Option<kanal::Sender<StreamFrame>>,
-    stdb: Arc<dyn EventSink>,
-    run_id: Arc<str>,
-    session_id: Arc<str>,
-    prompt: Arc<ArcSwap<Arc<str>>>,
-    metrics: Arc<PipelineMetrics>,
-    session_span: tracing::Span,
-) {
-    for i in 0..per_stream_analysis_workers(cores) {
+/// Clip mode forwards accepted frames to the clip accumulator with `try_send`,
+/// dropping if its queue is full.
+/// Inputs for the analysis worker pool.
+pub struct AnalysisWorkerParams {
+    /// Requested worker count; clamped to one per ordered stream.
+    pub workers: usize,
+    /// Gate-engine thresholds applied to each frame.
+    pub gate_config: GateConfig,
+    /// Perceptual-hash Hamming-distance threshold for treating frames as the same screen.
+    pub loop_hamming_threshold: u32,
+    /// Repeat count within the window that marks a stream as looping.
+    pub loop_repeat_threshold: usize,
+    /// Decoded stream frames in.
+    pub frame_rx: kanal::Receiver<StreamFrame>,
+    /// Accepted clip frames out to the accumulator.
+    pub clip_tx: kanal::Sender<StreamFrame>,
+    pub stdb: Arc<dyn EventSink>,
+    pub run_id: Arc<str>,
+    pub session_id: Arc<str>,
+    pub prompt: Arc<ArcSwap<Arc<str>>>,
+    pub metrics: Arc<PipelineMetrics>,
+    pub session_span: tracing::Span,
+}
+
+pub fn spawn_analysis_workers(params: AnalysisWorkerParams) {
+    let AnalysisWorkerParams {
+        workers,
+        gate_config,
+        loop_hamming_threshold,
+        loop_repeat_threshold,
+        frame_rx,
+        clip_tx,
+        stdb,
+        run_id,
+        session_id,
+        prompt,
+        metrics,
+        session_span,
+    } = params;
+    for i in 0..per_stream_analysis_workers(workers) {
         let frame_rx = frame_rx.clone();
-        let vlm_tx = vlm_tx.clone();
         let clip_tx = clip_tx.clone();
         let stdb = Arc::clone(&stdb);
         let run_id = Arc::clone(&run_id);
@@ -331,89 +806,40 @@ pub fn spawn_analysis_workers(
         let prompt = Arc::clone(&prompt);
         let metrics = Arc::clone(&metrics);
         let session_span = session_span.clone();
+        let gate_config = gate_config.clone();
 
         std::thread::Builder::new()
             .name(format!("vx-analysis-{i}"))
             .spawn(move || {
-                let mut pipeline =
-                    TwoPassPipeline::new(TwoPassConfig::default(), GateConfig::default());
-                let mut loop_det =
-                    LoopDetector::new(DEFAULT_LOOP_WINDOW, DEFAULT_LOOP_REPEAT_THRESHOLD);
-                // True while the loop detector considers the stream stuck.
-                // Cleared when the detector stops firing for a full window.
-                let mut loop_active = false;
+                let mut gate = GateStreamState::new(
+                    gate_config,
+                    loop_hamming_threshold,
+                    loop_repeat_threshold,
+                );
 
-                while let Ok(mut sf) = frame_rx.recv() {
+                while let Ok(sf) = frame_rx.recv() {
                     let _guard = session_span.enter();
 
-                    // ── Loop detection (always active) ───────────────────
-                    let loop_fired = loop_det.check(sf.signal.perceptual_hash);
-                    if loop_fired {
-                        // Only emit the event the first time we enter a loop
-                        // to avoid flooding the sink with repeated notices.
-                        if !loop_active {
-                            metrics.inc_loop_detected();
-                            let _ = stdb.emit_event_sync(
-                                &run_id,
-                                &session_id,
-                                sf.signal.frame_index,
-                                sf.pts_ms,
-                                "loop_detected",
-                                0.9,
-                                "loop detected via perceptual-hash ring buffer",
-                            );
-                        }
-                        loop_active = true;
-                    } else {
-                        // LoopDetector returns false when the window no longer
-                        // has enough repeated hashes — the scene has changed.
-                        loop_active = false;
+                    let ctx = KeyframeContext {
+                        run_id: &run_id,
+                        session_id: &session_id,
+                        prompt: &prompt,
+                        stdb: &stdb,
+                        metrics: &metrics,
+                    };
+
+                    if let Some(event) = gate.observe_loop(&sf.signal, sf.pts_ms, ctx.metrics) {
+                        let _ = ctx.stdb.emit_event_nonblocking(
+                            ctx.run_id,
+                            ctx.session_id,
+                            event.frame_index,
+                            event.pts_ms,
+                            "loop_detected",
+                            event.confidence,
+                            event.description,
+                        );
                     }
-
-                    if let Some(ref clip_tx) = clip_tx {
-                        let _ = clip_tx.try_send(sf);
-                    } else {
-                        let gate_start = std::time::Instant::now();
-                        let metas = pipeline.analyze_batch(&[sf.signal]);
-                        let gate_us = gate_start.elapsed().as_micros() as u64;
-                        metrics.gate_latency_us.record(gate_us);
-                        let meta = match metas.first() {
-                            Some(m) => *m,
-                            None => continue,
-                        };
-
-                        if meta.gate_event == GateEventType::KeepKeyframe {
-                            let jpeg_bytes = sf.jpeg.take().unwrap_or_default();
-
-                            let event_type: &'static str = if meta.scene_cut {
-                                "scene_cut"
-                            } else {
-                                "periodic_keepalive"
-                            };
-
-                            let work = KeyframeWork {
-                                run_id: Arc::clone(&run_id),
-                                session_id: Arc::clone(&session_id),
-                                frame_index: sf.signal.frame_index,
-                                pts_ms: sf.pts_ms,
-                                event_type,
-                                confidence: meta.confidence,
-                                novelty_score: meta.novelty_score,
-                                motion_score: meta.motion_score,
-                                jpeg_bytes,
-                                prompt: Arc::clone(&*prompt.load_full()),
-                                loop_active,
-                            };
-
-                            // Non-blocking: drop if VLM queue is full to avoid
-                            // stalling the decode → analysis pipeline.
-                            if vlm_tx.try_send(work).is_ok() {
-                                metrics.inc_keyframes();
-                            } else {
-                                metrics.inc_keyframes_dropped();
-                            }
-                        }
-                    }
+                    let _ = clip_tx.try_send(sf);
                 }
             })
             .expect("analysis thread spawn failed");
@@ -435,25 +861,34 @@ impl JpegSinkBacklog {
     }
 
     fn try_acquire(&self) -> Option<SinkJpegPermit> {
-        let mut current = self.in_flight.load(Ordering::Relaxed);
-        loop {
-            if current >= JPEG_SINK_EVENT_POOL_ALLOWANCE {
-                return None;
-            }
-            match self.in_flight.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    return Some(SinkJpegPermit {
-                        in_flight: Arc::clone(&self.in_flight),
-                    });
-                }
-                Err(next) => current = next,
-            }
+        // Claim a slot with a single wait-free `fetch_add`, then hand it back if we
+        // turned out to be over the cap. No compare-exchange retry loop: every
+        // caller reads a distinct pre-increment count, and only the callers whose
+        // count landed below the allowance keep their slot, so at most
+        // `JPEG_SINK_EVENT_POOL_ALLOWANCE` permits are ever live at once.
+        //
+        // The counter can momentarily read above the allowance while racing
+        // callers each add before the losers subtract back. That overshoot is
+        // private to this function — nothing else reads `in_flight` — and it
+        // cannot admit an extra permit, since a live permit never backs out, so
+        // the count stays at or above the number of held permits. The flip side is
+        // that a caller can be turned away while another is mid-back-out and a slot
+        // is really free; for a backlog whose whole job is to shed keyframes under
+        // pressure, dropping one slightly early is the right kind of wrong.
+        //
+        // Ordering is `Relaxed` throughout: this atomic only counts admissions. It
+        // guards no shared data — the keyframe bytes ride the sink channel, which
+        // carries its own happens-before — so there is nothing for an acquire/
+        // release edge to publish, and the count's own modification order is all
+        // the bound proof needs.
+        let prev = self.in_flight.fetch_add(1, Ordering::Relaxed);
+        if prev >= JPEG_SINK_EVENT_POOL_ALLOWANCE {
+            self.in_flight.fetch_sub(1, Ordering::Relaxed);
+            return None;
         }
+        Some(SinkJpegPermit {
+            in_flight: Arc::clone(&self.in_flight),
+        })
     }
 }
 
@@ -463,7 +898,9 @@ struct SinkJpegPermit {
 
 impl Drop for SinkJpegPermit {
     fn drop(&mut self) {
-        self.in_flight.fetch_sub(1, Ordering::Release);
+        // Relaxed for the same reason as `try_acquire`: releasing a slot publishes
+        // no data, it just frees the count for the next admission.
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -520,6 +957,184 @@ enum SinkEvent {
     },
 }
 
+// ─── Pipeline assembly ────────────────────────────────────────────────────────
+
+/// Channels, sinks, and provider that wire one session's worker pipeline
+/// together. Everything here is constructed once on the control path.
+pub struct PipelineWiring<I>
+where
+    I: InferenceProvider + 'static,
+{
+    /// RTP frames from the session feed into the decoder.
+    pub rtp_rx: kanal::Receiver<RtpFrame>,
+    /// Decoder to analysis.
+    pub stream_tx: kanal::Sender<StreamFrame>,
+    pub stream_rx: kanal::Receiver<StreamFrame>,
+    /// Analysis to the keyframe VLM workers.
+    pub vlm_tx: kanal::Sender<KeyframeWork>,
+    pub vlm_rx: kanal::Receiver<KeyframeWork>,
+    /// Event sink for emitted semantic events.
+    pub event_sink: Arc<dyn EventSink>,
+    /// Inference provider shared by the VLM workers.
+    pub provider: Arc<I>,
+    pub run_id: Arc<str>,
+    pub session_id: Arc<str>,
+    /// Live prompt handle; VLM workers reload it per keyframe.
+    pub prompt: Arc<ArcSwap<Arc<str>>>,
+    /// Optional guided-JSON schema handle.
+    pub guided_json: Arc<ArcSwapOption<Arc<str>>>,
+    pub vlm_config: TieredVlmConfig,
+    pub distillation: DistillationConfig,
+    pub training_store: Option<Arc<Mutex<TrainingStore>>>,
+    /// When set, run the stream in clip mode instead of the keyframe path.
+    pub clip_config: Option<ClipConfig>,
+    /// Negotiated codec, used to size the decoder output pool.
+    pub codec: VideoCodec,
+    pub metrics: Arc<PipelineMetrics>,
+    pub session_span: tracing::Span,
+    /// Where tiered VLM inference outcomes are recorded for `/metrics`. `None`
+    /// when the caller has no metrics sink wired up (e.g. tests).
+    pub observer: Option<Arc<dyn InferenceObserver>>,
+}
+
+/// Spawn one session's full worker pipeline from a config and its wiring.
+///
+/// Decode workers always run. When `wiring.clip_config` is set the stream runs
+/// in clip mode (analysis to clip accumulator to clip VLM); otherwise it runs
+/// the keyframe path (analysis to VLM). Every worker thread is detached and
+/// shuts down when its upstream channel closes.
+pub fn spawn_pipeline<I>(cfg: &WorkerPoolConfig, wiring: PipelineWiring<I>)
+where
+    I: InferenceProvider + 'static,
+{
+    let PipelineWiring {
+        rtp_rx,
+        stream_tx,
+        stream_rx,
+        vlm_tx,
+        vlm_rx,
+        event_sink,
+        provider,
+        run_id,
+        session_id,
+        prompt,
+        guided_json,
+        vlm_config,
+        distillation,
+        training_store,
+        clip_config,
+        codec,
+        metrics,
+        session_span,
+        observer,
+    } = wiring;
+
+    let output_pool_slots = decode_output_pool_slots(cfg.gpu_available, codec);
+    let jpeg_pool_slots = jpeg_pool_slots(cfg.analysis_workers, cfg.vlm_workers);
+
+    if let Some(clip_config) = clip_config {
+        // Clip mode: the decoder samples before encoding, the analysis worker
+        // runs loop detection, and the accumulator builds clip windows.
+        spawn_decode_workers(DecodeWorkerParams {
+            workers: cfg.decode_workers,
+            gpu_available: cfg.gpu_available,
+            decode_width: cfg.decode_width,
+            decode_height: cfg.decode_height,
+            output_pool_slots,
+            jpeg_pool_slots,
+            rtp_rx,
+            sink: DecodeSink::Stream {
+                frame_tx: stream_tx,
+                clip_config: clip_config.clone(),
+            },
+            metrics: Arc::clone(&metrics),
+            session_span: session_span.clone(),
+        });
+
+        let (clip_frame_tx, clip_frame_rx) =
+            kanal::bounded::<StreamFrame>(CLIP_FRAME_QUEUE_CAPACITY);
+        let (clip_tx, clip_rx) = kanal::bounded::<ClipWork>(CLIP_WORK_QUEUE_CAPACITY);
+
+        spawn_analysis_workers(AnalysisWorkerParams {
+            workers: cfg.analysis_workers,
+            gate_config: cfg.gate_config.clone(),
+            loop_hamming_threshold: cfg.loop_hamming_threshold,
+            loop_repeat_threshold: cfg.loop_repeat_threshold,
+            frame_rx: stream_rx,
+            clip_tx: clip_frame_tx,
+            stdb: Arc::clone(&event_sink),
+            run_id: Arc::clone(&run_id),
+            session_id: Arc::clone(&session_id),
+            prompt: Arc::clone(&prompt),
+            metrics: Arc::clone(&metrics),
+            session_span: session_span.clone(),
+        });
+        spawn_clip_accumulator(
+            clip_frame_rx,
+            clip_tx,
+            clip_config,
+            Arc::clone(&run_id),
+            Arc::clone(&session_id),
+            // load_full yields Arc<Arc<str>>; deref once so the accumulator gets the inner Arc<str>.
+            Arc::clone(&*prompt.load_full()),
+            session_span.clone(),
+        );
+        spawn_clip_vlm_workers(
+            cfg.vlm_workers,
+            clip_rx,
+            provider,
+            event_sink,
+            vlm_config,
+            metrics,
+            session_span,
+            cfg.max_output_tokens_per_second,
+            guided_json,
+            observer,
+        );
+    } else {
+        // Keyframe mode: the gate runs inline in the decoder, so a JPEG is
+        // encoded only for the frames it keeps and handed straight to the VLM
+        // workers. There is no separate analysis stage, and the `stream_tx` /
+        // `stream_rx` channel the caller allocated goes unused here.
+        spawn_decode_workers(DecodeWorkerParams {
+            workers: cfg.decode_workers,
+            gpu_available: cfg.gpu_available,
+            decode_width: cfg.decode_width,
+            decode_height: cfg.decode_height,
+            output_pool_slots,
+            jpeg_pool_slots,
+            rtp_rx,
+            sink: DecodeSink::Keyframe(KeyframeSink {
+                gate_config: cfg.gate_config.clone(),
+                loop_hamming_threshold: cfg.loop_hamming_threshold,
+                loop_repeat_threshold: cfg.loop_repeat_threshold,
+                vlm_tx,
+                stdb: Arc::clone(&event_sink),
+                run_id,
+                session_id,
+                prompt,
+            }),
+            metrics: Arc::clone(&metrics),
+            session_span: session_span.clone(),
+        });
+        let _ = (stream_tx, stream_rx);
+        spawn_vlm_workers(VlmWorkerParams {
+            workers: cfg.vlm_workers,
+            vlm_rx,
+            provider,
+            stdb: event_sink,
+            config: vlm_config,
+            metrics,
+            session_span,
+            max_output_tokens_per_second: cfg.max_output_tokens_per_second,
+            guided_json,
+            training_store,
+            distillation,
+            observer,
+        });
+    }
+}
+
 pub struct VlmWorkerParams<I>
 where
     I: InferenceProvider + 'static,
@@ -535,34 +1150,28 @@ where
     pub guided_json: Arc<ArcSwapOption<Arc<str>>>,
     pub training_store: Option<Arc<Mutex<TrainingStore>>>,
     pub distillation: DistillationConfig,
+    /// Where tiered VLM inference outcomes are recorded for `/metrics`. `None`
+    /// when the caller has no metrics sink wired up (e.g. tests).
+    pub observer: Option<Arc<dyn InferenceObserver>>,
 }
 
-/// Upper bound on sessions tracked by the per-session token budget map.
-pub(super) const VLM_TOKEN_BUDGET_MAX_SESSIONS: usize = 4096;
+/// Remove token-budget windows outside the active one-second interval.
+pub(super) fn prune_stale_token_budget_entries(
+    budget: &mut std::collections::HashMap<Arc<str>, (std::time::Instant, u32)>,
+    now: std::time::Instant,
+) {
+    budget.retain(|_, (ts, _)| now.duration_since(*ts).as_secs() < 1);
+}
 
-/// Returns the token-budget window for `session`, inserting it if absent and
-/// keeping the map within `VLM_TOKEN_BUDGET_MAX_SESSIONS` (stale windows are
-/// dropped first, then an arbitrary entry) so a long-lived worker cannot grow
-/// the map unbounded.
+/// Returns the token-budget window for `session`, inserting it if absent.
 pub(super) fn token_budget_entry<'a>(
     budget: &'a mut std::collections::HashMap<Arc<str>, (std::time::Instant, u32)>,
     session: &Arc<str>,
     now: std::time::Instant,
 ) -> &'a mut (std::time::Instant, u32) {
-    if !budget.contains_key(session.as_ref()) {
-        if budget.len() >= VLM_TOKEN_BUDGET_MAX_SESSIONS {
-            budget.retain(|_, (ts, _)| now.duration_since(*ts).as_secs() < 1);
-            if budget.len() >= VLM_TOKEN_BUDGET_MAX_SESSIONS {
-                if let Some(key) = budget.keys().next().cloned() {
-                    budget.remove(&key);
-                }
-            }
-        }
-        budget.insert(Arc::clone(session), (now, 0));
-    }
-    budget
-        .get_mut(session.as_ref())
-        .expect("entry inserted above")
+    // entry() reuses the existing window or inserts a fresh one; either way it
+    // hands back a live reference without a second lookup or an unwrap.
+    budget.entry(Arc::clone(session)).or_insert((now, 0))
 }
 
 /// Spawn VLM inference worker threads with 3-tier routing + training pair collection.
@@ -608,6 +1217,7 @@ where
         guided_json,
         training_store,
         distillation,
+        observer,
     } = params;
     #[cfg(not(feature = "training"))]
     let _training_store = training_store;
@@ -681,6 +1291,7 @@ where
         let metrics = Arc::clone(&metrics);
         let session_span = session_span.clone();
         let guided_json = Arc::clone(&guided_json);
+        let observer = observer.clone();
         #[cfg(feature = "training")]
         let training_store = training_store.clone();
         #[cfg(feature = "training")]
@@ -727,8 +1338,6 @@ where
                 let mut prompt_buf = String::with_capacity(512);
                 let mut jpeg_b64 = String::new();
                 let mut input_images: Vec<InferenceImage> = Vec::with_capacity(1);
-                let mut prev_word_hashes = std::collections::HashSet::new();
-                let mut curr_word_hashes = std::collections::HashSet::new();
 
                 while let Ok(work) = vlm_rx.recv() {
                     let _guard = session_span.enter();
@@ -745,6 +1354,7 @@ where
                     // already exceeded the per-second output token budget.
                     if max_output_tokens_per_second > 0 {
                         let now = std::time::Instant::now();
+                        prune_stale_token_budget_entries(&mut token_budget, now);
                         let entry = token_budget_entry(&mut token_budget, &work.session_id, now);
                         if now.duration_since(entry.0).as_secs() >= 1 {
                             *entry = (now, 0); // reset 1-second window
@@ -829,8 +1439,8 @@ where
 
                     // ── Tiers 2+3: VLM inference (when KNN misses or disabled) ──────
                     let vlm_start = std::time::Instant::now();
-                    let (description_str, used_second_pass) = if let Some(hit) = knn_hit {
-                        hit
+                    let inference_outcome = if let Some(hit) = knn_hit {
+                        Some(hit)
                     } else {
                         // Snapshot the current guided_json schema once per inference.
                         let current_guided_json: Option<Arc<str>> =
@@ -860,25 +1470,43 @@ where
                             guided_json: current_guided_json,
                         };
 
-                        match run_tiered(provider.as_ref(), &config, request, 1024, 10_000) {
+                        let tiered_call_start = std::time::Instant::now();
+                        match run_tiered(
+                            provider.as_ref(),
+                            &config,
+                            request,
+                            1024,
+                            10_000,
+                            observer.as_deref(),
+                        ) {
                             Ok(output) => {
                                 input_images = output.request.input_images;
                                 if let Some(image) = input_images.get_mut(0) {
                                     std::mem::swap(&mut image.data_base64, &mut jpeg_b64);
                                 }
-                                (output.result.output_text, output.used_second_pass)
+                                Some((output.result.output_text, output.used_second_pass))
                             }
                             Err(err) => {
+                                if let Some(o) = observer.as_deref() {
+                                    o.record_error(
+                                        provider.kind(),
+                                        tiered_call_start.elapsed().as_millis() as u64,
+                                    );
+                                }
                                 input_images = err.request.input_images;
                                 if let Some(image) = input_images.get_mut(0) {
                                     std::mem::swap(&mut image.data_base64, &mut jpeg_b64);
                                 }
-                                (format!("vlm_error: {:?}", err.error), false)
+                                tracing::warn!(error = ?err.error, "vlm inference failed");
+                                None
                             }
                         }
                     };
                     let vlm_elapsed_ms = vlm_start.elapsed().as_millis() as u64;
                     metrics.vlm_latency_ms.record(vlm_elapsed_ms);
+                    let Some((description_str, used_second_pass)) = inference_outcome else {
+                        continue;
+                    };
 
                     // Charge output tokens against the session budget.
                     // Approximate: 4 bytes per token (UTF-8 average).
@@ -896,35 +1524,30 @@ where
                     // the same allocation without cloning the String content.
                     let description: Arc<str> = Arc::from(description_str.into_boxed_str());
 
-                    // Compare current and previous descriptions to detect
-                    // coarse state transitions without sending a second image.
-                    let prev_desc = Arc::clone(&last_description);
-                    let state_changed = if prev_desc.is_empty() {
-                        // First frame — always emit as initial state.
+                    // Compare current and previous descriptions to detect a
+                    // coarse state transition without sending a second image.
+                    // Jaccard word-overlap compares the *set* of words, so
+                    // paraphrases or reordering don't fool the check. Computed on
+                    // the stack (no per-keyframe HashSet). `last_description` is
+                    // still the previous frame's text here — it's updated below.
+                    let state_changed = if last_description.is_empty() {
+                        // First frame — always emit as the initial state.
                         true
                     } else {
-                        // Jaccard word-overlap: compare the *set* of words so
-                        // that paraphrases or reordering don't fool the check,
-                        // unlike the previous positional char comparison.
-                        prev_word_hashes.clear();
-                        curr_word_hashes.clear();
-                        prev_word_hashes.extend(prev_desc.split_whitespace().map(hash_word));
-                        curr_word_hashes.extend(description.split_whitespace().map(hash_word));
-                        let intersection = prev_word_hashes.intersection(&curr_word_hashes).count();
-                        let union = prev_word_hashes.union(&curr_word_hashes).count();
-                        let jaccard = if union == 0 {
-                            1.0
-                        } else {
-                            intersection as f32 / union as f32
-                        };
-                        prev_word_hashes.clear();
-                        curr_word_hashes.clear();
-                        jaccard < 0.5
+                        jaccard_word_overlap(&last_description, &description)
+                            < STATE_CHANGE_JACCARD_MAX
                     };
 
-                    // Update temporal context for the next keyframe.
-                    last_description = truncate_arc_str(&description, 200);
-                    last_pts_ms = work.pts_ms;
+                    // Update temporal context for the next keyframe, keeping the
+                    // outgoing description for the transition event below.
+                    // `mem::replace` moves the old Arc out — no clone, no bump.
+                    let prev_description = advance_temporal_context(
+                        Some(&description),
+                        work.pts_ms,
+                        &mut last_description,
+                        &mut last_pts_ms,
+                    )
+                    .expect("successful VLM descriptions advance temporal context");
 
                     // Always emit the VLM description event.
                     if dedup.should_emit(&description) {
@@ -940,10 +1563,10 @@ where
                     }
 
                     // Emit state_transition when the scene changed.
-                    if state_changed && !prev_desc.is_empty() {
+                    if state_changed && !prev_description.is_empty() {
                         let transition_desc = format!(
                             "{{\"from_state\":{},\"to_state\":{},\"trigger\":\"{}\",\"confidence\":{:.2}}}",
-                            serde_json::Value::String(prev_desc.to_string()),
+                            serde_json::Value::String(prev_description.to_string()),
                             serde_json::Value::String(description.to_string()),
                             work.event_type,
                             work.confidence,
@@ -997,6 +1620,18 @@ where
 
 // ─── VLM worker helpers ────────────────────────────────────────────────────────
 
+fn advance_temporal_context(
+    description: Option<&Arc<str>>,
+    pts_ms: u64,
+    last_description: &mut Arc<str>,
+    last_pts_ms: &mut u64,
+) -> Option<Arc<str>> {
+    let description = description?;
+    let previous = std::mem::replace(last_description, truncate_arc_str(description, 200));
+    *last_pts_ms = pts_ms;
+    Some(previous)
+}
+
 fn truncate_arc_str(text: &Arc<str>, max_bytes: usize) -> Arc<str> {
     if text.len() <= max_bytes {
         return Arc::clone(text);
@@ -1016,6 +1651,75 @@ fn hash_word(word: &str) -> u64 {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     hash
+}
+
+/// Below this word-overlap, two consecutive descriptions count as a state
+/// change. 0.5 = "at least half the words turned over": tolerant of the VLM
+/// rephrasing a stable scene (which shares most nouns) while still firing when
+/// the subject actually changes. Coarse on purpose — it only gates whether we
+/// emit a transition event, never whether we call the VLM.
+const STATE_CHANGE_JACCARD_MAX: f32 = 0.5;
+
+/// Word budget for the on-stack Jaccard. The VLM caps generation at 128 tokens
+/// and one word is ≥ one token, so a real description never overflows this;
+/// pathological input is clamped to the first `JACCARD_MAX_WORDS` words, which
+/// only ever makes the overlap *look higher* (fewer distinct words), i.e. errs
+/// toward "no change" — the safe direction for a coarse transition gate.
+const JACCARD_MAX_WORDS: usize = 128;
+
+/// Fill `buf` with the sorted, deduplicated hashes of the words in `text`,
+/// returning the number of unique words. Models a `HashSet<u64>` of word hashes
+/// entirely on the stack — no allocation.
+fn word_hash_set(text: &str, buf: &mut [u64; JACCARD_MAX_WORDS]) -> usize {
+    let mut n = 0;
+    for word in text.split_whitespace() {
+        if n == JACCARD_MAX_WORDS {
+            break;
+        }
+        buf[n] = hash_word(word);
+        n += 1;
+    }
+    buf[..n].sort_unstable();
+    // Collapse runs of equal hashes so the count is a set cardinality.
+    let mut unique = 0;
+    for r in 0..n {
+        if unique == 0 || buf[r] != buf[unique - 1] {
+            buf[unique] = buf[r];
+            unique += 1;
+        }
+    }
+    unique
+}
+
+/// Jaccard similarity of the word *sets* of two descriptions, on the stack.
+///
+/// Set-identical to the previous `HashSet::intersection`/`union` version, but
+/// with zero per-keyframe heap traffic: two fixed buffers, sorted, then a
+/// single merge-walk. Returns 1.0 for two empty inputs (they are identical).
+fn jaccard_word_overlap(prev: &str, curr: &str) -> f32 {
+    let mut prev_buf = [0u64; JACCARD_MAX_WORDS];
+    let mut curr_buf = [0u64; JACCARD_MAX_WORDS];
+    let a = word_hash_set(prev, &mut prev_buf);
+    let b = word_hash_set(curr, &mut curr_buf);
+
+    let (mut i, mut j, mut intersection) = (0usize, 0usize, 0usize);
+    while i < a && j < b {
+        match prev_buf[i].cmp(&curr_buf[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                intersection += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    let union = a + b - intersection;
+    if union == 0 {
+        1.0
+    } else {
+        intersection as f32 / union as f32
+    }
 }
 
 /// POST `jpeg_b64` to the SigLIP2 embedding server and return a 768-dim vector.
@@ -1122,13 +1826,16 @@ fn collect_training_pair(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_stream_frame_from_yuv, decode_output_pool_slots, jpeg_pool_slots, token_budget_entry,
-        DecoderBackend, EventSink, KeyframeWork, StreamFrame, CLIP_FRAME_QUEUE_CAPACITY,
+        advance_temporal_context, build_clip_stream_frame_from_yuv, build_stream_frame_from_yuv,
+        decode_output_pool_slots, hash_word, jaccard_word_overlap, jpeg_pool_slots,
+        prune_stale_token_budget_entries, token_budget_entry, DecoderBackend, EventSink,
+        GateStreamState, KeyframeContext, KeyframeWork, StreamFrame, CLIP_FRAME_QUEUE_CAPACITY,
         CLIP_WORK_QUEUE_CAPACITY, FFMPEG_YUV_READER_QUEUE_CAPACITY, JPEG_POOL_SLOT_CEILING,
         JPEG_SINK_EVENT_POOL_ALLOWANCE, SINK_EVENT_QUEUE_CAPACITY, STREAM_FRAME_QUEUE_CAPACITY,
-        VLM_TOKEN_BUDGET_MAX_SESSIONS, VLM_WORK_QUEUE_CAPACITY,
+        VLM_WORK_QUEUE_CAPACITY,
     };
     use crate::gate::FrameSignal;
+    use crate::webrtc::clip::ClipRateGate;
     use crate::webrtc::clip::MAX_CLIP_FRAMES_PER_REQUEST;
     use crate::webrtc::decode::{
         VideoCodec, YuvFrame, FFMPEG_YUV_PENDING_POOL_ALLOWANCE, FFMPEG_YUV_READER_POOL_MIN_SLOTS,
@@ -1137,7 +1844,7 @@ mod tests {
     use crate::webrtc::recycle::VecPool;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     struct MockSink {
         events: Mutex<Vec<String>>,
@@ -1244,16 +1951,48 @@ mod tests {
     }
 
     #[test]
-    fn token_budget_entry_evicts_when_session_bound_is_reached() {
+    fn token_budget_prunes_sessions_outside_active_window() {
         let mut budget: HashMap<Arc<str>, (Instant, u32)> = HashMap::new();
         let now = Instant::now();
+        let stale_session: Arc<str> = Arc::from("stale");
+        let active_session: Arc<str> = Arc::from("active");
 
-        for i in 0..(VLM_TOKEN_BUDGET_MAX_SESSIONS + 4) {
-            let session: Arc<str> = Arc::from(format!("session-{i}"));
-            token_budget_entry(&mut budget, &session, now);
+        budget.insert(stale_session.clone(), (now - Duration::from_secs(2), 3));
+        budget.insert(
+            active_session.clone(),
+            (now - Duration::from_millis(500), 4),
+        );
+
+        prune_stale_token_budget_entries(&mut budget, now);
+
+        assert!(!budget.contains_key(stale_session.as_ref()));
+        assert_eq!(
+            budget.get(active_session.as_ref()),
+            Some(&(now - Duration::from_millis(500), 4))
+        );
+    }
+
+    #[test]
+    fn token_budget_window_still_enforces_per_second_cap() {
+        let mut budget: HashMap<Arc<str>, (Instant, u32)> = HashMap::new();
+        let now = Instant::now();
+        let session: Arc<str> = Arc::from("session");
+        let cap = 8;
+
+        let entry = token_budget_entry(&mut budget, &session, now);
+        entry.1 = entry.1.saturating_add(8);
+        assert!(entry.1 >= cap);
+
+        let next = now + Duration::from_millis(500);
+        let entry = token_budget_entry(&mut budget, &session, next);
+        assert!(entry.1 >= cap);
+
+        let reset = now + Duration::from_secs(1);
+        let entry = token_budget_entry(&mut budget, &session, reset);
+        if reset.duration_since(entry.0).as_secs() >= 1 {
+            *entry = (reset, 0);
         }
-
-        assert_eq!(budget.len(), VLM_TOKEN_BUDGET_MAX_SESSIONS);
+        assert_eq!(*entry, (reset, 0));
     }
 
     #[test]
@@ -1334,6 +2073,7 @@ mod tests {
                     &mut ycbcr_scratch,
                     &jpeg_pool,
                 )
+                .expect("a well-formed frame produces a stream frame")
             })
             .collect();
 
@@ -1423,6 +2163,52 @@ mod tests {
     }
 
     #[test]
+    fn sink_jpeg_backlog_bounds_permits_under_concurrent_acquire() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+
+        // Oversubscribe hard: many threads each try far more acquisitions than the
+        // allowance, and every granted permit is held (never dropped) until all
+        // threads have joined. The wait-free fetch_add path must still hand out
+        // exactly `JPEG_SINK_EVENT_POOL_ALLOWANCE` permits — no more (the cap), and
+        // no fewer: total attempts far exceed the cap and no permit is released
+        // before the join barrier, so the pool fills even under serialized
+        // scheduling, not by luck of the interleaving.
+        let backlog = StdArc::new(super::JpegSinkBacklog::new());
+        let granted = StdArc::new(AtomicUsize::new(0));
+        let threads = 8;
+        let attempts_per_thread = JPEG_SINK_EVENT_POOL_ALLOWANCE;
+
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let backlog = StdArc::clone(&backlog);
+                let granted = StdArc::clone(&granted);
+                std::thread::spawn(move || {
+                    let mut held = Vec::new();
+                    for _ in 0..attempts_per_thread {
+                        if let Some(permit) = backlog.try_acquire() {
+                            held.push(permit);
+                        }
+                    }
+                    granted.fetch_add(held.len(), Ordering::Relaxed);
+                    held // keep the permits alive past the join barrier
+                })
+            })
+            .collect();
+
+        let all_held: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            granted.load(Ordering::Relaxed),
+            JPEG_SINK_EVENT_POOL_ALLOWANCE,
+            "concurrent acquire must grant exactly the allowance while all permits are held"
+        );
+
+        // Once every permit drops, the pool is empty again and re-admits.
+        drop(all_held);
+        assert!(backlog.try_acquire().is_some());
+    }
+
+    #[test]
     fn per_stream_stateful_worker_counts_are_clamped_to_one() {
         assert_eq!(super::per_stream_decode_workers(0), 1);
         assert_eq!(super::per_stream_decode_workers(8), 1);
@@ -1433,86 +2219,54 @@ mod tests {
     }
 
     #[test]
-    fn analysis_workers_emit_loop_event() {
-        use super::spawn_analysis_workers;
-
+    fn observe_loop_returns_event_without_emitting_inline() {
         let sink = MockSink::new();
-        let prompt = Arc::new(arc_swap::ArcSwap::from(Arc::new(Arc::from(""))));
-        let (frame_tx, frame_rx) = kanal::bounded::<StreamFrame>(64);
-        let (vlm_tx, _vlm_rx) = kanal::bounded::<KeyframeWork>(64);
+        let metrics = crate::metrics::PipelineMetrics::new();
+        let mut gate = GateStreamState::new(crate::gate::GateConfig::default(), 6, 3);
 
-        spawn_analysis_workers(
-            1,
-            frame_rx,
-            vlm_tx,
-            None, // no clip mode
-            Arc::clone(&sink) as Arc<dyn EventSink>,
-            "run-test".into(),
-            "sess-test".into(),
-            prompt,
-            Arc::new(crate::metrics::PipelineMetrics::new()),
-            tracing::Span::none(),
-        );
-
-        // Send 8 frames with the same hash to trigger loop detection.
-        let same_hash_frame = StreamFrame {
-            signal: FrameSignal {
-                frame_index: 0,
-                pts_ms: 0,
+        let mut event = None;
+        for i in 0..8u64 {
+            let signal = FrameSignal {
+                frame_index: i,
+                pts_ms: i * 33,
                 perceptual_hash: 0xAAAA_AAAA_AAAA_AAAA,
                 luma_mean: 0.4,
                 flicker_score: 0.0,
                 ghosting_score: 0.0,
                 noise_variance_score: 0.0,
-            },
-            jpeg: Some([0xff_u8, 0xd8, 0xff, 0xd9].into()),
-            pts_ms: 0,
-            seq: 0,
-        };
-
-        for i in 0..8u64 {
-            let mut sf = same_hash_frame.clone();
-            sf.seq = i;
-            sf.signal.frame_index = i;
-            sf.pts_ms = i * 33;
-            frame_tx.send(sf).unwrap();
+            };
+            event = event.or_else(|| gate.observe_loop(&signal, signal.pts_ms, &metrics));
         }
 
-        drop(frame_tx); // signal EOF
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        let events = sink.events.lock().unwrap();
-        assert!(
-            events.iter().any(|e| e == "loop_detected"),
-            "expected at least one loop_detected event, got: {events:?}"
-        );
+        let event = event.expect("loop event should be returned on loop entry");
+        assert_eq!(event.frame_index, 3);
+        assert_eq!(sink.events.lock().unwrap().len(), 0);
+        assert!(metrics
+            .render_prometheus()
+            .contains("vidarax_pipeline_loop_detected_total 1"));
     }
 
     #[test]
-    fn analysis_workers_load_latest_prompt_for_keyframes() {
-        use super::spawn_analysis_workers;
-
+    fn gate_stream_state_loads_latest_prompt_for_keyframes() {
         let sink = MockSink::new();
         let prompt = Arc::new(arc_swap::ArcSwap::from(Arc::new(Arc::from(""))));
-        let (frame_tx, frame_rx) = kanal::bounded::<StreamFrame>(64);
-        let (vlm_tx, vlm_rx) = kanal::bounded::<KeyframeWork>(64);
+        let metrics = crate::metrics::PipelineMetrics::new();
+        let stdb = sink as Arc<dyn EventSink>;
+        let run_id: Arc<str> = "run-test".into();
+        let session_id: Arc<str> = "sess-test".into();
+        let mut gate = GateStreamState::new(crate::gate::GateConfig::default(), 6, 3);
+        let ctx = KeyframeContext {
+            run_id: &run_id,
+            session_id: &session_id,
+            prompt: &prompt,
+            stdb: &stdb,
+            metrics: &metrics,
+        };
 
-        spawn_analysis_workers(
-            1,
-            frame_rx,
-            vlm_tx,
-            None,
-            Arc::clone(&sink) as Arc<dyn EventSink>,
-            "run-test".into(),
-            "sess-test".into(),
-            Arc::clone(&prompt),
-            Arc::new(crate::metrics::PipelineMetrics::new()),
-            tracing::Span::none(),
-        );
-
-        frame_tx.send(make_stream_frame(0)).unwrap();
-        let first = vlm_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+        let first = gate
+            .on_frame(make_stream_frame(0).signal, 0, &ctx, || {
+                Some([0xff_u8, 0xd8, 0xff, 0xd9].into())
+            })
             .expect("initial keyframe work");
         assert_eq!(&*first.prompt, "");
 
@@ -1520,13 +2274,138 @@ mod tests {
 
         let mut scene_cut = make_stream_frame(1);
         scene_cut.signal.perceptual_hash = !scene_cut.signal.perceptual_hash;
-        frame_tx.send(scene_cut).unwrap();
-
-        let second = vlm_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+        let second = gate
+            .on_frame(scene_cut.signal, scene_cut.pts_ms, &ctx, || {
+                Some([0xff_u8, 0xd8, 0xff, 0xd9].into())
+            })
             .expect("scene-cut keyframe work");
         assert_eq!(&*second.prompt, "describe updated prompt");
+    }
 
-        drop(frame_tx);
+    #[test]
+    fn failed_keyframe_encode_does_not_commit_gate_reference() {
+        let sink = MockSink::new();
+        let prompt = Arc::new(arc_swap::ArcSwap::from(Arc::new(Arc::from(""))));
+        let metrics = crate::metrics::PipelineMetrics::new();
+        let stdb = sink as Arc<dyn EventSink>;
+        let run_id: Arc<str> = "run-test".into();
+        let session_id: Arc<str> = "sess-test".into();
+        let mut gate = GateStreamState::new(crate::gate::GateConfig::default(), 6, 3);
+        let ctx = KeyframeContext {
+            run_id: &run_id,
+            session_id: &session_id,
+            prompt: &prompt,
+            stdb: &stdb,
+            metrics: &metrics,
+        };
+
+        assert!(gate
+            .on_frame(make_stream_frame(0).signal, 0, &ctx, || None)
+            .is_none());
+
+        let second = gate
+            .on_frame(make_stream_frame(1).signal, 33, &ctx, || {
+                Some([0xff_u8, 0xd8, 0xff, 0xd9].into())
+            })
+            .expect("uncommitted failed keep should not suppress the next keep");
+        assert_eq!(second.frame_index, 1);
+    }
+
+    #[test]
+    fn over_rate_clip_frames_are_not_encoded() {
+        let yuv = tiny_yuv_frame(64, 64, 128);
+        let mut prev_signal = None;
+        let mut gate = ClipRateGate::new(1);
+        let mut encode_calls = 0usize;
+
+        let first =
+            build_clip_stream_frame_from_yuv(&yuv, 0, 0, &mut prev_signal, &mut gate, || {
+                encode_calls += 1;
+                Some([0xff_u8, 0xd8, 0xff, 0xd9].into())
+            });
+        assert!(first.is_some());
+
+        let second =
+            build_clip_stream_frame_from_yuv(&yuv, 1, 500, &mut prev_signal, &mut gate, || {
+                encode_calls += 1;
+                Some([0xff_u8, 0xd8, 0xff, 0xd9].into())
+            });
+
+        let second = second.expect("over-rate frame should still forward its signal");
+        assert!(second.jpeg.is_none());
+        assert_eq!(encode_calls, 1);
+    }
+
+    #[test]
+    fn failed_vlm_result_does_not_advance_temporal_context() {
+        let mut last_description: Arc<str> = Arc::from("stable scene");
+        let mut last_pts_ms = 120;
+
+        assert!(
+            advance_temporal_context(None, 200, &mut last_description, &mut last_pts_ms,).is_none()
+        );
+        assert_eq!(&*last_description, "stable scene");
+        assert_eq!(last_pts_ms, 120);
+
+        let description: Arc<str> = Arc::from("new scene");
+        let previous = advance_temporal_context(
+            Some(&description),
+            240,
+            &mut last_description,
+            &mut last_pts_ms,
+        )
+        .expect("successful description should advance context");
+        assert_eq!(&*previous, "stable scene");
+        assert_eq!(&*last_description, "new scene");
+        assert_eq!(last_pts_ms, 240);
+    }
+
+    /// Reference Jaccard over word-hash sets, exactly the `HashSet` version the
+    /// stack implementation replaced. The two must agree bit-for-bit.
+    fn jaccard_reference(prev: &str, curr: &str) -> f32 {
+        use std::collections::HashSet;
+        let a: HashSet<u64> = prev.split_whitespace().map(hash_word).collect();
+        let b: HashSet<u64> = curr.split_whitespace().map(hash_word).collect();
+        let inter = a.intersection(&b).count();
+        let union = a.union(&b).count();
+        if union == 0 {
+            1.0
+        } else {
+            inter as f32 / union as f32
+        }
+    }
+
+    #[test]
+    fn stack_jaccard_matches_hashset_reference() {
+        let cases = [
+            ("", ""),
+            ("a", ""),
+            ("the cat sat on the mat", "the cat sat on the mat"),
+            ("the cat sat on the mat", "a dog ran across the yard"),
+            (
+                "user opens the settings panel",
+                "user opens the settings menu",
+            ),
+            // Repeated words must fold to a set, not inflate the counts.
+            ("code code code review", "code review review review"),
+            ("reordered words here now", "now here words reordered"),
+        ];
+        for (prev, curr) in cases {
+            let got = jaccard_word_overlap(prev, curr);
+            let want = jaccard_reference(prev, curr);
+            assert!(
+                (got - want).abs() < 1e-6,
+                "jaccard({prev:?}, {curr:?}) = {got}, reference = {want}",
+            );
+        }
+    }
+
+    #[test]
+    fn stack_jaccard_is_symmetric_and_bounded() {
+        let got = jaccard_word_overlap("alpha beta gamma", "beta gamma delta");
+        assert!((0.0..=1.0).contains(&got));
+        assert!((got - jaccard_word_overlap("beta gamma delta", "alpha beta gamma")).abs() < 1e-6);
+        // 2 shared of 4 distinct → exactly 0.5.
+        assert!((got - 0.5).abs() < 1e-6, "expected 0.5, got {got}");
     }
 }

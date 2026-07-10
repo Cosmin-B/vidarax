@@ -54,7 +54,14 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
         Some(
             tokio::task::spawn_blocking(move || {
                 // reqwest::blocking builds and drops an internal runtime.
-                vidarax_core::backends::build_provider_chain(&backends)
+                //
+                // Use the model-routing builder, not the plain fallback
+                // chain: tiered VLM inference (see
+                // vidarax_core::tiered_vlm::run_tiered) swaps the model id on
+                // an escalated request and needs that id to reach whichever
+                // backend actually serves it, not just retry the same
+                // primary backend picked at startup.
+                vidarax_core::backends::build_provider_with_model_routing(&backends)
             })
             .await
             .map_err(|e| invalid_input(format!("failed to build provider chain: {e}")))?
@@ -128,6 +135,7 @@ fn backend_entries_from_explicit_urls(
             base_url: Some(base_url.clone()),
             api_key: None,
             model: None,
+            openai_kind: Some("vllm".to_string()),
             priority: 1,
         });
     }
@@ -138,6 +146,7 @@ fn backend_entries_from_explicit_urls(
             base_url: Some(base_url.clone()),
             api_key: None,
             model: None,
+            openai_kind: Some("sglang".to_string()),
             priority: 2,
         });
     }
@@ -172,6 +181,13 @@ fn build_webrtc_config(config: &ServerConfig) -> WebRtcConfig {
         decode_workers: config.webrtc_decode_workers,
         analysis_workers: per_stream_analysis_workers(config.webrtc_analysis_workers),
         vlm_workers: config.webrtc_vlm_workers,
+        gate_config: config.gate_config.clone(),
+        // Resolved once here from the ServerConfig fields, not the process
+        // environment, so it is the single source of truth every WHIP
+        // session on this AppState clones. See config::build_webrtc_vlm_config
+        // for why that distinction matters.
+        vlm_tiering: config::build_webrtc_vlm_config(config),
+        ..Default::default()
     }
 }
 
@@ -196,6 +212,7 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tower::ServiceExt;
     use vidarax_core::backends::BackendEntry;
+    use vidarax_core::gate::GateConfig;
     use vidarax_core::ingest::pipeline::{
         register_decode_backend, CpuFfmpegPipeline, PipelineBackend,
     };
@@ -244,6 +261,11 @@ mod tests {
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
             webrtc_vlm_workers: 2,
+            webrtc_first_pass_model: "Qwen/Qwen3-VL-8B-Instruct".to_string(),
+            webrtc_second_pass_model: None,
+            webrtc_second_pass_threshold: 0.7,
+            webrtc_second_pass_max_tokens: 256,
+            gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         }
     }
@@ -257,6 +279,7 @@ mod tests {
             base_url: Some(base_url.to_string()),
             api_key: None,
             model: None,
+            openai_kind: None,
             priority: 1,
         };
         vidarax_core::backends::build_provider_chain(&[entry]).unwrap()
@@ -410,6 +433,40 @@ mod tests {
     }
 
     #[test]
+    fn build_webrtc_config_carries_resolved_gate_config() {
+        let mut config = default_test_server_config();
+        config.gate_config.scene_cut_hamming_threshold = 7;
+
+        let webrtc = build_webrtc_config(&config);
+
+        assert_eq!(webrtc.gate_config.scene_cut_hamming_threshold, 7);
+    }
+
+    #[test]
+    fn build_webrtc_config_carries_resolved_tiering_config() {
+        // Set the tiering knobs on the ServerConfig directly, not via env, so
+        // this proves build_webrtc_config resolves TieredVlmConfig from the
+        // struct a caller passed to `run`, not whatever the process
+        // environment happens to hold.
+        let mut config = default_test_server_config();
+        config.webrtc_first_pass_model = "local-model".to_string();
+        config.webrtc_second_pass_model = Some("escalation-model".to_string());
+        config.webrtc_second_pass_threshold = 0.42;
+        config.webrtc_second_pass_max_tokens = 512;
+
+        let webrtc = build_webrtc_config(&config);
+
+        assert!(
+            webrtc.vlm_tiering.is_tiered(),
+            "a ServerConfig with a distinct second-pass model must resolve to tiered routing"
+        );
+        assert_eq!(&*webrtc.vlm_tiering.first_pass_model, "local-model");
+        assert_eq!(&*webrtc.vlm_tiering.second_pass_model, "escalation-model");
+        assert_eq!(webrtc.vlm_tiering.second_pass_threshold, 0.42);
+        assert_eq!(webrtc.vlm_tiering.second_pass_max_tokens, 512);
+    }
+
+    #[test]
     fn attach_spacetime_client_respects_env_gated_config() {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -465,6 +522,11 @@ mod tests {
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
             webrtc_vlm_workers: 2,
+            webrtc_first_pass_model: "Qwen/Qwen3-VL-8B-Instruct".to_string(),
+            webrtc_second_pass_model: None,
+            webrtc_second_pass_threshold: 0.7,
+            webrtc_second_pass_max_tokens: 256,
+            gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         };
 
@@ -2368,6 +2430,11 @@ mod tests {
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
             webrtc_vlm_workers: 2,
+            webrtc_first_pass_model: "Qwen/Qwen3-VL-8B-Instruct".to_string(),
+            webrtc_second_pass_model: None,
+            webrtc_second_pass_threshold: 0.7,
+            webrtc_second_pass_max_tokens: 256,
+            gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         })
         .unwrap();
@@ -2425,6 +2492,11 @@ mod tests {
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
             webrtc_vlm_workers: 2,
+            webrtc_first_pass_model: "Qwen/Qwen3-VL-8B-Instruct".to_string(),
+            webrtc_second_pass_model: None,
+            webrtc_second_pass_threshold: 0.7,
+            webrtc_second_pass_max_tokens: 256,
+            gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         })
         .unwrap();
@@ -2479,6 +2551,11 @@ mod tests {
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
             webrtc_vlm_workers: 2,
+            webrtc_first_pass_model: "Qwen/Qwen3-VL-8B-Instruct".to_string(),
+            webrtc_second_pass_model: None,
+            webrtc_second_pass_threshold: 0.7,
+            webrtc_second_pass_max_tokens: 256,
+            gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         })
         .unwrap();
@@ -2559,6 +2636,11 @@ mod tests {
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
             webrtc_vlm_workers: 2,
+            webrtc_first_pass_model: "Qwen/Qwen3-VL-8B-Instruct".to_string(),
+            webrtc_second_pass_model: None,
+            webrtc_second_pass_threshold: 0.7,
+            webrtc_second_pass_max_tokens: 256,
+            gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         })
         .unwrap();
@@ -2619,6 +2701,11 @@ mod tests {
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
             webrtc_vlm_workers: 2,
+            webrtc_first_pass_model: "Qwen/Qwen3-VL-8B-Instruct".to_string(),
+            webrtc_second_pass_model: None,
+            webrtc_second_pass_threshold: 0.7,
+            webrtc_second_pass_max_tokens: 256,
+            gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         }) {
             Ok(_) => panic!("required-tenant without required API keys should be rejected"),
@@ -2664,6 +2751,11 @@ mod tests {
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
             webrtc_vlm_workers: 2,
+            webrtc_first_pass_model: "Qwen/Qwen3-VL-8B-Instruct".to_string(),
+            webrtc_second_pass_model: None,
+            webrtc_second_pass_threshold: 0.7,
+            webrtc_second_pass_max_tokens: 256,
+            gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         })
         .unwrap();
@@ -2896,6 +2988,11 @@ mod tests {
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
             webrtc_vlm_workers: 2,
+            webrtc_first_pass_model: "Qwen/Qwen3-VL-8B-Instruct".to_string(),
+            webrtc_second_pass_model: None,
+            webrtc_second_pass_threshold: 0.7,
+            webrtc_second_pass_max_tokens: 256,
+            gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         };
 
@@ -3030,6 +3127,11 @@ mod tests {
             webrtc_decode_workers: 2,
             webrtc_analysis_workers: 1,
             webrtc_vlm_workers: 2,
+            webrtc_first_pass_model: "Qwen/Qwen3-VL-8B-Instruct".to_string(),
+            webrtc_second_pass_model: None,
+            webrtc_second_pass_threshold: 0.7,
+            webrtc_second_pass_max_tokens: 256,
+            gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         };
 

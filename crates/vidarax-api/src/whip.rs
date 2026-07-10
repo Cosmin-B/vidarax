@@ -35,19 +35,16 @@ use axum::Json;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use vidarax_core::provider::{
-    InferenceProvider, InferenceRequest, InferenceResult, ProviderError, ProviderKind,
+    InferenceObserver, InferenceProvider, InferenceRequest, InferenceResult, ProviderError,
+    ProviderKind, TokenUsage,
 };
-use vidarax_core::tiered_vlm::TieredVlmConfig;
-use vidarax_core::webrtc::clip::{
-    spawn_clip_accumulator, spawn_clip_vlm_workers, ClipConfig as CoreClipConfig,
-};
+use vidarax_core::webrtc::clip::ClipConfig as CoreClipConfig;
 use vidarax_core::webrtc::session::{
     PeerConnectionState, WebRtcSession, WebRtcSetupError, RTP_FRAME_QUEUE_CAPACITY,
 };
 use vidarax_core::webrtc::workers::{
-    decode_output_pool_slots, jpeg_pool_slots, spawn_analysis_workers, spawn_decode_workers,
-    spawn_vlm_workers, EventSink, VlmWorkerParams, CLIP_FRAME_QUEUE_CAPACITY,
-    CLIP_WORK_QUEUE_CAPACITY, STREAM_FRAME_QUEUE_CAPACITY, VLM_WORK_QUEUE_CAPACITY,
+    spawn_pipeline, EventSink, PipelineWiring, WorkerPoolConfig, STREAM_FRAME_QUEUE_CAPACITY,
+    VLM_WORK_QUEUE_CAPACITY,
 };
 
 use crate::models::AttachStreamRequest;
@@ -79,6 +76,7 @@ impl InferenceProvider for NullInferenceProvider {
             fallback_used: false,
             finish_reason: Some("stop".to_string()),
             inference_latency_ms: 0,
+            usage: TokenUsage::default(),
         })
     }
 }
@@ -402,8 +400,34 @@ async fn start_whip_session_transaction(
 
     // ── InferenceProvider selection ────────────────────────────────────────
     // Use the HTTP router when provider endpoints are configured.
-    let vlm_config = TieredVlmConfig::default();
+    //
+    // Tiering stays local-only (single model, no escalation) unless an
+    // operator opts in via VIDARAX_WEBRTC_SECOND_PASS_MODEL. That env var is
+    // only read once, at process startup, by ServerConfig::from_env and then
+    // resolved into a TieredVlmConfig on WebRtcConfig (see
+    // crate::config::build_webrtc_vlm_config and crate::build_webrtc_config).
+    // Every session below clones that already-resolved value instead of
+    // re-reading the environment itself, so a ServerConfig built
+    // programmatically (not from env) and passed to crate::run is what
+    // actually governs a session's tiering, not whatever the process
+    // environment happens to hold when this particular session starts.
+    //
+    // state.provider() below is built once at process startup by
+    // vidarax_core::backends::build_provider_with_model_routing, not the
+    // plain fallback chain: it routes a request by its exact `model` field
+    // to whichever backend was configured to serve that id, in addition to
+    // keeping the ordinary priority fallback for everything else. So
+    // run_tiered() swapping `request.model` to the second-pass model id
+    // genuinely reaches a different backend WHEN some backend is configured
+    // to serve that id (e.g. a `[[backends]] type = "gemini"` entry whose
+    // `model` is set to exactly VIDARAX_WEBRTC_SECOND_PASS_MODEL). If no
+    // backend is configured for that model id, the request still lands on
+    // the fallback chain's primary, which does not serve it; the call fails
+    // there and run_tiered() falls back to the first-pass result. So tiering
+    // is a safe no-op, never a crash, until a matching backend is configured;
+    // see the commented-out gemini block in vidarax.toml for how to opt in.
     let webrtc_config_for_workers = state.webrtc_config().clone();
+    let vlm_config = webrtc_config_for_workers.vlm_tiering.clone();
     let max_output_tokens_per_second = session.max_output_tokens_per_second;
 
     // Capture everything needed by the spawn_blocking closure.
@@ -413,6 +437,11 @@ async fn start_whip_session_transaction(
     let session_span_for_workers = session_span.clone();
     let metrics_for_workers = Arc::clone(&metrics_arc);
     let vlm_config_for_workers = vlm_config.clone();
+    // Same InferenceMetrics instance /metrics reads from, handed to the
+    // worker pipeline as an observer so each tiered VLM pass (keyframe or
+    // clip mode) is recorded under the provider that actually served it.
+    let observer_for_workers: Option<Arc<dyn InferenceObserver>> =
+        Some(Arc::clone(state.inference_metrics_arc()) as Arc<dyn InferenceObserver>);
     let provider = state.provider().cloned();
     let clip_config_for_workers = clip_config;
     // Share the session's guided_json handle with VLM workers so that
@@ -425,93 +454,41 @@ async fn start_whip_session_transaction(
     // Use spawn_blocking as a bridge from async context to the thread spawns;
     // the actual worker threads are spawned inside and run independently.
     tokio::task::spawn_blocking(move || {
-        // ── Decode workers ─────────────────────────────────────────────
-        spawn_decode_workers(
-            webrtc_config_for_workers.decode_workers,
-            frame_rx,
-            stream_tx,
-            false, // gpu_available — conservative default; no GPU assumed
-            decode_output_pool_slots(false, session.codec),
-            jpeg_pool_slots(
-                webrtc_config_for_workers.analysis_workers,
-                webrtc_config_for_workers.vlm_workers,
-            ),
-            Arc::clone(&metrics_for_workers),
-            session_span_for_workers.clone(),
-        );
-
         let vlm_provider: Arc<dyn InferenceProvider + Send + Sync> = match provider {
             Some(p) => p,
             None => Arc::new(NullInferenceProvider),
         };
-        let guided_json = guided_json_for_workers;
 
-        if let Some(clip_config) = clip_config_for_workers {
-            let (clip_frame_tx, clip_frame_rx) = kanal::bounded::<
-                vidarax_core::webrtc::workers::StreamFrame,
-            >(CLIP_FRAME_QUEUE_CAPACITY);
-            let (clip_tx, clip_rx) =
-                kanal::bounded::<vidarax_core::webrtc::clip::ClipWork>(CLIP_WORK_QUEUE_CAPACITY);
+        // Pool topology and tunables come from the session's WebRtcConfig. The
+        // token-rate cap uses the session value, which honours a PATCH that
+        // landed before the worker threads started.
+        let mut pool_config = WorkerPoolConfig::from(&webrtc_config_for_workers);
+        pool_config.max_output_tokens_per_second = max_output_tokens_per_second;
 
-            spawn_analysis_workers(
-                webrtc_config_for_workers.analysis_workers,
+        spawn_pipeline(
+            &pool_config,
+            PipelineWiring {
+                rtp_rx: frame_rx,
+                stream_tx,
                 stream_rx,
                 vlm_tx,
-                Some(clip_frame_tx),
-                Arc::clone(&event_sink_for_workers),
-                Arc::clone(&run_id_for_workers),
-                Arc::clone(&session_id_for_workers),
-                Arc::clone(&prompt_for_workers),
-                Arc::clone(&metrics_for_workers),
-                session_span_for_workers.clone(),
-            );
-            spawn_clip_accumulator(
-                clip_frame_rx,
-                clip_tx,
-                clip_config,
-                Arc::clone(&run_id_for_workers),
-                Arc::clone(&session_id_for_workers),
-                Arc::clone(&*prompt_for_workers.load_full()),
-                session_span_for_workers.clone(),
-            );
-            spawn_clip_vlm_workers(
-                webrtc_config_for_workers.vlm_workers,
-                clip_rx,
-                Arc::new(vlm_provider),
-                event_sink_for_workers,
-                vlm_config_for_workers,
-                metrics_for_workers,
-                session_span_for_workers,
-                max_output_tokens_per_second,
-                Arc::clone(&guided_json),
-            );
-        } else {
-            spawn_analysis_workers(
-                webrtc_config_for_workers.analysis_workers,
-                stream_rx,
-                vlm_tx,
-                None,
-                Arc::clone(&event_sink_for_workers),
-                Arc::clone(&run_id_for_workers),
-                Arc::clone(&session_id_for_workers),
-                Arc::clone(&prompt_for_workers),
-                Arc::clone(&metrics_for_workers),
-                session_span_for_workers.clone(),
-            );
-            spawn_vlm_workers(VlmWorkerParams {
-                workers: webrtc_config_for_workers.vlm_workers,
                 vlm_rx,
+                event_sink: event_sink_for_workers,
                 provider: Arc::new(vlm_provider),
-                stdb: event_sink_for_workers,
-                config: vlm_config_for_workers,
+                run_id: run_id_for_workers,
+                session_id: session_id_for_workers,
+                prompt: prompt_for_workers,
+                guided_json: guided_json_for_workers,
+                vlm_config: vlm_config_for_workers,
+                distillation: vidarax_core::tiered_vlm::DistillationConfig::default(),
+                training_store: None,
+                clip_config: clip_config_for_workers,
+                codec: session.codec,
                 metrics: metrics_for_workers,
                 session_span: session_span_for_workers,
-                max_output_tokens_per_second,
-                guided_json: Arc::clone(&guided_json),
-                training_store: None,
-                distillation: vidarax_core::tiered_vlm::DistillationConfig::default(),
-            });
-        }
+                observer: observer_for_workers,
+            },
+        );
     });
 
     Ok(WhipSessionStarted {
@@ -1115,7 +1092,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let state = AppState::with_wal_for_tests(dir.join("timeline.wal"));
-        std::fs::remove_dir_all(&dir).unwrap();
+        state.set_timeline_append_failure_for_tests(true);
         let session = Arc::new(WebRtcSession::new_for_tests());
 
         let response = start_whip_session(
@@ -1418,7 +1395,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
+        state.set_timeline_append_failure_for_tests(true);
 
         let started = std::time::Instant::now();
         let completed_inline = tombstone_created_whip_run_with_request_bound_and_backoff(
@@ -1443,7 +1420,7 @@ mod tests {
             sess_id.to_string(),
             "session_insert_failed".to_string(),
         );
-        std::fs::create_dir_all(&dir).unwrap();
+        state.set_timeline_append_failure_for_tests(false);
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
@@ -1526,8 +1503,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_reclaim_cannot_commit_tombstone_and_leave_live_session() {
-        use std::io::Read;
-
         let dir = std::env::temp_dir().join(format!(
             "vidarax-whip-reclaim-cancel-{}",
             std::process::id()
@@ -1563,12 +1538,7 @@ mod tests {
                 .await
         );
 
-        std::fs::remove_file(&wal_path).unwrap();
-        let status = std::process::Command::new("mkfifo")
-            .arg(&wal_path)
-            .status()
-            .expect("mkfifo should run");
-        assert!(status.success(), "mkfifo failed: {status}");
+        state.pause_timeline_appends_for_tests();
 
         let reclaim_state = state.clone();
         let reclaim_run_id = Arc::clone(&run_id);
@@ -1576,20 +1546,10 @@ mod tests {
             reclaim_whip_session(&reclaim_state, sess_id, &reclaim_run_id, "delete").await
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        state.wait_until_timeline_writer_paused_for_tests();
         reclaim_task.abort();
         let _ = reclaim_task.await;
-
-        let mut fifo_reader = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&wal_path)
-            .expect("open fifo reader");
-        let mut discarded = String::new();
-        fifo_reader
-            .read_to_string(&mut discarded)
-            .expect("read cancelled reclaim append");
-        drop(fifo_reader);
-        std::fs::remove_file(&wal_path).unwrap();
+        state.resume_timeline_appends_for_tests();
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
@@ -1878,7 +1838,7 @@ mod tests {
                 )
                 .await
         );
-        std::fs::remove_dir_all(&dir).unwrap();
+        state.set_timeline_append_failure_for_tests(true);
 
         let result = reclaim_whip_session(&state, sess_id, &run_id, "delete").await;
 
@@ -1924,12 +1884,12 @@ mod tests {
                 )
                 .await
         );
-        std::fs::remove_dir_all(&dir).unwrap();
+        state.set_timeline_append_failure_for_tests(true);
 
-        let restore_dir = dir.clone();
+        let restore_state = state.clone();
         let restore_task = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            std::fs::create_dir_all(&restore_dir).unwrap();
+            restore_state.set_timeline_append_failure_for_tests(false);
         });
 
         tokio::time::timeout(

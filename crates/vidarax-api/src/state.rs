@@ -1,17 +1,31 @@
 use arc_swap::ArcSwap;
+use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{mpsc, oneshot, Notify, RwLock};
 
 use serde_json::Value;
+
+/// Count of detached timeline events dropped because the writer queue was full.
+/// The non-blocking emit intentionally never blocks the frame path, so a full
+/// queue drops the event rather than applying backpressure. That drop is silent
+/// to the caller by design, but it must not be silent to an operator: every
+/// drop increments this counter and logs a warning carrying the running total,
+/// so the loss is visible rather than invisible.
+static DROPPED_DETACHED_TIMELINE_EVENTS: AtomicU64 = AtomicU64::new(0);
+
 use vidarax_contracts::lifecycle::StreamState;
 use vidarax_core::ingest::pipeline::{create_pipeline, DecodePipeline, PipelineBackend};
 use vidarax_core::provider::InferenceProvider;
 use vidarax_core::tiered_vlm::DistillationConfig;
-use vidarax_core::timeline::{append_event, read_all_events, TimelineEvent};
+#[cfg(test)]
+use vidarax_core::timeline::append_event;
+use vidarax_core::timeline::{read_all_events, TimelineEvent, WalWriter};
 use vidarax_core::webrtc::session::WebRtcSession;
 
 use crate::ids::{parse_run_sequence, random_run_id};
@@ -31,10 +45,10 @@ const DEFAULT_STREAM_ID: &str = "stream-0";
 /// In-memory store for active WebRTC sessions, keyed by session ID.
 /// Each entry stores the owning principal, run ID, and live session.
 type SessionEntry = (String, Arc<str>, Arc<WebRtcSession>);
-type SessionMap = Arc<RwLock<HashMap<String, SessionEntry>>>;
+type SessionMap = DashMap<String, SessionEntry>;
 type ReclaimedSessionEntry = (String, Arc<str>);
 type ReclaimedSessionMap = Arc<RwLock<ReclaimedSessions>>;
-type StreamReservations = Arc<Mutex<HashMap<String, usize>>>;
+type StreamReservations = Arc<DashMap<String, usize>>;
 
 /// WHIP DELETE remains idempotent for watcher-reclaimed sessions within this
 /// window. Older random session IDs are tombstones only; retaining them forever
@@ -45,6 +59,27 @@ const RECLAIMED_SESSION_MAX_ENTRIES: usize = 1024;
 const RUN_DELETE_LIVE: u8 = 0;
 const RUN_DELETE_APPEND_IN_FLIGHT: u8 = 1;
 const RUN_DELETE_DELETED: u8 = 2;
+
+/// How many of a run's most recent events stay mirrored in memory. A client
+/// polling with an advancing `from_seq` cursor is served straight from this
+/// ring; only a cursor older than the ring's oldest retained event falls back
+/// to a full WAL scan. Sized to hold well over a minute of keyframe and
+/// structural events at typical rates so steady polling never misses the ring.
+const RUN_EVENT_TAIL_CAP: usize = 256;
+/// How many of the most recently deleted runs keep their registry entry so a
+/// repeated DELETE stays idempotent (served as AlreadyDeleted with no new WAL
+/// write). Beyond this, the oldest deleted entries are forgotten; a DELETE of
+/// one then falls through to the Missing path and appends a fresh run_deleted,
+/// which is acceptable for long-forgotten runs. Sized well above any realistic
+/// re-DELETE window.
+const DELETED_RUN_RETENTION_CAP: usize = 4096;
+/// How many runs keep a warm in-memory event tail. Beyond this, the least
+/// recently appended run's warm tail is dropped. Its subsequent reads fall
+/// back to the durable WAL scan, which is always correct but slower. This is
+/// sized well above any realistic concurrent live-run count so normal
+/// operation never evicts.
+const WARM_RUN_TAIL_CAP: usize = 1024;
+const TIMELINE_WRITER_QUEUE_CAP: usize = 1024;
 
 #[derive(Default)]
 struct ReclaimedSessions {
@@ -119,20 +154,30 @@ impl ReclaimedSessions {
 
 #[derive(Clone)]
 pub struct AppState {
-    run_seq: Arc<AtomicU64>,
-    request_seq: Arc<AtomicU64>,
-    event_seq: Arc<AtomicU64>,
+    inner: Arc<AppStateInner>,
+}
+
+pub struct AppStateInner {
+    run_seq: AtomicU64,
+    request_seq: AtomicU64,
     wal_path: Arc<PathBuf>,
-    ingest_file_roots: Arc<Vec<PathBuf>>,
+    ingest_file_roots: Vec<PathBuf>,
     provider: Option<Arc<dyn InferenceProvider + Send + Sync>>,
     decode_pipeline: Arc<dyn DecodePipeline>,
-    security_policy: Arc<SecurityPolicy>,
+    security_policy: SecurityPolicy,
+    // Arc-wrapped so a background WHIP worker thread can hold its own handle
+    // (as an `InferenceObserver`) and record tiered inference outcomes
+    // without borrowing from AppState.
     inference_metrics: Arc<InferenceMetrics>,
     pipeline_metrics: Arc<PipelineMetrics>,
-    distillation_config: Arc<DistillationConfig>,
-    run_registry: Arc<ArcSwap<RunRegistry>>,
+    distillation_config: DistillationConfig,
+    run_registry: Arc<RunRegistry>,
+    timeline_tx: mpsc::Sender<TimelineCommand>,
+    timeline_snapshot: Arc<ArcSwap<RingSnapshot>>,
+    #[cfg(test)]
+    timeline_test_control: Arc<TimelineWriterTestControl>,
     stream_reservations: StreamReservations,
-    tenant_label_maps: Arc<TenantLabelMaps>,
+    tenant_label_maps: TenantLabelMaps,
     stream_ttl_secs: u64,
     active_stream_limit: usize,
     spacetime_client: Option<SpacetimeClient>,
@@ -145,6 +190,14 @@ pub struct AppState {
     webrtc_config: WebRtcConfig,
 }
 
+impl Deref for AppState {
+    type Target = AppStateInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 #[must_use]
 pub struct StreamSlotGuard {
     reservations: StreamReservations,
@@ -153,15 +206,16 @@ pub struct StreamSlotGuard {
 
 impl Drop for StreamSlotGuard {
     fn drop(&mut self) {
-        let mut reservations = self
-            .reservations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(count) = reservations.get_mut(&self.principal_key) {
-            if *count <= 1 {
-                reservations.remove(&self.principal_key);
+        // Release the principal's slot under a single shard lock so a concurrent
+        // reservation for the same principal cannot race the decrement. Holding the
+        // entry across the check and the remove keeps the count and its presence in
+        // step, and dropping the entry when it reaches zero keeps the map bounded to
+        // principals that actually hold reservations.
+        if let Entry::Occupied(mut slot) = self.reservations.entry(self.principal_key.clone()) {
+            if *slot.get() <= 1 {
+                slot.remove();
             } else {
-                *count -= 1;
+                *slot.get_mut() -= 1;
             }
         }
     }
@@ -187,27 +241,47 @@ impl AppStateConfig {
     }
 
     fn build(self) -> AppState {
+        let wal_path = Arc::new(self.wal_path);
+        let wal = WalWriter::open(wal_path.as_ref()).expect("timeline WAL should open");
+        let run_registry = Arc::new(RunRegistry::default());
+        let timeline_snapshot = Arc::new(ArcSwap::from_pointee(RingSnapshot::default()));
+        #[cfg(test)]
+        let timeline_test_control = Arc::new(TimelineWriterTestControl::default());
+        let timeline_tx = spawn_timeline_writer(
+            wal,
+            Arc::clone(&run_registry),
+            Arc::clone(&timeline_snapshot),
+            0,
+            HashMap::new(),
+            #[cfg(test)]
+            Arc::clone(&timeline_test_control),
+        );
         AppState {
-            run_seq: Arc::new(AtomicU64::new(0)),
-            request_seq: Arc::new(AtomicU64::new(0)),
-            event_seq: Arc::new(AtomicU64::new(0)),
-            wal_path: Arc::new(self.wal_path),
-            ingest_file_roots: Arc::new(default_test_ingest_roots()),
-            provider: self.provider,
-            decode_pipeline: default_test_decode_pipeline(),
-            security_policy: Arc::new(self.security_policy),
-            inference_metrics: Arc::new(InferenceMetrics::new()),
-            pipeline_metrics: Arc::new(PipelineMetrics::new()),
-            distillation_config: Arc::new(DistillationConfig::default()),
-            run_registry: Arc::new(ArcSwap::from_pointee(RunRegistry::default())),
-            stream_reservations: Arc::new(Mutex::new(HashMap::new())),
-            tenant_label_maps: Arc::new(TenantLabelMaps::default()),
-            stream_ttl_secs: self.stream_ttl_secs.max(1),
-            active_stream_limit: self.active_stream_limit.max(1),
-            spacetime_client: None,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            reclaimed_sessions: Arc::new(RwLock::new(ReclaimedSessions::default())),
-            webrtc_config: WebRtcConfig::default(),
+            inner: Arc::new(AppStateInner {
+                run_seq: AtomicU64::new(0),
+                request_seq: AtomicU64::new(0),
+                wal_path,
+                ingest_file_roots: default_test_ingest_roots(),
+                provider: self.provider,
+                decode_pipeline: default_test_decode_pipeline(),
+                security_policy: self.security_policy,
+                inference_metrics: Arc::new(InferenceMetrics::new()),
+                pipeline_metrics: Arc::new(PipelineMetrics::new()),
+                distillation_config: DistillationConfig::default(),
+                run_registry,
+                timeline_tx,
+                timeline_snapshot,
+                #[cfg(test)]
+                timeline_test_control,
+                stream_reservations: Arc::new(DashMap::new()),
+                tenant_label_maps: TenantLabelMaps::default(),
+                stream_ttl_secs: self.stream_ttl_secs.max(1),
+                active_stream_limit: self.active_stream_limit.max(1),
+                spacetime_client: None,
+                sessions: DashMap::new(),
+                reclaimed_sessions: Arc::new(RwLock::new(ReclaimedSessions::default())),
+                webrtc_config: WebRtcConfig::default(),
+            }),
         }
     }
 }
@@ -227,8 +301,17 @@ impl AppState {
         distillation: DistillationConfig,
     ) -> Result<Self, String> {
         let existing_events = read_all_events(&wal_path).map_err(|err| err.to_string())?;
-        let run_registry = Arc::new(ArcSwap::from(build_run_registry(&existing_events)));
-        let tenant_label_maps = Arc::new(TenantLabelMaps::from_env()?);
+        let run_registry = build_run_registry(&existing_events);
+        let initial_tails = build_event_tails(&existing_events);
+        let timeline_snapshot = Arc::new(ArcSwap::from_pointee(RingSnapshot::from_tails(
+            &initial_tails,
+            existing_events
+                .iter()
+                .map(|event| event.seq)
+                .max()
+                .unwrap_or(0),
+        )));
+        let tenant_label_maps = TenantLabelMaps::from_env()?;
         let max_run_seq = existing_events.iter().fold(0u64, |acc, event| {
             let from_legacy = parse_run_sequence(&event.run_id).unwrap_or(0);
             acc.max(from_legacy)
@@ -237,33 +320,51 @@ impl AppState {
             .iter()
             .filter(|event| event.kind == "run_created")
             .count() as u64;
-        let max_event_seq = existing_events
+        let max_seq = existing_events
             .iter()
             .map(|event| event.seq)
             .max()
             .unwrap_or(0);
+        let wal_path = Arc::new(wal_path);
+        let wal = WalWriter::open(wal_path.as_ref()).map_err(|err| err.to_string())?;
+        #[cfg(test)]
+        let timeline_test_control = Arc::new(TimelineWriterTestControl::default());
+        let timeline_tx = spawn_timeline_writer(
+            wal,
+            Arc::clone(&run_registry),
+            Arc::clone(&timeline_snapshot),
+            max_seq,
+            initial_tails,
+            #[cfg(test)]
+            Arc::clone(&timeline_test_control),
+        );
 
         Ok(Self {
-            run_seq: Arc::new(AtomicU64::new(run_count.max(max_run_seq))),
-            request_seq: Arc::new(AtomicU64::new(0)),
-            event_seq: Arc::new(AtomicU64::new(max_event_seq)),
-            wal_path: Arc::new(wal_path),
-            ingest_file_roots: Arc::new(ingest_file_roots),
-            provider,
-            decode_pipeline,
-            security_policy: Arc::new(security_policy),
-            inference_metrics: Arc::new(InferenceMetrics::new()),
-            pipeline_metrics: Arc::new(PipelineMetrics::new()),
-            distillation_config: Arc::new(distillation),
-            run_registry,
-            stream_reservations: Arc::new(Mutex::new(HashMap::new())),
-            tenant_label_maps,
-            stream_ttl_secs,
-            active_stream_limit: active_stream_limit.max(1),
-            spacetime_client: None,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            reclaimed_sessions: Arc::new(RwLock::new(ReclaimedSessions::default())),
-            webrtc_config,
+            inner: Arc::new(AppStateInner {
+                run_seq: AtomicU64::new(run_count.max(max_run_seq)),
+                request_seq: AtomicU64::new(0),
+                wal_path,
+                ingest_file_roots,
+                provider,
+                decode_pipeline,
+                security_policy,
+                inference_metrics: Arc::new(InferenceMetrics::new()),
+                pipeline_metrics: Arc::new(PipelineMetrics::new()),
+                distillation_config: distillation,
+                run_registry,
+                timeline_tx,
+                timeline_snapshot,
+                #[cfg(test)]
+                timeline_test_control,
+                stream_reservations: Arc::new(DashMap::new()),
+                tenant_label_maps,
+                stream_ttl_secs,
+                active_stream_limit: active_stream_limit.max(1),
+                spacetime_client: None,
+                sessions: DashMap::new(),
+                reclaimed_sessions: Arc::new(RwLock::new(ReclaimedSessions::default())),
+                webrtc_config,
+            }),
         })
     }
 
@@ -316,6 +417,26 @@ impl AppState {
         .build()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_timeline_append_failure_for_tests(&self, fail: bool) {
+        self.timeline_test_control.set_failure(fail);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_timeline_appends_for_tests(&self) {
+        self.timeline_test_control.pause();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_until_timeline_writer_paused_for_tests(&self) {
+        self.timeline_test_control.wait_until_paused();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resume_timeline_appends_for_tests(&self) {
+        self.timeline_test_control.resume();
+    }
+
     /// Attach a `SpacetimeClient` to this state (builder pattern).
     ///
     /// ```no_run
@@ -326,7 +447,9 @@ impl AppState {
     /// );
     /// ```
     pub fn with_spacetime_client(mut self, client: SpacetimeClient) -> Self {
-        self.spacetime_client = Some(client);
+        Arc::get_mut(&mut self.inner)
+            .expect("AppState builder mutation requires an unshared state")
+            .spacetime_client = Some(client);
         self
     }
 
@@ -335,7 +458,9 @@ impl AppState {
         mut self,
         maps: crate::tenant_labels::TenantLabelMaps,
     ) -> Self {
-        self.tenant_label_maps = Arc::new(maps);
+        Arc::get_mut(&mut self.inner)
+            .expect("AppState test mutation requires an unshared state")
+            .tenant_label_maps = maps;
         self
     }
 
@@ -359,45 +484,56 @@ impl AppState {
         run_id: Arc<str>,
         session: Arc<WebRtcSession>,
     ) -> bool {
-        let mut map = self.sessions.write().await;
-        if map.len() >= MAX_WEBRTC_SESSIONS {
+        // The cap is a coarse resource guard, so a plain length check is enough
+        // even though a burst of concurrent inserts near the ceiling can admit a
+        // few extra. Check it before claiming the entry: reading the map length
+        // while holding an entry guard would deadlock against the same map.
+        if self.sessions.len() >= MAX_WEBRTC_SESSIONS {
             return false;
         }
-        if map.contains_key(&sess_id) {
-            return false;
+        // Claim the id under one shard lock so two inserts for the same id cannot
+        // both win.
+        match self.sessions.entry(sess_id.clone()) {
+            Entry::Occupied(_) => return false,
+            Entry::Vacant(slot) => {
+                slot.insert((principal, run_id, session));
+            }
         }
-        map.insert(sess_id.clone(), (principal, run_id, session));
-        drop(map);
         self.reclaimed_sessions.write().await.remove(&sess_id);
         true
     }
 
     /// Look up a WebRTC session by ID.  Returns `None` if not found.
     pub async fn get_session(&self, sess_id: &str) -> Option<SessionEntry> {
-        self.sessions.read().await.get(sess_id).cloned()
+        self.sessions
+            .get(sess_id)
+            .map(|entry| entry.value().clone())
     }
 
     /// Remove and return a WebRTC session only if it still belongs to `run_id`.
     ///
-    /// The write lock makes session removal the atomic ownership transfer for
-    /// reclaim paths: exactly one caller can win cleanup for a given session.
+    /// `remove_if` evaluates ownership and removes under one shard lock, so the
+    /// removal is the atomic ownership transfer for reclaim paths: exactly one
+    /// caller can win cleanup for a given session. The reclaim record is written
+    /// right after the winning removal.
     pub(crate) async fn remove_session_for_run(
         &self,
         sess_id: &str,
         run_id: &str,
     ) -> Option<SessionEntry> {
-        let mut map = self.sessions.write().await;
-        let (principal, existing_run_id, _session) = map.get(sess_id)?;
-        if &**existing_run_id != run_id {
-            return None;
-        }
+        let (_id, entry) = self
+            .sessions
+            .remove_if(sess_id, |_, (_, existing_run_id, _)| {
+                &**existing_run_id == run_id
+            })?;
+        let (principal, existing_run_id, _session) = &entry;
         self.reclaimed_sessions.write().await.insert(
             sess_id.to_string(),
             principal.clone(),
             Arc::clone(existing_run_id),
             now_epoch_ms(),
         );
-        map.remove(sess_id)
+        Some(entry)
     }
 
     pub(crate) async fn get_reclaimed_session(
@@ -417,7 +553,7 @@ impl AppState {
 
     /// Number of active WebRTC sessions.
     pub async fn session_count(&self) -> usize {
-        self.sessions.read().await.len()
+        self.sessions.len()
     }
 
     pub fn next_run_id(&self) -> String {
@@ -440,6 +576,15 @@ impl AppState {
         self.append_run_event_for_stream(run_id, DEFAULT_STREAM_ID, kind, payload)
     }
 
+    pub fn append_run_event_nonblocking(
+        &self,
+        run_id: &str,
+        kind: &str,
+        payload: Value,
+    ) -> Result<(), String> {
+        self.append_run_event_for_stream_nonblocking(run_id, DEFAULT_STREAM_ID, kind, payload)
+    }
+
     pub fn append_run_event_for_stream(
         &self,
         run_id: &str,
@@ -453,18 +598,25 @@ impl AppState {
                 .map(|result| result.event);
         }
 
-        let seq = self.event_seq.fetch_add(1, Ordering::AcqRel) + 1;
-        let event = TimelineEvent {
-            seq,
-            run_id: run_id.to_owned(),
-            stream_id: stream_id.to_owned(),
-            pts_ms: now_epoch_ms(),
-            kind: kind.to_owned(),
-            payload: payload.to_string(),
-        };
-        append_event(self.wal_path.as_ref(), &event).map_err(|err| err.to_string())?;
-        self.apply_event_to_registry(&event);
-        Ok(event)
+        self.append_timeline_sync(TimelineAppendRequest::new(
+            run_id, stream_id, kind, payload, None,
+        ))
+    }
+
+    pub fn append_run_event_for_stream_nonblocking(
+        &self,
+        run_id: &str,
+        stream_id: &str,
+        kind: &str,
+        payload: Value,
+    ) -> Result<(), String> {
+        if kind == "run_deleted" {
+            return Err("run_deleted requires confirmed append".to_string());
+        }
+
+        self.append_timeline_nonblocking(TimelineAppendRequest::new(
+            run_id, stream_id, kind, payload, None,
+        ))
     }
 
     pub async fn append_run_event_async(
@@ -491,23 +643,10 @@ impl AppState {
                 .map(|result| result.event);
         }
 
-        let seq = self.event_seq.fetch_add(1, Ordering::AcqRel) + 1;
-        let event = TimelineEvent {
-            seq,
-            run_id: run_id.to_owned(),
-            stream_id: stream_id.to_owned(),
-            pts_ms: now_epoch_ms(),
-            kind: kind.to_owned(),
-            payload: payload.to_string(),
-        };
-        let wal_path = Arc::clone(&self.wal_path);
-        let event_for_write = event.clone();
-        tokio::task::spawn_blocking(move || append_event(wal_path.as_ref(), &event_for_write))
-            .await
-            .map_err(|err| format!("timeline append worker join failure: {err}"))?
-            .map_err(|err| err.to_string())?;
-        self.apply_event_to_registry(&event);
-        Ok(event)
+        self.append_timeline_async(TimelineAppendRequest::new(
+            run_id, stream_id, kind, payload, None,
+        ))
+        .await
     }
 
     pub(crate) async fn append_run_deleted_idempotent_async(
@@ -530,12 +669,13 @@ impl AppState {
             match self.begin_run_deleted_append(run_id) {
                 RunDeleteClaim::Claimed(run) => {
                     let guard = RunDeleteAppendGuard::new(run);
-                    let event = self.new_timeline_event(run_id, stream_id, "run_deleted", &payload);
-                    if let Err(err) = append_event(self.wal_path.as_ref(), &event) {
-                        return Err(err.to_string());
-                    }
-                    self.apply_event_to_registry(&event);
-                    guard.commit();
+                    let event = self.append_timeline_sync(TimelineAppendRequest::new(
+                        run_id,
+                        stream_id,
+                        "run_deleted",
+                        payload,
+                        Some(guard),
+                    ))?;
                     return Ok(RunDeletedAppend {
                         event,
                         appended: true,
@@ -549,9 +689,13 @@ impl AppState {
                 }
                 RunDeleteClaim::InFlight(run) => run.wait_delete_append_blocking(),
                 RunDeleteClaim::Missing => {
-                    let event = self.new_timeline_event(run_id, stream_id, "run_deleted", &payload);
-                    append_event(self.wal_path.as_ref(), &event).map_err(|err| err.to_string())?;
-                    self.apply_event_to_registry(&event);
+                    let event = self.append_timeline_sync(TimelineAppendRequest::new(
+                        run_id,
+                        stream_id,
+                        "run_deleted",
+                        payload,
+                        None,
+                    ))?;
                     return Ok(RunDeletedAppend {
                         event,
                         appended: true,
@@ -570,32 +714,20 @@ impl AppState {
         loop {
             match self.begin_run_deleted_append(run_id) {
                 RunDeleteClaim::Claimed(run) => {
-                    let event = self.new_timeline_event(run_id, stream_id, "run_deleted", &payload);
-                    let state = self.clone();
-                    let append_task = tokio::spawn(async move {
-                        let guard = RunDeleteAppendGuard::new(run);
-                        let wal_path = Arc::clone(&state.wal_path);
-                        let event_for_write = event.clone();
-                        let write_result = tokio::task::spawn_blocking(move || {
-                            append_event(wal_path.as_ref(), &event_for_write)
-                        })
-                        .await
-                        .map_err(|err| format!("timeline append worker join failure: {err}"))?
-                        .map_err(|err| err.to_string());
-
-                        write_result?;
-
-                        state.apply_event_to_registry(&event);
-                        guard.commit();
-                        Ok(RunDeletedAppend {
-                            event,
-                            appended: true,
-                        })
+                    let guard = RunDeleteAppendGuard::new(run);
+                    let event = self
+                        .append_timeline_async(TimelineAppendRequest::new(
+                            run_id,
+                            stream_id,
+                            "run_deleted",
+                            payload,
+                            Some(guard),
+                        ))
+                        .await?;
+                    return Ok(RunDeletedAppend {
+                        event,
+                        appended: true,
                     });
-
-                    return append_task.await.map_err(|err| {
-                        format!("timeline append coordinator join failure: {err}")
-                    })?;
                 }
                 RunDeleteClaim::AlreadyDeleted => {
                     return Ok(RunDeletedAppend {
@@ -605,16 +737,15 @@ impl AppState {
                 }
                 RunDeleteClaim::InFlight(run) => run.wait_delete_append().await,
                 RunDeleteClaim::Missing => {
-                    let event = self.new_timeline_event(run_id, stream_id, "run_deleted", &payload);
-                    let wal_path = Arc::clone(&self.wal_path);
-                    let event_for_write = event.clone();
-                    tokio::task::spawn_blocking(move || {
-                        append_event(wal_path.as_ref(), &event_for_write)
-                    })
-                    .await
-                    .map_err(|err| format!("timeline append worker join failure: {err}"))?
-                    .map_err(|err| err.to_string())?;
-                    self.apply_event_to_registry(&event);
+                    let event = self
+                        .append_timeline_async(TimelineAppendRequest::new(
+                            run_id,
+                            stream_id,
+                            "run_deleted",
+                            payload,
+                            None,
+                        ))
+                        .await?;
                     return Ok(RunDeletedAppend {
                         event,
                         appended: true,
@@ -625,8 +756,12 @@ impl AppState {
     }
 
     fn begin_run_deleted_append(&self, run_id: &str) -> RunDeleteClaim {
-        let registry = self.run_registry.load();
-        let Some(run) = registry.runs.get(run_id).cloned() else {
+        let Some(run) = self
+            .run_registry
+            .runs
+            .get(run_id)
+            .map(|entry| Arc::clone(&entry))
+        else {
             return RunDeleteClaim::Missing;
         };
         match run.begin_delete_append() {
@@ -636,22 +771,67 @@ impl AppState {
         }
     }
 
-    fn new_timeline_event(
+    fn append_timeline_sync(
         &self,
-        run_id: &str,
-        stream_id: &str,
-        kind: &str,
-        payload: &Value,
-    ) -> TimelineEvent {
-        let seq = self.event_seq.fetch_add(1, Ordering::AcqRel) + 1;
-        TimelineEvent {
-            seq,
-            run_id: run_id.to_owned(),
-            stream_id: stream_id.to_owned(),
-            pts_ms: now_epoch_ms(),
-            kind: kind.to_owned(),
-            payload: payload.to_string(),
+        request: TimelineAppendRequest,
+    ) -> Result<TimelineEvent, String> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let mut command = TimelineCommand::Append {
+            request: Some(request),
+            reply: TimelineReply::Sync(reply_tx),
+        };
+        loop {
+            match self.timeline_tx.try_send(command) {
+                Ok(()) => break,
+                Err(mpsc::error::TrySendError::Full(returned)) => {
+                    command = returned;
+                    std::thread::yield_now();
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err("timeline writer is closed".to_string());
+                }
+            }
         }
+        reply_rx
+            .recv()
+            .map_err(|err| format!("timeline writer reply failure: {err}"))?
+    }
+
+    fn append_timeline_nonblocking(&self, request: TimelineAppendRequest) -> Result<(), String> {
+        match self
+            .timeline_tx
+            .try_send(TimelineCommand::AppendDetached { request })
+        {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let dropped = DROPPED_DETACHED_TIMELINE_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(
+                    dropped_total = dropped,
+                    "timeline writer queue full; dropping detached event"
+                );
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err("timeline writer is closed".to_string())
+            }
+        }
+    }
+
+    async fn append_timeline_async(
+        &self,
+        request: TimelineAppendRequest,
+    ) -> Result<TimelineEvent, String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.timeline_tx
+            .send(TimelineCommand::Append {
+                request: Some(request),
+                reply: TimelineReply::Async(reply_tx),
+            })
+            .await
+            .map_err(|_| "timeline writer is closed".to_string())?;
+        reply_rx
+            .await
+            .map_err(|err| format!("timeline writer reply failure: {err}"))?
     }
 
     fn synthetic_run_deleted_event(
@@ -661,7 +841,7 @@ impl AppState {
         payload: &Value,
     ) -> TimelineEvent {
         TimelineEvent {
-            seq: self.event_seq.load(Ordering::Acquire),
+            seq: self.timeline_snapshot.load().max_seq,
             run_id: run_id.to_owned(),
             stream_id: stream_id.to_owned(),
             pts_ms: now_epoch_ms(),
@@ -707,9 +887,28 @@ impl AppState {
         .map_err(|err| format!("timeline read worker join failure: {err}"))?
     }
 
+    /// Read a run's events with `seq >= from_seq`, served from the in-memory
+    /// tail when it still holds that range and falling back to a WAL scan only
+    /// on a cold ring or a cursor older than the tail. The result is filtered to
+    /// `seq >= from_seq` and ordered by `seq` whichever source answers, so a
+    /// polling client sees the same cursor order on a warm hit and a cold miss.
+    pub async fn read_run_events_from(
+        &self,
+        run_id: &str,
+        from_seq: u64,
+    ) -> Result<Vec<TimelineEvent>, String> {
+        if let Some(events) = self.timeline_snapshot.load().events_since(run_id, from_seq) {
+            return Ok(events);
+        }
+        let mut events = self.read_run_events_async(run_id).await?;
+        events.retain(|event| event.seq >= from_seq);
+        events.sort_by_key(|event| event.seq);
+        Ok(events)
+    }
+
     pub fn metrics_snapshot(&self) -> (u64, u64) {
         let runs = self.run_seq.load(Ordering::Acquire);
-        let events = self.event_seq.load(Ordering::Acquire);
+        let events = self.timeline_snapshot.load().max_seq;
         (runs, events)
     }
 
@@ -722,19 +921,26 @@ impl AppState {
     }
 
     pub fn ingest_file_roots(&self) -> &[PathBuf] {
-        self.ingest_file_roots.as_ref().as_slice()
+        self.ingest_file_roots.as_slice()
     }
 
     pub fn security_policy(&self) -> &SecurityPolicy {
-        self.security_policy.as_ref()
+        &self.security_policy
     }
 
     pub fn inference_metrics(&self) -> &InferenceMetrics {
-        self.inference_metrics.as_ref()
+        &self.inference_metrics
+    }
+
+    /// Return the raw `Arc` for cases that need to move the metrics into
+    /// a background thread (e.g. WHIP VLM/clip worker wiring) as an
+    /// `InferenceObserver`.
+    pub fn inference_metrics_arc(&self) -> &Arc<InferenceMetrics> {
+        &self.inference_metrics
     }
 
     pub fn pipeline_metrics(&self) -> &PipelineMetrics {
-        self.pipeline_metrics.as_ref()
+        &self.pipeline_metrics
     }
 
     /// Return the raw `Arc` for cases that need to move the metrics into
@@ -749,7 +955,7 @@ impl AppState {
     }
 
     pub fn distillation_config(&self) -> &DistillationConfig {
-        self.distillation_config.as_ref()
+        &self.distillation_config
     }
 
     pub fn map_event_label(&self, tenant_id: Option<&str>, label: &str) -> LabelMapResult {
@@ -761,8 +967,7 @@ impl AppState {
     }
 
     pub fn run_runtime_snapshot(&self, run_id: &str, now_ms: u64) -> Option<RunRuntimeSnapshot> {
-        let registry = self.run_registry.load();
-        let summary = registry.runs.get(run_id)?.snapshot();
+        let summary = self.run_registry.runs.get(run_id)?.snapshot();
         if !summary.created || summary.deleted {
             return None;
         }
@@ -775,8 +980,7 @@ impl AppState {
     }
 
     pub(crate) fn run_is_deleted(&self, run_id: &str) -> bool {
-        let registry = self.run_registry.load();
-        registry
+        self.run_registry
             .runs
             .get(run_id)
             .map(|summary| summary.snapshot().deleted)
@@ -784,17 +988,21 @@ impl AppState {
     }
 
     pub fn count_active_runs_for_principal(&self, principal_key: &str, now_ms: u64) -> usize {
-        let registry = self.run_registry.load();
-        let Some(run_ids) = registry.by_principal.get(principal_key) else {
+        let Some(run_ids) = self.run_registry.by_principal.get(principal_key) else {
             return 0;
         };
         let ttl_ms = self.stream_ttl_secs.saturating_mul(1000);
         run_ids
             .iter()
-            .filter_map(|run_id| registry.runs.get(run_id))
+            .filter_map(|run_id| self.run_registry.runs.get(run_id))
             .filter(|summary| {
                 let summary = summary.snapshot();
-                !summary.deleted
+                // Trust the run entry, not just the index bucket: only count a run
+                // that still names this principal. The index and the entry are
+                // locked independently now, so this rejects any run whose bucket
+                // membership has drifted from its live principal.
+                summary.principal_key.as_ref() == principal_key
+                    && !summary.deleted
                     && !apply_expiry(summary.state, summary.last_activity_ms, now_ms, ttl_ms)
                         .is_terminal()
             })
@@ -812,17 +1020,26 @@ impl AppState {
         principal_key: &str,
         now_ms: u64,
     ) -> Option<StreamSlotGuard> {
-        let mut reservations = self
-            .stream_reservations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Hold the principal's shard entry across the check and the increment so
+        // two creators for the same principal cannot both pass the same snapshot.
+        // The committed active count comes from the run registry, a different map,
+        // so reading it here does not re-enter this one.
+        let entry = self.stream_reservations.entry(principal_key.to_string());
+        let reserved = match &entry {
+            Entry::Occupied(slot) => *slot.get(),
+            Entry::Vacant(_) => 0,
+        };
         let committed = self.count_active_runs_for_principal(principal_key, now_ms);
-        let reserved = *reservations.get(principal_key).unwrap_or(&0);
         if committed.saturating_add(reserved) >= self.active_stream_limit {
             return None;
         }
 
-        *reservations.entry(principal_key.to_string()).or_insert(0) += 1;
+        match entry {
+            Entry::Occupied(mut slot) => *slot.get_mut() += 1,
+            Entry::Vacant(slot) => {
+                slot.insert(1);
+            }
+        }
         Some(StreamSlotGuard {
             reservations: Arc::clone(&self.stream_reservations),
             principal_key: principal_key.to_string(),
@@ -837,22 +1054,9 @@ impl AppState {
         self.active_stream_limit
     }
 
+    #[cfg(test)]
     fn apply_event_to_registry(&self, event: &TimelineEvent) {
-        if matches!(event.kind.as_str(), "run_created" | "run_deleted") {
-            self.run_registry
-                .rcu(|current| Arc::new(current.with_structural_event(event)));
-            return;
-        }
-
-        let registry = self.run_registry.load();
-        if let Some(summary) = registry.runs.get(&event.run_id) {
-            summary.apply_event(event);
-            return;
-        }
-        drop(registry);
-
-        self.run_registry
-            .rcu(|current| Arc::new(current.with_structural_event(event)));
+        self.run_registry.apply_appended_event(event);
     }
 }
 
@@ -872,6 +1076,278 @@ fn default_test_decode_pipeline() -> Arc<dyn DecodePipeline> {
     create_pipeline(PipelineBackend::CpuFfmpeg)
 }
 
+#[derive(Default)]
+struct RingSnapshot {
+    tails: HashMap<String, Arc<VecDeque<TimelineEvent>>>,
+    max_seq: u64,
+}
+
+impl RingSnapshot {
+    fn from_tails(tails: &HashMap<String, Arc<VecDeque<TimelineEvent>>>, max_seq: u64) -> Self {
+        Self {
+            tails: tails.clone(),
+            max_seq,
+        }
+    }
+
+    fn events_since(&self, run_id: &str, from_seq: u64) -> Option<Vec<TimelineEvent>> {
+        let tail = self.tails.get(run_id)?;
+        let oldest = tail.front()?.seq;
+        if from_seq < oldest {
+            return None;
+        }
+        Some(
+            tail.iter()
+                .filter(|event| event.seq >= from_seq)
+                .cloned()
+                .collect(),
+        )
+    }
+}
+
+struct TimelineAppendRequest {
+    run_id: String,
+    stream_id: String,
+    kind: String,
+    payload: Value,
+    delete_guard: Option<RunDeleteAppendGuard>,
+}
+
+impl TimelineAppendRequest {
+    fn new(
+        run_id: &str,
+        stream_id: &str,
+        kind: &str,
+        payload: Value,
+        delete_guard: Option<RunDeleteAppendGuard>,
+    ) -> Self {
+        Self {
+            run_id: run_id.to_owned(),
+            stream_id: stream_id.to_owned(),
+            kind: kind.to_owned(),
+            payload,
+            delete_guard,
+        }
+    }
+}
+
+enum TimelineReply {
+    Async(oneshot::Sender<Result<TimelineEvent, String>>),
+    Sync(std::sync::mpsc::Sender<Result<TimelineEvent, String>>),
+}
+
+impl TimelineReply {
+    fn send(self, result: Result<TimelineEvent, String>) {
+        match self {
+            TimelineReply::Async(reply) => {
+                let _ = reply.send(result);
+            }
+            TimelineReply::Sync(reply) => {
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
+
+enum TimelineCommand {
+    Append {
+        request: Option<TimelineAppendRequest>,
+        reply: TimelineReply,
+    },
+    AppendDetached {
+        request: TimelineAppendRequest,
+    },
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TimelineWriterTestState {
+    fail_appends: bool,
+    pause_appends: bool,
+    writer_paused: bool,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TimelineWriterTestControl {
+    state: std::sync::Mutex<TimelineWriterTestState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl TimelineWriterTestControl {
+    fn before_append(&self) -> Result<(), String> {
+        let mut state = self.state.lock().expect("timeline test control lock");
+        while state.pause_appends {
+            state.writer_paused = true;
+            self.changed.notify_all();
+            state = self
+                .changed
+                .wait(state)
+                .expect("timeline test control wait");
+        }
+        state.writer_paused = false;
+        if state.fail_appends {
+            Err("injected timeline WAL append failure".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn set_failure(&self, fail: bool) {
+        self.state
+            .lock()
+            .expect("timeline test control lock")
+            .fail_appends = fail;
+    }
+
+    fn pause(&self) {
+        self.state
+            .lock()
+            .expect("timeline test control lock")
+            .pause_appends = true;
+    }
+
+    fn wait_until_paused(&self) {
+        let state = self.state.lock().expect("timeline test control lock");
+        let (_state, timeout) = self
+            .changed
+            .wait_timeout_while(state, std::time::Duration::from_secs(2), |state| {
+                !state.writer_paused
+            })
+            .expect("timeline test control wait");
+        assert!(!timeout.timed_out(), "timeline writer did not pause");
+    }
+
+    fn resume(&self) {
+        let mut state = self.state.lock().expect("timeline test control lock");
+        state.pause_appends = false;
+        self.changed.notify_all();
+    }
+}
+
+struct TimelineWriter {
+    wal: WalWriter,
+    registry: Arc<RunRegistry>,
+    snapshot: Arc<ArcSwap<RingSnapshot>>,
+    next_seq: u64,
+    tails: HashMap<String, Arc<VecDeque<TimelineEvent>>>,
+    tail_recency: HashMap<String, u64>,
+    tail_touch_tick: u64,
+    #[cfg(test)]
+    test_control: Arc<TimelineWriterTestControl>,
+}
+
+impl TimelineWriter {
+    fn run(mut self, mut rx: mpsc::Receiver<TimelineCommand>) {
+        while let Some(command) = rx.blocking_recv() {
+            match command {
+                TimelineCommand::Append { request, reply } => {
+                    let result = self.append(request.expect("timeline append request present"));
+                    reply.send(result);
+                }
+                TimelineCommand::AppendDetached { request } => {
+                    if let Err(err) = self.append(request) {
+                        tracing::warn!(%err, "detached timeline append failed");
+                    }
+                }
+            }
+        }
+    }
+
+    fn append(&mut self, mut request: TimelineAppendRequest) -> Result<TimelineEvent, String> {
+        self.next_seq = self.next_seq.saturating_add(1);
+        let event = TimelineEvent {
+            seq: self.next_seq,
+            run_id: request.run_id,
+            stream_id: request.stream_id,
+            pts_ms: now_epoch_ms(),
+            kind: request.kind,
+            payload: request.payload.to_string(),
+        };
+        if let Err(err) = self.append_wal(&event) {
+            self.next_seq = self.next_seq.saturating_sub(1);
+            return Err(err);
+        }
+
+        self.registry.apply_appended_event(&event);
+        match event.kind.as_str() {
+            "run_deleted" => {
+                self.tails.remove(&event.run_id);
+                self.tail_recency.remove(&event.run_id);
+            }
+            _ => {
+                let is_new_run = !self.tails.contains_key(&event.run_id);
+                if is_new_run && self.tails.len() >= WARM_RUN_TAIL_CAP {
+                    evict_least_recent_tail(&mut self.tails, &mut self.tail_recency);
+                }
+                // Snapshots may still hold the previous tail, so append by
+                // replacing only this run's bounded tail and sharing all others.
+                let mut tail = self
+                    .tails
+                    .get(&event.run_id)
+                    .map(|existing| existing.as_ref().clone())
+                    .unwrap_or_default();
+                insert_event_by_seq(&mut tail, &event);
+                self.tails.insert(event.run_id.clone(), Arc::new(tail));
+                self.tail_touch_tick = self.tail_touch_tick.saturating_add(1);
+                record_tail_touch(&mut self.tail_recency, &event.run_id, self.tail_touch_tick);
+            }
+        }
+        if let Some(guard) = request.delete_guard.take() {
+            guard.commit();
+        }
+        self.publish();
+        Ok(event)
+    }
+
+    fn append_wal(&mut self, event: &TimelineEvent) -> Result<(), String> {
+        // Tests inject failures and pauses here so rollback and cancellation
+        // behavior can be exercised without changing the persistent file path.
+        #[cfg(test)]
+        self.test_control.before_append()?;
+        self.wal.append(event).map_err(|err| err.to_string())
+    }
+
+    fn publish(&self) {
+        self.snapshot.store(Arc::new(RingSnapshot::from_tails(
+            &self.tails,
+            self.next_seq,
+        )));
+    }
+}
+
+fn spawn_timeline_writer(
+    wal: WalWriter,
+    registry: Arc<RunRegistry>,
+    snapshot: Arc<ArcSwap<RingSnapshot>>,
+    next_seq: u64,
+    tails: HashMap<String, Arc<VecDeque<TimelineEvent>>>,
+    #[cfg(test)] test_control: Arc<TimelineWriterTestControl>,
+) -> mpsc::Sender<TimelineCommand> {
+    let (tx, rx) = mpsc::channel(TIMELINE_WRITER_QUEUE_CAP);
+    let tail_recency = tails
+        .iter()
+        .map(|(run_id, tail)| (run_id.clone(), tail.back().map_or(0, |event| event.seq)))
+        .collect();
+    let writer = TimelineWriter {
+        wal,
+        registry,
+        snapshot,
+        next_seq,
+        tails,
+        tail_recency,
+        tail_touch_tick: next_seq,
+        #[cfg(test)]
+        test_control,
+    };
+    std::thread::Builder::new()
+        .name("vidarax-timeline-writer".to_string())
+        .spawn(move || writer.run(rx))
+        .expect("timeline writer thread should spawn");
+    tx
+}
+
 #[derive(Clone)]
 pub struct RunRuntimeSnapshot {
     pub principal_key: String,
@@ -879,20 +1355,34 @@ pub struct RunRuntimeSnapshot {
     pub last_activity_ms: u64,
 }
 
-#[derive(Clone, Default)]
+/// Sharded per-run registry. Both maps carry their own locking, so adding or
+/// deleting a run only touches that run's shard plus its principal's index
+/// bucket; unrelated runs keep processing events with no contention and nothing
+/// gets copied. The per-run state itself lives in atomics inside `RunState`, so
+/// once a run exists its ongoing events never come back through here.
+#[derive(Default)]
 struct RunRegistry {
-    runs: HashMap<String, Arc<RunState>>,
-    by_principal: HashMap<Arc<str>, HashSet<String>>,
+    runs: DashMap<String, Arc<RunState>>,
+    by_principal: DashMap<Arc<str>, HashSet<String>>,
+    /// Structural registry writes are owned by the timeline writer thread, so
+    /// this FIFO's mutex has no writer contention. The mutex only permits the
+    /// registry to remain shared with concurrent readers.
+    deleted_run_order: Mutex<VecDeque<String>>,
 }
 
 impl RunRegistry {
-    fn with_structural_event(&self, event: &TimelineEvent) -> Self {
-        let mut next = self.clone();
-        next.apply_structural_event(event);
-        next
-    }
-
-    fn apply_structural_event(&mut self, event: &TimelineEvent) {
+    /// Register the effect of a create/delete (or an out-of-order first event)
+    /// for one run. Every lock here is taken and released before the next map is
+    /// touched: the `by_principal` bucket is settled with no `runs` lock held,
+    /// and the run entry is written with no `by_principal` lock held. That keeps
+    /// the write order the mirror of the reader in `count_active_runs_for_principal`
+    /// (which walks `by_principal` then `runs`) so the two can never deadlock.
+    ///
+    /// Same-run structural events do not overlap in practice: a run is created by
+    /// a single owner and deleted through the `RunState` compare-exchange claim,
+    /// which lets exactly one caller reach this point. Distinct runs are free to
+    /// arrive together and land on their own shards.
+    fn apply_structural_event(&self, event: &TimelineEvent) {
         let before = self
             .runs
             .get(&event.run_id)
@@ -900,35 +1390,121 @@ impl RunRegistry {
             .unwrap_or_else(RunSummary::default_public);
         let mut after = before.clone();
         after.apply_event(event);
+        let freshly_deleted = !before.deleted && after.deleted;
 
         if before.created
             && (!after.created || after.deleted || before.principal_key != after.principal_key)
         {
-            if let Some(set) = self.by_principal.get_mut(&*before.principal_key) {
+            let stale = &*before.principal_key;
+            if let Some(mut set) = self.by_principal.get_mut(stale) {
                 set.remove(&event.run_id);
-                if set.is_empty() {
-                    self.by_principal.remove(&*before.principal_key);
-                }
             }
+            // Re-checks emptiness under the bucket lock, so a run that slipped
+            // back in between the drop above and here keeps its bucket.
+            self.by_principal.remove_if(stale, |_, set| set.is_empty());
         }
 
-        if !after.created || after.deleted {
-            self.runs.insert(
-                event.run_id.clone(),
-                Arc::new(RunState::from_summary(after)),
-            );
-            return;
+        if after.created && !after.deleted {
+            self.by_principal
+                .entry(after.principal_key.clone())
+                .or_default()
+                .insert(event.run_id.clone());
         }
 
-        self.by_principal
-            .entry(after.principal_key.clone())
-            .or_default()
-            .insert(event.run_id.clone());
         self.runs.insert(
             event.run_id.clone(),
             Arc::new(RunState::from_summary(after)),
         );
+
+        if freshly_deleted {
+            let mut deleted_run_order = self
+                .deleted_run_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            deleted_run_order.push_back(event.run_id.clone());
+            if deleted_run_order.len() > DELETED_RUN_RETENTION_CAP {
+                let oldest = deleted_run_order
+                    .pop_front()
+                    .expect("deleted run FIFO exceeded its cap");
+                self.runs
+                    .remove_if(&oldest, |_, run| run.snapshot().deleted);
+            }
+        }
     }
+
+    /// Apply one durable event to the shared structural registry. The timeline
+    /// writer owns the event rings, so this method only mutates run metadata and
+    /// per-run state needed by other handlers.
+    fn apply_appended_event(&self, event: &TimelineEvent) {
+        match event.kind.as_str() {
+            "run_created" => {
+                self.apply_structural_event(event);
+            }
+            "run_deleted" => {
+                self.apply_structural_event(event);
+            }
+            _ => {
+                // A run we already know about carries its whole state in per-run
+                // atomics, so the common path just nudges those in place and
+                // touches no other run.
+                if let Some(run) = self.runs.get(&event.run_id) {
+                    run.apply_event(event);
+                } else {
+                    // First sight of a run without its create event (out-of-order
+                    // replay); fall back to the structural path to register it.
+                    self.apply_structural_event(event);
+                }
+            }
+        }
+    }
+}
+
+/// Place `event` in a per-run tail so the ring stays ordered by `seq` and
+/// bounded to [`RUN_EVENT_TAIL_CAP`]. Near-sorted arrivals take the push-back
+/// fast path; a late or out-of-order event is inserted at its seq and an exact
+/// duplicate is ignored. Trimming always drops the smallest seq, so the tail
+/// keeps the run's highest-seq events and its front is the oldest it can serve.
+fn insert_event_by_seq(tail: &mut VecDeque<TimelineEvent>, event: &TimelineEvent) {
+    if tail.back().is_none_or(|back| event.seq > back.seq) {
+        tail.push_back(event.clone());
+    } else {
+        match tail.binary_search_by(|held| held.seq.cmp(&event.seq)) {
+            Ok(_) => return,
+            Err(pos) => tail.insert(pos, event.clone()),
+        }
+    }
+
+    while tail.len() > RUN_EVENT_TAIL_CAP {
+        tail.pop_front();
+    }
+}
+
+/// Refresh an existing run without allocating another owned map key. Only a
+/// newly warm run needs to allocate its recency key.
+fn record_tail_touch(recency: &mut HashMap<String, u64>, run_id: &str, tick: u64) {
+    if let Some(last_touch) = recency.get_mut(run_id) {
+        *last_touch = tick;
+    } else {
+        recency.insert(run_id.to_owned(), tick);
+    }
+}
+
+/// Remove only the coldest warm-read accelerator. The WAL, sequence counter,
+/// and run registry remain untouched because they own durable data and run
+/// state. Published snapshots may retain the removed tail through its `Arc`.
+fn evict_least_recent_tail<T>(tails: &mut HashMap<String, T>, recency: &mut HashMap<String, u64>) {
+    let Some(run_id) = recency
+        .iter()
+        .min_by_key(|(_, tick)| **tick)
+        .map(|(run_id, _)| run_id.clone())
+    else {
+        debug_assert!(tails.is_empty());
+        return;
+    };
+
+    let removed_tail = tails.remove(&run_id).is_some();
+    let removed_recency = recency.remove(&run_id).is_some();
+    debug_assert!(removed_tail && removed_recency);
 }
 
 struct RunDeletedAppend {
@@ -1108,11 +1684,35 @@ impl RunSummary {
 }
 
 fn build_run_registry(events: &[TimelineEvent]) -> Arc<RunRegistry> {
-    let mut registry = RunRegistry::default();
+    let registry = RunRegistry::default();
     for event in events {
         registry.apply_structural_event(event);
     }
     Arc::new(registry)
+}
+
+fn build_event_tails(events: &[TimelineEvent]) -> HashMap<String, Arc<VecDeque<TimelineEvent>>> {
+    let mut sorted = events.to_vec();
+    sorted.sort_by_key(|event| event.seq);
+    let mut tails: HashMap<String, VecDeque<TimelineEvent>> = HashMap::new();
+    let mut recency = HashMap::new();
+    for event in sorted {
+        if event.kind == "run_deleted" {
+            tails.remove(&event.run_id);
+            recency.remove(&event.run_id);
+        } else {
+            let is_new_run = !tails.contains_key(&event.run_id);
+            if is_new_run && tails.len() >= WARM_RUN_TAIL_CAP {
+                evict_least_recent_tail(&mut tails, &mut recency);
+            }
+            insert_event_by_seq(tails.entry(event.run_id.clone()).or_default(), &event);
+            record_tail_touch(&mut recency, &event.run_id, event.seq);
+        }
+    }
+    tails
+        .into_iter()
+        .map(|(run_id, tail)| (run_id, Arc::new(tail)))
+        .collect()
 }
 
 fn principal_key_from_payload(raw: &str) -> Option<Arc<str>> {
@@ -1184,9 +1784,19 @@ mod tests {
     use std::thread;
 
     fn event(seq: u64, kind: &str, pts_ms: u64, payload: Value) -> TimelineEvent {
+        event_for_run(seq, "run-1", kind, pts_ms, payload)
+    }
+
+    fn event_for_run(
+        seq: u64,
+        run_id: &str,
+        kind: &str,
+        pts_ms: u64,
+        payload: Value,
+    ) -> TimelineEvent {
         TimelineEvent {
             seq,
-            run_id: "run-1".to_string(),
+            run_id: run_id.to_string(),
             stream_id: "stream-0".to_string(),
             pts_ms,
             kind: kind.to_string(),
@@ -1205,19 +1815,446 @@ mod tests {
             100,
             json!({"principal_key": "tenant-a"}),
         ));
-        let before = state.run_registry.load_full();
+        let before = Arc::clone(&state.run_registry.runs.get("run-1").expect("run exists"));
 
         state.apply_event_to_registry(&event(2, "analysis_generated", 150, json!({})));
-        let after = state.run_registry.load_full();
+        let after = Arc::clone(&state.run_registry.runs.get("run-1").expect("run exists"));
 
+        // Same `RunState` pointer before and after means the per-event write went
+        // straight to the run's atomics: it neither allocated a replacement entry
+        // nor rebuilt any map, which is the whole point of dropping the old
+        // clone-the-registry write path.
         assert!(
             Arc::ptr_eq(&before, &after),
-            "existing-run events must update run atomics without replacing the registry map"
+            "existing-run events must update run atomics in place without replacing the entry"
         );
         let snapshot = state.run_runtime_snapshot("run-1", 150).unwrap();
         assert_eq!(snapshot.principal_key, "tenant-a");
         assert_eq!(snapshot.state, StreamState::Processing);
         assert_eq!(snapshot.last_activity_ms, 150);
+    }
+
+    #[test]
+    fn tail_insert_orders_by_seq_and_dedups() {
+        let mut tail = VecDeque::new();
+        for seq in [1u64, 2, 5] {
+            insert_event_by_seq(&mut tail, &event(seq, "analysis_generated", seq, json!({})));
+        }
+        // A late, out-of-order arrival lands at its seq, not at the back.
+        insert_event_by_seq(&mut tail, &event(3, "analysis_generated", 3, json!({})));
+        // An exact-seq repeat is ignored rather than double-counted.
+        insert_event_by_seq(&mut tail, &event(3, "analysis_generated", 3, json!({})));
+
+        let seqs: Vec<u64> = tail.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 5]);
+    }
+
+    #[test]
+    fn tail_eviction_keeps_highest_seqs() {
+        let mut tail = VecDeque::new();
+        for seq in 1..=(RUN_EVENT_TAIL_CAP as u64 + 5) {
+            insert_event_by_seq(&mut tail, &event(seq, "analysis_generated", seq, json!({})));
+        }
+        assert_eq!(tail.len(), RUN_EVENT_TAIL_CAP);
+        assert_eq!(tail.front().unwrap().seq, 6);
+        assert_eq!(tail.back().unwrap().seq, RUN_EVENT_TAIL_CAP as u64 + 5);
+
+        // An arrival older than everything retained never displaces the window.
+        insert_event_by_seq(&mut tail, &event(1, "analysis_generated", 1, json!({})));
+        assert_eq!(tail.len(), RUN_EVENT_TAIL_CAP);
+        assert_eq!(tail.front().unwrap().seq, 6);
+    }
+
+    #[test]
+    fn snapshot_serves_warm_cursor_and_defers_cold() {
+        let mut tails = HashMap::new();
+        let mut tail = VecDeque::new();
+        for seq in 1..=4 {
+            insert_event_by_seq(&mut tail, &event(seq, "analysis_generated", seq, json!({})));
+        }
+        tails.insert("run-1".to_string(), Arc::new(tail));
+        let snapshot = RingSnapshot::from_tails(&tails, 4);
+
+        let served = snapshot
+            .events_since("run-1", 2)
+            .expect("warm cursor served");
+        assert_eq!(
+            served.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert_eq!(snapshot.events_since("run-1", 99).unwrap().len(), 0);
+        assert!(snapshot.events_since("run-1", 0).is_none());
+        assert!(snapshot.events_since("missing", 1).is_none());
+    }
+
+    #[test]
+    fn snapshot_eviction_defers_when_cursor_predates_window() {
+        let mut tails = HashMap::new();
+        let mut tail = VecDeque::new();
+        for seq in 1..=(RUN_EVENT_TAIL_CAP as u64 + 3) {
+            insert_event_by_seq(&mut tail, &event(seq, "analysis_generated", seq, json!({})));
+        }
+        tails.insert("run-1".to_string(), Arc::new(tail));
+        let snapshot = RingSnapshot::from_tails(&tails, RUN_EVENT_TAIL_CAP as u64 + 3);
+
+        assert!(snapshot.events_since("run-1", 1).is_none());
+        assert!(snapshot.events_since("run-1", 4).is_some());
+    }
+
+    #[test]
+    fn publishing_append_reuses_unchanged_run_tail_arc() {
+        let wal_path =
+            std::env::temp_dir().join(format!("vidarax-state-cow-tail-{}.wal", std::process::id()));
+        std::fs::remove_file(&wal_path).ok();
+        let snapshot = Arc::new(ArcSwap::from_pointee(RingSnapshot::default()));
+        let mut writer = TimelineWriter {
+            wal: WalWriter::open(&wal_path).unwrap(),
+            registry: Arc::new(RunRegistry::default()),
+            snapshot: Arc::clone(&snapshot),
+            next_seq: 0,
+            tails: HashMap::new(),
+            tail_recency: HashMap::new(),
+            tail_touch_tick: 0,
+            test_control: Arc::new(TimelineWriterTestControl::default()),
+        };
+
+        writer
+            .append(TimelineAppendRequest::new(
+                "run-1",
+                "stream-0",
+                "analysis_generated",
+                json!({}),
+                None,
+            ))
+            .unwrap();
+        let first_snapshot = snapshot.load();
+        let first_run_tail = Arc::clone(first_snapshot.tails.get("run-1").unwrap());
+        drop(first_snapshot);
+
+        writer
+            .append(TimelineAppendRequest::new(
+                "run-2",
+                "stream-0",
+                "analysis_generated",
+                json!({}),
+                None,
+            ))
+            .unwrap();
+
+        let second_snapshot = snapshot.load();
+        let second_run_tail = Arc::clone(second_snapshot.tails.get("run-1").unwrap());
+        assert!(Arc::ptr_eq(&first_run_tail, &second_run_tail));
+
+        std::fs::remove_file(wal_path).ok();
+    }
+
+    #[tokio::test]
+    async fn warm_run_tail_lru_caps_and_falls_back_to_wal() {
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-state-warm-tail-cap-{}.wal",
+            std::process::id()
+        ));
+        std::fs::remove_file(&wal_path).ok();
+        let state = AppState::with_wal_for_tests(wal_path.clone());
+
+        for run in 0..(WARM_RUN_TAIL_CAP + 2) {
+            state
+                .append_run_event(&format!("run-{run}"), "run_created", json!({}))
+                .unwrap();
+        }
+
+        let snapshot = state.timeline_snapshot.load();
+        assert_eq!(snapshot.tails.len(), WARM_RUN_TAIL_CAP);
+        assert!(!snapshot.tails.contains_key("run-0"));
+        assert!(!snapshot.tails.contains_key("run-1"));
+        drop(snapshot);
+
+        let cold_events = state.read_run_events_from("run-0", 0).await.unwrap();
+        assert_eq!(cold_events.len(), 1);
+        assert_eq!(cold_events[0].run_id, "run-0");
+        assert_eq!(cold_events[0].kind, "run_created");
+
+        std::fs::remove_file(wal_path).ok();
+    }
+
+    #[test]
+    fn warm_run_tail_lru_refreshes_recently_appended_run() {
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-state-warm-tail-refresh-{}.wal",
+            std::process::id()
+        ));
+        std::fs::remove_file(&wal_path).ok();
+        let state = AppState::with_wal_for_tests(wal_path.clone());
+
+        for run in 0..WARM_RUN_TAIL_CAP {
+            state
+                .append_run_event(&format!("run-{run}"), "run_created", json!({}))
+                .unwrap();
+        }
+        state
+            .append_run_event("run-0", "analysis_generated", json!({}))
+            .unwrap();
+        state
+            .append_run_event(
+                &format!("run-{WARM_RUN_TAIL_CAP}"),
+                "run_created",
+                json!({}),
+            )
+            .unwrap();
+
+        let snapshot = state.timeline_snapshot.load();
+        assert_eq!(snapshot.tails.len(), WARM_RUN_TAIL_CAP);
+        assert!(snapshot.tails.contains_key("run-0"));
+        assert!(!snapshot.tails.contains_key("run-1"));
+
+        std::fs::remove_file(wal_path).ok();
+    }
+
+    #[test]
+    fn run_deleted_removes_tail_and_recency_entry() {
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-state-warm-tail-delete-{}.wal",
+            std::process::id()
+        ));
+        std::fs::remove_file(&wal_path).ok();
+        let snapshot = Arc::new(ArcSwap::from_pointee(RingSnapshot::default()));
+        let mut writer = TimelineWriter {
+            wal: WalWriter::open(&wal_path).unwrap(),
+            registry: Arc::new(RunRegistry::default()),
+            snapshot,
+            next_seq: 0,
+            tails: HashMap::new(),
+            tail_recency: HashMap::new(),
+            tail_touch_tick: 0,
+            test_control: Arc::new(TimelineWriterTestControl::default()),
+        };
+
+        writer
+            .append(TimelineAppendRequest::new(
+                "run-1",
+                "stream-0",
+                "run_created",
+                json!({}),
+                None,
+            ))
+            .unwrap();
+        assert!(writer.tails.contains_key("run-1"));
+        assert!(writer.tail_recency.contains_key("run-1"));
+
+        writer
+            .append(TimelineAppendRequest::new(
+                "run-1",
+                "stream-0",
+                "run_deleted",
+                json!({}),
+                None,
+            ))
+            .unwrap();
+        assert!(!writer.tails.contains_key("run-1"));
+        assert!(!writer.tail_recency.contains_key("run-1"));
+
+        std::fs::remove_file(wal_path).ok();
+    }
+
+    #[test]
+    fn build_event_tails_forgets_deleted_run() {
+        let events = vec![
+            event(1, "run_created", 1, json!({"principal_key": "public"})),
+            event(2, "analysis_generated", 2, json!({})),
+            event(3, "run_deleted", 3, json!({})),
+        ];
+
+        let tails = build_event_tails(&events);
+
+        assert!(!tails.contains_key("run-1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_run_appends_never_skip_a_seq() {
+        const TASKS: u64 = 4;
+        const PER: u64 = 60;
+        let total = (TASKS * PER) as usize;
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-state-same-run-race-{}.wal",
+            std::process::id()
+        ));
+        std::fs::remove_file(&wal_path).ok();
+        let state = Arc::new(AppState::with_wal_for_tests(wal_path));
+
+        let writers: Vec<_> = (0..TASKS)
+            .map(|task| {
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let stream = format!("stream-{task}");
+                    for _ in 0..PER {
+                        state
+                            .append_run_event_for_stream_async(
+                                "run-1",
+                                &stream,
+                                "analysis_generated",
+                                json!({}),
+                            )
+                            .await
+                            .expect("append failed");
+                        tokio::task::yield_now().await;
+                    }
+                })
+            })
+            .collect();
+
+        let reader = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let mut cursor = 1u64;
+                let mut consumed = 0usize;
+                let start = std::time::Instant::now();
+                while consumed < total {
+                    assert!(
+                        start.elapsed() < std::time::Duration::from_secs(30),
+                        "reader stalled at cursor {cursor}, consumed {consumed}/{total}"
+                    );
+                    let batch = state.read_run_events_from("run-1", cursor).await.unwrap();
+                    if batch.is_empty() {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    for ev in batch {
+                        assert_eq!(ev.seq, cursor, "reader served seq {} out of order", ev.seq);
+                        cursor += 1;
+                        consumed += 1;
+                    }
+                }
+            })
+        };
+
+        for writer in writers {
+            writer.await.expect("writer panicked");
+        }
+        reader
+            .await
+            .expect("reader saw a skipped or out-of-order seq");
+
+        std::fs::remove_file(state.wal_path.as_ref()).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_fallback_reads_never_skip_a_seq() {
+        // Drive read_run_events_from against racing async appends. The writer
+        // serializes seq assignment, WAL append, and snapshot publication, so the
+        // reader must see only contiguous seqs as it advances its cursor.
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-state-fallback-race-{}.wal",
+            std::process::id()
+        ));
+        std::fs::remove_file(&wal_path).ok();
+        let state = Arc::new(AppState::with_wal_for_tests(wal_path));
+
+        const TASKS: u64 = 8;
+        const PER: u64 = 30;
+        let total = (TASKS * PER) as usize;
+
+        let writers: Vec<_> = (0..TASKS)
+            .map(|task| {
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let stream = format!("stream-{task}");
+                    for _ in 0..PER {
+                        state
+                            .append_run_event_for_stream_async(
+                                "run-1",
+                                &stream,
+                                "analysis_generated",
+                                json!({}),
+                            )
+                            .await
+                            .expect("append failed");
+                    }
+                })
+            })
+            .collect();
+
+        let reader = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let mut cursor = 1u64;
+                let mut consumed = 0usize;
+                let start = std::time::Instant::now();
+                while consumed < total {
+                    assert!(
+                        start.elapsed() < std::time::Duration::from_secs(30),
+                        "reader stalled at cursor {cursor}, consumed {consumed}/{total}"
+                    );
+                    let batch = state.read_run_events_from("run-1", cursor).await.unwrap();
+                    if batch.is_empty() {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    for ev in batch {
+                        assert_eq!(ev.seq, cursor, "reader served seq {} out of order", ev.seq);
+                        cursor += 1;
+                        consumed += 1;
+                    }
+                }
+            })
+        };
+
+        for writer in writers {
+            writer.await.expect("writer panicked");
+        }
+        reader
+            .await
+            .expect("reader saw a skipped or out-of-order seq");
+
+        std::fs::remove_file(state.wal_path.as_ref()).ok();
+    }
+
+    #[tokio::test]
+    async fn read_run_events_from_matches_wal_for_same_cursor() {
+        let state = AppState::with_wal_for_tests(std::env::temp_dir().join(format!(
+            "vidarax-state-tail-cursor-{}.wal",
+            std::process::id()
+        )));
+        state
+            .append_run_event("run-1", "run_created", json!({"principal_key": "public"}))
+            .unwrap();
+        for _ in 0..5 {
+            state
+                .append_run_event("run-1", "analysis_generated", json!({}))
+                .unwrap();
+        }
+
+        // A warm cursor serves exactly the WAL tail for the same from_seq.
+        let from_seq = 3;
+        let memory = state.read_run_events_from("run-1", from_seq).await.unwrap();
+        let wal: Vec<_> = state
+            .read_run_events_async("run-1")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.seq >= from_seq)
+            .collect();
+        assert_eq!(memory, wal);
+        assert!(memory.iter().all(|e| e.seq >= from_seq));
+    }
+
+    #[tokio::test]
+    async fn fallback_filters_and_sorts_wal_events() {
+        let state = AppState::with_wal_for_tests(std::env::temp_dir().join(format!(
+            "vidarax-state-fallback-sort-{}.wal",
+            std::process::id()
+        )));
+        for seq in [4, 2, 3, 1] {
+            append_event(
+                state.wal_path.as_ref(),
+                &event(seq, "analysis_generated", seq, json!({})),
+            )
+            .unwrap();
+        }
+
+        let served = state.read_run_events_from("run-1", 3).await.unwrap();
+        assert_eq!(served.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4]);
+
+        std::fs::remove_file(state.wal_path.as_ref()).ok();
     }
 
     #[test]
@@ -1265,6 +2302,245 @@ mod tests {
         assert!(state.try_reserve_stream_slot(principal, now_ms).is_some());
         drop(guards);
         assert!(state.try_reserve_stream_slot(principal, now_ms).is_some());
+    }
+
+    #[test]
+    fn deleted_run_registry_retention_cap_evicts_only_old_tombstones() {
+        const EXTRA_DELETIONS: usize = 7;
+        let registry = RunRegistry::default();
+        let live_run_id = "run-live";
+        registry.apply_structural_event(&event_for_run(
+            1,
+            live_run_id,
+            "run_created",
+            1,
+            json!({ "principal_key": "tenant-a" }),
+        ));
+
+        let mut seq = 2;
+        for i in 0..(DELETED_RUN_RETENTION_CAP + EXTRA_DELETIONS) {
+            let run_id = format!("run-deleted-{i:05}");
+            registry.apply_structural_event(&event_for_run(
+                seq,
+                &run_id,
+                "run_created",
+                seq,
+                json!({ "principal_key": "tenant-a" }),
+            ));
+            seq += 1;
+            registry.apply_structural_event(&event_for_run(
+                seq,
+                &run_id,
+                "run_deleted",
+                seq,
+                json!({}),
+            ));
+            seq += 1;
+        }
+
+        assert_eq!(
+            registry
+                .runs
+                .iter()
+                .filter(|run| run.snapshot().deleted)
+                .count(),
+            DELETED_RUN_RETENTION_CAP
+        );
+        assert_eq!(registry.runs.len(), DELETED_RUN_RETENTION_CAP + 1);
+        for i in 0..EXTRA_DELETIONS {
+            assert!(!registry.runs.contains_key(&format!("run-deleted-{i:05}")));
+        }
+        assert!(registry.runs.get(live_run_id).is_some_and(|run| {
+            let run = run.snapshot();
+            run.created && !run.deleted
+        }));
+        assert!(registry
+            .by_principal
+            .get("tenant-a")
+            .is_some_and(|run_ids| run_ids.contains(live_run_id)));
+    }
+
+    #[test]
+    fn recent_deleted_run_keeps_delete_idempotency() {
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-state-recent-delete-idempotency-{}.wal",
+            std::process::id()
+        ));
+        std::fs::remove_file(&wal_path).ok();
+        let state = AppState::with_wal_for_tests(wal_path.clone());
+        state
+            .append_run_event(
+                "run-recent",
+                "run_created",
+                json!({ "principal_key": "tenant-a" }),
+            )
+            .unwrap();
+
+        let first = state
+            .append_run_deleted_for_stream_idempotent("run-recent", "stream-0", json!({}))
+            .unwrap();
+        let second = state
+            .append_run_deleted_for_stream_idempotent("run-recent", "stream-0", json!({}))
+            .unwrap();
+
+        assert!(first.appended);
+        assert!(!second.appended);
+        assert_eq!(
+            state
+                .read_run_events("run-recent")
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "run_deleted")
+                .count(),
+            1
+        );
+        drop(state);
+        std::fs::remove_file(wal_path).ok();
+    }
+
+    #[test]
+    fn evicted_deleted_run_appends_delete_again_via_missing_path() {
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-state-evicted-delete-boundary-{}.wal",
+            std::process::id()
+        ));
+        std::fs::remove_file(&wal_path).ok();
+        let state = AppState::with_wal_for_tests(wal_path.clone());
+        state.apply_event_to_registry(&event_for_run(
+            1,
+            "run-evicted",
+            "run_created",
+            1,
+            json!({ "principal_key": "tenant-a" }),
+        ));
+        state.apply_event_to_registry(&event_for_run(
+            2,
+            "run-evicted",
+            "run_deleted",
+            2,
+            json!({}),
+        ));
+        for i in 0..DELETED_RUN_RETENTION_CAP {
+            state.apply_event_to_registry(&event_for_run(
+                i as u64 + 3,
+                &format!("run-newer-deleted-{i:05}"),
+                "run_deleted",
+                i as u64 + 3,
+                json!({}),
+            ));
+        }
+        assert!(!state.run_registry.runs.contains_key("run-evicted"));
+
+        let repeated = state
+            .append_run_deleted_for_stream_idempotent(
+                "run-evicted",
+                "stream-0",
+                json!({ "reason": "late retry" }),
+            )
+            .unwrap();
+
+        assert!(repeated.appended);
+        assert_eq!(
+            state
+                .read_run_events("run-evicted")
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "run_deleted")
+                .count(),
+            1
+        );
+        drop(state);
+        std::fs::remove_file(wal_path).ok();
+    }
+
+    #[test]
+    fn registry_replay_bounds_deleted_runs_and_keeps_live_runs() {
+        const EXTRA_DELETIONS: usize = 5;
+        let mut events = Vec::with_capacity((DELETED_RUN_RETENTION_CAP + EXTRA_DELETIONS) * 2 + 2);
+        let mut seq = 1u64;
+        for i in 0..(DELETED_RUN_RETENTION_CAP + EXTRA_DELETIONS) {
+            let run_id = format!("run-replay-deleted-{i:05}");
+            events.push(event_for_run(
+                seq,
+                &run_id,
+                "run_created",
+                seq,
+                json!({ "principal_key": "tenant-a" }),
+            ));
+            seq += 1;
+            events.push(event_for_run(seq, &run_id, "run_deleted", seq, json!({})));
+            seq += 1;
+        }
+        for run_id in ["run-replay-live-a", "run-replay-live-b"] {
+            events.push(event_for_run(
+                seq,
+                run_id,
+                "run_created",
+                seq,
+                json!({ "principal_key": "tenant-a" }),
+            ));
+            seq += 1;
+        }
+
+        let registry = build_run_registry(&events);
+
+        assert_eq!(registry.runs.len(), DELETED_RUN_RETENTION_CAP + 2);
+        assert!(!registry.runs.contains_key("run-replay-deleted-00000"));
+        let live_runs = registry.by_principal.get("tenant-a").unwrap();
+        assert_eq!(live_runs.len(), 2);
+        assert!(live_runs.contains("run-replay-live-a"));
+        assert!(live_runs.contains("run-replay-live-b"));
+        drop(live_runs);
+        let most_recent_deleted = format!(
+            "run-replay-deleted-{:05}",
+            DELETED_RUN_RETENTION_CAP + EXTRA_DELETIONS - 1
+        );
+        let run = registry.runs.get(&most_recent_deleted).unwrap();
+        assert!(matches!(
+            run.begin_delete_append(),
+            RunDeleteState::AlreadyDeleted
+        ));
+    }
+
+    #[test]
+    fn stale_deleted_fifo_entry_does_not_evict_recreated_live_run() {
+        let registry = RunRegistry::default();
+        registry.apply_structural_event(&event_for_run(
+            1,
+            "run-recreated",
+            "run_deleted",
+            1,
+            json!({}),
+        ));
+
+        // Model the old tombstone being forgotten before the identifier is
+        // reused. Its stale FIFO entry must not remove the new live lifecycle.
+        registry.runs.remove("run-recreated");
+        registry.apply_structural_event(&event_for_run(
+            2,
+            "run-recreated",
+            "run_created",
+            2,
+            json!({ "principal_key": "tenant-a" }),
+        ));
+        for i in 0..DELETED_RUN_RETENTION_CAP {
+            registry.apply_structural_event(&event_for_run(
+                i as u64 + 3,
+                &format!("run-after-recreate-{i:05}"),
+                "run_deleted",
+                i as u64 + 3,
+                json!({}),
+            ));
+        }
+
+        assert!(registry.runs.get("run-recreated").is_some_and(|run| {
+            let run = run.snapshot();
+            run.created && !run.deleted
+        }));
+        assert!(registry
+            .by_principal
+            .get("tenant-a")
+            .is_some_and(|run_ids| run_ids.contains("run-recreated")));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1328,8 +2604,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_run_deleted_append_releases_claim_for_retry() {
-        use std::io::Read;
-
         let dir = std::env::temp_dir().join(format!(
             "vidarax-state-delete-cancel-{}",
             std::process::id()
@@ -1346,12 +2620,7 @@ mod tests {
             )
             .unwrap();
 
-        std::fs::remove_file(&wal_path).unwrap();
-        let status = std::process::Command::new("mkfifo")
-            .arg(&wal_path)
-            .status()
-            .expect("mkfifo should run");
-        assert!(status.success(), "mkfifo failed: {status}");
+        state.pause_timeline_appends_for_tests();
 
         let delete_state = state.clone();
         let delete_task = tokio::spawn(async move {
@@ -1360,33 +2629,11 @@ mod tests {
                 .await
         });
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let registry = state.run_registry.load();
-                let run = registry.runs.get("run-1").expect("run exists");
-                if run.delete_state.load(Ordering::Acquire) == RUN_DELETE_APPEND_IN_FLIGHT {
-                    return;
-                }
-                drop(registry);
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("delete append should reach in-flight claim");
+        state.wait_until_timeline_writer_paused_for_tests();
 
         delete_task.abort();
         let _ = delete_task.await;
-
-        let mut fifo_reader = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&wal_path)
-            .expect("open fifo reader");
-        let mut discarded = String::new();
-        fifo_reader
-            .read_to_string(&mut discarded)
-            .expect("read cancelled append");
-        drop(fifo_reader);
-        std::fs::remove_file(&wal_path).unwrap();
+        state.resume_timeline_appends_for_tests();
 
         let appended = tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -1497,5 +2744,60 @@ mod tests {
         }
 
         assert_eq!(run.snapshot().state, StreamState::Completed);
+    }
+
+    // Measurement harness for the timeline snapshot-publish cost (w3r.12).
+    // Run explicitly: cargo test -p vidarax-api --lib --release measure_publish -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn measure_publish_snapshot_cost_by_run_count() {
+        use std::time::Instant;
+        for &n in &[1usize, 10, 100, 1000, 5000] {
+            let mut tails: HashMap<String, Arc<VecDeque<TimelineEvent>>> = HashMap::new();
+            for r in 0..n {
+                let mut dq = VecDeque::new();
+                for s in 0..8u64 {
+                    dq.push_back(event(s + 1, "analysis_generated", s + 1, json!({})));
+                }
+                tails.insert(format!("run-{r}"), Arc::new(dq));
+            }
+            for _ in 0..200 {
+                std::hint::black_box(RingSnapshot::from_tails(&tails, n as u64));
+            }
+            let iters = 5000u32;
+            let start = Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(RingSnapshot::from_tails(&tails, n as u64));
+            }
+            let per = start.elapsed().as_nanos() as f64 / iters as f64;
+            println!("publish from_tails: {n:>5} runs -> {per:>10.0} ns/append");
+        }
+    }
+
+    // Measurement harness for a real end-to-end sync append (WAL + writer),
+    // for scale comparison against the publish cost above.
+    #[test]
+    #[ignore]
+    fn measure_sync_append_latency() {
+        use std::time::Instant;
+        let wal_path =
+            std::env::temp_dir().join(format!("vidarax-bench-append-{}.wal", std::process::id()));
+        std::fs::remove_file(&wal_path).ok();
+        let state = AppState::with_wal_for_tests(wal_path);
+        for i in 0..200u64 {
+            state
+                .append_run_event(&format!("run-{i}"), "run_created", json!({}))
+                .unwrap();
+        }
+        let iters = 2000u32;
+        let start = Instant::now();
+        for i in 0..iters {
+            state
+                .append_run_event("run-0", "analysis_generated", json!({ "i": i }))
+                .unwrap();
+        }
+        let per = start.elapsed().as_nanos() as f64 / iters as f64;
+        println!("end-to-end sync append (200 runs live): {per:.0} ns/append");
+        std::fs::remove_file(state.wal_path.as_ref()).ok();
     }
 }

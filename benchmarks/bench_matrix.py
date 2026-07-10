@@ -21,6 +21,92 @@ DEFAULT_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 
 _UPLOAD_DIR = os.environ.get("VIDARAX_UPLOAD_DIR", "/tmp/vidarax-uploads")
 
+# ─── Pricing ─────────────────────────────────────────────────────────────────
+# USD per 1,000,000 tokens, (input, output). These are ILLUSTRATIVE defaults for
+# ranking configs against each other — verify against the live rate card before
+# quoting an absolute dollar figure. Matched by substring against the model id;
+# anything unmatched (i.e. a locally-hosted model) is priced at $0 tokens, since
+# its cost is GPU-time, not per-token billing. Override wholesale with
+# VIDARAX_PRICE_INPUT / VIDARAX_PRICE_OUTPUT (USD per 1M) to price one run.
+PRICES_PER_MTOK = {
+    # Approximate (input, output) USD per 1M tokens for the recognised GA Gemini
+    # models; output tokens include thinking tokens. These are illustrative list
+    # prices, not a live quote: override them per run with VIDARAX_PRICE_INPUT /
+    # VIDARAX_PRICE_OUTPUT for exact accounting. Longest matching key wins in
+    # price_for_model(), so version-qualified ids resolve exactly.
+    "gemini-3.1-flash-lite": (0.25, 1.50),
+    "gemini-flash-lite-latest": (0.25, 1.50),     # alias -> 3.1-flash-lite
+    "gemini-flash-lite": (0.25, 1.50),
+    "gemini-flash-latest": (0.25, 1.50),          # alias -> 3.1-flash-lite
+    "gemini-flash": (0.25, 1.50),
+    "gemini": (0.25, 1.50),  # generic fallback
+}
+
+
+def price_for_model(model):
+    """(input, output) USD per 1M tokens for `model`. Env override wins; then
+    the longest matching substring key; else $0 (local model, GPU-time cost)."""
+    env_in = os.environ.get("VIDARAX_PRICE_INPUT")
+    env_out = os.environ.get("VIDARAX_PRICE_OUTPUT")
+    if env_in is not None and env_out is not None:
+        return (float(env_in), float(env_out))
+    m = model.lower()
+    best = None
+    for key, rate in PRICES_PER_MTOK.items():
+        if key in m and (best is None or len(key) > len(best[0])):
+            best = (key, rate)
+    return best[1] if best else (0.0, 0.0)
+
+
+def estimate_cost_usd(model, prompt_tokens, output_tokens):
+    """Billable cost. `output_tokens` must be the FULL billed output — visible
+    completion plus any hidden thinking tokens — since Google bills thinking at
+    the output rate. See billed_output_tokens()."""
+    in_rate, out_rate = price_for_model(model)
+    return (prompt_tokens * in_rate + output_tokens * out_rate) / 1_000_000.0
+
+
+def billed_output_tokens(prompt_tokens, completion_tokens, total_tokens):
+    """Output tokens Google actually bills = candidates + thoughts. Gemini's
+    usageMetadata reports totalTokenCount = prompt + candidates + thoughts, but
+    exposes only candidates as completion_tokens; thinking (thoughtsTokenCount)
+    is billed at the output rate yet omitted from completion. So the true billed
+    output is total - prompt, which collapses to completion for non-thinking
+    models. max() guards the fallback where total == prompt + completion."""
+    if total_tokens > prompt_tokens:
+        return max(completion_tokens, total_tokens - prompt_tokens)
+    return completion_tokens
+
+
+def pareto_frontier(results):
+    """Return the subset of runs not dominated on all three objectives at once:
+    higher F1, lower est_cost_usd, lower time_s. A run is dominated when another
+    is at least as good on every objective and strictly better on one. These are
+    the configs worth choosing between — the rest are beaten outright."""
+    ok = [r for r in results if "error" not in r]
+    frontier = []
+    for a in ok:
+        dominated = False
+        for b in ok:
+            if b is a:
+                continue
+            no_worse = (
+                b["f1"] >= a["f1"]
+                and b["est_cost_usd"] <= a["est_cost_usd"]
+                and b["time_s"] <= a["time_s"]
+            )
+            strictly_better = (
+                b["f1"] > a["f1"]
+                or b["est_cost_usd"] < a["est_cost_usd"]
+                or b["time_s"] < a["time_s"]
+            )
+            if no_worse and strictly_better:
+                dominated = True
+                break
+        if not dominated:
+            frontier.append(a)
+    return frontier
+
 RESOLUTIONS = {
     "1080p": f"file://{_UPLOAD_DIR}/Wiki.mp4",
     "720p": f"file://{_UPLOAD_DIR}/Wiki_720p.mp4",
@@ -246,6 +332,31 @@ def run_single(api, model, source_uri, gt, preset_name, preset):
     min_chunk_ms = min(chunk_times) if chunk_times else 0
     max_chunk_ms = max(chunk_times) if chunk_times else 0
 
+    # Token accounting: prefer the aggregate `analysis_generated` event; fall
+    # back to summing per-chunk `semantic_chunk_generated` events.
+    prompt_tokens = completion_tokens = total_tokens = 0
+    agg = next((e for e in evts if e.get("kind") == "analysis_generated"), None)
+    if agg:
+        p = agg.get("payload", {})
+        prompt_tokens = p.get("prompt_tokens", 0) or 0
+        completion_tokens = p.get("completion_tokens", 0) or 0
+        total_tokens = p.get("total_tokens", 0) or 0
+    if total_tokens == 0:
+        for e in evts:
+            if e.get("kind") == "semantic_chunk_generated":
+                p = e.get("payload", {})
+                prompt_tokens += p.get("prompt_tokens", 0) or 0
+                completion_tokens += p.get("completion_tokens", 0) or 0
+                total_tokens += p.get("total_tokens", 0) or 0
+    if total_tokens == 0 and (prompt_tokens or completion_tokens):
+        total_tokens = prompt_tokens + completion_tokens
+
+    # Thinking models (e.g. gemini-3.1-flash-lite) burn thoughtsTokenCount that shows
+    # up in total_tokens but not completion_tokens — bill on the full output.
+    billed_output = billed_output_tokens(prompt_tokens, completion_tokens, total_tokens)
+    thinking_tokens = max(0, billed_output - completion_tokens)
+    est_cost = estimate_cost_usd(model, prompt_tokens, billed_output)
+
     # Match against ground truth
     matched = set()
     det_matched = set()
@@ -265,6 +376,14 @@ def run_single(api, model, source_uri, gt, preset_name, preset):
     recall = n_match / n_gt if n_gt else 0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0
 
+    # Efficiency: quality earned per unit of price and per unit of wall-clock.
+    # F1 per 1k total tokens = quality per price; F1 per second = quality per
+    # speed. Cost-per-F1-point (¢) is the headline "price of quality" figure.
+    f1_per_1k_tok = round(f1 / (total_tokens / 1000.0), 4) if total_tokens else 0.0
+    f1_per_s = round(f1 / t_reason, 4) if t_reason else 0.0
+    tok_per_s = round(total_tokens / t_reason) if t_reason else 0
+    cents_per_f1 = round((est_cost * 100.0) / f1, 4) if f1 else 0.0
+
     return {
         "preset": preset_name,
         "label": preset["label"],
@@ -282,6 +401,16 @@ def run_single(api, model, source_uri, gt, preset_name, preset):
         "avg_chunk_ms": avg_chunk_ms,
         "min_chunk_ms": min_chunk_ms,
         "max_chunk_ms": max_chunk_ms,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "thinking_tokens": thinking_tokens,
+        "billed_output_tokens": billed_output,
+        "total_tokens": total_tokens,
+        "est_cost_usd": round(est_cost, 6),
+        "f1_per_1k_tok": f1_per_1k_tok,
+        "f1_per_s": f1_per_s,
+        "tok_per_s": tok_per_s,
+        "cents_per_f1": cents_per_f1,
     }
 
 
@@ -362,6 +491,63 @@ def main():
                 f"{r['vlm_ok']:>3}/{r['vlm_ok']+r['vlm_err']:<3}"
             )
     print(f"{'=' * 105}")
+
+    # ─── Efficiency: quality per price, quality per speed ─────────────────────
+    ok_results = [r for r in all_results if "error" not in r]
+    if ok_results:
+        frontier = pareto_frontier(ok_results)
+        frontier_ids = {id(r) for r in frontier}
+        in_rate, out_rate = price_for_model(args.model)
+        priced = (in_rate or out_rate) > 0
+
+        # Rank by quality-per-price when priced, else quality-per-second.
+        rank_key = (
+            (lambda r: r["f1_per_1k_tok"]) if priced else (lambda r: r["f1_per_s"])
+        )
+        ranked = sorted(ok_results, key=rank_key, reverse=True)
+
+        print()
+        print(f"\033[1m{'=' * 105}\033[0m")
+        print(f"\033[1mEFFICIENCY — highest quality per price & per second  "
+              f"(★ = on the quality/price/latency frontier)\033[0m")
+        rate_note = (
+            f"pricing: ${in_rate}/${out_rate} per 1M in/out tok"
+            if priced
+            else "pricing: local model → $0 tokens (cost is GPU-time); ranked by F1/second"
+        )
+        print(f"  {rate_note}")
+        print(f"\033[1m{'=' * 105}\033[0m")
+        hdr = (f"{'':<2}{'Res':<6} {'Preset':<28} {'F1':>4} {'Tok':>8} "
+               f"{'$/run':>9} {'F1/1kTok':>9} {'F1/s':>6} {'Tok/s':>6} {'Time':>6}")
+        print(f"\033[1m{hdr}\033[0m")
+        print(f"{'─' * 105}")
+        for r in ranked:
+            star = "★ " if id(r) in frontier_ids else "  "
+            f1c = "\033[32m" if r["f1"] >= 0.5 else "\033[33m" if r["f1"] >= 0.3 else "\033[31m"
+            print(
+                f"{star}{r['resolution']:<6} "
+                f"{r['label'][:28]:<28} "
+                f"{f1c}{r['f1']:>3.0%}\033[0m "
+                f"{r['total_tokens']:>8} "
+                f"${r['est_cost_usd']:>8.5f} "
+                f"{r['f1_per_1k_tok']:>9.3f} "
+                f"{r['f1_per_s']:>6.3f} "
+                f"{r['tok_per_s']:>6} "
+                f"{r['time_s']:>5.1f}s"
+            )
+        print(f"{'=' * 105}")
+        # The single best pick under each lens.
+        if priced:
+            best_val = max(ok_results, key=lambda r: r["f1_per_1k_tok"])
+            print(f"  best quality/price : {best_val['label']} "
+                  f"({best_val['f1']:.0%} F1 @ {best_val['f1_per_1k_tok']:.3f} F1/1kTok, "
+                  f"${best_val['est_cost_usd']:.5f}/run)")
+        best_spd = max(ok_results, key=lambda r: r["f1_per_s"])
+        print(f"  best quality/speed : {best_spd['label']} "
+              f"({best_spd['f1']:.0%} F1 in {best_spd['time_s']:.1f}s, {best_spd['f1_per_s']:.3f} F1/s)")
+        best_f1 = max(ok_results, key=lambda r: r["f1"])
+        print(f"  best quality (abs) : {best_f1['label']} ({best_f1['f1']:.0%} F1)")
+        print(f"{'=' * 105}")
 
     # Save JSON
     out_path = os.environ.get("VIDARAX_BENCH_OUTPUT", "/tmp/vidarax_bench_matrix.json")

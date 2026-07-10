@@ -34,10 +34,13 @@ use base64::Engine as _;
 
 use crate::gate::FrameSignal;
 use crate::metrics::PipelineMetrics;
-use crate::provider::{InferenceImage, InferenceProvider, InferenceRequest};
+use crate::provider::{InferenceImage, InferenceObserver, InferenceProvider, InferenceRequest};
 use crate::tiered_vlm::{run_tiered, TieredVlmConfig};
 use crate::webrtc::recycle::RecycledBytes;
-use crate::webrtc::workers::{per_stream_vlm_workers, token_budget_entry, EventSink, StreamFrame};
+use crate::webrtc::workers::{
+    per_stream_vlm_workers, prune_stale_token_budget_entries, token_budget_entry, EventSink,
+    StreamFrame,
+};
 
 // ─── ClipConfig ───────────────────────────────────────────────────────────────
 
@@ -136,13 +139,41 @@ pub struct ClipWork {
     ///
     /// JPEG buffers are recycled byte handles moved into clip work without
     /// copying the payload on the runtime path.
-    pub frames: Vec<(FrameSignal, RecycledBytes)>,
+    pub frames: VecDeque<(FrameSignal, RecycledBytes)>,
     /// PTS of the first frame in the batch (milliseconds).
     pub pts_start: u64,
     /// PTS of the last frame in the batch (milliseconds).
     pub pts_end: u64,
     /// Semantic prompt forwarded to the VLM.
     pub prompt: Arc<str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClipRateGate {
+    /// Minimum inter-sample distance in ms (1000 / target_fps).
+    sample_interval_ms: u64,
+    /// PTS of the last frame accepted into the buffer.
+    last_accepted_pts: Option<u64>,
+}
+
+impl ClipRateGate {
+    pub fn new(target_fps: u32) -> Self {
+        Self {
+            sample_interval_ms: 1000u64 / (target_fps as u64).max(1),
+            last_accepted_pts: None,
+        }
+    }
+
+    pub fn should_keep(&self, pts_ms: u64) -> bool {
+        let Some(last_pts) = self.last_accepted_pts else {
+            return true;
+        };
+        pts_ms.saturating_sub(last_pts) >= self.sample_interval_ms
+    }
+
+    pub fn commit(&mut self, pts_ms: u64) {
+        self.last_accepted_pts = Some(pts_ms);
+    }
 }
 
 // ─── ClipAccumulator ──────────────────────────────────────────────────────────
@@ -161,10 +192,8 @@ pub struct ClipAccumulator {
     prompt: Arc<str>,
     /// Buffered frames for the current window.
     buffer: VecDeque<(FrameSignal, RecycledBytes)>,
-    /// Minimum inter-sample distance in ms (1000 / target_fps).
-    sample_interval_ms: u64,
-    /// PTS of the last frame accepted into the buffer (for rate limiting).
-    last_accepted_pts: Option<u64>,
+    /// PTS-based sampling state shared with the decode-side pre-encode gate.
+    rate_gate: ClipRateGate,
     /// PTS of the first accepted frame in the current logical clip window.
     window_start_pts: Option<u64>,
     /// Wall-clock instant of the last emission (for delay enforcement).
@@ -185,15 +214,14 @@ impl ClipAccumulator {
         session_id: Arc<str>,
         prompt: Arc<str>,
     ) -> Self {
-        let sample_interval_ms = 1000u64 / (config.target_fps as u64).max(1);
+        let rate_gate = ClipRateGate::new(config.target_fps);
         Self {
             config,
             run_id,
             session_id,
             prompt,
             buffer: VecDeque::new(),
-            sample_interval_ms,
-            last_accepted_pts: None,
+            rate_gate,
             window_start_pts: None,
             last_emit: None,
         }
@@ -208,11 +236,8 @@ impl ClipAccumulator {
     /// - The inter-emission delay has not elapsed.
     pub fn push(&mut self, mut sf: StreamFrame) -> Option<ClipWork> {
         // ── Rate-limit to target_fps ───────────────────────────────────────
-        if let Some(last_pts) = self.last_accepted_pts {
-            let gap = sf.pts_ms.saturating_sub(last_pts);
-            if gap < self.sample_interval_ms {
-                return None; // too soon
-            }
+        if !self.rate_gate.should_keep(sf.pts_ms) {
+            return None; // too soon
         }
 
         // ── Accept JPEG ────────────────────────────────────────────────────
@@ -221,7 +246,7 @@ impl ClipAccumulator {
             _ => return None, // no image data
         };
 
-        self.last_accepted_pts = Some(sf.pts_ms);
+        self.rate_gate.commit(sf.pts_ms);
         if self.window_start_pts.is_none() {
             self.window_start_pts = Some(sf.pts_ms);
         }
@@ -257,13 +282,10 @@ impl ClipAccumulator {
         let pts_end = deque.back().map(|(s, _)| s.pts_ms).unwrap_or(pts_start);
         self.last_emit = Some(now);
         self.window_start_pts = None;
-        // Collect into Vec for ClipWork (O(n) but done once per clip emission).
-        let frames: Vec<(FrameSignal, RecycledBytes)> = deque.into_iter().collect();
-
         Some(ClipWork {
             run_id: Arc::clone(&self.run_id),
             session_id: Arc::clone(&self.session_id),
-            frames,
+            frames: deque,
             pts_start,
             pts_end,
             prompt: Arc::clone(&self.prompt),
@@ -330,6 +352,9 @@ pub fn spawn_clip_vlm_workers<I>(
     // the schema is passed to the first-pass VLM request and `max_tokens`
     // is raised to 1024 to accommodate structured output.
     guided_json: Arc<ArcSwapOption<Arc<str>>>,
+    // Where tiered VLM inference outcomes are recorded for `/metrics`. `None`
+    // when the caller has no metrics sink wired up (e.g. tests).
+    observer: Option<Arc<dyn InferenceObserver>>,
 ) where
     I: InferenceProvider + 'static,
 {
@@ -341,6 +366,7 @@ pub fn spawn_clip_vlm_workers<I>(
         let metrics = Arc::clone(&metrics);
         let session_span = session_span.clone();
         let guided_json = Arc::clone(&guided_json);
+        let observer = observer.clone();
         let mut token_budget = std::collections::HashMap::new();
 
         std::thread::Builder::new()
@@ -350,6 +376,7 @@ pub fn spawn_clip_vlm_workers<I>(
                     let _guard = session_span.enter();
                     if max_output_tokens_per_second > 0 {
                         let now = std::time::Instant::now();
+                        prune_stale_token_budget_entries(&mut token_budget, now);
                         let entry = token_budget_entry(&mut token_budget, &work.session_id, now);
                         if now.duration_since(entry.0).as_secs() >= 1 {
                             *entry = (now, 0);
@@ -395,11 +422,26 @@ pub fn spawn_clip_vlm_workers<I>(
                         guided_json: current_guided_json,
                     };
 
-                    let (description, used_second_pass) =
-                        match run_tiered(provider.as_ref(), &config, request, 1024, 20_000) {
-                            Ok(output) => (output.result.output_text, output.used_second_pass),
-                            Err(err) => (format!("clip_vlm_error: {:?}", err.error), false),
-                        };
+                    let clip_call_start = std::time::Instant::now();
+                    let (description, used_second_pass) = match run_tiered(
+                        provider.as_ref(),
+                        &config,
+                        request,
+                        1024,
+                        20_000,
+                        observer.as_deref(),
+                    ) {
+                        Ok(output) => (output.result.output_text, output.used_second_pass),
+                        Err(err) => {
+                            if let Some(o) = observer.as_deref() {
+                                o.record_error(
+                                    provider.kind(),
+                                    clip_call_start.elapsed().as_millis() as u64,
+                                );
+                            }
+                            (format!("clip_vlm_error: {:?}", err.error), false)
+                        }
+                    };
 
                     if max_output_tokens_per_second > 0 {
                         let token_count = (description.len() / 4).max(1) as u32;
@@ -416,7 +458,7 @@ pub fn spawn_clip_vlm_workers<I>(
 
                     // Use the last frame's signal for metadata.
                     let (last_signal, last_jpeg) =
-                        work.frames.last().cloned().unwrap_or_else(|| {
+                        work.frames.back().cloned().unwrap_or_else(|| {
                             (
                                 FrameSignal {
                                     frame_index: 0,
@@ -554,11 +596,11 @@ mod tests {
         let clip = clip.expect("long clip should emit");
         assert_eq!(clip.frames.len(), MAX_CLIP_FRAMES_PER_REQUEST);
         assert!(
-            clip.frames.first().unwrap().0.pts_ms <= 100,
+            clip.frames.front().unwrap().0.pts_ms <= 100,
             "first retained frame should stay near the window start, got {}ms",
-            clip.frames.first().unwrap().0.pts_ms
+            clip.frames.front().unwrap().0.pts_ms
         );
-        assert_eq!(clip.frames.last().unwrap().0.pts_ms, clip.pts_end);
+        assert_eq!(clip.frames.back().unwrap().0.pts_ms, clip.pts_end);
     }
 
     #[test]

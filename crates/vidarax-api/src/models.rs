@@ -108,6 +108,10 @@ pub struct RealtimeReasonRequest {
     pub marker_correction_window_frames: Option<u64>,
     pub semantic_inference: Option<bool>,
     pub semantic_frames_per_chunk: Option<usize>,
+    /// Optional cap on the longest edge (px) of each frame sent to the VLM.
+    /// The "fewer pixels" lever: smaller frames occupy fewer Gemini image tiles,
+    /// cutting per-image prompt tokens. `None` keeps source resolution.
+    pub semantic_frame_max_edge: Option<u32>,
     pub semantic_timeout_ms: Option<u64>,
     // Deserialized for request-shape compatibility; not consumed on the realtime path.
     #[allow(dead_code)]
@@ -176,6 +180,7 @@ pub struct InferResponse {
     pub output_text: String,
     pub finish_reason: Option<String>,
     pub inference_latency_ms: u64,
+    pub tokens: vidarax_core::provider::TokenUsage,
 }
 
 #[derive(Debug, Serialize)]
@@ -284,6 +289,37 @@ pub struct AnalyzeFramesResponse {
     pub markers: Vec<AnalyzeMarker>,
 }
 
+/// Aggregate token + latency spend for a pipeline run, summed across every
+/// analyzed chunk (and every tiered pass within a chunk). Lets callers see the
+/// full cost of an analysis — "how many tokens did this cost, how long did the
+/// model work" — without post-hoc log scraping.
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub struct TokenMetrics {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub thinking_tokens: u32,
+    pub total_tokens: u32,
+    /// Summed wall-clock inference latency across chunks (server-side model time).
+    pub inference_latency_ms: u64,
+    /// Number of chunks that actually ran inference (denominator for per-chunk means).
+    pub chunks_analyzed: usize,
+}
+
+impl TokenMetrics {
+    /// Fold one analyzed chunk's token spend and latency into the run total,
+    /// saturating on overflow and bumping the analyzed-chunk count.
+    pub fn accumulate_chunk(&mut self, usage: vidarax_core::provider::TokenUsage, latency_ms: u64) {
+        self.prompt_tokens = self.prompt_tokens.saturating_add(usage.prompt_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(usage.completion_tokens);
+        self.thinking_tokens = self.thinking_tokens.saturating_add(usage.thinking_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
+        self.inference_latency_ms = self.inference_latency_ms.saturating_add(latency_ms);
+        self.chunks_analyzed += 1;
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct RealtimeReasonResponse {
     pub request_id: String,
@@ -294,6 +330,7 @@ pub struct RealtimeReasonResponse {
     pub sample_fps: f32,
     pub lag_p95_ms: u64,
     pub lag_p99_ms: u64,
+    pub tokens: TokenMetrics,
     pub metadata: Vec<AnalyzeFrameMetadata>,
     pub markers: Vec<AnalyzeMarker>,
 }

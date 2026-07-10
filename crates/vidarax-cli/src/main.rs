@@ -1386,6 +1386,27 @@ fn print_analyze_human(response: &Value, output: OutputMode, generated: u64, chu
         "decoded_frames={decoded_frames} frames={generated} chunks={chunks} markers_emitted={markers_emitted} sample_fps={sample_fps:.2}"
     );
 
+    // Token + latency cost of the analysis (e2e model spend across all chunks).
+    if let Some(tokens) = response.get("tokens") {
+        let total = u64_field(tokens, "total_tokens").unwrap_or(0);
+        if total > 0 {
+            let prompt = u64_field(tokens, "prompt_tokens").unwrap_or(0);
+            let completion = u64_field(tokens, "completion_tokens").unwrap_or(0);
+            let thinking = u64_field(tokens, "thinking_tokens").unwrap_or(0);
+            let infer_ms = u64_field(tokens, "inference_latency_ms").unwrap_or(0);
+            let analyzed = u64_field(tokens, "chunks_analyzed").unwrap_or(0);
+            let per_chunk = if analyzed > 0 { total / analyzed } else { 0 };
+            let mut cost = format!("tokens total={total} (prompt={prompt} completion={completion}");
+            if thinking > 0 {
+                cost.push_str(&format!(" thinking={thinking}"));
+            }
+            cost.push_str(&format!(
+                ") ~{per_chunk}/chunk infer_latency={infer_ms}ms across {analyzed} chunks"
+            ));
+            println!("{}", colorize(&cost, "dim", output.color));
+        }
+    }
+
     let metadata = response
         .get("metadata")
         .and_then(Value::as_array)

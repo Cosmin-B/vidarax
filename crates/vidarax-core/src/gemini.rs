@@ -11,7 +11,7 @@
 //!
 //! let provider = GeminiProvider::new(
 //!     "MY_API_KEY".to_string(),
-//!     "gemini-2.5-flash-preview-05-20".to_string(),
+//!     "gemini-3.1-flash-lite".to_string(),
 //! ).unwrap();
 //! assert_eq!(provider.kind(), ProviderKind::Gemini);
 //! ```
@@ -23,13 +23,23 @@ use arc_swap::ArcSwap;
 use base64::Engine as _;
 use serde_json::Value;
 
+use std::collections::HashSet;
+
 use crate::provider::{
     cached_arc_str, new_arc_str_cache, InferenceProvider, InferenceRequest, InferenceResult,
-    InferenceVideo, ProviderError, ProviderKind,
+    InferenceVideo, ProviderError, ProviderKind, TokenUsage,
 };
 
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
 const INLINE_SIZE_LIMIT: usize = 20 * 1024 * 1024; // 20 MB
+
+/// Extra output tokens granted on a retry once a model is observed to "think"
+/// (i.e. it spent `usageMetadata.thoughtsTokenCount` and starved its visible
+/// answer). Added on top of the caller's `max_tokens` so hidden reasoning has
+/// room and the structured JSON still lands. Billing is on tokens actually
+/// used, so an unused reserve costs nothing — hence a generous value. We never
+/// name-match models; thinking is deduced from the response itself.
+const GEMINI_THINKING_HEADROOM: u32 = 2048;
 
 // ── Provider ─────────────────────────────────────────────────────────────────
 
@@ -38,6 +48,12 @@ pub struct GeminiProvider {
     default_model: String,
     client: reqwest::blocking::Client,
     model_cache: ArcSwap<Arc<str>>,
+    /// Models observed at runtime to "think" (spend hidden reasoning tokens and
+    /// starve their visible answer at a tight budget). Lock-free copy-on-write
+    /// set: once a model is learned, later calls pre-reserve output headroom
+    /// instead of wasting a starved first attempt. Populated only from observed
+    /// responses — never from model-name matching.
+    learned_thinking: ArcSwap<HashSet<Arc<str>>>,
 }
 
 impl GeminiProvider {
@@ -55,10 +71,28 @@ impl GeminiProvider {
             default_model,
             client,
             model_cache: new_arc_str_cache(),
+            learned_thinking: ArcSwap::from_pointee(HashSet::new()),
         })
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// Whether `model` was previously observed to think and starve its output.
+    fn is_learned_thinking(&self, model: &str) -> bool {
+        self.learned_thinking.load().contains(model)
+    }
+
+    /// Record that `model` thinks, so future calls pre-reserve output headroom.
+    /// Copy-on-write; a lost race just means we re-learn on the next starve.
+    fn learn_thinking(&self, model: &str) {
+        let cur = self.learned_thinking.load();
+        if cur.contains(model) {
+            return;
+        }
+        let mut next = HashSet::clone(&cur);
+        next.insert(Arc::from(model));
+        self.learned_thinking.store(Arc::new(next));
+    }
 
     /// Build the `generateContent` request body as a JSON string.
     pub(crate) fn build_payload(
@@ -257,57 +291,25 @@ impl GeminiProvider {
         }
     }
 
-    /// Parse a raw `generateContent` JSON response into `(output_text, finish_reason)`.
-    pub(crate) fn parse_response(
+    /// One `generateContent` round-trip. When `reserve` is set, extra output
+    /// headroom is granted on top of the caller's `max_tokens` so a thinking
+    /// model's hidden reasoning does not starve the visible JSON.
+    fn attempt(
         &self,
-        raw: &str,
+        request: &InferenceRequest,
         model: &str,
-        start: Instant,
+        reserve: bool,
     ) -> Result<InferenceResult, ProviderError> {
-        let json: Value = serde_json::from_str(raw).map_err(|e| {
-            ProviderError::InvalidResponse(format!("invalid JSON from Gemini: {e}").into())
-        })?;
-
-        let text = json
-            .pointer("/candidates/0/content/parts/0/text")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ProviderError::InvalidResponse(
-                    "Gemini response missing candidates[0].content.parts[0].text".into(),
-                )
-            })?
-            .to_string();
-
-        let finish_reason = json
-            .pointer("/candidates/0/finishReason")
-            .and_then(|v| v.as_str())
-            .map(map_finish_reason);
-
-        Ok(InferenceResult {
-            provider: ProviderKind::Gemini,
-            model: cached_arc_str(&self.model_cache, model),
-            output_text: text,
-            fallback_used: false,
-            finish_reason,
-            inference_latency_ms: start.elapsed().as_millis() as u64,
-        })
-    }
-}
-
-impl InferenceProvider for GeminiProvider {
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::Gemini
-    }
-
-    fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
         let start = Instant::now();
-        let model = if request.model.is_empty() {
-            &self.default_model
+
+        let body = if reserve {
+            let mut req = request.clone();
+            req.max_tokens = req.max_tokens.saturating_add(GEMINI_THINKING_HEADROOM);
+            self.build_payload(&req)?
         } else {
-            &*request.model
+            self.build_payload(request)?
         };
 
-        let body = self.build_payload(request)?;
         let url = format!(
             "{}/v1beta/models/{}:generateContent?key={}",
             GEMINI_API_BASE, model, self.api_key
@@ -333,6 +335,110 @@ impl InferenceProvider for GeminiProvider {
 
         self.parse_response(&text, model, start)
     }
+
+    /// Parse a raw `generateContent` JSON response into an [`InferenceResult`].
+    ///
+    /// A candidate must be present, but its visible text may be empty: a
+    /// thinking model that exhausts its output budget on hidden reasoning
+    /// returns `finishReason=MAX_TOKENS` with no `parts[0].text`. We surface
+    /// that as empty output plus the token usage (`thoughtsTokenCount`), and let
+    /// [`is_thinking_starved`] / the retry in `infer` react — rather than
+    /// erroring, which would hide the reason the answer was empty.
+    pub(crate) fn parse_response(
+        &self,
+        raw: &str,
+        model: &str,
+        start: Instant,
+    ) -> Result<InferenceResult, ProviderError> {
+        let json: Value = serde_json::from_str(raw).map_err(|e| {
+            ProviderError::InvalidResponse(format!("invalid JSON from Gemini: {e}").into())
+        })?;
+
+        let candidate = json.pointer("/candidates/0").ok_or_else(|| {
+            ProviderError::InvalidResponse("Gemini response missing candidates[0]".into())
+        })?;
+
+        let text = candidate
+            .pointer("/content/parts/0/text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let finish_reason = candidate
+            .pointer("/finishReason")
+            .and_then(|v| v.as_str())
+            .map(map_finish_reason);
+
+        let usage = json
+            .pointer("/usageMetadata")
+            .map(|u| {
+                // Saturating u64->u32: token counts are external JSON; a bogus
+                // oversized value must clamp, not wrap to a small number.
+                let count = |ptr: &str| {
+                    u.pointer(ptr)
+                        .and_then(|v| v.as_u64())
+                        .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+                        .unwrap_or(0)
+                };
+                TokenUsage {
+                    prompt_tokens: count("/promptTokenCount"),
+                    completion_tokens: count("/candidatesTokenCount"),
+                    thinking_tokens: count("/thoughtsTokenCount"),
+                    total_tokens: count("/totalTokenCount"),
+                }
+            })
+            .unwrap_or_default();
+
+        Ok(InferenceResult {
+            provider: ProviderKind::Gemini,
+            model: cached_arc_str(&self.model_cache, model),
+            output_text: text,
+            fallback_used: false,
+            finish_reason,
+            inference_latency_ms: start.elapsed().as_millis() as u64,
+            usage,
+        })
+    }
+}
+
+impl InferenceProvider for GeminiProvider {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Gemini
+    }
+
+    fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+        let model = if request.model.is_empty() {
+            &self.default_model
+        } else {
+            &*request.model
+        };
+
+        // Empirical thinking support (no model-name matching): if this model was
+        // previously seen to starve its output on hidden reasoning, pre-reserve
+        // output headroom so the first attempt already lands valid JSON.
+        let reserve = self.is_learned_thinking(model);
+        let result = self.attempt(request, model, reserve)?;
+
+        // First encounter with a thinking model: the response itself reports the
+        // starvation (MAX_TOKENS + thoughtsTokenCount + empty text). Learn it and
+        // retry once with headroom. We only retry when we did not already
+        // reserve, so this can never loop.
+        if !reserve && is_thinking_starved(&result) {
+            self.learn_thinking(model);
+            let mut retry = self.attempt(request, model, true)?;
+            // The starved first attempt was still billed (prompt + hidden
+            // thinking tokens) and cost wall-clock time. Fold it into the
+            // surfaced totals so token/latency accounting reflects the whole
+            // inference, not just the retry.
+            retry.usage.accumulate(result.usage);
+            retry.inference_latency_ms = retry
+                .inference_latency_ms
+                .saturating_add(result.inference_latency_ms);
+            return Ok(retry);
+        }
+
+        Ok(result)
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -346,6 +452,17 @@ fn map_finish_reason(raw: &str) -> String {
     }
 }
 
+/// Whether a completed response shows the model was starved by its own hidden
+/// "thinking": it hit the output-token limit, spent thinking tokens, and left
+/// the visible answer empty. This is deduced from the provider's own
+/// `usageMetadata` — no model-name matching — so it holds for any current or
+/// future thinking model (Gemini 2.5/3, Gemma, and beyond).
+fn is_thinking_starved(result: &InferenceResult) -> bool {
+    result.finish_reason.as_deref() == Some("length")
+        && result.usage.thinking_tokens > 0
+        && result.output_text.trim().is_empty()
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -356,11 +473,7 @@ mod tests {
     use std::sync::Arc;
 
     fn provider() -> GeminiProvider {
-        GeminiProvider::new(
-            "test-key".to_string(),
-            "gemini-2.5-flash-preview-05-20".to_string(),
-        )
-        .unwrap()
+        GeminiProvider::new("test-key".to_string(), "gemini-3.1-flash-lite".to_string()).unwrap()
     }
 
     fn request() -> InferenceRequest {
@@ -448,7 +561,10 @@ mod tests {
     }
 
     #[test]
-    fn payload_generation_config_present() {
+    fn payload_generation_config_passthrough() {
+        // build_payload is pure: it serializes the request verbatim and never
+        // adds a thinkingConfig. Thinking support lives in infer()/attempt(),
+        // which reserves output headroom empirically — not in the payload.
         let p = provider();
         let mut req = request();
         req.max_tokens = 256;
@@ -458,6 +574,74 @@ mod tests {
         let cfg = &v["generationConfig"];
         assert_eq!(cfg["maxOutputTokens"].as_u64(), Some(256));
         assert!((cfg["temperature"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+        assert!(
+            cfg.get("thinkingConfig").is_none(),
+            "build_payload must never emit a thinkingConfig"
+        );
+    }
+
+    #[test]
+    fn thinking_starvation_detected_from_usage_not_name() {
+        // A thinking model that spends its whole budget on hidden reasoning:
+        // MAX_TOKENS + thoughts spent + empty visible text. Deduced from usage,
+        // works for any model name.
+        let starved = InferenceResult {
+            provider: ProviderKind::Gemini,
+            model: Arc::from("some-future-model"),
+            output_text: "   ".to_string(),
+            fallback_used: false,
+            finish_reason: Some("length".to_string()),
+            inference_latency_ms: 0,
+            usage: TokenUsage {
+                prompt_tokens: 40,
+                completion_tokens: 0,
+                thinking_tokens: 89,
+                total_tokens: 129,
+            },
+        };
+        assert!(is_thinking_starved(&starved));
+
+        // Same length cutoff but visible text present → not starved (real
+        // truncation of a genuine answer, must not trigger a headroom retry).
+        let truncated = InferenceResult {
+            output_text: "{\"event".to_string(),
+            ..starved.clone()
+        };
+        assert!(!is_thinking_starved(&truncated));
+
+        // Clean stop with no thinking → not starved.
+        let clean = InferenceResult {
+            output_text: String::new(),
+            finish_reason: Some("stop".to_string()),
+            usage: TokenUsage::default(),
+            ..starved.clone()
+        };
+        assert!(!is_thinking_starved(&clean));
+
+        // Empty + length but zero thinking tokens (non-thinking model that just
+        // produced nothing) → not starved; retrying with headroom won't help.
+        let no_thoughts = InferenceResult {
+            output_text: String::new(),
+            usage: TokenUsage {
+                thinking_tokens: 0,
+                ..starved.usage
+            },
+            ..starved.clone()
+        };
+        assert!(!is_thinking_starved(&no_thoughts));
+    }
+
+    #[test]
+    fn learned_thinking_cache_is_per_model() {
+        let p = provider();
+        assert!(!p.is_learned_thinking("model-x"));
+        p.learn_thinking("model-x");
+        assert!(p.is_learned_thinking("model-x"));
+        // Learning is scoped to the exact model, not a name pattern.
+        assert!(!p.is_learned_thinking("model-y"));
+        // Idempotent.
+        p.learn_thinking("model-x");
+        assert!(p.is_learned_thinking("model-x"));
     }
 
     #[test]
@@ -519,7 +703,7 @@ mod tests {
         let p = provider();
         let raw = make_gemini_response("hello world", "STOP");
         let result = p
-            .parse_response(&raw, "gemini-2.5-flash-preview-05-20", Instant::now())
+            .parse_response(&raw, "gemini-3.1-flash-lite", Instant::now())
             .unwrap();
         assert_eq!(result.output_text, "hello world");
         assert_eq!(result.finish_reason.as_deref(), Some("stop"));
@@ -527,11 +711,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_response_extracts_token_usage_including_thoughts() {
+        let p = provider();
+        // usageMetadata is what makes empirical thinking-detection possible:
+        // thoughtsTokenCount is the hidden reasoning spend.
+        let raw = r#"{
+            "candidates":[{"content":{"parts":[{"text":""}]},"finishReason":"MAX_TOKENS"}],
+            "usageMetadata":{"promptTokenCount":40,"candidatesTokenCount":3,"thoughtsTokenCount":89,"totalTokenCount":132}
+        }"#;
+        let result = p
+            .parse_response(raw, "gemini-3.1-flash-lite", Instant::now())
+            .unwrap();
+        assert_eq!(result.usage.prompt_tokens, 40);
+        assert_eq!(result.usage.completion_tokens, 3);
+        assert_eq!(result.usage.thinking_tokens, 89);
+        assert_eq!(result.usage.total_tokens, 132);
+        // This exact shape must read as thinking-starvation.
+        assert!(is_thinking_starved(&result));
+    }
+
+    #[test]
+    fn parse_response_usage_defaults_to_zero_when_absent() {
+        let p = provider();
+        let raw = make_gemini_response("ok", "STOP");
+        let result = p
+            .parse_response(&raw, "gemini-3.1-flash-lite", Instant::now())
+            .unwrap();
+        assert_eq!(result.usage, TokenUsage::default());
+    }
+
+    #[test]
     fn parse_response_maps_max_tokens_to_length() {
         let p = provider();
         let raw = make_gemini_response("truncated", "MAX_TOKENS");
         let result = p
-            .parse_response(&raw, "gemini-2.0-flash", Instant::now())
+            .parse_response(&raw, "gemini-3.1-flash-lite", Instant::now())
             .unwrap();
         assert_eq!(result.finish_reason.as_deref(), Some("length"));
     }
@@ -541,7 +755,7 @@ mod tests {
         let p = provider();
         let raw = make_gemini_response("", "SAFETY");
         let result = p
-            .parse_response(&raw, "gemini-2.0-flash", Instant::now())
+            .parse_response(&raw, "gemini-3.1-flash-lite", Instant::now())
             .unwrap();
         assert_eq!(result.finish_reason.as_deref(), Some("content_filter"));
     }
@@ -551,7 +765,7 @@ mod tests {
         let p = provider();
         let raw = make_gemini_response("text", "RECITATION");
         let result = p
-            .parse_response(&raw, "gemini-2.0-flash", Instant::now())
+            .parse_response(&raw, "gemini-3.1-flash-lite", Instant::now())
             .unwrap();
         assert_eq!(result.finish_reason.as_deref(), Some("recitation"));
     }
@@ -586,7 +800,7 @@ mod tests {
     fn parse_response_invalid_json_returns_error() {
         let p = provider();
         assert!(p
-            .parse_response("{{{{", "gemini-2.0-flash", Instant::now())
+            .parse_response("{{{{", "gemini-3.1-flash-lite", Instant::now())
             .is_err());
     }
 
@@ -595,7 +809,7 @@ mod tests {
         let p = provider();
         let raw = r#"{"candidates":[]}"#;
         assert!(p
-            .parse_response(raw, "gemini-2.0-flash", Instant::now())
+            .parse_response(raw, "gemini-3.1-flash-lite", Instant::now())
             .is_err());
     }
 
@@ -605,9 +819,9 @@ mod tests {
     #[ignore = "requires GEMINI_API_KEY env var"]
     fn live_text_only() {
         let key = std::env::var("GEMINI_API_KEY").unwrap();
-        let p = GeminiProvider::new(key, "gemini-2.0-flash".to_string()).unwrap();
+        let p = GeminiProvider::new(key, "gemini-3.1-flash-lite".to_string()).unwrap();
         let req = InferenceRequest {
-            model: std::sync::Arc::from("gemini-2.0-flash"),
+            model: std::sync::Arc::from("gemini-3.1-flash-lite"),
             prompt: std::sync::Arc::from("Say hello in exactly 3 words."),
             input_images: vec![],
             input_videos: vec![],
@@ -630,11 +844,11 @@ mod tests {
     #[ignore = "requires GEMINI_API_KEY env var + /tmp/test_frame.jpg"]
     fn live_image() {
         let key = std::env::var("GEMINI_API_KEY").unwrap();
-        let p = GeminiProvider::new(key, "gemini-2.0-flash".to_string()).unwrap();
+        let p = GeminiProvider::new(key, "gemini-3.1-flash-lite".to_string()).unwrap();
         let jpeg = std::fs::read("/tmp/test_frame.jpg").expect("need /tmp/test_frame.jpg");
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &jpeg);
         let req = InferenceRequest {
-            model: std::sync::Arc::from("gemini-2.0-flash"),
+            model: std::sync::Arc::from("gemini-3.1-flash-lite"),
             prompt: std::sync::Arc::from("What does this screenshot show? One sentence."),
             input_images: vec![crate::provider::InferenceImage {
                 media_type: "image/jpeg",
@@ -656,11 +870,11 @@ mod tests {
     #[ignore = "requires GEMINI_API_KEY env var + /tmp/test_clip.mp4"]
     fn live_inline_video() {
         let key = std::env::var("GEMINI_API_KEY").unwrap();
-        let p = GeminiProvider::new(key, "gemini-2.0-flash".to_string()).unwrap();
+        let p = GeminiProvider::new(key, "gemini-3.1-flash-lite".to_string()).unwrap();
         let mp4 = std::fs::read("/tmp/test_clip.mp4").expect("need /tmp/test_clip.mp4");
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &mp4);
         let req = InferenceRequest {
-            model: std::sync::Arc::from("gemini-2.0-flash"),
+            model: std::sync::Arc::from("gemini-3.1-flash-lite"),
             prompt: std::sync::Arc::from("Describe what happens in this video in one sentence."),
             input_images: vec![],
             input_videos: vec![crate::provider::InferenceVideo {
@@ -682,12 +896,12 @@ mod tests {
     #[ignore = "requires GEMINI_API_KEY env var + /tmp/test_frame.jpg"]
     fn live_structured_json() {
         let key = std::env::var("GEMINI_API_KEY").unwrap();
-        let p = GeminiProvider::new(key, "gemini-2.0-flash".to_string()).unwrap();
+        let p = GeminiProvider::new(key, "gemini-3.1-flash-lite".to_string()).unwrap();
         let jpeg = std::fs::read("/tmp/test_frame.jpg").expect("need /tmp/test_frame.jpg");
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &jpeg);
         let schema = r#"{"type":"object","properties":{"title":{"type":"string"},"has_button":{"type":"boolean"}},"required":["title","has_button"]}"#;
         let req = InferenceRequest {
-            model: std::sync::Arc::from("gemini-2.0-flash"),
+            model: std::sync::Arc::from("gemini-3.1-flash-lite"),
             prompt: std::sync::Arc::from(
                 "Extract the page title and whether there is a visible button.",
             ),

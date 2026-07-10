@@ -5,6 +5,7 @@ use std::time::Duration;
 use reqwest::StatusCode;
 use serde_json::Value;
 use vidarax_api::{run, ServerConfig, TransportMode};
+use vidarax_core::gate::GateConfig;
 use vidarax_core::tiered_vlm::DistillationConfig;
 
 #[tokio::test]
@@ -53,6 +54,11 @@ async fn staging_live_provider_e2e_opt_in() {
         webrtc_decode_workers: 2,
         webrtc_analysis_workers: 1,
         webrtc_vlm_workers: 2,
+        webrtc_first_pass_model: "Qwen/Qwen3-VL-8B-Instruct".to_string(),
+        webrtc_second_pass_model: None,
+        webrtc_second_pass_threshold: 0.7,
+        webrtc_second_pass_max_tokens: 256,
+        gate_config: GateConfig::default(),
         distillation: DistillationConfig::default(),
     };
 
