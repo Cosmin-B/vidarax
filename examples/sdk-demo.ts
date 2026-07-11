@@ -1,16 +1,27 @@
 /**
  * Vidarax SDK Demo — shows how easy it is to analyze video and stream events
  *
- * Run: npx tsx examples/sdk-demo.ts
+ * Run: VIDARAX_API_KEY=your-key npx tsx examples/sdk-demo.ts
  */
 
-import { Vidarax } from '../packages/vidarax-sdk/src/index'
+import { Vidarax } from '../packages/vidarax-sdk/src/index.js'
 
-const API_URL = process.env.VIDARAX_API || 'http://localhost:8080'
+// No @types/node dependency here, so declare the ambient bits this script
+// needs directly (same approach the SDK's own e2e test file uses).
+declare const process: {
+  env: Record<string, string | undefined>
+  exit(code?: number): never
+}
+
+const API_URL = process.env['VIDARAX_API'] || 'http://localhost:8080'
+const API_KEY = process.env['VIDARAX_API_KEY']
 
 async function main() {
   // ── 1. Connect ─────────────────────────────────────────────────────
-  const v = new Vidarax(API_URL)
+  // Built conditionally rather than `{ apiKey: API_KEY }` because the SDK's
+  // exactOptionalPropertyTypes tsconfig rejects an explicit `undefined` for
+  // an optional field — it must be omitted entirely when there's no key.
+  const v = new Vidarax(API_URL, API_KEY !== undefined ? { apiKey: API_KEY } : {})
   console.log('🔌 Connected to', API_URL)
 
   // ── 2. Health check ────────────────────────────────────────────────
@@ -24,7 +35,7 @@ async function main() {
     console.log(`   ${m.id} [${m.tier}] — ${m.availability}`)
   }
 
-  // ── 4. Analyze a video with a custom prompt ────────────────────────
+  // ── 4. Analyze a video with the realtime reason pipeline ───────────
   console.log('\n📹 Analyzing video...')
   const t0 = Date.now()
 
@@ -51,17 +62,17 @@ async function main() {
   // ── 5. Stream events ───────────────────────────────────────────────
   console.log('\n📡 Events:')
   const events = await v.getEvents(run.run_id)
-  for (const evt of events.events.slice(0, 10)) {
+  for (const evt of events.slice(0, 10)) {
     console.log(`   ${evt.kind} [seq=${evt.seq}]`)
   }
-  if (events.events.length > 10) {
-    console.log(`   ... and ${events.events.length - 10} more`)
+  if (events.length > 10) {
+    console.log(`   ... and ${events.length - 10} more`)
   }
 
   // ── 6. Get markers ─────────────────────────────────────────────────
   console.log('\n🎯 Markers:')
   const markers = await v.getMarkers(run.run_id)
-  for (const m of markers.markers.slice(0, 5)) {
+  for (const m of markers.slice(0, 5)) {
     console.log(`   ${m.event_type} [${m.status}] frames ${m.start_frame}-${m.end_frame} conf=${(m.confidence * 100).toFixed(0)}%`)
   }
 
@@ -74,15 +85,15 @@ async function main() {
     temperature: 0.0,
     timeout_ms: 10000,
   })
-  console.log(`   "${answer.output_text}"`)
+  console.log(`   "${answer.result}"`)
 
   // ── 8. Search ──────────────────────────────────────────────────────
   console.log('\n🔍 Search:')
   try {
-    const search = await v.search({ query: 'scene', limit: 3 })
+    const search = await v.search('scene', { limit: 3 })
     console.log(`   ${search.total_hits} hits (showing ${search.hits.length})`)
     for (const hit of search.hits) {
-      console.log(`   [${hit.kind}] ${hit.description?.slice(0, 60)}...`)
+      console.log(`   [${hit.kind}] ${hit.description.slice(0, 60)}...`)
     }
   } catch {
     console.log('   (search not available on this server)')

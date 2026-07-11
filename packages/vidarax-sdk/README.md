@@ -15,11 +15,15 @@ Requires Node.js 18+ or any modern browser.
 ```typescript
 import { Vidarax } from 'vidarax'
 const v = new Vidarax('http://localhost:8080')
-const run = await v.analyze('video.mp4', { prompt: 'Describe what happens' })
+// analyze() runs the deterministic frame-signal pipeline; it takes no prompt.
+const run = await v.analyze('video.mp4')
 for await (const event of run.events()) {
   console.log(event.kind, event.payload)
 }
 ```
+
+For prompt-driven semantic analysis, use `reason(id, opts)` with a
+`semantic_prompt` field instead of `analyze()`.
 
 ## Constructor
 
