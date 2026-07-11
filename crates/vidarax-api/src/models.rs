@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use vidarax_core::crop::CropRegion;
 
 // ─── Clip mode ────────────────────────────────────────────────────────────────
 
@@ -112,6 +113,11 @@ pub struct RealtimeReasonRequest {
     /// The "fewer pixels" lever: smaller frames occupy fewer Gemini image tiles,
     /// cutting per-image prompt tokens. `None` keeps source resolution.
     pub semantic_frame_max_edge: Option<u32>,
+    /// Optional region of interest, as fractions of the frame in `[0, 1]`. When
+    /// set, both the gate's frame signals and the frames sent to the VLM are
+    /// restricted to this sub-rectangle, so only that part of the screen is
+    /// analyzed. `None` analyzes the whole frame.
+    pub crop: Option<CropRegion>,
     pub semantic_timeout_ms: Option<u64>,
     // Deserialized for request-shape compatibility; not consumed on the realtime path.
     #[allow(dead_code)]
@@ -467,6 +473,11 @@ pub struct AttachStreamRequest {
     /// Optional clip-mode config. When set, frames are accumulated into
     /// temporal windows for multi-image VLM inference instead of per-keyframe.
     pub clip_mode: Option<ClipConfig>,
+    /// Optional region of interest for this session, as fractions of the frame
+    /// in `[0,1]`. Overrides the server default (`VIDARAX_WEBRTC_CROP`) so a
+    /// live client can point analysis at part of its screen. Absent keeps the
+    /// server default.
+    pub crop: Option<CropRegion>,
     /// Optional index name for this streaming session.
     ///
     /// When set, all VLM events emitted during this session are tagged with the
@@ -599,6 +610,39 @@ mod tests {
         }"#;
         let parsed: RealtimeReasonRequest = serde_json::from_str(raw).unwrap();
         assert!(parsed.index_name.is_none());
+    }
+
+    #[test]
+    fn realtime_reason_request_parses_crop_region() {
+        let raw = r#"{
+            "source_uri": "file:///tmp/test.mp4",
+            "model": "Qwen/Qwen3-VL-2B",
+            "crop": { "x": 0.25, "y": 0.1, "width": 0.5, "height": 0.5 }
+        }"#;
+        let parsed: RealtimeReasonRequest = serde_json::from_str(raw).unwrap();
+        let crop = parsed.crop.expect("crop parsed");
+        assert_eq!(crop.x, 0.25);
+        assert_eq!(crop.width, 0.5);
+        assert!(crop.validate().is_ok());
+    }
+
+    #[test]
+    fn realtime_reason_request_crop_absent_is_none() {
+        let raw = r#"{
+            "source_uri": "file:///tmp/test.mp4",
+            "model": "Qwen/Qwen3-VL-2B"
+        }"#;
+        let parsed: RealtimeReasonRequest = serde_json::from_str(raw).unwrap();
+        assert!(parsed.crop.is_none());
+    }
+
+    #[test]
+    fn attach_stream_request_parses_crop_region() {
+        let raw = r#"{"crop": {"x": 0.0, "y": 0.0, "width": 0.5, "height": 1.0}}"#;
+        let parsed: AttachStreamRequest = serde_json::from_str(raw).unwrap();
+        let crop = parsed.crop.expect("crop parsed");
+        assert_eq!(crop.width, 0.5);
+        assert_eq!(crop.height, 1.0);
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use vidarax_core::crop::CropRegion;
 use vidarax_core::gate::GateConfig;
 use vidarax_core::tiered_vlm::{DistillationConfig, TieredVlmConfig};
 
@@ -133,6 +134,11 @@ pub struct ServerConfig {
     /// Max output tokens for the second-pass model
     /// (`VIDARAX_WEBRTC_SECOND_PASS_MAX_TOKENS`).
     pub webrtc_second_pass_max_tokens: u32,
+    /// Default region of interest for live WHIP sessions
+    /// (`VIDARAX_WEBRTC_CROP`), as `x,y,width,height` fractions in `[0,1]`. A
+    /// per-attach crop on the stream request overrides it. Unset analyzes the
+    /// whole frame.
+    pub webrtc_crop: Option<CropRegion>,
     pub gate_config: GateConfig,
     pub distillation: DistillationConfig,
 }
@@ -210,6 +216,7 @@ impl ServerConfig {
             webrtc_second_pass_threshold,
             webrtc_second_pass_max_tokens,
         ) = parse_webrtc_vlm_tiering()?;
+        let webrtc_crop = parse_crop_env("VIDARAX_WEBRTC_CROP")?;
         let gate_config = parse_gate_config()?;
         let distillation = parse_distillation_config()?;
         Ok(Self {
@@ -247,6 +254,7 @@ impl ServerConfig {
             webrtc_second_pass_model,
             webrtc_second_pass_threshold,
             webrtc_second_pass_max_tokens,
+            webrtc_crop,
             gate_config,
             distillation,
         })
@@ -351,6 +359,37 @@ fn parse_csv_env(var: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Parse a `VIDARAX_*_CROP` env var of the form `x,y,width,height` (fractions in
+/// `[0,1]`) into a validated [`CropRegion`]. Absent yields `None`; a malformed or
+/// out-of-range value is a hard config error so a typo fails fast at startup
+/// rather than silently analyzing the whole frame.
+fn parse_crop_env(var: &str) -> Result<Option<CropRegion>, String> {
+    let Ok(raw) = env::var(var) else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let parts: Vec<&str> = raw.split(',').map(str::trim).collect();
+    if parts.len() != 4 {
+        return Err(format!("{var} must be four fractions: x,y,width,height"));
+    }
+    let mut vals = [0f32; 4];
+    for (slot, part) in vals.iter_mut().zip(parts.iter()) {
+        *slot = part
+            .parse::<f32>()
+            .map_err(|_| format!("{var} value '{part}' is not a number"))?;
+    }
+    let crop = CropRegion {
+        x: vals[0],
+        y: vals[1],
+        width: vals[2],
+        height: vals[3],
+    };
+    crop.validate().map_err(|e| format!("{var}: {e}"))?;
+    Ok(Some(crop))
 }
 
 fn parse_f32_env(var: &str, default: f32) -> Result<f32, String> {
@@ -791,6 +830,7 @@ mod tests {
             webrtc_second_pass_model: None,
             webrtc_second_pass_threshold: 0.7,
             webrtc_second_pass_max_tokens: 256,
+            webrtc_crop: None,
             gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         };
@@ -848,6 +888,7 @@ mod tests {
             webrtc_second_pass_model: None,
             webrtc_second_pass_threshold: 0.7,
             webrtc_second_pass_max_tokens: 256,
+            webrtc_crop: None,
             gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         };
@@ -1115,6 +1156,7 @@ mod tests {
             webrtc_second_pass_model: None,
             webrtc_second_pass_threshold: 0.7,
             webrtc_second_pass_max_tokens: 256,
+            webrtc_crop: None,
             gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         }

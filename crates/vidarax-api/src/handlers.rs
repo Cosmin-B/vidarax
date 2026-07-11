@@ -273,6 +273,9 @@ pub async fn ingest_run(
                 sample_fps: effective_sample_fps,
                 max_frames: max_frames as usize,
                 max_edge: None,
+                // The signals-only ingest endpoint does not expose a crop; the
+                // region-of-interest lever lives on the /reason analysis path.
+                crop: None,
             };
             decode_pipeline
                 .decode_signals(decode_source, decode_config)
@@ -1021,6 +1024,7 @@ struct RealtimeReasonParams {
     semantic_inference: bool,
     semantic_frames_per_chunk: usize,
     semantic_frame_max_edge: Option<u32>,
+    crop: Option<vidarax_core::crop::CropRegion>,
     semantic_timeout_ms: u64,
     semantic_prompt: String,
     tiered_config: vidarax_core::tiered_vlm::TieredVlmConfig,
@@ -1127,6 +1131,16 @@ fn validate_realtime_reason_params(
             ));
         }
     }
+    let crop = payload.crop;
+    if let Some(region) = crop {
+        if let Err(err) = region.validate() {
+            return Err(validation_error(
+                state,
+                "invalid realtime reason request",
+                vec![field_error("crop", err.to_string())],
+            ));
+        }
+    }
     let semantic_timeout_ms = payload.semantic_timeout_ms.unwrap_or(1_500);
     if !(100..=120_000).contains(&semantic_timeout_ms) {
         return Err(validation_error(
@@ -1215,6 +1229,7 @@ fn validate_realtime_reason_params(
         semantic_inference,
         semantic_frames_per_chunk,
         semantic_frame_max_edge,
+        crop,
         semantic_timeout_ms,
         semantic_prompt,
         tiered_config,
@@ -1523,6 +1538,7 @@ pub async fn reason_realtime_run(
     let semantic_inference = params.semantic_inference;
     let semantic_frames_per_chunk = params.semantic_frames_per_chunk;
     let semantic_frame_max_edge = params.semantic_frame_max_edge;
+    let crop = params.crop;
     let semantic_timeout_ms = params.semantic_timeout_ms;
     let semantic_prompt = params.semantic_prompt;
     let tiered_config = params.tiered_config;
@@ -1552,6 +1568,9 @@ pub async fn reason_realtime_run(
                 // Signals stay at source resolution; only VLM-bound JPEGs are
                 // downscaled (below), so the gate engine keeps full detail.
                 max_edge: None,
+                // Crop applies to signals too: the gate should judge only the
+                // region the VLM will ultimately see, so both agree on the ROI.
+                crop,
             };
             // Pass 1: frame signals (cheap, no encoding)
             let decoded = decode_pipeline.decode_signals(decode_source, decode_config)?;
@@ -1570,6 +1589,7 @@ pub async fn reason_realtime_run(
                     &indices,
                     max_frames as usize,
                     semantic_frame_max_edge,
+                    crop,
                 )?;
                 let lookup: std::collections::HashMap<u64, DecodedJpegFrame> =
                     jpegs.into_iter().map(|f| (f.frame_index, f)).collect();
@@ -1676,6 +1696,7 @@ pub async fn reason_realtime_run(
         video_clip_mode,
         semantic_decode_enabled,
         video_clip_duration_s,
+        crop,
     )
     .await;
 

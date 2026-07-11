@@ -926,8 +926,8 @@ mod tests {
 
         // A shorter and a longer embedding must not panic, and must not leave a
         // stale scratch lane that changes a later, correctly-sized decision.
-        let _ = gate.evaluate_detailed(&sig, &vec![0.5f32; DIM / 2], 0);
-        let _ = gate.evaluate_detailed(&sig, &vec![0.5f32; DIM * 2], 0);
+        let _ = gate.evaluate_detailed(&sig, &[0.5f32; DIM / 2], 0);
+        let _ = gate.evaluate_detailed(&sig, &[0.5f32; DIM * 2], 0);
 
         let (_d, b) = gate.evaluate_detailed(&sig, &embed(0, 1.0), 0);
         assert!(b.fused.is_finite() && (0.0..=1.0).contains(&b.fused));

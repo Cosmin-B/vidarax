@@ -49,6 +49,7 @@ use rustrtc::{
     IceServer, RtcConfiguration, SdpType, SessionDescription,
 };
 
+use crate::crop::CropRegion;
 use crate::gate::GateConfig;
 use crate::metrics::PipelineMetrics;
 use crate::tiered_vlm::TieredVlmConfig;
@@ -158,6 +159,11 @@ pub struct WebRtcConfig {
     /// choice silently ignored in favor of whatever the environment happens
     /// to hold when a session starts.
     pub vlm_tiering: TieredVlmConfig,
+    /// Optional region of interest applied to every decoded frame before the
+    /// gate and JPEG encoder see it, so only that part of the screen is
+    /// analyzed. Session default; a per-attach crop on the stream request
+    /// overrides it. `None` analyzes the whole frame.
+    pub crop: Option<CropRegion>,
 }
 
 /// Failure from [`WebRtcSession::new`].
@@ -199,6 +205,7 @@ impl Default for WebRtcConfig {
             loop_hamming_threshold: 6,
             loop_repeat_threshold: 3,
             vlm_tiering: TieredVlmConfig::default(),
+            crop: None,
         }
     }
 }
@@ -222,6 +229,10 @@ pub struct WebRtcSession {
     pub guided_json: Arc<ArcSwapOption<Arc<str>>>,
     /// Token output rate cap (tokens/s) for backpressure in VLM workers.
     pub max_output_tokens_per_second: u32,
+    /// Effective region of interest for this session's decode workers. Starts
+    /// from the server default and can be overridden per attach. `None` analyzes
+    /// the whole frame.
+    pub crop: Option<CropRegion>,
     /// Video codec negotiated from the SDP offer.
     pub codec: VideoCodec,
     rtp_nal_pool_slots: usize,
@@ -242,6 +253,7 @@ impl WebRtcSession {
             prompt: Arc::new(ArcSwap::from(Arc::new(Arc::from("")))),
             guided_json: Arc::new(ArcSwapOption::from(None::<Arc<Arc<str>>>)),
             max_output_tokens_per_second: 128,
+            crop: None,
             codec: VideoCodec::H264,
             rtp_nal_pool_slots: rtp_nal_pool_slots(1),
             #[cfg(any(test, debug_assertions))]
@@ -414,6 +426,7 @@ impl WebRtcSession {
                 prompt: Arc::new(ArcSwap::from(Arc::new(Arc::from("")))),
                 guided_json: Arc::new(ArcSwapOption::from(None::<Arc<Arc<str>>>)),
                 max_output_tokens_per_second: config.max_output_tokens_per_second,
+                crop: config.crop,
                 codec,
                 rtp_nal_pool_slots: rtp_nal_pool_slots(config.decode_workers),
                 #[cfg(any(test, debug_assertions))]
@@ -1266,6 +1279,7 @@ a=rtpmap:111 opus/48000/2\r\n";
             prompt: Arc::new(arc_swap::ArcSwap::from(Arc::new(Arc::from("")))),
             guided_json: Arc::new(arc_swap::ArcSwapOption::from(None::<Arc<Arc<str>>>)),
             max_output_tokens_per_second: 128,
+            crop: None,
             codec: VideoCodec::H264,
             rtp_nal_pool_slots: super::rtp_nal_pool_slots(2),
             close_calls: std::sync::atomic::AtomicU64::new(0),

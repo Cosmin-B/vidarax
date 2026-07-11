@@ -4,6 +4,7 @@
 //! to the gate engine's [`crate::gate::FrameSignal`] type, and provides JPEG
 //! thumbnail encoding for downstream consumers.
 
+use crate::crop::PixelCrop;
 use crate::gate::FrameSignal;
 use crate::webrtc::decode::YuvFrame;
 use crate::webrtc::recycle::{RecycledBytes, VecPool};
@@ -132,6 +133,99 @@ pub fn check_frame(yuv: &YuvFrame) -> Result<(), MalformedFrame> {
     }
 
     Ok(())
+}
+
+/// Reusable Y/U/V plane buffers for the live-path crop.
+///
+/// The crop runs on every decoded frame before the gate decides to keep it, so
+/// allocating three fresh plane buffers per frame would put per-frame heap
+/// traffic on the hot path. This pools them the same way the JPEG encoder pools
+/// its output: [`crop_yuv`] draws cleared buffers here and the returned frame's
+/// planes recycle back on drop.
+#[derive(Clone, Debug)]
+pub struct CropPool {
+    y: VecPool,
+    u: VecPool,
+    v: VecPool,
+}
+
+impl CropPool {
+    pub fn new(slots: usize) -> Self {
+        let slots = slots.max(1);
+        Self {
+            y: VecPool::with_slots(slots),
+            u: VecPool::with_slots(slots),
+            v: VecPool::with_slots(slots),
+        }
+    }
+}
+
+/// Copy the sub-rectangle `rect` out of `yuv` into a packed I420 frame drawn
+/// from `pool`.
+///
+/// I420 planes are stored without stride, so a sub-rectangle is not a contiguous
+/// slice; this re-packs row by row into pooled plane buffers. Cropping here,
+/// right after decode, means the perceptual-hash/luma signals and the JPEG the
+/// VLM sees are all restricted to the same region of the screen.
+///
+/// Returns `None` (leave the frame untouched) when the source planes are too
+/// short to read `rect` safely or `rect` does not fit inside the frame, so a
+/// malformed frame is never indexed out of bounds — the caller's existing
+/// [`check_frame`] guard still sees the original and drops it. `rect` is expected
+/// even-aligned and in-bounds, as produced by
+/// [`crate::crop::CropRegion::resolve`].
+pub fn crop_yuv(yuv: &YuvFrame, rect: PixelCrop, pool: &CropPool) -> Option<YuvFrame> {
+    let src_w = yuv.width as usize;
+    let src_h = yuv.height as usize;
+    let x0 = rect.x as usize;
+    let y0 = rect.y as usize;
+    let cw = rect.width as usize;
+    let ch = rect.height as usize;
+
+    // The rectangle must be even (4:2:0 chroma grid) and fit inside the frame.
+    if cw == 0 || ch == 0 || cw % 2 != 0 || ch % 2 != 0 || x0 % 2 != 0 || y0 % 2 != 0 {
+        return None;
+    }
+    if x0 + cw > src_w || y0 + ch > src_h {
+        return None;
+    }
+    // Confirm the source planes actually hold the frame they claim before we
+    // index them; a malformed frame falls through to the caller unchanged.
+    if check_frame(yuv).is_err() {
+        return None;
+    }
+
+    let mut y = pool.y.acquire();
+    y.reserve(cw * ch);
+    for row in 0..ch {
+        let start = (y0 + row) * src_w + x0;
+        y.extend_from_slice(&yuv.y[start..start + cw]);
+    }
+
+    // Chroma is half resolution in each axis; offsets and extents halve cleanly
+    // because the luma rectangle is even on all sides.
+    let src_cw = src_w / 2;
+    let ccw = cw / 2;
+    let cch = ch / 2;
+    let cx0 = x0 / 2;
+    let cy0 = y0 / 2;
+    let mut u = pool.u.acquire();
+    let mut v = pool.v.acquire();
+    u.reserve(ccw * cch);
+    v.reserve(ccw * cch);
+    for row in 0..cch {
+        let start = (cy0 + row) * src_cw + cx0;
+        u.extend_from_slice(&yuv.u[start..start + ccw]);
+        v.extend_from_slice(&yuv.v[start..start + ccw]);
+    }
+
+    Some(YuvFrame {
+        y: pool.y.recycle(y),
+        u: pool.u.recycle(u),
+        v: pool.v.recycle(v),
+        width: rect.width,
+        height: rect.height,
+    })
 }
 
 /// Compute a [`FrameSignal`] from a decoded YUV 4:2:0 frame.
@@ -338,6 +432,80 @@ mod tests {
         let mut odd = solid_frame(16, 16);
         odd.width = 15;
         assert!(check_frame(&odd).is_err());
+    }
+
+    #[test]
+    fn crop_yuv_repacks_the_requested_rectangle() {
+        // 4x4 luma with distinct values 0..16, 2x2 chroma 0..4 / 100..104.
+        let frame = YuvFrame {
+            y: (0u8..16).collect::<Vec<_>>().into(),
+            u: vec![0u8, 1, 2, 3].into(),
+            v: vec![100u8, 101, 102, 103].into(),
+            width: 4,
+            height: 4,
+        };
+        // Bottom-right 2x2 luma quadrant.
+        let rect = PixelCrop {
+            x: 2,
+            y: 2,
+            width: 2,
+            height: 2,
+        };
+        let pool = CropPool::new(2);
+        let cropped = crop_yuv(&frame, rect, &pool).expect("in-bounds crop");
+        assert_eq!(cropped.width, 2);
+        assert_eq!(cropped.height, 2);
+        // Rows (2,3) x cols (2,3): y = [10,11, 14,15].
+        assert_eq!(&*cropped.y, &[10, 11, 14, 15]);
+        // Chroma is 1x1 at (1,1): u = [3], v = [103].
+        assert_eq!(&*cropped.u, &[3]);
+        assert_eq!(&*cropped.v, &[103]);
+        // The re-packed frame is itself well formed.
+        assert!(check_frame(&cropped).is_ok());
+    }
+
+    #[test]
+    fn crop_yuv_rejects_out_of_bounds_and_malformed() {
+        let frame = solid_frame(16, 16);
+        let pool = CropPool::new(2);
+        // Runs past the right edge.
+        assert!(crop_yuv(
+            &frame,
+            PixelCrop {
+                x: 8,
+                y: 0,
+                width: 12,
+                height: 4
+            },
+            &pool
+        )
+        .is_none());
+        // Odd rectangle can't map onto the 4:2:0 chroma grid.
+        assert!(crop_yuv(
+            &frame,
+            PixelCrop {
+                x: 0,
+                y: 0,
+                width: 3,
+                height: 4
+            },
+            &pool
+        )
+        .is_none());
+        // A short-plane source is left for check_frame to reject, not indexed.
+        let mut short = solid_frame(16, 16);
+        short.y = vec![128u8; 16 * 16 - 1].into();
+        assert!(crop_yuv(
+            &short,
+            PixelCrop {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 8
+            },
+            &pool
+        )
+        .is_none());
     }
 
     #[test]
