@@ -1,23 +1,60 @@
 # Vidarax backend configuration.
-# Backends are tried in priority order (lowest = first).
-# String values support ${ENV_VAR} interpolation.
-
+# Backends are tried in priority order (lowest = first); a retryable failure
+# on one backend falls through to the next.
+# String values support ${ENV_VAR} interpolation, with one exception: the
+# server reads VIDARAX_VLLM_BASE_URL / VIDARAX_SGLANG_BASE_URL itself before
+# this file is ever opened, and an explicit value there replaces this whole
+# file rather than filling in the base_url below. So base_url for vllm/sglang
+# is set as a literal below, not via ${VIDARAX_*_BASE_URL}: point it straight
+# at your inference server, or export VIDARAX_VLLM_BASE_URL /
+# VIDARAX_SGLANG_BASE_URL and skip editing this file entirely.
+#
+# Default: self-hosted, open-source inference. Point these at your local vLLM
+# and SGLang servers (ports below match the common setup in docs/deployment.md).
 [[backends]]
 name = "vllm"
 type = "openai_compat"
-base_url = "${VIDARAX_VLLM_BASE_URL}"
+base_url = "http://127.0.0.1:8000"
 priority = 1
 
 [[backends]]
 name = "sglang"
 type = "openai_compat"
-base_url = "${VIDARAX_SGLANG_BASE_URL}"
+base_url = "http://127.0.0.1:30000"
 priority = 2
 
-# Uncomment to add Gemini as a fallback/teacher model:
+# mlx-vlm is opt-in, for local first-pass inference on Apple Silicon. It serves
+# the same OpenAI-compatible chat/completions API as vLLM/SGLang, so it reuses
+# the openai_compat backend type below; openai_kind = "mlx" only changes the
+# telemetry label (and its LOCAL/second-pass grouping in the tiering split),
+# not how requests are sent. Point base_url at wherever you started
+# `mlx_vlm.server` (defaults to 127.0.0.1:8080; see README.md).
+#
+# To tier this to a Gemini second pass, uncomment the gemini backend below and
+# set the WHIP/analyze second_pass model to that backend's `model` value;
+# routing is by exact model id, same as any other tiering setup.
+# [[backends]]
+# name = "mlx"
+# type = "openai_compat"
+# openai_kind = "mlx"
+# base_url = "http://127.0.0.1:8080"
+# priority = 1
+
+# Gemini is opt-in, not the default. Uncomment to add it as a hosted fallback
+# behind the self-hosted backends above (or comment those out to use Gemini
+# alone), and set GEMINI_API_KEY in the environment.
+#
+# This entry also doubles as the second-pass target for tiered VLM escalation
+# (see VIDARAX_WEBRTC_SECOND_PASS_MODEL for WebRTC sessions, or the
+# second_pass_model field on the reason() / realtime-reason request for
+# file and URI sources). Routing to it is by exact model id, not by name
+# pattern, so to enable local-to-Gemini tiering you must uncomment this
+# backend AND set its `model` below to exactly the same id you pass as the
+# second-pass model — otherwise the escalated request has nowhere configured
+# to land and tiering quietly stays a no-op.
 # [[backends]]
 # name = "gemini-flash"
 # type = "gemini"
 # api_key = "${GEMINI_API_KEY}"
-# model = "gemini-2.5-flash-preview-05-20"
+# model = "gemini-3.1-flash-lite"
 # priority = 10

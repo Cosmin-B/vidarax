@@ -10,6 +10,23 @@ services:
       VIDARAX_DATA_DIR: /var/lib/vidarax
       VIDARAX_TRANSPORT: h1h2
       VIDARAX_TRACES_ENDPOINT: http://victoriatraces:4317
+      # VIDARAX_REQUIRE_API_KEY defaults to true, so a key must be present for
+      # the stack to be usable at all. This is a local-dev-only placeholder,
+      # not a real secret; replace it before running anywhere reachable by
+      # anyone but you. vm-scrape.yml sends this same value as an x-api-key
+      # header so victoriametrics can authenticate its /v1/metrics scrape.
+      VIDARAX_API_KEYS: local-dev-only-key-do-not-use-in-prod
+      # VIDARAX_METRICS_REQUIRE_API_KEY is left at its default (true): the
+      # dedicated metrics-auth check in security.rs only runs when this is
+      # true, so setting it "false" does not disable auth on /v1/metrics.
+      # It just makes the request fall through to the global api-key check
+      # below, which is on anyway because VIDARAX_API_KEYS is set. Metrics
+      # auth is satisfied instead by having victoriametrics send the key
+      # (see vm-scrape.yml).
+      # No inference backend is wired up here. Set VIDARAX_VLLM_BASE_URL /
+      # VIDARAX_SGLANG_BASE_URL to point at a running vLLM or SGLang server,
+      # or edit vidarax.toml, before expecting /v1/infer or /v1/runs/*/analyze
+      # to do anything useful.
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
