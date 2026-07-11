@@ -334,8 +334,20 @@ fn compute_ahashes_from_source(
         .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
         .args(ffmpeg_input_options_for_source(source))
         .args([
-            "-i", source_uri, "-an", "-sn", "-dn", "-vf", &vf_expr, "-frames:v",
-            &max_frames.to_string(), "-f", "rawvideo", "-pix_fmt", "gray", "-",
+            "-i",
+            source_uri,
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            &vf_expr,
+            "-frames:v",
+            &max_frames.to_string(),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
         ])
         .output()
         .map_err(|_| "failed to run ffmpeg".to_string())?;
@@ -1017,10 +1029,9 @@ mod tests {
         ahash_cell_grid, ahashes_from_gray_grid, ffmpeg_input_options_for_source,
         ffmpeg_protocol_whitelist_for_source, parse_ffprobe_frame_rate, parse_framemd5_to_signals,
         parse_jpeg_stream_to_frames, Mp4DecodeConfig, TimestampNormalizer,
-        FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST,
-        FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST, FFMPEG_HTTPS_PROTOCOL_WHITELIST,
-        FFMPEG_HTTP_PROTOCOL_WHITELIST, FFMPEG_LOCAL_PROTOCOL_WHITELIST,
-        FFMPEG_RTSPS_PROTOCOL_WHITELIST,
+        FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST, FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST,
+        FFMPEG_HTTPS_PROTOCOL_WHITELIST, FFMPEG_HTTP_PROTOCOL_WHITELIST,
+        FFMPEG_LOCAL_PROTOCOL_WHITELIST, FFMPEG_RTSPS_PROTOCOL_WHITELIST,
     };
     use crate::ingest::InputSource;
 
