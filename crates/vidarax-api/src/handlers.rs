@@ -2421,8 +2421,8 @@ fn infer_execution_error_to_response(state: &AppState, err: InferExecutionError)
 mod tests {
     use super::{
         feedback_rows_to_json_for_owned_runs, marker_to_emit_event_request,
-        owned_run_ids_from_events, run_command_with_timeout, validate_infer_request, AnalyzeMarker,
-        InferRequest,
+        owned_run_ids_from_events, parse_provider, run_command_with_timeout,
+        validate_infer_request, AnalyzeMarker, InferRequest, ProviderKind,
     };
     use crate::spacetime_client::FeedbackRow;
     use crate::state::AppState;
@@ -2432,6 +2432,20 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn parse_provider_accepts_every_configured_backend() {
+        // mlx was wired everywhere (ProviderKind, metrics, backend flavor) except
+        // this string boundary, so an /v1/infer with primary_provider=mlx used to
+        // 422 and an omitted field defaulted to vLLM, mis-attributing MLX errors.
+        assert_eq!(parse_provider(Some("vllm")), Ok(ProviderKind::Vllm));
+        assert_eq!(parse_provider(Some("sglang")), Ok(ProviderKind::Sglang));
+        assert_eq!(parse_provider(Some("gemini")), Ok(ProviderKind::Gemini));
+        assert_eq!(parse_provider(Some("mlx")), Ok(ProviderKind::Mlx));
+        assert_eq!(parse_provider(Some("MLX")), Ok(ProviderKind::Mlx));
+        assert_eq!(parse_provider(None), Ok(ProviderKind::Vllm));
+        assert!(parse_provider(Some("bogus")).is_err());
+    }
 
     static WAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -3428,7 +3442,8 @@ fn parse_provider(raw: Option<&str>) -> Result<ProviderKind, &'static str> {
         "vllm" => Ok(ProviderKind::Vllm),
         "sglang" => Ok(ProviderKind::Sglang),
         "gemini" => Ok(ProviderKind::Gemini),
-        _ => Err("primary_provider must be one of: vllm, sglang, gemini"),
+        "mlx" => Ok(ProviderKind::Mlx),
+        _ => Err("primary_provider must be one of: vllm, sglang, gemini, mlx"),
     }
 }
 

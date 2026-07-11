@@ -121,6 +121,20 @@ fn select_expr_two_singletons_stay_literal() {
 }
 
 #[test]
+fn select_expr_is_order_and_dedup_independent() {
+    // ffmpeg's select filter emits frames in ascending stream order, once per
+    // distinct index, so an unsorted or duplicated caller list yields the same
+    // filter. That invariant is exactly why the selective decoders restamp the
+    // emitted frames against the sorted-unique index order rather than the
+    // caller's order; stamping against the caller's order would swap identities
+    // (e.g. [10, 2] emits 2 then 10 but would label them 10 then 2).
+    let canonical = build_select_expr(&[2, 10]);
+    assert_eq!(build_select_expr(&[10, 2]), canonical);
+    assert_eq!(build_select_expr(&[2, 2, 10]), canonical);
+    assert_eq!(build_select_expr(&[10, 2, 10, 2]), canonical);
+}
+
+#[test]
 fn select_expr_partial_final_chunk_keeps_bulk_collapsed() {
     // THE production case: 833 frames, chunk_size=5, 1 frame/chunk. The 166
     // full chunks give evenly-strided midpoints 2,7,..,827; the trailing
