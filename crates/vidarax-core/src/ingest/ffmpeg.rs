@@ -1064,8 +1064,10 @@ fn extract_video_clip_inner(
 /// `sample_fps` first (matching the framemd5 pass), then the select filter
 /// picks only the requested indices from that resampled stream.
 ///
-/// `frame_indices` must be sorted ascending. Returns frames in the same order,
-/// each stamped with its original resampled-stream index.
+/// `frame_indices` may be in any order and may repeat; it is normalized to
+/// sorted-unique internally, since ffmpeg's `select` filter emits frames in
+/// ascending stream order once per distinct index. Returns those frames in that
+/// sorted-unique order, each stamped with its resampled-stream index.
 pub fn decode_selective_jpeg_frames(
     source: &InputSource,
     sample_fps: f32,
@@ -1104,13 +1106,22 @@ pub(crate) fn decode_selective_jpeg_frames_inner(
         crop.validate().map_err(|e| e.to_string())?;
     }
 
-    let select_expr = build_select_expr(frame_indices);
+    // ffmpeg's select filter emits frames in ascending stream order, once per
+    // distinct index, so work in that same sorted-unique order for the filter,
+    // the frame cap, the parse limit, and the restamp below. An unsorted or
+    // duplicated caller list would otherwise stamp the emitted frames with the
+    // wrong indices.
+    let mut indices = frame_indices.to_vec();
+    indices.sort_unstable();
+    indices.dedup();
+
+    let select_expr = build_select_expr(&indices);
     let crop = crop_prefix(crop);
     let vf_chain = match longest_edge_scale_filter(max_edge) {
         Some(scale) => format!("{crop}fps={sample_fps:.3},{select_expr},{scale}"),
         None => format!("{crop}fps={sample_fps:.3},{select_expr}"),
     };
-    let frames_cap = frame_indices.len().min(max_frames).to_string();
+    let frames_cap = indices.len().min(max_frames).to_string();
 
     let source_uri = source.as_ffmpeg_input();
     let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
@@ -1146,13 +1157,14 @@ pub(crate) fn decode_selective_jpeg_frames_inner(
         return Err("selective video decode failed".to_string());
     }
 
-    let mut parsed = parse_jpeg_stream_to_frames(&output.stdout, frame_indices.len())?;
+    let mut parsed = parse_jpeg_stream_to_frames(&output.stdout, indices.len())?;
 
-    // Re-stamp frame_index with the original resampled-stream index.
-    let usable = parsed.len().min(frame_indices.len());
+    // Re-stamp each emitted frame with its resampled-stream index, in the same
+    // sorted-unique order ffmpeg emitted them.
+    let usable = parsed.len().min(indices.len());
     parsed.truncate(usable);
-    for (frame, &original_idx) in parsed.iter_mut().zip(frame_indices.iter()) {
-        frame.frame_index = original_idx;
+    for (frame, &idx) in parsed.iter_mut().zip(indices.iter()) {
+        frame.frame_index = idx;
     }
 
     Ok(parsed)

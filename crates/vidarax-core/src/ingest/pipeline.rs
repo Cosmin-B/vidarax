@@ -292,7 +292,13 @@ fn decode_selective_jpeg_frames_nvdec_inner(
     };
     use std::process::Command;
 
-    let select_expr = build_select_expr(frame_indices);
+    // Sorted-unique to match ffmpeg's select emission order (see the CPU path in
+    // ffmpeg.rs); the same slice drives the filter, cap, parse limit, and restamp.
+    let mut indices = frame_indices.to_vec();
+    indices.sort_unstable();
+    indices.dedup();
+
+    let select_expr = build_select_expr(&indices);
     // The crop runs on the CPU side after hwdownload, so it must sit right after
     // `format=nv12` and before select/scale. `iw`/`ih` in the crop expression
     // resolve to the downloaded frame size, which is the source resolution.
@@ -308,7 +314,7 @@ fn decode_selective_jpeg_frames_nvdec_inner(
             format!("fps={sample_fps:.3},hwdownload,format=nv12,{crop}{select_expr},format=yuv420p")
         }
     };
-    let frames_cap = frame_indices.len().min(max_frames).to_string();
+    let frames_cap = indices.len().min(max_frames).to_string();
 
     let output = Command::new(super::ffmpeg_path())
         .args([
@@ -351,11 +357,10 @@ fn decode_selective_jpeg_frames_nvdec_inner(
         return Err("GPU video decode failed".to_string());
     }
 
-    let mut parsed =
-        crate::ingest::parse_jpeg_stream_to_frames(&output.stdout, frame_indices.len())?;
-    let usable = parsed.len().min(frame_indices.len());
+    let mut parsed = crate::ingest::parse_jpeg_stream_to_frames(&output.stdout, indices.len())?;
+    let usable = parsed.len().min(indices.len());
     parsed.truncate(usable);
-    for (frame, &idx) in parsed.iter_mut().zip(frame_indices.iter()) {
+    for (frame, &idx) in parsed.iter_mut().zip(indices.iter()) {
         frame.frame_index = idx;
     }
     Ok(parsed)
@@ -457,7 +462,13 @@ fn decode_selective_jpeg_frames_videotoolbox_inner(
     };
     use std::process::Command;
 
-    let select_expr = build_select_expr(frame_indices);
+    // Sorted-unique to match ffmpeg's select emission order (see the CPU path in
+    // ffmpeg.rs); the same slice drives the filter, cap, parse limit, and restamp.
+    let mut indices = frame_indices.to_vec();
+    indices.sort_unstable();
+    indices.dedup();
+
+    let select_expr = build_select_expr(&indices);
     // Unlike the nvdec path, this leaves -hwaccel_output_format unset, so
     // VideoToolbox hands decoded frames back in a normal software pixel format
     // and the filter chain here is the same crop+fps+select+scale chain the CPU
@@ -470,7 +481,7 @@ fn decode_selective_jpeg_frames_videotoolbox_inner(
         Some(scale) => format!("{crop}fps={sample_fps:.3},{select_expr},{scale}"),
         None => format!("{crop}fps={sample_fps:.3},{select_expr}"),
     };
-    let frames_cap = frame_indices.len().min(max_frames).to_string();
+    let frames_cap = indices.len().min(max_frames).to_string();
 
     let output = Command::new(super::ffmpeg_path())
         .args([
@@ -511,11 +522,26 @@ fn decode_selective_jpeg_frames_videotoolbox_inner(
         return Err("GPU video decode failed".to_string());
     }
 
-    let mut parsed =
-        crate::ingest::parse_jpeg_stream_to_frames(&output.stdout, frame_indices.len())?;
-    let usable = parsed.len().min(frame_indices.len());
+    // VideoToolbox can recognise the accelerator yet fail to initialise it: ffmpeg
+    // logs the setup failure, decodes on the CPU anyway, and still exits 0. Unlike
+    // the NVDEC path (whose forced CUDA output format cannot silently continue on
+    // CPU), that fallback is invisible in the exit status, so a deployment that
+    // asked for hardware decode would quietly run the JPEG phase on the CPU. Detect
+    // the marker and warn rather than report a hardware run that did not happen.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("Failed setup for format videotoolbox")
+        || (stderr.contains("videotoolbox") && stderr.contains("hwaccel"))
+    {
+        tracing::warn!(
+            stderr = %stderr.trim(),
+            "VideoToolbox hardware init failed; ffmpeg fell back to software decode for this batch"
+        );
+    }
+
+    let mut parsed = crate::ingest::parse_jpeg_stream_to_frames(&output.stdout, indices.len())?;
+    let usable = parsed.len().min(indices.len());
     parsed.truncate(usable);
-    for (frame, &idx) in parsed.iter_mut().zip(frame_indices.iter()) {
+    for (frame, &idx) in parsed.iter_mut().zip(indices.iter()) {
         frame.frame_index = idx;
     }
     Ok(parsed)
