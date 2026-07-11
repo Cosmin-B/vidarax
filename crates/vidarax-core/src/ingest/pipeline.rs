@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::{Arc, OnceLock};
 
+use crate::crop::CropRegion;
 use crate::ingest::{
     decode_mp4_to_frame_signals, decode_selective_jpeg_frames, extract_video_clip,
     DecodedJpegFrame, DecodedMp4Batch, InputSource, Mp4DecodeConfig,
@@ -99,6 +100,9 @@ pub trait DecodePipeline: Send + Sync {
     ///
     /// `max_edge` optionally caps the longest edge of each emitted frame (see
     /// [`Mp4DecodeConfig::max_edge`]) — the "fewer pixels" lever for VLM token cost.
+    /// `crop` optionally restricts each frame to a region of interest (see
+    /// [`Mp4DecodeConfig::crop`]); pass the same crop used for the signals pass so
+    /// the gate and the VLM agree on what was analyzed.
     fn decode_jpegs(
         &self,
         source: &InputSource,
@@ -106,6 +110,7 @@ pub trait DecodePipeline: Send + Sync {
         frame_indices: &[u64],
         max_frames: usize,
         max_edge: Option<u32>,
+        crop: Option<CropRegion>,
     ) -> Result<Vec<DecodedJpegFrame>, String>;
 
     /// Extract a short self-contained MP4 clip beginning at `start_s` and
@@ -153,11 +158,19 @@ impl DecodePipeline for CpuFfmpegPipeline {
         frame_indices: &[u64],
         max_frames: usize,
         max_edge: Option<u32>,
+        crop: Option<CropRegion>,
     ) -> Result<Vec<DecodedJpegFrame>, String> {
         if frame_indices.is_empty() {
             return Ok(Vec::new());
         }
-        decode_selective_jpeg_frames(source, sample_fps, frame_indices, max_frames, max_edge)
+        decode_selective_jpeg_frames(
+            source,
+            sample_fps,
+            frame_indices,
+            max_frames,
+            max_edge,
+            crop,
+        )
     }
 
     fn extract_clip(
@@ -204,11 +217,19 @@ impl DecodePipeline for NvdecCudaPipeline {
         frame_indices: &[u64],
         max_frames: usize,
         max_edge: Option<u32>,
+        crop: Option<CropRegion>,
     ) -> Result<Vec<DecodedJpegFrame>, String> {
         if frame_indices.is_empty() {
             return Ok(Vec::new());
         }
-        decode_selective_jpeg_frames_nvdec(source, sample_fps, frame_indices, max_frames, max_edge)
+        decode_selective_jpeg_frames_nvdec(
+            source,
+            sample_fps,
+            frame_indices,
+            max_frames,
+            max_edge,
+            crop,
+        )
     }
 
     fn extract_clip(
@@ -240,6 +261,7 @@ fn decode_selective_jpeg_frames_nvdec(
     frame_indices: &[u64],
     max_frames: usize,
     max_edge: Option<u32>,
+    crop: Option<CropRegion>,
 ) -> Result<Vec<DecodedJpegFrame>, String> {
     super::fetch::with_prefetched_downloadable_source(source, |source| {
         decode_selective_jpeg_frames_nvdec_inner(
@@ -248,6 +270,7 @@ fn decode_selective_jpeg_frames_nvdec(
             frame_indices,
             max_frames,
             max_edge,
+            crop,
         )
     })?
 }
@@ -258,6 +281,7 @@ fn decode_selective_jpeg_frames_nvdec_inner(
     frame_indices: &[u64],
     max_frames: usize,
     max_edge: Option<u32>,
+    crop: Option<CropRegion>,
 ) -> Result<Vec<DecodedJpegFrame>, String> {
     use crate::ingest::{
         build_select_expr, ffmpeg_input_options_for_source, ffmpeg_protocol_whitelist_for_source,
@@ -265,11 +289,20 @@ fn decode_selective_jpeg_frames_nvdec_inner(
     use std::process::Command;
 
     let select_expr = build_select_expr(frame_indices);
+    // The crop runs on the CPU side after hwdownload, so it must sit right after
+    // `format=nv12` and before select/scale. `iw`/`ih` in the crop expression
+    // resolve to the downloaded frame size, which is the source resolution.
+    let crop = crop
+        .filter(|c| !c.is_full_frame())
+        .map(|c| format!("{},", c.ffmpeg_crop_filter()))
+        .unwrap_or_default();
     let vf_chain = match super::ffmpeg::longest_edge_scale_filter(max_edge) {
         Some(scale) => format!(
-            "fps={sample_fps:.3},hwdownload,format=nv12,{select_expr},format=yuv420p,{scale}"
+            "fps={sample_fps:.3},hwdownload,format=nv12,{crop}{select_expr},format=yuv420p,{scale}"
         ),
-        None => format!("fps={sample_fps:.3},hwdownload,format=nv12,{select_expr},format=yuv420p"),
+        None => {
+            format!("fps={sample_fps:.3},hwdownload,format=nv12,{crop}{select_expr},format=yuv420p")
+        }
     };
     let frames_cap = frame_indices.len().min(max_frames).to_string();
 
@@ -348,6 +381,7 @@ impl DecodePipeline for MlxVideoToolboxPipeline {
         frame_indices: &[u64],
         max_frames: usize,
         max_edge: Option<u32>,
+        crop: Option<CropRegion>,
     ) -> Result<Vec<DecodedJpegFrame>, String> {
         if frame_indices.is_empty() {
             return Ok(Vec::new());
@@ -358,6 +392,7 @@ impl DecodePipeline for MlxVideoToolboxPipeline {
             frame_indices,
             max_frames,
             max_edge,
+            crop,
         )
     }
 
@@ -390,6 +425,7 @@ fn decode_selective_jpeg_frames_videotoolbox(
     frame_indices: &[u64],
     max_frames: usize,
     max_edge: Option<u32>,
+    crop: Option<CropRegion>,
 ) -> Result<Vec<DecodedJpegFrame>, String> {
     super::fetch::with_prefetched_downloadable_source(source, |source| {
         decode_selective_jpeg_frames_videotoolbox_inner(
@@ -398,6 +434,7 @@ fn decode_selective_jpeg_frames_videotoolbox(
             frame_indices,
             max_frames,
             max_edge,
+            crop,
         )
     })?
 }
@@ -408,6 +445,7 @@ fn decode_selective_jpeg_frames_videotoolbox_inner(
     frame_indices: &[u64],
     max_frames: usize,
     max_edge: Option<u32>,
+    crop: Option<CropRegion>,
 ) -> Result<Vec<DecodedJpegFrame>, String> {
     use crate::ingest::{
         build_select_expr, ffmpeg_input_options_for_source, ffmpeg_protocol_whitelist_for_source,
@@ -417,11 +455,15 @@ fn decode_selective_jpeg_frames_videotoolbox_inner(
     let select_expr = build_select_expr(frame_indices);
     // Unlike the nvdec path, this leaves -hwaccel_output_format unset, so
     // VideoToolbox hands decoded frames back in a normal software pixel format
-    // and the filter chain here is the same fps+select+scale chain the CPU path
-    // uses. No hwdownload/format step is needed before the mjpeg encoder.
+    // and the filter chain here is the same crop+fps+select+scale chain the CPU
+    // path uses. No hwdownload/format step is needed before the mjpeg encoder.
+    let crop = crop
+        .filter(|c| !c.is_full_frame())
+        .map(|c| format!("{},", c.ffmpeg_crop_filter()))
+        .unwrap_or_default();
     let vf_chain = match super::ffmpeg::longest_edge_scale_filter(max_edge) {
-        Some(scale) => format!("fps={sample_fps:.3},{select_expr},{scale}"),
-        None => format!("fps={sample_fps:.3},{select_expr}"),
+        Some(scale) => format!("{crop}fps={sample_fps:.3},{select_expr},{scale}"),
+        None => format!("{crop}fps={sample_fps:.3},{select_expr}"),
     };
     let frames_cap = frame_indices.len().min(max_frames).to_string();
 

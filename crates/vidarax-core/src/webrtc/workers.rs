@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use base64::Engine as _;
 
+use crate::crop::{CropRegion, ResolvedCrop};
 use crate::dedup::DedupFilter;
 use crate::gate::{FrameSignal, GateConfig, GateEventType};
 use crate::loop_detector::LoopDetector;
@@ -30,7 +31,7 @@ use crate::webrtc::decode::{
 };
 use crate::webrtc::recycle::{RecycledBytes, VecPool};
 use crate::webrtc::session::{RtpFrame, WebRtcConfig};
-use crate::webrtc::signals::{check_frame, yuv_to_frame_signal, yuv_to_jpeg};
+use crate::webrtc::signals::{check_frame, crop_yuv, yuv_to_frame_signal, yuv_to_jpeg, CropPool};
 
 pub const STREAM_FRAME_QUEUE_CAPACITY: usize = 64;
 pub const VLM_WORK_QUEUE_CAPACITY: usize = 32;
@@ -468,6 +469,9 @@ pub struct WorkerPoolConfig {
     pub loop_repeat_threshold: usize,
     /// VLM output token-rate cap; zero disables the limiter.
     pub max_output_tokens_per_second: u32,
+    /// Optional region of interest cropped from each decoded frame before the
+    /// gate and JPEG encoder run. `None` analyzes the whole frame.
+    pub crop: Option<CropRegion>,
 }
 
 impl From<&WebRtcConfig> for WorkerPoolConfig {
@@ -483,6 +487,7 @@ impl From<&WebRtcConfig> for WorkerPoolConfig {
             loop_hamming_threshold: cfg.loop_hamming_threshold,
             loop_repeat_threshold: cfg.loop_repeat_threshold,
             max_output_tokens_per_second: cfg.max_output_tokens_per_second,
+            crop: cfg.crop,
         }
     }
 }
@@ -508,6 +513,9 @@ pub struct DecodeWorkerParams {
     pub rtp_rx: kanal::Receiver<RtpFrame>,
     /// Where decoded frames go, and whether the gate runs inline.
     pub sink: DecodeSink,
+    /// Optional region of interest cropped from each decoded frame before the
+    /// gate and JPEG encoder run.
+    pub crop: Option<CropRegion>,
     pub metrics: Arc<PipelineMetrics>,
     pub session_span: tracing::Span,
 }
@@ -562,6 +570,7 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) {
         jpeg_pool_slots,
         rtp_rx,
         sink,
+        crop,
         metrics,
         session_span,
     } = params;
@@ -610,10 +619,15 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) {
             // rather than two fields that could drift apart.
             let mut decoder: Option<(VideoCodec, Decoder)> = None;
             let mut prev_signal: Option<FrameSignal> = None;
+            // Warn only once if the crop cannot be represented at the live size.
+            let mut warned_undersized_crop = false;
             // Reused across frames to avoid per-frame 6MB YCbCr allocation.
             let mut ycbcr_scratch: Vec<u8> =
                 Vec::with_capacity(decode_width as usize * decode_height as usize * 3);
             let jpeg_pool = VecPool::with_slots(jpeg_pool_slots);
+            // Only built when a crop is configured; keeps the re-pack off the
+            // per-frame allocator, matching the JPEG pool above.
+            let crop_pool = crop.map(|_| CropPool::new(output_pool_slots));
 
             'rtp_frames: while let Ok(frame) = rtp_rx.recv() {
                 let _guard = session_span.enter();
@@ -659,6 +673,38 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) {
                     .decode_latency_us
                     .record(decode_start.elapsed().as_micros() as u64);
                 metrics.inc_frames_decoded();
+
+                // Restrict analysis to the configured region of interest. Cropping
+                // here, before either sink branch, means the gate signals and the
+                // VLM JPEG both see only the ROI.
+                let yuv = match crop.map(|c| c.resolve(yuv.width, yuv.height)) {
+                    // No crop, or one that covers the whole frame: use it as-is.
+                    None | Some(ResolvedCrop::Full) => yuv,
+                    Some(ResolvedCrop::Rect(rect)) => {
+                        // A malformed source re-pack falls back to the original,
+                        // which the per-branch check_frame then drops.
+                        match &crop_pool {
+                            Some(pool) => crop_yuv(&yuv, rect, pool).unwrap_or(yuv),
+                            None => yuv,
+                        }
+                    }
+                    Some(ResolvedCrop::TooSmall) => {
+                        // The requested region is too small to represent at this
+                        // resolution. Dropping is deliberate: widening it back to
+                        // the whole frame would analyze more of the screen than
+                        // the caller asked for. Warn once so the operator sees why
+                        // no analysis is coming out, without per-frame spam.
+                        if !warned_undersized_crop {
+                            warned_undersized_crop = true;
+                            tracing::warn!(
+                                width = yuv.width,
+                                height = yuv.height,
+                                "configured crop is smaller than 2x2 at this resolution; dropping frames rather than analyzing the whole screen"
+                            );
+                        }
+                        continue 'rtp_frames;
+                    }
+                };
 
                 match &mut sink_state {
                     SinkState::Keyframe {
@@ -1047,6 +1093,7 @@ where
                 frame_tx: stream_tx,
                 clip_config: clip_config.clone(),
             },
+            crop: cfg.crop,
             metrics: Arc::clone(&metrics),
             session_span: session_span.clone(),
         });
@@ -1114,6 +1161,7 @@ where
                 session_id,
                 prompt,
             }),
+            crop: cfg.crop,
             metrics: Arc::clone(&metrics),
             session_span: session_span.clone(),
         });

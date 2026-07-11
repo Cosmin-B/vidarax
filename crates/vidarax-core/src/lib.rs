@@ -1,4 +1,5 @@
 pub mod backends;
+pub mod crop;
 pub mod dedup;
 pub mod gate;
 pub mod gemini;

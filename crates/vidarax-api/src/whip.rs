@@ -429,6 +429,9 @@ async fn start_whip_session_transaction(
     let webrtc_config_for_workers = state.webrtc_config().clone();
     let vlm_config = webrtc_config_for_workers.vlm_tiering.clone();
     let max_output_tokens_per_second = session.max_output_tokens_per_second;
+    // The session's crop starts from the server default and may have been
+    // overridden by the attach request; it wins over the config default.
+    let session_crop = session.crop;
 
     // Capture everything needed by the spawn_blocking closure.
     let run_id_for_workers = Arc::clone(&run_id);
@@ -464,6 +467,7 @@ async fn start_whip_session_transaction(
         // landed before the worker threads started.
         let mut pool_config = WorkerPoolConfig::from(&webrtc_config_for_workers);
         pool_config.max_output_tokens_per_second = max_output_tokens_per_second;
+        pool_config.crop = session_crop;
 
         spawn_pipeline(
             &pool_config,
@@ -533,6 +537,10 @@ fn apply_attach_config(
     }
     if let Some(max) = config.max_output_tokens_per_second {
         session.max_output_tokens_per_second = max;
+    }
+    if let Some(crop) = config.crop {
+        crop.validate().map_err(|e| e.to_string())?;
+        session.crop = Some(crop);
     }
     if let Some(clip) = config.clip_mode {
         let clip = clip.into_core();

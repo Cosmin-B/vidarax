@@ -58,6 +58,7 @@ async fn staging_live_provider_e2e_opt_in() {
         webrtc_second_pass_model: None,
         webrtc_second_pass_threshold: 0.7,
         webrtc_second_pass_max_tokens: 256,
+        webrtc_crop: None,
         gate_config: GateConfig::default(),
         distillation: DistillationConfig::default(),
     };

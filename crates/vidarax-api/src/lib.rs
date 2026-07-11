@@ -187,6 +187,7 @@ fn build_webrtc_config(config: &ServerConfig) -> WebRtcConfig {
         // session on this AppState clones. See config::build_webrtc_vlm_config
         // for why that distinction matters.
         vlm_tiering: config::build_webrtc_vlm_config(config),
+        crop: config.webrtc_crop,
         ..Default::default()
     }
 }
@@ -265,6 +266,7 @@ mod tests {
             webrtc_second_pass_model: None,
             webrtc_second_pass_threshold: 0.7,
             webrtc_second_pass_max_tokens: 256,
+            webrtc_crop: None,
             gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         }
@@ -526,6 +528,7 @@ mod tests {
             webrtc_second_pass_model: None,
             webrtc_second_pass_threshold: 0.7,
             webrtc_second_pass_max_tokens: 256,
+            webrtc_crop: None,
             gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         };
@@ -2434,6 +2437,7 @@ mod tests {
             webrtc_second_pass_model: None,
             webrtc_second_pass_threshold: 0.7,
             webrtc_second_pass_max_tokens: 256,
+            webrtc_crop: None,
             gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         })
@@ -2496,6 +2500,7 @@ mod tests {
             webrtc_second_pass_model: None,
             webrtc_second_pass_threshold: 0.7,
             webrtc_second_pass_max_tokens: 256,
+            webrtc_crop: None,
             gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         })
@@ -2555,6 +2560,7 @@ mod tests {
             webrtc_second_pass_model: None,
             webrtc_second_pass_threshold: 0.7,
             webrtc_second_pass_max_tokens: 256,
+            webrtc_crop: None,
             gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         })
@@ -2640,6 +2646,7 @@ mod tests {
             webrtc_second_pass_model: None,
             webrtc_second_pass_threshold: 0.7,
             webrtc_second_pass_max_tokens: 256,
+            webrtc_crop: None,
             gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         })
@@ -2705,6 +2712,7 @@ mod tests {
             webrtc_second_pass_model: None,
             webrtc_second_pass_threshold: 0.7,
             webrtc_second_pass_max_tokens: 256,
+            webrtc_crop: None,
             gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         }) {
@@ -2755,6 +2763,7 @@ mod tests {
             webrtc_second_pass_model: None,
             webrtc_second_pass_threshold: 0.7,
             webrtc_second_pass_max_tokens: 256,
+            webrtc_crop: None,
             gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         })
@@ -2992,6 +3001,7 @@ mod tests {
             webrtc_second_pass_model: None,
             webrtc_second_pass_threshold: 0.7,
             webrtc_second_pass_max_tokens: 256,
+            webrtc_crop: None,
             gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         };
@@ -3131,6 +3141,7 @@ mod tests {
             webrtc_second_pass_model: None,
             webrtc_second_pass_threshold: 0.7,
             webrtc_second_pass_max_tokens: 256,
+            webrtc_crop: None,
             gate_config: GateConfig::default(),
             distillation: DistillationConfig::default(),
         };
