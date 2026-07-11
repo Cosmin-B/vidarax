@@ -114,14 +114,16 @@ pub trait DecodePipeline: Send + Sync {
     ) -> Result<Vec<DecodedJpegFrame>, String>;
 
     /// Extract a short self-contained MP4 clip beginning at `start_s` and
-    /// running for `duration_s` seconds. Clip-mode realtime analysis hands the
-    /// VLM this moving window instead of stills, so it rides the same swappable
-    /// backend as the two decode phases.
+    /// running for `duration_s` seconds, optionally restricted to `crop`. Clip-
+    /// mode realtime analysis hands the VLM this moving window instead of stills,
+    /// so it rides the same swappable backend as the two decode phases, and the
+    /// crop keeps the clip pinned to the same region the gate saw.
     fn extract_clip(
         &self,
         source: &InputSource,
         start_s: f32,
         duration_s: f32,
+        crop: Option<CropRegion>,
     ) -> Result<Vec<u8>, String>;
 
     fn backend(&self) -> PipelineBackend;
@@ -178,8 +180,9 @@ impl DecodePipeline for CpuFfmpegPipeline {
         source: &InputSource,
         start_s: f32,
         duration_s: f32,
+        crop: Option<CropRegion>,
     ) -> Result<Vec<u8>, String> {
-        extract_video_clip(source, start_s, duration_s)
+        extract_video_clip(source, start_s, duration_s, crop)
     }
 
     fn backend(&self) -> PipelineBackend {
@@ -237,10 +240,11 @@ impl DecodePipeline for NvdecCudaPipeline {
         source: &InputSource,
         start_s: f32,
         duration_s: f32,
+        crop: Option<CropRegion>,
     ) -> Result<Vec<u8>, String> {
         // Local clips are a stream copy and remote ones a short segment re-encode,
         // so NVDEC buys no decode win here. Reuse the CPU extractor.
-        extract_video_clip(source, start_s, duration_s)
+        extract_video_clip(source, start_s, duration_s, crop)
     }
 
     fn backend(&self) -> PipelineBackend {
@@ -401,10 +405,11 @@ impl DecodePipeline for MlxVideoToolboxPipeline {
         source: &InputSource,
         start_s: f32,
         duration_s: f32,
+        crop: Option<CropRegion>,
     ) -> Result<Vec<u8>, String> {
         // Local clips are a stream copy and remote ones a short segment re-encode,
         // so VideoToolbox buys no decode win here either. Reuse the CPU extractor.
-        extract_video_clip(source, start_s, duration_s)
+        extract_video_clip(source, start_s, duration_s, crop)
     }
 
     fn backend(&self) -> PipelineBackend {

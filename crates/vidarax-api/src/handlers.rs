@@ -1205,20 +1205,6 @@ fn validate_realtime_reason_params(
             )],
         ));
     }
-    // Clip mode hands the VLM a re-extracted MP4 window, and the clip extractor
-    // does not crop yet, so a crop would restrict the gate but not the video the
-    // model actually sees. Reject the combination rather than analyze the whole
-    // frame while claiming the crop was applied.
-    if crop.is_some() && video_clip_mode {
-        return Err(validation_error(
-            state,
-            "invalid realtime reason request",
-            vec![field_error(
-                "crop",
-                "crop is not supported together with video_clip_mode".to_string(),
-            )],
-        ));
-    }
 
     let fixed_fps = payload.fixed_fps.unwrap_or(1.0);
     if sampling_policy == SamplingPolicy::Fixed && !(0.2..=120.0).contains(&fixed_fps) {
@@ -1710,6 +1696,7 @@ pub async fn reason_realtime_run(
         video_clip_mode,
         semantic_decode_enabled,
         video_clip_duration_s,
+        crop,
     )
     .await;
 

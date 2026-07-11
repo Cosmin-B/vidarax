@@ -209,6 +209,7 @@ pub async fn prepare_realtime_chunks(
     video_clip_mode: bool,
     semantic_decode_enabled: bool,
     video_clip_duration_s: f32,
+    crop: Option<vidarax_core::crop::CropRegion>,
 ) -> Vec<ChunkPrep> {
     let mut chunk_preps: Vec<ChunkPrep> = Vec::new();
     for (chunk_idx, chunk) in signals.chunks(chunk_size).enumerate() {
@@ -236,7 +237,7 @@ pub async fn prepare_realtime_chunks(
             let clip_pipeline = Arc::clone(decode_pipeline);
             let duration = video_clip_duration_s;
             match tokio::task::spawn_blocking(move || {
-                clip_pipeline.extract_clip(clip_source.source(), clip_start, duration)
+                clip_pipeline.extract_clip(clip_source.source(), clip_start, duration, crop)
             })
             .await
             {

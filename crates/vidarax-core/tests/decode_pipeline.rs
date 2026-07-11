@@ -125,6 +125,7 @@ impl DecodePipeline for CustomPipeline {
         _source: &InputSource,
         _start_s: f32,
         _duration_s: f32,
+        _crop: Option<vidarax_core::crop::CropRegion>,
     ) -> Result<Vec<u8>, String> {
         unimplemented!("test backend is only built, not executed")
     }

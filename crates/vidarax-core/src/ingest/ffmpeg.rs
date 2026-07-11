@@ -932,17 +932,34 @@ pub fn build_select_expr(indices: &[u64]) -> String {
     expr
 }
 
-/// Extract a short MP4 clip from `source`.
+/// Decide how to produce a clip: whether it can be stream-copied, and the crop
+/// filter to apply if any.
+///
+/// Stream copy passes packets through untouched, so it is only possible for a
+/// local file with no effective crop; a crop (or a remote source) forces a
+/// re-encode. A full-frame crop is a no-op and neither adds a filter nor forces
+/// the re-encode.
+fn clip_encode_plan(source: &InputSource, crop: Option<CropRegion>) -> (bool, Option<String>) {
+    let crop_vf = crop
+        .filter(|c| !c.is_full_frame())
+        .map(|c| c.ffmpeg_crop_filter());
+    let use_stream_copy = matches!(source, InputSource::FilePath(_)) && crop_vf.is_none();
+    (use_stream_copy, crop_vf)
+}
+
+/// Extract a short MP4 clip from `source`, optionally restricted to a crop.
 ///
 /// Local files use stream copy; remote/HLS sources are re-encoded into a
-/// self-contained temporary MP4 and read back.
+/// self-contained temporary MP4 and read back. A crop forces the re-encode path
+/// even for a local file, since stream copy cannot run a video filter.
 pub fn extract_video_clip(
     source: &InputSource,
     start_s: f32,
     duration_s: f32,
+    crop: Option<CropRegion>,
 ) -> Result<Vec<u8>, String> {
     with_prefetched_downloadable_source(source, |source| {
-        extract_video_clip_inner(source, start_s, duration_s)
+        extract_video_clip_inner(source, start_s, duration_s, crop)
     })?
 }
 
@@ -950,6 +967,7 @@ fn extract_video_clip_inner(
     source: &InputSource,
     start_s: f32,
     duration_s: f32,
+    crop: Option<CropRegion>,
 ) -> Result<Vec<u8>, String> {
     if !start_s.is_finite() || start_s < 0.0 {
         return Err("start_s must be >= 0".to_string());
@@ -957,15 +975,16 @@ fn extract_video_clip_inner(
     if !duration_s.is_finite() || duration_s <= 0.0 {
         return Err("duration_s must be > 0".to_string());
     }
+    if let Some(crop) = crop {
+        crop.validate().map_err(|e| e.to_string())?;
+    }
 
     let source_uri = source.as_ffmpeg_input();
     let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
     let start_str = format!("{start_s:.6}");
     let duration_str = format!("{duration_s:.6}");
 
-    // Local files can use stream copy without re-encoding.
-    // Remote/HLS sources need a re-encode to produce a self-contained clip.
-    let use_stream_copy = matches!(source, InputSource::FilePath(_));
+    let (use_stream_copy, crop_vf) = clip_encode_plan(source, crop);
 
     // MP4 requires seekable output, so we write to a temp file and read back.
     let tmp = std::env::temp_dir().join(format!(
@@ -999,25 +1018,23 @@ fn extract_video_clip_inner(
             .output()
             .map_err(|_| "failed to run ffmpeg".to_string())?
     } else {
-        Command::new(ffmpeg_path())
-            .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
+        let mut cmd = Command::new(ffmpeg_path());
+        cmd.args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
             .args(ffmpeg_input_options_for_source(source))
-            .args([
-                "-ss",
-                &start_str,
-                "-t",
-                &duration_str,
-                "-i",
-                source_uri,
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-an",
-                "-y",
-                &tmp_str,
-            ])
-            .output()
+            .args(["-ss", &start_str, "-t", &duration_str, "-i", source_uri]);
+        if let Some(vf) = &crop_vf {
+            cmd.args(["-vf", vf]);
+        }
+        cmd.args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-an",
+            "-y",
+            &tmp_str,
+        ]);
+        cmd.output()
             .map_err(|_| "failed to run ffmpeg".to_string())?
     };
 
@@ -1148,13 +1165,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        ahash_cell_grid, ahashes_from_gray_grid, build_decode_vf, ffmpeg_input_options_for_source,
-        ffmpeg_protocol_whitelist_for_source, longest_edge_scale_filter, parse_ffprobe_frame_rate,
-        parse_framemd5_to_signals, parse_jpeg_stream_to_frames, CropRegion, Mp4DecodeConfig,
-        Timebase, TimestampNormalizer, FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST,
-        FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST, FFMPEG_HTTPS_PROTOCOL_WHITELIST,
-        FFMPEG_HTTP_PROTOCOL_WHITELIST, FFMPEG_LOCAL_PROTOCOL_WHITELIST,
-        FFMPEG_RTSPS_PROTOCOL_WHITELIST,
+        ahash_cell_grid, ahashes_from_gray_grid, build_decode_vf, clip_encode_plan,
+        ffmpeg_input_options_for_source, ffmpeg_protocol_whitelist_for_source,
+        longest_edge_scale_filter, parse_ffprobe_frame_rate, parse_framemd5_to_signals,
+        parse_jpeg_stream_to_frames, CropRegion, Mp4DecodeConfig, Timebase, TimestampNormalizer,
+        FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST, FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST,
+        FFMPEG_HTTPS_PROTOCOL_WHITELIST, FFMPEG_HTTP_PROTOCOL_WHITELIST,
+        FFMPEG_LOCAL_PROTOCOL_WHITELIST, FFMPEG_RTSPS_PROTOCOL_WHITELIST,
     };
     use crate::ingest::InputSource;
 
@@ -1352,6 +1369,38 @@ mod tests {
             height: 1.0,
         };
         assert_eq!(build_decode_vf(Some(full), 4.0, None), "fps=4.000");
+    }
+
+    #[test]
+    fn clip_encode_plan_re_encodes_only_when_a_crop_needs_it() {
+        let local = InputSource::FilePath("/tmp/x.mp4".to_string());
+        let remote = InputSource::Url("https://example.com/x.mp4".to_string());
+        let crop = CropRegion {
+            x: 0.25,
+            y: 0.25,
+            width: 0.5,
+            height: 0.5,
+        };
+        let full = CropRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+
+        // Local, no crop: stream copy, no filter.
+        assert_eq!(clip_encode_plan(&local, None), (true, None));
+        // Local, full-frame crop: still a no-op, so still stream copy.
+        assert_eq!(clip_encode_plan(&local, Some(full)), (true, None));
+        // Local, real crop: must re-encode with a crop filter.
+        let (copy, vf) = clip_encode_plan(&local, Some(crop));
+        assert!(!copy);
+        assert!(vf.expect("crop filter").starts_with("crop="));
+        // Remote source always re-encodes; a crop just adds the filter.
+        assert_eq!(clip_encode_plan(&remote, None), (false, None));
+        let (copy, vf) = clip_encode_plan(&remote, Some(crop));
+        assert!(!copy);
+        assert!(vf.is_some());
     }
 
     #[test]
