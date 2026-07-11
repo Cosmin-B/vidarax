@@ -18,7 +18,7 @@ paths. Values below come from the current Rust source, mainly
 | `VIDARAX_CONFIG` | `vidarax.toml` | Backend TOML path, used when explicit backend URLs are not set. |
 | `VIDARAX_VLLM_BASE_URL` | unset | vLLM OpenAI-compatible base URL. When set, it is used as priority 1. |
 | `VIDARAX_SGLANG_BASE_URL` | unset | SGLang OpenAI-compatible base URL. When set, it is used as priority 2. |
-| `VIDARAX_DECODE_BACKEND` | `auto` | Video decode backend. Accepts `cpu`, `ffmpeg`, `cpu-ffmpeg`, `nvdec`, `cuda`, `nvdec-cuda`, `gpu`, `mlx`, `apple`, or `metal`. |
+| `VIDARAX_DECODE_BACKEND` | `auto` | Video decode backend. Accepts `cpu`, `ffmpeg`, `cpu-ffmpeg`, `nvdec`, `cuda`, `nvdec-cuda`, `gpu`, `mlx`, `apple`, `metal`, or `videotoolbox`. |
 | `VIDARAX_FFMPEG_PATH` | `ffmpeg` | ffmpeg binary path. |
 | `VIDARAX_FFPROBE_PATH` | `ffprobe` | ffprobe binary path. |
 | `VIDARAX_NVIDIA_SMI_PATH` | `nvidia-smi` | Binary used by decode auto-detection to find NVIDIA hardware. |
@@ -40,6 +40,10 @@ paths. Values below come from the current Rust source, mainly
 | `VIDARAX_WEBRTC_DECODE_WORKERS` | `1` | Loaded for compatibility, clamped to 1. One ordered stream uses one stateful decoder. |
 | `VIDARAX_WEBRTC_ANALYSIS_WORKERS` | `1` | Loaded for compatibility, clamped to 1. Analysis owns stream-order state. |
 | `VIDARAX_WEBRTC_VLM_WORKERS` | `1` | Loaded for compatibility, clamped to 1. VLM processing owns temporal state. |
+| `VIDARAX_WEBRTC_FIRST_PASS_MODEL` | `Qwen/Qwen3-VL-8B-Instruct` | Local first-pass VLM for WebRTC keyframes. Must be a supported model id. |
+| `VIDARAX_WEBRTC_SECOND_PASS_MODEL` | unset | Escalation model id. Set to a distinct supported id (e.g. a `gemini` backend's model) to enable tiering; unset or equal to the first pass keeps sessions local-only. |
+| `VIDARAX_WEBRTC_SECOND_PASS_THRESHOLD` | `0.7` | Escalate when first-pass confidence is below this. Clamped to `[0.0, 1.0]`; non-finite values fall back to the default. |
+| `VIDARAX_WEBRTC_SECOND_PASS_MAX_TOKENS` | `256` | Output token cap for the escalation pass. |
 | `VIDARAX_DISTILL_ENABLED` | `false` | Enable distillation sample collection. |
 | `VIDARAX_DISTILL_EMBEDDING_URL` | unset | Optional embedding server URL. |
 | `VIDARAX_DISTILL_TEACHER_MODEL` | `Qwen/Qwen3-VL-8B-Instruct` | Teacher VLM model used for distillation labels. |
@@ -116,8 +120,13 @@ interpolation.
 
 The video decode backend is separate from the VLM backend. `cpu-ffmpeg` works
 with ffmpeg and ffprobe on `PATH`. `nvdec-cuda` uses ffmpeg with NVDEC for the
-JPEG phase. `mlx` is registered as an Apple Silicon decode option, but the
-current implementation falls back to the CPU ffmpeg pipeline.
+JPEG phase. `mlx`, `apple`, `metal`, and `videotoolbox` are aliases for the
+same backend, which uses ffmpeg's `-hwaccel videotoolbox` for the JPEG phase
+on Apple Silicon. As with `nvdec-cuda`, the frame-signal phase runs on CPU
+regardless of backend: it decodes to `framemd5` text output, which has no
+hardware-decode benefit. This backend requires an ffmpeg binary built with
+VideoToolbox support; if the configured `ffmpeg` lacks it, decode fails at
+runtime with an error rather than silently falling back to the CPU pipeline.
 
 ## Deployment dependencies
 
@@ -152,8 +161,11 @@ VIDARAX_DATA_DIR=/var/lib/vidarax
 `deploy/docker-compose.local.yml` builds that Dockerfile, exposes the API on
 `127.0.0.1:8080`, mounts a named volume for `/var/lib/vidarax`, and starts
 VictoriaMetrics, VictoriaLogs, and VictoriaTraces. The compose file sets an
-OTLP traces endpoint, but it does not configure an inference backend or API
-keys. Add those values before using the API with the default security settings.
+OTLP traces endpoint and a local-dev placeholder API key (the same value the
+metrics scrape sends as its `x-api-key` header), but it does not configure an
+inference backend. Point `VIDARAX_VLLM_BASE_URL`/`VIDARAX_SGLANG_BASE_URL` at a
+running backend, and replace the placeholder key, before using the API anywhere
+reachable by anyone but you.
 
 Check readiness with:
 

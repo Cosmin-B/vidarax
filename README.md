@@ -9,7 +9,7 @@ Vidarax decodes live or file-based video, runs a deterministic gate engine (scen
 ```
  Sources                      vidarax                           Consumers
 ┌──────────┐   ┌──────────────────────────────────────────┐   ┌──────────────┐
-│ MP4/File  │──>│                                          │──>│ REST / SSE   │
+│ MP4/File  │──>│                                          │──>│ REST (poll)  │
 │ WebRTC    │──>│  Decode ──> Gate Engine ──> VLM Tiering  │──>│ TypeScript   │
 │ RTSP/HLS  │──>│               │                │         │──>│   SDK        │
 │ Upload    │──>│          Markers +         Semantic       │──>│ Vue 3 UI     │
@@ -34,7 +34,7 @@ one only when it is uncertain.
 ### Local
 
 ```bash
-git clone https://github.com/vidarax/vidarax && cd vidarax
+git clone https://github.com/Cosmin-B/vidarax && cd vidarax
 cargo build --release -p vidarax-api
 VIDARAX_API_KEYS=dev-key VIDARAX_VLLM_BASE_URL=http://localhost:8000 cargo run --release -p vidarax-api
 ```
@@ -56,13 +56,24 @@ import { Vidarax } from 'vidarax'
 
 const v = new Vidarax('http://localhost:8080', { apiKey: 'your-key' })
 
-const run = await v.analyze('video.mp4', {
-  prompt: 'Describe what happens in each scene',
-})
+// analyze() runs the deterministic frame-signal pipeline; it takes no prompt.
+const run = await v.analyze('video.mp4', { mode: 'balanced' })
 
 for await (const event of run.events()) {
   console.log(event.kind, event.payload)
 }
+```
+
+For prompt-driven semantic analysis, create a run and call `reason()` with a
+`semantic_prompt` instead:
+
+```typescript
+const { run_id } = await v.createRun()
+const result = await v.reason(run_id, {
+  source_uri: 'video.mp4',
+  model: 'your-model',
+  semantic_prompt: 'Describe what happens in each scene',
+})
 ```
 
 The SDK also supports WebRTC streaming, batch inference, structured JSON output via `output_schema`, and typed async iterators over events and markers.
@@ -80,7 +91,7 @@ The SDK also supports WebRTC streaming, batch inference, structured JSON output 
 | `POST` | `/v1/runs/:id/reason` | Realtime semantic reasoning (tiered VLM) |
 | `POST` | `/v1/runs/:id/stop` | Stop a run |
 | `POST` | `/v1/runs/:id/keepalive` | Refresh active run TTL |
-| `GET` | `/v1/runs/:id/events` | Stream run events |
+| `GET` | `/v1/runs/:id/events` | List run events (poll; the SDK does not push-stream this) |
 | `GET` | `/v1/runs/:id/markers` | Marker timeline (filterable) |
 | `GET` | `/v1/runs/:id/state` | Derived run state |
 | `GET` | `/v1/runs/:id/interactions` | Interaction timeline |
@@ -116,6 +127,45 @@ The SDK also supports WebRTC streaming, batch inference, structured JSON output 
 
 Full configuration reference in [docs/deployment.md](docs/deployment.md).
 
+### Local first-pass VLM on Apple Silicon (mlx-vlm)
+
+[mlx-vlm](https://github.com/Blaizzy/mlx-vlm) runs a Vision Language Model on-device
+on Apple Silicon and serves it behind the same OpenAI-compatible
+`/v1/chat/completions` API as vLLM/SGLang, so it plugs into vidarax as an
+ordinary `openai_compat` backend, with no new provider code needed on the
+vidarax side:
+
+```bash
+pip install mlx-vlm
+# Serve a supported VL family. vidarax accepts only its curated model ids, so the
+# id you hand back to vidarax has to be one of them (see the note below).
+mlx_vlm.server --model mlx-community/Qwen3-VL-4B-Instruct-4bit --port 8080
+```
+
+Point a backend at it with `openai_kind = "mlx"` so its telemetry (`/v1/metrics`)
+and its side of the tiering split are labelled `mlx` instead of `vllm`:
+
+```toml
+[[backends]]
+name = "mlx"
+type = "openai_compat"
+openai_kind = "mlx"
+base_url = "http://127.0.0.1:8080"
+priority = 1
+```
+
+To escalate uncertain first-pass results to a hosted Gemini second pass, add a
+`gemini` backend (see the commented example in `vidarax.toml`) and set the
+`reason()`/WHIP second-pass model to that backend's exact `model` id: the
+model-routing provider dispatches on that id, so nothing else needs to change.
+
+vidarax checks every request's `model` id against its supported-model contract
+and rejects unknown ids before it opens a connection, so the first-pass and
+second-pass models you configure must be supported ids, for example
+`Qwen/Qwen3-VL-4B-Instruct`, not a raw `mlx-community/...-4bit` conversion name.
+Load the matching conversion under mlx-vlm and make sure its server answers to
+that id.
+
 ## Tech stack
 
 | Layer | Technology |
@@ -123,7 +173,7 @@ Full configuration reference in [docs/deployment.md](docs/deployment.md).
 | Backend | Rust, Axum, Hyper (HTTP/1.1 + H2, optional H3) |
 | Gate engine | Deterministic frame analysis on a single-threaded hot path |
 | Inference | vLLM and SGLang through OpenAI-compatible backends with fallback |
-| Decode | ffmpeg CPU and NVDEC; the registered MLX decode path currently falls back to CPU ffmpeg |
+| Decode | ffmpeg CPU, NVDEC, and Apple VideoToolbox (the MLX decode backend); VideoToolbox may fall back to software decode inside ffmpeg when the input or host cannot initialise hardware |
 | Persistence | WAL-backed event log; optional SpacetimeDB client and module are present but not wired into the production server path |
 | Frontend | Vue 3, dark command-center UI |
 | Streaming | WebRTC via WHIP (RFC 9725) |
