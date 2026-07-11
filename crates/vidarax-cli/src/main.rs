@@ -210,6 +210,53 @@ struct SearchArgs {
     limit: Option<usize>,
 }
 
+/// A region of interest parsed from the `--crop X,Y,W,H` flag, as fractions of
+/// the frame. Shape is validated here; the server enforces the range and
+/// in-frame bounds so both sides agree on one rule.
+#[derive(Debug, Clone, Copy)]
+struct CropArg {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+impl std::str::FromStr for CropArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+        if parts.len() != 4 {
+            return Err(
+                "crop must be four comma-separated fractions: X,Y,WIDTH,HEIGHT".to_string(),
+            );
+        }
+        let mut vals = [0f32; 4];
+        for (slot, part) in vals.iter_mut().zip(parts.iter()) {
+            *slot = part
+                .parse::<f32>()
+                .map_err(|_| format!("crop value '{part}' is not a number"))?;
+        }
+        Ok(CropArg {
+            x: vals[0],
+            y: vals[1],
+            width: vals[2],
+            height: vals[3],
+        })
+    }
+}
+
+impl CropArg {
+    fn to_json(self) -> Value {
+        json!({
+            "x": self.x,
+            "y": self.y,
+            "width": self.width,
+            "height": self.height,
+        })
+    }
+}
+
 #[derive(Args, Debug, Clone)]
 struct AnalyzeArgs {
     /// Local video file to analyze.
@@ -238,6 +285,11 @@ struct AnalyzeArgs {
     /// Optional ingest sampling policy.
     #[arg(long, value_name = "P")]
     sampling_policy: Option<String>,
+    /// Analyze only a region of the frame: X,Y,WIDTH,HEIGHT as fractions in
+    /// [0,1] (e.g. 0.25,0.25,0.5,0.5 for the center half). Restricts both the
+    /// gate and the VLM to that part of the screen. Omit to analyze the whole frame.
+    #[arg(long, value_name = "X,Y,W,H")]
+    crop: Option<CropArg>,
 }
 
 impl AnalyzeArgs {
@@ -302,6 +354,9 @@ impl AnalyzeArgs {
                 "semantic_prompt".to_string(),
                 Value::String(prompt.to_string()),
             );
+        }
+        if let Some(crop) = self.crop {
+            body.insert("crop".to_string(), crop.to_json());
         }
         Value::Object(body)
     }
@@ -1386,6 +1441,27 @@ fn print_analyze_human(response: &Value, output: OutputMode, generated: u64, chu
         "decoded_frames={decoded_frames} frames={generated} chunks={chunks} markers_emitted={markers_emitted} sample_fps={sample_fps:.2}"
     );
 
+    // Token + latency cost of the analysis (e2e model spend across all chunks).
+    if let Some(tokens) = response.get("tokens") {
+        let total = u64_field(tokens, "total_tokens").unwrap_or(0);
+        if total > 0 {
+            let prompt = u64_field(tokens, "prompt_tokens").unwrap_or(0);
+            let completion = u64_field(tokens, "completion_tokens").unwrap_or(0);
+            let thinking = u64_field(tokens, "thinking_tokens").unwrap_or(0);
+            let infer_ms = u64_field(tokens, "inference_latency_ms").unwrap_or(0);
+            let analyzed = u64_field(tokens, "chunks_analyzed").unwrap_or(0);
+            let per_chunk = if analyzed > 0 { total / analyzed } else { 0 };
+            let mut cost = format!("tokens total={total} (prompt={prompt} completion={completion}");
+            if thinking > 0 {
+                cost.push_str(&format!(" thinking={thinking}"));
+            }
+            cost.push_str(&format!(
+                ") ~{per_chunk}/chunk infer_latency={infer_ms}ms across {analyzed} chunks"
+            ));
+            println!("{}", colorize(&cost, "dim", output.color));
+        }
+    }
+
     let metadata = response
         .get("metadata")
         .and_then(Value::as_array)
@@ -2305,7 +2381,36 @@ mod tests {
             max_frames: None,
             index_name: None,
             sampling_policy: None,
+            crop: None,
         }
+    }
+
+    #[test]
+    fn crop_arg_parses_four_fractions_and_rejects_malformed() {
+        let c: CropArg = "0.1, 0.2 ,0.3,0.4".parse().expect("valid crop");
+        assert_eq!(c.x, 0.1);
+        assert_eq!(c.y, 0.2);
+        assert_eq!(c.width, 0.3);
+        assert_eq!(c.height, 0.4);
+        assert!("0.1,0.2,0.3".parse::<CropArg>().is_err());
+        assert!("a,b,c,d".parse::<CropArg>().is_err());
+        assert!("".parse::<CropArg>().is_err());
+    }
+
+    #[test]
+    fn reason_body_includes_crop_only_when_supplied() {
+        let mut args = analyze_args();
+        assert!(args.reason_body("/tmp/x.mp4").get("crop").is_none());
+        args.crop = Some(CropArg {
+            x: 0.25,
+            y: 0.25,
+            width: 0.5,
+            height: 0.5,
+        });
+        let body = args.reason_body("/tmp/x.mp4");
+        let crop = body.get("crop").expect("crop present");
+        assert_eq!(crop.get("x").and_then(Value::as_f64), Some(0.25));
+        assert_eq!(crop.get("width").and_then(Value::as_f64), Some(0.5));
     }
 
     #[test]

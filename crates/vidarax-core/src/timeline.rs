@@ -105,6 +105,13 @@ impl WalWriter {
         Ok(Self { path, file })
     }
 
+    /// Durability policy: an appended event is written and flushed out of the
+    /// process, so it survives a process crash and is immediately visible to
+    /// readers. It is NOT fsync'd, so it can still be lost if the machine loses
+    /// power or the kernel panics before the page cache reaches disk. This is a
+    /// deliberate throughput choice for a high-rate event log: the WAL is
+    /// crash-safe, not power-loss-safe. Callers that need power-loss durability
+    /// must add their own fsync or run on storage that guarantees it.
     pub fn append(&mut self, event: &TimelineEvent) -> Result<(), TimelineError> {
         writeln!(self.file, "{}", event.encode_line())?;
         self.file.flush()?;

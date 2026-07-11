@@ -1,6 +1,7 @@
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use crate::crop::CropRegion;
 use crate::gate::FrameSignal;
 
 use super::fetch::with_prefetched_downloadable_source;
@@ -119,6 +120,32 @@ pub struct FramePacket {
     pub source_uri: String,
 }
 
+/// A stream time base as a rational `num/den` seconds per PTS tick, with the two
+/// halves kept together so a caller cannot transpose them. A bare `(num, den)`
+/// pair of `u32`s is the classic way a PTS-to-milliseconds conversion silently
+/// corrupts a whole stream: the two arguments are adjacent, same-typed, and a
+/// swap compiles cleanly while turning, say, 1/1000 into 1000/1. Both halves are
+/// floored at 1 in the constructor — a zero from a malformed container header
+/// would otherwise make the ratio degenerate or divide by zero — so downstream
+/// arithmetic stays total and needs no second guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timebase {
+    num: u32,
+    den: u32,
+}
+
+impl Timebase {
+    /// Builds a time base, flooring each half at 1. Keeping that clamp here means
+    /// the "never zero" invariant lives in exactly one place rather than at every
+    /// site that parses a `num/den` out of a container.
+    pub fn new(num: u32, den: u32) -> Self {
+        Self {
+            num: num.max(1),
+            den: den.max(1),
+        }
+    }
+}
+
 pub struct TimestampNormalizer {
     base_pts: Option<i64>,
     last_ms: u64,
@@ -133,16 +160,19 @@ impl TimestampNormalizer {
     }
 
     /// Normalizes PTS to monotonic milliseconds from the first observed frame.
-    pub fn normalize_pts_ms(&mut self, pts: i64, timebase_num: u32, timebase_den: u32) -> u64 {
+    pub fn normalize_pts_ms(&mut self, pts: i64, timebase: Timebase) -> u64 {
         let base = *self.base_pts.get_or_insert(pts);
         let delta = pts.saturating_sub(base).max(0) as u128;
-        let num = (timebase_num as u128).saturating_mul(1000);
-        let den = (timebase_den as u128).max(1);
+        let num = (timebase.num as u128).saturating_mul(1000);
+        let den = timebase.den as u128;
         let mut ms = delta.saturating_mul(num) / den;
         if ms < self.last_ms as u128 {
             ms = self.last_ms as u128;
         }
-        let ms = ms as u64;
+        // Saturate rather than truncate: an absurd timebase can push the u128
+        // result past u64::MAX, and a plain cast would wrap it below last_ms and
+        // break the monotonic contract this function promises.
+        let ms = ms.min(u64::MAX as u128) as u64;
         self.last_ms = ms;
         ms
     }
@@ -182,6 +212,20 @@ pub fn make_frame_packet(input: FramePacketInput<'_>) -> FramePacket {
 pub struct Mp4DecodeConfig {
     pub sample_fps: f32,
     pub max_frames: usize,
+    /// Optional cap on the longest edge of each decoded frame, in pixels.
+    ///
+    /// When set, an ffmpeg `scale` filter downsamples every frame so its longer
+    /// side is at most this many pixels (aspect preserved, even dims, never
+    /// upscaled). This is the "fewer pixels" lever: a 1920x1080 frame costs ~4
+    /// Gemini image tiles, but capping the longest edge to 768 collapses it to a
+    /// single tile — roughly a 4x cut in per-image prompt tokens. `None` leaves
+    /// frames at source resolution.
+    pub max_edge: Option<u32>,
+    /// Optional region of interest. When set, an ffmpeg `crop` filter runs first
+    /// in every decode pass, so both the gate's frame signals and the JPEG the
+    /// VLM sees are restricted to the same sub-rectangle of the frame. `None`
+    /// analyzes the whole frame.
+    pub crop: Option<CropRegion>,
 }
 
 impl Default for Mp4DecodeConfig {
@@ -189,6 +233,8 @@ impl Default for Mp4DecodeConfig {
         Self {
             sample_fps: 2.0,
             max_frames: 512,
+            max_edge: None,
+            crop: None,
         }
     }
 }
@@ -205,7 +251,7 @@ pub struct DecodedMp4Batch {
 #[derive(Debug, Clone)]
 pub struct DecodedJpegFrame {
     pub frame_index: u64,
-    pub jpeg_bytes: Vec<u8>,
+    pub jpeg_bytes: Arc<[u8]>,
 }
 
 pub fn probe_source_fps(source: &InputSource) -> Option<f32> {
@@ -278,10 +324,15 @@ fn decode_mp4_to_frame_signals_inner(
     if config.max_frames == 0 {
         return Err("max_frames must be >= 1".to_string());
     }
+    // External callers validate the crop already; this guards a programmatically
+    // built config so an invalid crop is a clear error, not a cryptic ffmpeg one.
+    if let Some(crop) = config.crop {
+        crop.validate().map_err(|e| e.to_string())?;
+    }
 
     let source_uri = source.as_ffmpeg_input();
     let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
-    let fps_expr = format!("fps={:.3}", config.sample_fps);
+    let fps_expr = format!("{}fps={:.3}", crop_prefix(config.crop), config.sample_fps);
     let output = Command::new(ffmpeg_path())
         .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
         .args(ffmpeg_input_options_for_source(source))
@@ -307,11 +358,12 @@ fn decode_mp4_to_frame_signals_inner(
     // frame and average-hash it. Both passes use the same `fps` sampler, so
     // hash[i] lines up with framemd5 frame i. Degrade to the (weak) checksum
     // hash per-frame if the pass fails, so ingest never regresses to an error.
-    let ahashes = compute_ahashes_from_source(source, config.sample_fps, config.max_frames)
-        .unwrap_or_else(|err| {
-            tracing::warn!(%err, "perceptual-hash pass failed; falling back to checksum hash");
-            Vec::new()
-        });
+    let ahashes =
+        compute_ahashes_from_source(source, config.crop, config.sample_fps, config.max_frames)
+            .unwrap_or_else(|err| {
+                tracing::warn!(%err, "perceptual-hash pass failed; falling back to checksum hash");
+                Vec::new()
+            });
     parse_framemd5_to_signals(&text, source_uri, config.max_frames, &ahashes)
 }
 
@@ -322,14 +374,19 @@ fn decode_mp4_to_frame_signals_inner(
 /// as the framemd5 pass, so the returned hashes align index-for-index.
 fn compute_ahashes_from_source(
     source: &InputSource,
+    crop: Option<CropRegion>,
     sample_fps: f32,
     max_frames: usize,
 ) -> Result<Vec<u64>, String> {
     let source_uri = source.as_ffmpeg_input();
     let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
-    // fps first (same frame set as framemd5), then squash to 8×8 luma. `area`
-    // box-averages on downscale; `format=gray` makes it one byte per cell.
-    let vf_expr = format!("fps={sample_fps:.3},scale=8:8:flags=area,format=gray");
+    // Optional crop first (so the hash sees only the ROI), then fps (same frame
+    // set as framemd5), then squash to 8×8 luma. `area` box-averages on
+    // downscale; `format=gray` makes it one byte per cell.
+    let vf_expr = format!(
+        "{}fps={sample_fps:.3},scale=8:8:flags=area,format=gray",
+        crop_prefix(crop)
+    );
     let output = Command::new(ffmpeg_path())
         .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
         .args(ffmpeg_input_options_for_source(source))
@@ -383,6 +440,53 @@ fn ahash_cell_grid(cells: &[u8]) -> u64 {
     hash
 }
 
+/// An ffmpeg `scale` filter that caps the longest edge of a frame to `max_edge`
+/// pixels, or `None` when no cap is requested.
+///
+/// The expression preserves aspect ratio, forces even output dimensions
+/// (`-2`), and never upscales (`min(edge, source_dim)`). Landscape/square frames
+/// cap width; portrait caps height. This is the "fewer pixels" lever: a
+/// 1920x1080 frame costs ~4 Gemini image tiles, but capping the longest edge to
+/// 768 collapses it to a single tile — roughly a 4x cut in per-image tokens.
+pub(crate) fn longest_edge_scale_filter(max_edge: Option<u32>) -> Option<String> {
+    match max_edge {
+        Some(edge) if edge > 1 => {
+            // Force the cap even so the explicitly-sized side is even; the
+            // derived side uses `-2` (nearest even). Both even keeps the mjpeg /
+            // yuv420p (4:2:0) NVDEC path valid for any requested cap, e.g. 769.
+            let edge = edge & !1;
+            Some(format!(
+                "scale='if(gte(iw,ih),min(iw,{edge}),-2)':'if(gte(iw,ih),-2,min(ih,{edge}))'"
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// A `crop=...,` prefix for a `-vf` chain, or an empty string when there is no
+/// crop. Because the crop runs first, every later filter (`fps`, `select`,
+/// `scale`) sees only the cropped region, and the framemd5 signals, the 8x8
+/// perceptual-hash grid, and the mjpeg frames all decode from the identical ROI.
+fn crop_prefix(crop: Option<CropRegion>) -> String {
+    match crop {
+        // A full-frame crop is a no-op; emitting `crop=iw:ih:0:0` would only risk
+        // trimming an odd last row/column, so skip it.
+        Some(c) if !c.is_full_frame() => format!("{},", c.ffmpeg_crop_filter()),
+        _ => String::new(),
+    }
+}
+
+/// Build the `-vf` chain for a full JPEG decode: optional crop, then the `fps`
+/// sampler, then an optional longest-edge scale cap.
+fn build_decode_vf(crop: Option<CropRegion>, sample_fps: f32, max_edge: Option<u32>) -> String {
+    let fps_expr = format!("fps={sample_fps:.3}");
+    let sized = match longest_edge_scale_filter(max_edge) {
+        Some(scale) => format!("{fps_expr},{scale}"),
+        None => fps_expr,
+    };
+    format!("{}{sized}", crop_prefix(crop))
+}
+
 pub fn decode_mp4_to_jpeg_frames(
     source: &InputSource,
     config: Mp4DecodeConfig,
@@ -405,7 +509,7 @@ fn decode_mp4_to_jpeg_frames_inner(
 
     let source_uri = source.as_ffmpeg_input();
     let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
-    let fps_expr = format!("fps={:.3}", config.sample_fps);
+    let vf_expr = build_decode_vf(config.crop, config.sample_fps, config.max_edge);
     let output = Command::new(ffmpeg_path())
         .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
         .args(ffmpeg_input_options_for_source(source))
@@ -416,7 +520,7 @@ fn decode_mp4_to_jpeg_frames_inner(
             "-sn",
             "-dn",
             "-vf",
-            &fps_expr,
+            &vf_expr,
             "-frames:v",
             &config.max_frames.to_string(),
             "-f",
@@ -443,8 +547,7 @@ fn parse_framemd5_to_signals(
     max_frames: usize,
     ahashes: &[u64],
 ) -> Result<DecodedMp4Batch, String> {
-    let mut tb_num = 1u32;
-    let mut tb_den = 1000u32;
+    let mut timebase = Timebase::new(1, 1000);
     let mut width = 0u32;
     let mut height = 0u32;
     let mut normalizer = TimestampNormalizer::new();
@@ -459,8 +562,7 @@ fn parse_framemd5_to_signals(
         }
         if let Some(rest) = line.strip_prefix("#tb ") {
             if let Some((num, den)) = parse_fraction_suffix(rest) {
-                tb_num = num.max(1);
-                tb_den = den.max(1);
+                timebase = Timebase::new(num, den);
             }
             continue;
         }
@@ -506,11 +608,15 @@ fn parse_framemd5_to_signals(
         let noise_seed = parse_hex_u64_prefix(checksum, 24, 8).unwrap_or(0) as u32;
         let luma_mean = (luma_seed as f64 / u32::MAX as f64) as f32;
         let flicker_score = normalize_unit((luma_mean - prev_luma).abs());
+        // Normalised Hamming *distance* (hd/64), same polarity as the live
+        // webrtc path (signals.rs): a bigger hash delta = higher score. The old
+        // `1.0 - hd/64` (similarity) was inverted — a static screen scored 1.0
+        // and tripped the gate's ghosting threshold on every frame.
         let ghosting_score = prev_hash
             .map(|prev| normalize_unit((prev ^ perceptual_hash).count_ones() as f32 / 64.0))
             .unwrap_or(0.0);
         let noise_variance_score = (noise_seed as f64 / u32::MAX as f64) as f32;
-        let pts_ms = normalizer.normalize_pts_ms(pts, tb_num, tb_den);
+        let pts_ms = normalizer.normalize_pts_ms(pts, timebase);
         let frame_index = frame_signals.len() as u64;
         frame_signals.push(FrameSignal {
             frame_index,
@@ -549,10 +655,6 @@ fn parse_ffprobe_frame_rate(raw: &str) -> Option<f32> {
         return None;
     }
     if let Some((num, den)) = raw.split_once('/') {
-        // Normalised Hamming *distance* (hd/64), same polarity as the live
-        // webrtc path (signals.rs): a bigger hash delta = higher score. The old
-        // `1.0 - hd/64` (similarity) was inverted — a static screen scored 1.0
-        // and tripped the gate's ghosting threshold on every frame.
         let num = num.trim().parse::<f32>().ok()?;
         let den = den.trim().parse::<f32>().ok()?;
         if den <= 0.0 {
@@ -631,7 +733,9 @@ pub(crate) fn parse_jpeg_stream_to_frames(
 
         frames.push(DecodedJpegFrame {
             frame_index: frames.len() as u64,
-            jpeg_bytes: raw[start..end].to_vec(),
+            // Store each decoded JPEG behind an Arc so chunk dispatch can copy
+            // frame descriptors without copying image payloads.
+            jpeg_bytes: raw[start..end].to_vec().into(),
         });
     }
 
@@ -828,17 +932,34 @@ pub fn build_select_expr(indices: &[u64]) -> String {
     expr
 }
 
-/// Extract a short MP4 clip from `source`.
+/// Decide how to produce a clip: whether it can be stream-copied, and the crop
+/// filter to apply if any.
+///
+/// Stream copy passes packets through untouched, so it is only possible for a
+/// local file with no effective crop; a crop (or a remote source) forces a
+/// re-encode. A full-frame crop is a no-op and neither adds a filter nor forces
+/// the re-encode.
+fn clip_encode_plan(source: &InputSource, crop: Option<CropRegion>) -> (bool, Option<String>) {
+    let crop_vf = crop
+        .filter(|c| !c.is_full_frame())
+        .map(|c| c.ffmpeg_crop_filter());
+    let use_stream_copy = matches!(source, InputSource::FilePath(_)) && crop_vf.is_none();
+    (use_stream_copy, crop_vf)
+}
+
+/// Extract a short MP4 clip from `source`, optionally restricted to a crop.
 ///
 /// Local files use stream copy; remote/HLS sources are re-encoded into a
-/// self-contained temporary MP4 and read back.
+/// self-contained temporary MP4 and read back. A crop forces the re-encode path
+/// even for a local file, since stream copy cannot run a video filter.
 pub fn extract_video_clip(
     source: &InputSource,
     start_s: f32,
     duration_s: f32,
+    crop: Option<CropRegion>,
 ) -> Result<Vec<u8>, String> {
     with_prefetched_downloadable_source(source, |source| {
-        extract_video_clip_inner(source, start_s, duration_s)
+        extract_video_clip_inner(source, start_s, duration_s, crop)
     })?
 }
 
@@ -846,6 +967,7 @@ fn extract_video_clip_inner(
     source: &InputSource,
     start_s: f32,
     duration_s: f32,
+    crop: Option<CropRegion>,
 ) -> Result<Vec<u8>, String> {
     if !start_s.is_finite() || start_s < 0.0 {
         return Err("start_s must be >= 0".to_string());
@@ -853,15 +975,16 @@ fn extract_video_clip_inner(
     if !duration_s.is_finite() || duration_s <= 0.0 {
         return Err("duration_s must be > 0".to_string());
     }
+    if let Some(crop) = crop {
+        crop.validate().map_err(|e| e.to_string())?;
+    }
 
     let source_uri = source.as_ffmpeg_input();
     let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
     let start_str = format!("{start_s:.6}");
     let duration_str = format!("{duration_s:.6}");
 
-    // Local files can use stream copy without re-encoding.
-    // Remote/HLS sources need a re-encode to produce a self-contained clip.
-    let use_stream_copy = matches!(source, InputSource::FilePath(_));
+    let (use_stream_copy, crop_vf) = clip_encode_plan(source, crop);
 
     // MP4 requires seekable output, so we write to a temp file and read back.
     let tmp = std::env::temp_dir().join(format!(
@@ -895,25 +1018,23 @@ fn extract_video_clip_inner(
             .output()
             .map_err(|_| "failed to run ffmpeg".to_string())?
     } else {
-        Command::new(ffmpeg_path())
-            .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
+        let mut cmd = Command::new(ffmpeg_path());
+        cmd.args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
             .args(ffmpeg_input_options_for_source(source))
-            .args([
-                "-ss",
-                &start_str,
-                "-t",
-                &duration_str,
-                "-i",
-                source_uri,
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast",
-                "-an",
-                "-y",
-                &tmp_str,
-            ])
-            .output()
+            .args(["-ss", &start_str, "-t", &duration_str, "-i", source_uri]);
+        if let Some(vf) = &crop_vf {
+            cmd.args(["-vf", vf]);
+        }
+        cmd.args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-an",
+            "-y",
+            &tmp_str,
+        ]);
+        cmd.output()
             .map_err(|_| "failed to run ffmpeg".to_string())?
     };
 
@@ -950,9 +1071,18 @@ pub fn decode_selective_jpeg_frames(
     sample_fps: f32,
     frame_indices: &[u64],
     max_frames: usize,
+    max_edge: Option<u32>,
+    crop: Option<CropRegion>,
 ) -> Result<Vec<DecodedJpegFrame>, String> {
     with_prefetched_downloadable_source(source, |source| {
-        decode_selective_jpeg_frames_inner(source, sample_fps, frame_indices, max_frames)
+        decode_selective_jpeg_frames_inner(
+            source,
+            sample_fps,
+            frame_indices,
+            max_frames,
+            max_edge,
+            crop,
+        )
     })?
 }
 
@@ -961,6 +1091,8 @@ pub(crate) fn decode_selective_jpeg_frames_inner(
     sample_fps: f32,
     frame_indices: &[u64],
     max_frames: usize,
+    max_edge: Option<u32>,
+    crop: Option<CropRegion>,
 ) -> Result<Vec<DecodedJpegFrame>, String> {
     if frame_indices.is_empty() {
         return Ok(Vec::new());
@@ -968,9 +1100,16 @@ pub(crate) fn decode_selective_jpeg_frames_inner(
     if !sample_fps.is_finite() || sample_fps <= 0.0 {
         return Err("sample_fps must be > 0".to_string());
     }
+    if let Some(crop) = crop {
+        crop.validate().map_err(|e| e.to_string())?;
+    }
 
     let select_expr = build_select_expr(frame_indices);
-    let vf_chain = format!("fps={sample_fps:.3},{select_expr}");
+    let crop = crop_prefix(crop);
+    let vf_chain = match longest_edge_scale_filter(max_edge) {
+        Some(scale) => format!("{crop}fps={sample_fps:.3},{select_expr},{scale}"),
+        None => format!("{crop}fps={sample_fps:.3},{select_expr}"),
+    };
     let frames_cap = frame_indices.len().min(max_frames).to_string();
 
     let source_uri = source.as_ffmpeg_input();
@@ -1026,9 +1165,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        ahash_cell_grid, ahashes_from_gray_grid, ffmpeg_input_options_for_source,
-        ffmpeg_protocol_whitelist_for_source, parse_ffprobe_frame_rate, parse_framemd5_to_signals,
-        parse_jpeg_stream_to_frames, Mp4DecodeConfig, TimestampNormalizer,
+        ahash_cell_grid, ahashes_from_gray_grid, build_decode_vf, clip_encode_plan,
+        ffmpeg_input_options_for_source, ffmpeg_protocol_whitelist_for_source,
+        longest_edge_scale_filter, parse_ffprobe_frame_rate, parse_framemd5_to_signals,
+        parse_jpeg_stream_to_frames, CropRegion, Mp4DecodeConfig, Timebase, TimestampNormalizer,
         FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST, FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST,
         FFMPEG_HTTPS_PROTOCOL_WHITELIST, FFMPEG_HTTP_PROTOCOL_WHITELIST,
         FFMPEG_LOCAL_PROTOCOL_WHITELIST, FFMPEG_RTSPS_PROTOCOL_WHITELIST,
@@ -1064,11 +1204,24 @@ mod tests {
 
     #[test]
     fn normalizes_pts_monotonically() {
+        let tb = Timebase::new(1, 30);
         let mut n = TimestampNormalizer::new();
-        assert_eq!(n.normalize_pts_ms(300, 1, 30), 0);
-        assert_eq!(n.normalize_pts_ms(330, 1, 30), 1000);
+        assert_eq!(n.normalize_pts_ms(300, tb), 0);
+        assert_eq!(n.normalize_pts_ms(330, tb), 1000);
         // Out-of-order sample should clamp to last_ms for deterministic monotonic output.
-        assert_eq!(n.normalize_pts_ms(320, 1, 30), 1000);
+        assert_eq!(n.normalize_pts_ms(320, tb), 1000);
+    }
+
+    #[test]
+    fn timebase_floors_each_half_at_one() {
+        // A zero denominator from a malformed header must not divide by zero. This
+        // guards the constructor's clamp now that `normalize_pts_ms` no longer
+        // re-guards the denominator itself.
+        let tb = Timebase::new(0, 0);
+        let mut n = TimestampNormalizer::new();
+        // Both halves floored to 1: one tick past the base is 1000 ms, no panic.
+        assert_eq!(n.normalize_pts_ms(5, tb), 0);
+        assert_eq!(n.normalize_pts_ms(6, tb), 1000);
     }
 
     #[test]
@@ -1087,7 +1240,12 @@ mod tests {
         assert_eq!(decoded.height, 240);
         assert_eq!(decoded.frame_signals.len(), 2);
         assert_eq!(decoded.frame_signals[0].pts_ms, 0);
-        assert!(decoded.frame_signals[1].pts_ms >= decoded.frame_signals[0].pts_ms);
+        // Pin the exact millisecond, not just monotonicity: at the parsed 1/25
+        // timebase one PTS tick is 40 ms. A `>=` here would still pass if the
+        // `#tb` line were ignored (falling back to the 1/1000 default → 1 ms) or
+        // the numerator/denominator were transposed, which is the whole thing the
+        // Timebase newtype guards.
+        assert_eq!(decoded.frame_signals[1].pts_ms, 40);
         assert!((0.0..=1.0).contains(&decoded.frame_signals[1].flicker_score));
     }
 
@@ -1143,6 +1301,106 @@ mod tests {
         let cfg = Mp4DecodeConfig::default();
         assert!(cfg.sample_fps > 0.0);
         assert!(cfg.max_frames > 0);
+        // The pixel lever is opt-in: default keeps source resolution.
+        assert!(cfg.max_edge.is_none());
+    }
+
+    #[test]
+    fn longest_edge_scale_filter_is_opt_in() {
+        assert!(longest_edge_scale_filter(None).is_none());
+        // Zero/one are treated as "no cap" so callers can't emit a degenerate
+        // (or after even-rounding, zero-width) scale.
+        assert!(longest_edge_scale_filter(Some(0)).is_none());
+        assert!(longest_edge_scale_filter(Some(1)).is_none());
+    }
+
+    #[test]
+    fn longest_edge_scale_filter_rounds_cap_down_to_even() {
+        // An odd cap must not produce an odd explicit dimension — that would
+        // break the 4:2:0 (yuv420p) NVDEC path. 769 -> 768.
+        let f = longest_edge_scale_filter(Some(769)).expect("cap requested");
+        assert!(f.contains("min(iw,768)"), "odd cap not rounded down: {f}");
+        assert!(!f.contains("769"), "raw odd cap leaked into filter: {f}");
+    }
+
+    #[test]
+    fn longest_edge_scale_filter_caps_longer_side_without_upscaling() {
+        let f = longest_edge_scale_filter(Some(768)).expect("cap requested");
+        // Landscape/square path caps width; portrait path caps height. Both use
+        // min(...) against the source dim so a smaller frame is never upscaled,
+        // and -2 keeps the free dimension even for mjpeg.
+        assert_eq!(
+            f,
+            "scale='if(gte(iw,ih),min(iw,768),-2)':'if(gte(iw,ih),-2,min(ih,768))'"
+        );
+    }
+
+    #[test]
+    fn build_decode_vf_appends_scale_only_when_capped() {
+        assert_eq!(build_decode_vf(None, 4.0, None), "fps=4.000");
+        assert_eq!(
+            build_decode_vf(None, 4.0, Some(768)),
+            "fps=4.000,scale='if(gte(iw,ih),min(iw,768),-2)':'if(gte(iw,ih),-2,min(ih,768))'"
+        );
+    }
+
+    #[test]
+    fn build_decode_vf_prepends_crop_first() {
+        let crop = CropRegion {
+            x: 0.25,
+            y: 0.25,
+            width: 0.5,
+            height: 0.5,
+        };
+        let vf = build_decode_vf(Some(crop), 4.0, Some(768));
+        // Crop must be the FIRST filter so fps and scale operate on the ROI.
+        assert!(vf.starts_with("crop="), "crop not first: {vf}");
+        assert!(vf.contains(",fps=4.000,scale="));
+    }
+
+    #[test]
+    fn build_decode_vf_omits_full_frame_crop() {
+        // A full-frame crop is a no-op and must add no filter (it would only risk
+        // trimming an odd last row/column).
+        let full = CropRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        assert_eq!(build_decode_vf(Some(full), 4.0, None), "fps=4.000");
+    }
+
+    #[test]
+    fn clip_encode_plan_re_encodes_only_when_a_crop_needs_it() {
+        let local = InputSource::FilePath("/tmp/x.mp4".to_string());
+        let remote = InputSource::Url("https://example.com/x.mp4".to_string());
+        let crop = CropRegion {
+            x: 0.25,
+            y: 0.25,
+            width: 0.5,
+            height: 0.5,
+        };
+        let full = CropRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+
+        // Local, no crop: stream copy, no filter.
+        assert_eq!(clip_encode_plan(&local, None), (true, None));
+        // Local, full-frame crop: still a no-op, so still stream copy.
+        assert_eq!(clip_encode_plan(&local, Some(full)), (true, None));
+        // Local, real crop: must re-encode with a crop filter.
+        let (copy, vf) = clip_encode_plan(&local, Some(crop));
+        assert!(!copy);
+        assert!(vf.expect("crop filter").starts_with("crop="));
+        // Remote source always re-encodes; a crop just adds the filter.
+        assert_eq!(clip_encode_plan(&remote, None), (false, None));
+        let (copy, vf) = clip_encode_plan(&remote, Some(crop));
+        assert!(!copy);
+        assert!(vf.is_some());
     }
 
     #[test]
@@ -1312,6 +1570,8 @@ mod tests {
             Mp4DecodeConfig {
                 sample_fps: 1.0,
                 max_frames: 1,
+                max_edge: None,
+                crop: None,
             },
             server.allow_origin_validator(),
         )

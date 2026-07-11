@@ -44,6 +44,58 @@ fn is_downloadable_remote_url(source: &InputSource) -> bool {
     matches!(source, InputSource::Url(url) if url.starts_with("https://") || url.starts_with("http://"))
 }
 
+/// A media source made ready for repeated decode passes. A downloadable remote
+/// URL is fetched once into a temp file that lives as long as this guard, and
+/// every read of [`source`](Self::source) hands back that local path. Reuse it
+/// across probe, signal decode, JPEG decode, and per-chunk clip extraction so
+/// none of them re-download the same bytes. A local or non-downloadable source
+/// passes through untouched and holds no temp file.
+pub struct PreparedSource {
+    source: InputSource,
+    // Kept only for its Drop: deleting the temp file once the guard falls out of
+    // scope. A local passthrough leaves this None.
+    _prefetched: Option<PrefetchedMedia>,
+}
+
+impl PreparedSource {
+    /// The source to hand every decode call. Points at the local temp file for a
+    /// prefetched remote URL, or the original source when nothing was fetched.
+    pub fn source(&self) -> &InputSource {
+        &self.source
+    }
+}
+
+/// Fetch a downloadable remote source once so later decode passes reuse the local
+/// copy instead of re-downloading per call. Applies the same URL validation,
+/// address pinning, and redirect rules as the per-call prefetch path. The caller
+/// must keep the returned guard alive until every decode over the source is done.
+pub fn prepare_source_for_reuse(source: &InputSource) -> Result<PreparedSource, String> {
+    prepare_source_for_reuse_with_validator(source, Arc::new(validate_remote_fetch_url))
+}
+
+fn prepare_source_for_reuse_with_validator(
+    source: &InputSource,
+    validate_url: FetchUrlValidator,
+) -> Result<PreparedSource, String> {
+    if !is_downloadable_remote_url(source) {
+        return Ok(PreparedSource {
+            source: source.clone(),
+            _prefetched: None,
+        });
+    }
+
+    let prefetched = prefetch_remote_media_with_limit_and_validator(
+        source.as_ffmpeg_input(),
+        REMOTE_MEDIA_PREFETCH_MAX_BYTES,
+        validate_url,
+    )?;
+    let source = InputSource::FilePath(prefetched.path.to_string_lossy().to_string());
+    Ok(PreparedSource {
+        source,
+        _prefetched: Some(prefetched),
+    })
+}
+
 pub(crate) fn prefetch_remote_media(url: &str) -> Result<PrefetchedMedia, String> {
     prefetch_remote_media_with_limit(url, REMOTE_MEDIA_PREFETCH_MAX_BYTES)
 }
@@ -84,6 +136,10 @@ fn prefetch_remote_media_with_limit_and_validator(
     }
 
     let (path, mut file) = create_prefetch_file()?;
+    // Own the temp file from here on. Every early return below then deletes it
+    // through PrefetchedMedia::drop, including the timeout, read, write, and
+    // sync bails that previously left a partial file behind.
+    let prefetched = PrefetchedMedia { path };
     let mut total = 0u64;
     let mut first_bytes = Vec::with_capacity(64);
     let mut buf = [0u8; 64 * 1024];
@@ -97,7 +153,6 @@ fn prefetch_remote_media_with_limit_and_validator(
         }
         total = total.saturating_add(read as u64);
         if total > max_bytes {
-            let _ = fs::remove_file(&path);
             return Err("remote media exceeds prefetch size limit".to_string());
         }
         if first_bytes.len() < 64 {
@@ -112,19 +167,14 @@ fn prefetch_remote_media_with_limit_and_validator(
     drop(file);
 
     if total == 0 {
-        let _ = fs::remove_file(&path);
         return Err("remote media response was empty".to_string());
     }
     if has_extm3u_magic(&first_bytes) {
-        let _ = fs::remove_file(&path);
         return Err("remote media must be a media container, not a playlist manifest".to_string());
     }
-    if let Err(err) = validate_prefetched_media_container(&path) {
-        let _ = fs::remove_file(&path);
-        return Err(err);
-    }
+    validate_prefetched_media_container(&prefetched.path)?;
 
-    Ok(PrefetchedMedia { path })
+    Ok(prefetched)
 }
 
 fn fetch_remote_media_response(
@@ -401,9 +451,11 @@ impl Drop for PrefetchedMedia {
 #[cfg(test)]
 mod tests {
     use super::{
-        has_extm3u_magic, prefetch_remote_media_with_limit_and_validator_for_test,
+        has_extm3u_magic, is_downloadable_remote_url,
+        prefetch_remote_media_with_limit_and_validator_for_test,
+        prepare_source_for_reuse_with_validator,
         validate_prefetched_media_container_with_probe_for_test, validate_redirect_target,
-        REMOTE_MEDIA_PREFETCH_MAX_BYTES,
+        InputSource, REMOTE_MEDIA_PREFETCH_MAX_BYTES,
     };
     use std::fs;
     use std::process::Command;
@@ -613,6 +665,50 @@ mod tests {
         )
         .expect_err("body larger than cap fails");
         assert!(err.contains("size limit"), "{err}");
+    }
+
+    #[test]
+    fn prepare_source_reuse_passes_through_local_source() {
+        let source = InputSource::FilePath("/tmp/example.mp4".to_string());
+        let prepared = prepare_source_for_reuse_with_validator(
+            &source,
+            Arc::new(super::validate_remote_fetch_url),
+        )
+        .expect("a local source needs no prefetch");
+        assert_eq!(prepared.source(), &source);
+    }
+
+    #[test]
+    fn prepare_source_reuse_fetches_remote_once_to_local_file() {
+        let server = super::test_helpers::MockHttpServer::serve_once(
+            "200 OK",
+            &[("Content-Type", "video/mp4")],
+            create_test_mp4_bytes(),
+        );
+        let prepared = prepare_source_for_reuse_with_validator(
+            &InputSource::Url(server.url("/media.mp4")),
+            server.allow_origin_validator(),
+        )
+        .expect("remote source prefetches to a local file");
+
+        let local_path = match prepared.source() {
+            InputSource::FilePath(path) => path.clone(),
+            other => panic!("expected a local file source, got {other:?}"),
+        };
+        assert!(
+            std::path::Path::new(&local_path).exists(),
+            "prefetched file should exist while the guard is alive"
+        );
+        // Reuse reads the local copy: the source is no longer downloadable, so
+        // every later decode skips the network path. The mock served its one
+        // response, so a second fetch would have nothing to answer it.
+        assert!(!is_downloadable_remote_url(prepared.source()));
+
+        drop(prepared);
+        assert!(
+            !std::path::Path::new(&local_path).exists(),
+            "dropping the guard should delete the prefetched file"
+        );
     }
 
     #[test]

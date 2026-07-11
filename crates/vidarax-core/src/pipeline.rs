@@ -3,29 +3,17 @@ use crate::gate::{FrameSignal, GateConfig, GateEngine, GateEvent, GateEventType,
 pub const TWO_PASS_CONFIDENCE_NOVELTY_WEIGHT: f32 = 0.45;
 pub const TWO_PASS_CONFIDENCE_INSTABILITY_WEIGHT: f32 = 0.35;
 pub const TWO_PASS_CONFIDENCE_MOTION_WEIGHT: f32 = 0.20;
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TwoPassWeights {
-    pub novelty: f32,
-    pub instability: f32,
-    pub motion: f32,
-}
-
-impl Default for TwoPassWeights {
-    fn default() -> Self {
-        Self {
-            novelty: TWO_PASS_CONFIDENCE_NOVELTY_WEIGHT,
-            instability: TWO_PASS_CONFIDENCE_INSTABILITY_WEIGHT,
-            motion: TWO_PASS_CONFIDENCE_MOTION_WEIGHT,
-        }
-    }
-}
+pub const TWO_PASS_CONFIDENCE_WEIGHTS: [f32; 3] = [
+    TWO_PASS_CONFIDENCE_NOVELTY_WEIGHT,
+    TWO_PASS_CONFIDENCE_INSTABILITY_WEIGHT,
+    TWO_PASS_CONFIDENCE_MOTION_WEIGHT,
+];
 
 #[derive(Debug, Clone, Copy)]
 pub struct TwoPassConfig {
     pub window_size: usize,
     pub segment_ms: u64,
-    pub confidence_weights: TwoPassWeights,
+    pub confidence_weights: [f32; 3],
 }
 
 impl Default for TwoPassConfig {
@@ -33,7 +21,7 @@ impl Default for TwoPassConfig {
         Self {
             window_size: 16,
             segment_ms: 250,
-            confidence_weights: TwoPassWeights::default(),
+            confidence_weights: TWO_PASS_CONFIDENCE_WEIGHTS,
         }
     }
 }
@@ -84,10 +72,30 @@ impl TwoPassPipeline {
     }
 
     pub fn analyze_batch(&mut self, frames: &[FrameSignal]) -> &[FrameMetadata] {
+        self.analyze_batch_inner(frames, true)
+    }
+
+    pub fn analyze_batch_defer_gate_commit(&mut self, frames: &[FrameSignal]) -> &[FrameMetadata] {
+        self.analyze_batch_inner(frames, false)
+    }
+
+    pub fn commit_gate_keyframe(&mut self, frame: FrameSignal) {
+        self.gate.commit_keyframe(frame);
+    }
+
+    fn analyze_batch_inner(
+        &mut self,
+        frames: &[FrameSignal],
+        commit_kept_keyframes: bool,
+    ) -> &[FrameMetadata] {
         // Pass 1: compute deterministic gate events; reuse allocation.
         self.pass1_buf.clear();
         for frame in frames {
-            self.pass1_buf.push(self.gate.process(*frame));
+            let event = self.gate.process(*frame);
+            if commit_kept_keyframes && event.event_type == GateEventType::KeepKeyframe {
+                self.gate.commit_keyframe(*frame);
+            }
+            self.pass1_buf.push(event);
         }
 
         // Pass 2: derive contextual metadata from a bounded sliding window.
@@ -101,10 +109,11 @@ impl TwoPassPipeline {
 
             let (novelty, stability) = self.window_metrics(frame.perceptual_hash, frame.luma_mean);
             let motion = self.motion_score(frame.perceptual_hash);
-            let weights = self.config.confidence_weights;
-            let confidence = (weights.novelty * novelty
-                + weights.instability * (1.0 - stability)
-                + weights.motion * motion)
+            let [novelty_weight, instability_weight, motion_weight] =
+                self.config.confidence_weights;
+            let confidence = (novelty_weight * novelty
+                + instability_weight * (1.0 - stability)
+                + motion_weight * motion)
                 .clamp(0.0, 1.0);
 
             let segment_start_ms = (frame.pts_ms / self.config.segment_ms) * self.config.segment_ms;
@@ -130,22 +139,27 @@ impl TwoPassPipeline {
         &self.out_buf
     }
 
-    /// Fused single-pass over the sliding window: computes both novelty
-    /// (hamming similarity) and temporal stability (luma drift) in one loop.
+    /// Fused single-pass over the sliding window. Returns novelty (average
+    /// perceptual-hash distance to the window, high when the frame is new) and
+    /// temporal stability, defined as one minus the normalized luma drift so a
+    /// still screen scores near 1 and an abrupt luma change scores near 0. The
+    /// confidence term is `instability_weight * (1 - stability)`, which must
+    /// therefore grow with drift: returning drift directly here would invert it
+    /// and hand a perfectly stable screen the maximum instability contribution.
     fn window_metrics(&self, hash: u64, luma_mean: f32) -> (f32, f32) {
         if self.window_len == 0 {
-            return (1.0, 0.0);
+            return (1.0, 1.0);
         }
-        let mut similarity = 0.0f32;
+        let mut distance = 0.0f32;
         let mut drift = 0.0f32;
         for sample in self.window.iter().take(self.window_len) {
-            similarity += hamming_similarity(hash, sample.perceptual_hash);
+            distance += hamming_similarity(hash, sample.perceptual_hash);
             drift += (sample.luma_mean - luma_mean).abs();
         }
         let inv = 1.0 / self.window_len as f32;
         (
-            (similarity * inv).clamp(0.0, 1.0),
-            (drift * inv).clamp(0.0, 1.0),
+            (distance * inv).clamp(0.0, 1.0),
+            (1.0 - drift * inv).clamp(0.0, 1.0),
         )
     }
 
@@ -181,8 +195,9 @@ fn hamming_similarity(a: u64, b: u64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        TwoPassConfig, TwoPassPipeline, TwoPassWeights, TWO_PASS_CONFIDENCE_INSTABILITY_WEIGHT,
+        TwoPassConfig, TwoPassPipeline, TWO_PASS_CONFIDENCE_INSTABILITY_WEIGHT,
         TWO_PASS_CONFIDENCE_MOTION_WEIGHT, TWO_PASS_CONFIDENCE_NOVELTY_WEIGHT,
+        TWO_PASS_CONFIDENCE_WEIGHTS,
     };
     use crate::gate::{FrameSignal, GateConfig, GateEventType};
 
@@ -243,14 +258,18 @@ mod tests {
 
     #[test]
     fn default_confidence_weights_are_named_and_preserved() {
-        let weights = TwoPassWeights::default();
-
-        assert_eq!(weights.novelty, TWO_PASS_CONFIDENCE_NOVELTY_WEIGHT);
-        assert_eq!(weights.instability, TWO_PASS_CONFIDENCE_INSTABILITY_WEIGHT);
-        assert_eq!(weights.motion, TWO_PASS_CONFIDENCE_MOTION_WEIGHT);
-        assert_eq!(weights.novelty, 0.45);
-        assert_eq!(weights.instability, 0.35);
-        assert_eq!(weights.motion, 0.20);
+        assert_eq!(
+            TWO_PASS_CONFIDENCE_WEIGHTS,
+            [
+                TWO_PASS_CONFIDENCE_NOVELTY_WEIGHT,
+                TWO_PASS_CONFIDENCE_INSTABILITY_WEIGHT,
+                TWO_PASS_CONFIDENCE_MOTION_WEIGHT
+            ]
+        );
+        assert_eq!(
+            TwoPassConfig::default().confidence_weights,
+            [0.45, 0.35, 0.20]
+        );
     }
 
     #[test]
@@ -259,11 +278,7 @@ mod tests {
             TwoPassConfig {
                 window_size: 4,
                 segment_ms: 250,
-                confidence_weights: TwoPassWeights {
-                    novelty: 0.0,
-                    instability: 0.0,
-                    motion: 1.0,
-                },
+                confidence_weights: [0.0, 0.0, 1.0],
             },
             GateConfig::default(),
         );

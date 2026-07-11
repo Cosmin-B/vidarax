@@ -6,10 +6,12 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::{Id as TaskId, JoinError, JoinSet};
 use vidarax_core::gate::{FrameSignal, GateEventType};
-use vidarax_core::ingest::{extract_video_clip, DecodedJpegFrame, InputSource};
+use vidarax_core::ingest::pipeline::DecodePipeline;
+use vidarax_core::ingest::{DecodedJpegFrame, PreparedSource};
 use vidarax_core::pipeline::{FrameMetadata, TwoPassPipeline};
 use vidarax_core::provider::{
-    InferenceImage, InferenceProvider, InferenceRequest, InferenceVideo, ProviderError,
+    InferenceImage, InferenceObserver, InferenceProvider, InferenceRequest, InferenceVideo,
+    ProviderError, TokenUsage,
 };
 use vidarax_core::tiered_vlm::{run_tiered, TieredVlmConfig};
 use vidarax_core::timeline::TimelineEvent;
@@ -50,6 +52,10 @@ pub struct ChunkSemanticResult {
     pub error: Option<String>,
     pub attempted: bool,
     pub finish_reason: Option<String>,
+    /// Token spend for this chunk's analysis (summed across tiered passes).
+    pub usage: TokenUsage,
+    /// Wall-clock inference latency for this chunk (summed across passes).
+    pub inference_latency_ms: u64,
 }
 
 impl ChunkSemanticResult {
@@ -74,6 +80,11 @@ impl ChunkSemanticResult {
                 "description": self.overlay.as_ref().map(|o| o.description.clone()),
                 "confidence": self.overlay.as_ref().map(|o| o.confidence),
                 "raw_output": self.raw_output,
+                "prompt_tokens": self.usage.prompt_tokens,
+                "completion_tokens": self.usage.completion_tokens,
+                "thinking_tokens": self.usage.thinking_tokens,
+                "total_tokens": self.usage.total_tokens,
+                "inference_latency_ms": self.inference_latency_ms,
             })
         })
     }
@@ -193,10 +204,12 @@ pub async fn prepare_realtime_chunks(
     chunk_size: usize,
     decoded_jpegs: Option<&std::collections::HashMap<u64, DecodedJpegFrame>>,
     pipeline: &mut TwoPassPipeline,
-    decode_source: &InputSource,
+    decode_pipeline: &Arc<dyn DecodePipeline>,
+    prepared_source: &Arc<PreparedSource>,
     video_clip_mode: bool,
     semantic_decode_enabled: bool,
     video_clip_duration_s: f32,
+    crop: Option<vidarax_core::crop::CropRegion>,
 ) -> Vec<ChunkPrep> {
     let mut chunk_preps: Vec<ChunkPrep> = Vec::new();
     for (chunk_idx, chunk) in signals.chunks(chunk_size).enumerate() {
@@ -216,10 +229,15 @@ pub async fn prepare_realtime_chunks(
         let pts_start_ms_for_clip = chunk.first().map(|f| f.pts_ms).unwrap_or(0);
         let chunk_video_clip: Option<Arc<[u8]>> = if video_clip_mode && semantic_decode_enabled {
             let clip_start = pts_start_ms_for_clip as f32 / 1000.0;
-            let source_for_clip = decode_source.clone();
+            // Hold an owning handle to the prepared source for the whole blocking
+            // task. spawn_blocking runs detached, so if the request future is
+            // cancelled mid-extraction this clone keeps the prefetched temp file
+            // alive until ffmpeg is done reading it.
+            let clip_source = Arc::clone(prepared_source);
+            let clip_pipeline = Arc::clone(decode_pipeline);
             let duration = video_clip_duration_s;
             match tokio::task::spawn_blocking(move || {
-                extract_video_clip(&source_for_clip, clip_start, duration)
+                clip_pipeline.extract_clip(clip_source.source(), clip_start, duration, crop)
             })
             .await
             {
@@ -266,10 +284,11 @@ pub async fn run_semantic_dispatch(
     semantic_timeout_ms: u64,
     semantic_frames_per_chunk: usize,
     tiered_config: TieredVlmConfig,
-    guided_json_str: Option<String>,
+    guided_json_str: Option<Arc<str>>,
     visual_diff: bool,
     temporal_chain: bool,
     vlm_concurrency: usize,
+    observer: Option<Arc<dyn InferenceObserver>>,
 ) -> (Vec<Option<ChunkSemanticResult>>, Vec<Instant>) {
     let num_chunks = chunk_preps.len();
     let mut semantic_results: Vec<Option<ChunkSemanticResult>> =
@@ -283,7 +302,7 @@ pub async fn run_semantic_dispatch(
     if temporal_chain {
         let mut last_description = String::new();
         let mut last_pts_ms: u64 = 0;
-        let mut last_jpeg: Option<Vec<u8>> = None;
+        let mut last_jpeg: Option<Arc<[u8]>> = None;
 
         for (chunk_idx, prep) in chunk_preps.iter().enumerate() {
             let prompt_with_context = if last_description.is_empty() {
@@ -311,15 +330,16 @@ pub async fn run_semantic_dispatch(
                 prep.pts_start_ms,
                 prep.pts_end_ms,
                 tiered_config.clone(),
-                guided_json_str.clone(),
+                guided_json_str.as_ref().map(Arc::clone),
                 prev_jpeg_ref,
-                prep.chunk_video_clip.clone(),
+                prep.chunk_video_clip.as_ref().map(Arc::clone),
+                observer.clone(),
             )
             .await;
 
             if visual_diff {
                 if let Some(frame) = select_semantic_images(&prep.chunk_jpegs, 1).first() {
-                    last_jpeg = Some(frame.jpeg_bytes.clone());
+                    last_jpeg = Some(Arc::clone(&frame.jpeg_bytes));
                 }
             }
 
@@ -355,7 +375,8 @@ pub async fn run_semantic_dispatch(
                 semantic_timeout_ms,
                 semantic_frames_per_chunk,
                 tiered_config.clone(),
-                guided_json_str.clone(),
+                guided_json_str.as_ref().map(Arc::clone),
+                observer.clone(),
             );
             task_chunks.insert(task_id, chunk_idx);
         }
@@ -392,7 +413,8 @@ pub async fn run_semantic_dispatch(
                     semantic_timeout_ms,
                     semantic_frames_per_chunk,
                     tiered_config.clone(),
-                    guided_json_str.clone(),
+                    guided_json_str.as_ref().map(Arc::clone),
+                    observer.clone(),
                 );
                 task_chunks.insert(task_id, chunk_idx);
             }
@@ -411,7 +433,8 @@ fn spawn_semantic_task(
     semantic_timeout_ms: u64,
     semantic_frames_per_chunk: usize,
     tiered_config: TieredVlmConfig,
-    guided_json_str: Option<String>,
+    guided_json_str: Option<Arc<str>>,
+    observer: Option<Arc<dyn InferenceObserver>>,
 ) -> (usize, TaskId) {
     let providers_c = providers;
     let prompt_c = semantic_prompt.to_string();
@@ -422,6 +445,7 @@ fn spawn_semantic_task(
     let pts_end_ms = prep.pts_end_ms;
     let tiered_config_c = tiered_config;
     let guided_json_c = guided_json_str;
+    let observer_c = observer;
     let handle = join_set.spawn(async move {
         #[cfg(test)]
         if chunk_idx
@@ -444,6 +468,7 @@ fn spawn_semantic_task(
             guided_json_c,
             None,
             chunk_video_clip_c,
+            observer_c,
         )
         .await;
         (chunk_idx, overlay, Instant::now())
@@ -513,9 +538,10 @@ pub async fn infer_chunk_semantics(
     pts_start_ms: u64,
     pts_end_ms: u64,
     tiered_config: TieredVlmConfig,
-    guided_json: Option<String>,
+    guided_json: Option<Arc<str>>,
     prev_jpeg: Option<&[u8]>,
     video_clip: Option<Arc<[u8]>>,
+    observer: Option<Arc<dyn InferenceObserver>>,
 ) -> ChunkSemanticResult {
     if !semantic_available {
         return ChunkSemanticResult::default();
@@ -566,12 +592,11 @@ pub async fn infer_chunk_semantics(
         }
         imgs.extend(selected.iter().map(|frame| InferenceImage {
             media_type: "image/jpeg",
-            data_base64: BASE64_STANDARD.encode(&frame.jpeg_bytes),
+            data_base64: BASE64_STANDARD.encode(frame.jpeg_bytes.as_ref()),
         }));
         (imgs, Vec::new())
     };
 
-    let guided_json_arc: Option<Arc<str>> = guided_json.as_deref().map(Arc::from);
     let request = InferenceRequest {
         model: tiered_config.first_pass_model.clone(),
         prompt: Arc::from(prompt),
@@ -581,17 +606,34 @@ pub async fn infer_chunk_semantics(
         temperature: 0.0,
         timeout_ms,
         allow_fallback: true,
-        guided_json: guided_json_arc,
+        guided_json: guided_json.as_ref().map(Arc::clone),
     };
 
+    let call_started = Instant::now();
     let provider_result = match tokio::task::spawn_blocking({
         let provider = Arc::clone(&provider);
-        move || run_tiered(provider.as_ref(), &tiered_config, request, 1024, timeout_ms)
+        let observer_for_call = observer.clone();
+        move || {
+            run_tiered(
+                provider.as_ref(),
+                &tiered_config,
+                request,
+                1024,
+                timeout_ms,
+                observer_for_call.as_deref(),
+            )
+        }
     })
     .await
     {
         Ok(Ok(output)) => output.result,
         Ok(Err(err)) => {
+            // run_tiered already recorded any successful pass it made before
+            // failing; a failed first pass records nothing internally, so the
+            // caller (here) is where that error lands in /metrics.
+            if let Some(o) = observer.as_deref() {
+                o.record_error(provider.kind(), call_started.elapsed().as_millis() as u64);
+            }
             result.used_fallback = true;
             result.error = Some(match err.error {
                 ProviderError::UnsupportedModel(_) => "unsupported_model".to_string(),
@@ -602,6 +644,9 @@ pub async fn infer_chunk_semantics(
             return result;
         }
         Err(err) => {
+            if let Some(o) = observer.as_deref() {
+                o.record_error(provider.kind(), call_started.elapsed().as_millis() as u64);
+            }
             result.used_fallback = true;
             result.error = Some(format!("join_error:{err}"));
             return result;
@@ -611,6 +656,8 @@ pub async fn infer_chunk_semantics(
     result.provider = Some(provider_result.provider.name().to_string());
     result.provider_fallback_used = provider_result.fallback_used;
     result.finish_reason = provider_result.finish_reason.clone();
+    result.usage = provider_result.usage;
+    result.inference_latency_ms = provider_result.inference_latency_ms;
 
     if guided_json.is_some() {
         let parsed = serde_json::from_str::<Value>(&provider_result.output_text)
@@ -735,7 +782,7 @@ fn truncate_context(text: &str, max_chars: usize) -> &str {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use vidarax_core::provider::{InferenceResult, ProviderKind};
+    use vidarax_core::provider::{InferenceResult, ProviderKind, TokenUsage};
 
     struct SemanticTestProvider;
 
@@ -752,6 +799,7 @@ mod tests {
                 fallback_used: false,
                 finish_reason: Some("stop".to_string()),
                 inference_latency_ms: 1,
+                usage: TokenUsage::default(),
             })
         }
     }
@@ -825,6 +873,7 @@ mod tests {
             false,
             false,
             2,
+            None,
         )
         .await;
 
@@ -857,13 +906,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn chunk_prep_dispatch_clones_share_heavy_payload_storage() {
+        let jpeg_bytes: Arc<[u8]> = Arc::from(vec![0xff, 0xd8, 0xff, 0xd9]);
+        let clip_bytes: Arc<[u8]> = Arc::from(vec![0, 0, 0, 24, b'f', b't', b'y', b'p']);
+        let prep = ChunkPrep {
+            analyzed: Vec::new(),
+            frame_offset: 0,
+            chunk_jpegs: Arc::from([DecodedJpegFrame {
+                frame_index: 0,
+                jpeg_bytes: Arc::clone(&jpeg_bytes),
+            }]),
+            chunk_video_clip: Some(Arc::clone(&clip_bytes)),
+            pts_start_ms: 0,
+            pts_end_ms: 33,
+            chunk_len: 1,
+            started: Instant::now(),
+        };
+
+        let chunk_jpegs_c = Arc::clone(&prep.chunk_jpegs);
+        let chunk_video_clip_c = prep.chunk_video_clip.as_ref().map(Arc::clone);
+        let cloned_frame = prep.chunk_jpegs[0].clone();
+
+        assert!(Arc::ptr_eq(&prep.chunk_jpegs, &chunk_jpegs_c));
+        assert!(Arc::ptr_eq(
+            &prep.chunk_jpegs[0].jpeg_bytes,
+            &chunk_jpegs_c[0].jpeg_bytes
+        ));
+        assert!(Arc::ptr_eq(
+            &prep.chunk_jpegs[0].jpeg_bytes,
+            &cloned_frame.jpeg_bytes
+        ));
+        assert!(Arc::ptr_eq(
+            prep.chunk_video_clip.as_ref().expect("clip present"),
+            chunk_video_clip_c.as_ref().expect("clip clone present")
+        ));
+    }
+
     fn test_chunk_prep(idx: usize) -> ChunkPrep {
         ChunkPrep {
             analyzed: Vec::new(),
             frame_offset: idx,
             chunk_jpegs: Arc::from([DecodedJpegFrame {
                 frame_index: idx as u64,
-                jpeg_bytes: vec![0xff, 0xd8, 0xff, idx as u8],
+                jpeg_bytes: Arc::from(vec![0xff, 0xd8, 0xff, idx as u8]),
             }]),
             chunk_video_clip: None,
             pts_start_ms: idx as u64 * 33,

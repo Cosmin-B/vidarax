@@ -60,7 +60,7 @@ fn jpeg_encoding_produces_valid_jpeg() {
     let frame = make_gray_frame(128, 64, 64);
     let mut scratch = Vec::new();
     let jpeg_pool = VecPool::with_slots(1);
-    let jpeg = yuv_to_jpeg(&frame, 80, &mut scratch, &jpeg_pool);
+    let jpeg = yuv_to_jpeg(&frame, 80, &mut scratch, &jpeg_pool).expect("gray frame encodes");
     assert!(jpeg.len() > 100, "JPEG too small: {} bytes", jpeg.len());
     assert_eq!(&jpeg[0..2], &[0xFF, 0xD8], "not a JPEG header");
 }

@@ -19,10 +19,33 @@
 //! `Authorization: Bearer <token>` on subsequent calls so all reducer invocations
 //! share the same persistent identity.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
+use reqwest::header::HeaderValue;
+use serde::ser::{Serialize, SerializeSeq, Serializer};
 use serde_json::Value;
+
+/// Give up on a stalled connect quickly so a dead SpacetimeDB doesn't wedge a
+/// worker thread for the full request budget.
+const SPACETIME_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default per-request ceiling, sized for reducer writes, which are tiny.
+const SPACETIME_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// A `SELECT * FROM keyframe_store` pulls a whole run's rows, JPEG bytes and all,
+/// so the read path overrides the default with a much larger ceiling. Still bounded
+/// so a stuck query cannot hang a caller forever.
+const SPACETIME_QUERY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// One shared blocking client for every `SpacetimeClient` instance and call.
+///
+/// The old code built a fresh `reqwest::blocking::Client` per call, which threw
+/// away connection reuse and, worse, dropped the client's internal tokio runtime
+/// on every call. A process-wide client pools connections and, because a `static`
+/// is never dropped, sidesteps the drop-inside-a-runtime hazard entirely. Auth is
+/// carried per request in the `Authorization` header, so nothing here is
+/// instance-specific.
+static SPACETIME_BLOCKING_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
 
 // ─── Error ────────────────────────────────────────────────────────────────────
 
@@ -85,6 +108,118 @@ pub struct StoreKeyframeRequest {
     pub jpeg_data: Vec<u8>,
 }
 
+// ─── Reducer argument wires ─────────────────────────────────────────────────────
+//
+// SpacetimeDB reducer arguments travel as a positional JSON array. These
+// borrow-only views serialize straight from `&str`/`&[u8]` into the request
+// body, with no owned `String`s, no `jpeg_data` copy, and no intermediate
+// `serde_json::Value` tree. Element order must match each reducer's signature.
+
+struct EmitEventArgs<'a> {
+    run_id: &'a str,
+    session_id: &'a str,
+    frame_index: u64,
+    pts_ms: u64,
+    event_type: &'a str,
+    confidence: f32,
+    description: &'a str,
+}
+
+impl Serialize for EmitEventArgs<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(7))?;
+        seq.serialize_element(self.run_id)?;
+        seq.serialize_element(self.session_id)?;
+        seq.serialize_element(&self.frame_index)?;
+        seq.serialize_element(&self.pts_ms)?;
+        seq.serialize_element(self.event_type)?;
+        seq.serialize_element(&self.confidence)?;
+        seq.serialize_element(self.description)?;
+        seq.end()
+    }
+}
+
+impl<'a> From<&'a EmitEventRequest> for EmitEventArgs<'a> {
+    fn from(r: &'a EmitEventRequest) -> Self {
+        Self {
+            run_id: &r.run_id,
+            session_id: &r.session_id,
+            frame_index: r.frame_index,
+            pts_ms: r.pts_ms,
+            event_type: &r.event_type,
+            confidence: r.confidence,
+            description: &r.description,
+        }
+    }
+}
+
+struct StoreKeyframeArgs<'a> {
+    run_id: &'a str,
+    frame_index: u64,
+    pts_ms: u64,
+    event_type: &'a str,
+    description: &'a str,
+    jpeg_data: &'a [u8],
+}
+
+impl Serialize for StoreKeyframeArgs<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(6))?;
+        seq.serialize_element(self.run_id)?;
+        seq.serialize_element(&self.frame_index)?;
+        seq.serialize_element(&self.pts_ms)?;
+        seq.serialize_element(self.event_type)?;
+        seq.serialize_element(self.description)?;
+        seq.serialize_element(self.jpeg_data)?;
+        seq.end()
+    }
+}
+
+impl<'a> From<&'a StoreKeyframeRequest> for StoreKeyframeArgs<'a> {
+    fn from(r: &'a StoreKeyframeRequest) -> Self {
+        Self {
+            run_id: &r.run_id,
+            frame_index: r.frame_index,
+            pts_ms: r.pts_ms,
+            event_type: &r.event_type,
+            description: &r.description,
+            jpeg_data: &r.jpeg_data,
+        }
+    }
+}
+
+struct SubmitFeedbackArgs<'a> {
+    run_id: &'a str,
+    session_id: &'a str,
+    rating: u32,
+    category: &'a str,
+    feedback: &'a str,
+}
+
+impl Serialize for SubmitFeedbackArgs<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(5))?;
+        seq.serialize_element(self.run_id)?;
+        seq.serialize_element(self.session_id)?;
+        seq.serialize_element(&self.rating)?;
+        seq.serialize_element(self.category)?;
+        seq.serialize_element(self.feedback)?;
+        seq.end()
+    }
+}
+
+impl<'a> From<&'a SubmitFeedbackRequest> for SubmitFeedbackArgs<'a> {
+    fn from(r: &'a SubmitFeedbackRequest) -> Self {
+        Self {
+            run_id: &r.run_id,
+            session_id: &r.session_id,
+            rating: r.rating,
+            category: &r.category,
+            feedback: &r.feedback,
+        }
+    }
+}
+
 // ─── Response types ───────────────────────────────────────────────────────────
 
 /// Row from the `agent_event` table.
@@ -133,12 +268,24 @@ pub struct StoredKeyframe {
 
 // ─── Client ───────────────────────────────────────────────────────────────────
 
+/// The SpacetimeDB identity paired with the request header it produces. Holding
+/// both in one object means the token used for the "did it rotate?" check and
+/// the header actually sent can never drift apart under a concurrent rotation.
+struct AuthState {
+    /// The JWT last issued by SpacetimeDB, kept for the rotation comparison.
+    token: Arc<str>,
+    /// The `Authorization: Bearer <jwt>` header, formatted once from `token`.
+    header: HeaderValue,
+}
+
 struct Inner {
     base_url: String,
     database: String,
     async_client: reqwest::Client,
-    /// JWT issued by SpacetimeDB — persisted across calls for identity continuity.
-    token: ArcSwapOption<Arc<str>>,
+    /// The current identity and its pre-formatted auth header, swapped atomically
+    /// when the token rotates. Every request loads this one pointer instead of
+    /// formatting the Bearer string again per call.
+    auth: ArcSwapOption<AuthState>,
 }
 
 /// Cheap-to-clone (Arc-backed) HTTP client for the Vidarax SpacetimeDB module.
@@ -161,7 +308,7 @@ impl SpacetimeClient {
                 base_url: base_url.into(),
                 database: database.into(),
                 async_client: reqwest::Client::new(),
-                token: ArcSwapOption::from(None::<Arc<Arc<str>>>),
+                auth: ArcSwapOption::from(None::<Arc<AuthState>>),
             }),
         }
     }
@@ -182,18 +329,29 @@ impl SpacetimeClient {
         )
     }
 
-    fn read_token(&self) -> Option<Arc<str>> {
-        self.inner
-            .token
-            .load_full()
-            .map(|token| Arc::clone(&*token))
-    }
-
     fn store_token_from_headers(&self, headers: &reqwest::header::HeaderMap) {
-        if let Some(val) = headers.get("spacetime-identity-token") {
-            if let Ok(tok) = val.to_str() {
-                self.inner.token.store(Some(Arc::new(Arc::from(tok))));
+        let Some(incoming) = headers
+            .get("spacetime-identity-token")
+            .and_then(|val| val.to_str().ok())
+        else {
+            return;
+        };
+        // Reducer responses echo the identity token on every call. Only rebuild
+        // the Bearer header when the token actually changes (normally just once,
+        // on the first response), so the per-keyframe writer path allocates
+        // nothing here in steady state.
+        if let Some(current) = self.inner.auth.load_full() {
+            if &*current.token == incoming {
+                return;
             }
+        }
+        if let Ok(mut header) = HeaderValue::try_from(format!("Bearer {incoming}")) {
+            // Keep the credential out of any header dump reqwest/hyper might log.
+            header.set_sensitive(true);
+            self.inner.auth.store(Some(Arc::new(AuthState {
+                token: Arc::from(incoming),
+                header,
+            })));
         }
     }
 
@@ -201,33 +359,39 @@ impl SpacetimeClient {
         self.store_token_from_headers(headers);
     }
 
-    fn auth_header(&self) -> Option<String> {
-        self.read_token().map(|t| format!("Bearer {t}"))
+    fn auth_header(&self) -> Option<HeaderValue> {
+        // HeaderValue is Bytes-backed, so this clone is a refcount bump, not a copy.
+        self.inner.auth.load_full().map(|s| s.header.clone())
     }
 
-    fn blocking_client() -> reqwest::blocking::Client {
-        reqwest::blocking::Client::new()
+    /// The shared blocking client, built on first use. The first caller is always
+    /// on a worker thread (never the async executor), so building the client's
+    /// internal runtime here is safe.
+    fn blocking_client() -> &'static reqwest::blocking::Client {
+        SPACETIME_BLOCKING_CLIENT.get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .connect_timeout(SPACETIME_CONNECT_TIMEOUT)
+                .timeout(SPACETIME_REQUEST_TIMEOUT)
+                .pool_max_idle_per_host(4)
+                .build()
+                .expect("failed to build SpacetimeDB blocking HTTP client")
+        })
     }
 
-    // ── Async methods ────────────────────────────────────────────────────────
-
-    /// Call the `emit_event` reducer (async).
-    pub async fn emit_event_async(&self, req: &EmitEventRequest) -> Result<(), SpacetimeError> {
-        let body = serde_json::json!([
-            req.run_id,
-            req.session_id,
-            req.frame_index,
-            req.pts_ms,
-            req.event_type,
-            req.confidence,
-            req.description,
-        ]);
+    /// POST a reducer call over the shared async client, serializing `args`
+    /// straight into the request body. Captures any refreshed identity token
+    /// from the response before checking status. `.json()` serializes eagerly,
+    /// so the borrow in `args` never has to be held across the await.
+    async fn call_reducer_async<T: Serialize>(
+        &self,
+        reducer: &str,
+        args: &T,
+    ) -> Result<(), SpacetimeError> {
         let mut rb = self
             .inner
             .async_client
-            .post(self.reducer_url("emit_event"))
-            .header("Content-Type", "application/json")
-            .json(&body);
+            .post(self.reducer_url(reducer))
+            .json(args);
         if let Some(auth) = self.auth_header() {
             rb = rb.header("Authorization", auth);
         }
@@ -242,6 +406,36 @@ impl SpacetimeClient {
             return Err(SpacetimeError::BadResponse(status, text));
         }
         Ok(())
+    }
+
+    /// Blocking counterpart of [`Self::call_reducer_async`] for the worker-thread
+    /// keyframe path.
+    fn call_reducer_blocking<T: Serialize>(
+        &self,
+        reducer: &str,
+        args: &T,
+    ) -> Result<(), SpacetimeError> {
+        let client = Self::blocking_client();
+        let mut rb = client.post(self.reducer_url(reducer)).json(args);
+        if let Some(auth) = self.auth_header() {
+            rb = rb.header("Authorization", auth);
+        }
+        let resp = rb.send().map_err(|e| SpacetimeError::Http(e.to_string()))?;
+        self.store_token_from_headers_blocking(resp.headers());
+        let status = resp.status().as_u16();
+        if status != 200 {
+            let text = resp.text().unwrap_or_default();
+            return Err(SpacetimeError::BadResponse(status, text));
+        }
+        Ok(())
+    }
+
+    // ── Async methods ────────────────────────────────────────────────────────
+
+    /// Call the `emit_event` reducer (async).
+    pub async fn emit_event_async(&self, req: &EmitEventRequest) -> Result<(), SpacetimeError> {
+        self.call_reducer_async("emit_event", &EmitEventArgs::from(req))
+            .await
     }
 
     /// Call the `store_keyframe` reducer (async).
@@ -249,34 +443,8 @@ impl SpacetimeClient {
         &self,
         req: &StoreKeyframeRequest,
     ) -> Result<(), SpacetimeError> {
-        let body = serde_json::json!([
-            req.run_id,
-            req.frame_index,
-            req.pts_ms,
-            req.event_type,
-            req.description,
-            req.jpeg_data,
-        ]);
-        let mut rb = self
-            .inner
-            .async_client
-            .post(self.reducer_url("store_keyframe"))
-            .header("Content-Type", "application/json")
-            .json(&body);
-        if let Some(auth) = self.auth_header() {
-            rb = rb.header("Authorization", auth);
-        }
-        let resp = rb
-            .send()
+        self.call_reducer_async("store_keyframe", &StoreKeyframeArgs::from(req))
             .await
-            .map_err(|e| SpacetimeError::Http(e.to_string()))?;
-        self.store_token_from_headers(resp.headers());
-        let status = resp.status().as_u16();
-        if status != 200 {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(SpacetimeError::BadResponse(status, text));
-        }
-        Ok(())
     }
 
     /// Query the `agent_event` table (async).
@@ -308,33 +476,8 @@ impl SpacetimeClient {
         &self,
         req: &SubmitFeedbackRequest,
     ) -> Result<(), SpacetimeError> {
-        let body = serde_json::json!([
-            req.run_id,
-            req.session_id,
-            req.rating,
-            req.category,
-            req.feedback,
-        ]);
-        let mut rb = self
-            .inner
-            .async_client
-            .post(self.reducer_url("submit_feedback"))
-            .header("Content-Type", "application/json")
-            .json(&body);
-        if let Some(auth) = self.auth_header() {
-            rb = rb.header("Authorization", auth);
-        }
-        let resp = rb
-            .send()
+        self.call_reducer_async("submit_feedback", &SubmitFeedbackArgs::from(req))
             .await
-            .map_err(|e| SpacetimeError::Http(e.to_string()))?;
-        self.store_token_from_headers(resp.headers());
-        let status = resp.status().as_u16();
-        if status != 200 {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(SpacetimeError::BadResponse(status, text));
-        }
-        Ok(())
     }
 
     /// Query the `feedback` table (async).
@@ -383,59 +526,12 @@ impl SpacetimeClient {
 
     /// Call the `emit_event` reducer (sync).
     pub fn emit_event(&self, req: &EmitEventRequest) -> Result<(), SpacetimeError> {
-        let body = serde_json::json!([
-            req.run_id,
-            req.session_id,
-            req.frame_index,
-            req.pts_ms,
-            req.event_type,
-            req.confidence,
-            req.description,
-        ]);
-        let client = Self::blocking_client();
-        let mut rb = client
-            .post(self.reducer_url("emit_event"))
-            .header("Content-Type", "application/json")
-            .json(&body);
-        if let Some(auth) = self.auth_header() {
-            rb = rb.header("Authorization", auth);
-        }
-        let resp = rb.send().map_err(|e| SpacetimeError::Http(e.to_string()))?;
-        self.store_token_from_headers_blocking(resp.headers());
-        let status = resp.status().as_u16();
-        if status != 200 {
-            let text = resp.text().unwrap_or_default();
-            return Err(SpacetimeError::BadResponse(status, text));
-        }
-        Ok(())
+        self.call_reducer_blocking("emit_event", &EmitEventArgs::from(req))
     }
 
     /// Call the `store_keyframe` reducer (sync).
     pub fn store_keyframe(&self, req: &StoreKeyframeRequest) -> Result<(), SpacetimeError> {
-        let body = serde_json::json!([
-            req.run_id,
-            req.frame_index,
-            req.pts_ms,
-            req.event_type,
-            req.description,
-            req.jpeg_data,
-        ]);
-        let client = Self::blocking_client();
-        let mut rb = client
-            .post(self.reducer_url("store_keyframe"))
-            .header("Content-Type", "application/json")
-            .json(&body);
-        if let Some(auth) = self.auth_header() {
-            rb = rb.header("Authorization", auth);
-        }
-        let resp = rb.send().map_err(|e| SpacetimeError::Http(e.to_string()))?;
-        self.store_token_from_headers_blocking(resp.headers());
-        let status = resp.status().as_u16();
-        if status != 200 {
-            let text = resp.text().unwrap_or_default();
-            return Err(SpacetimeError::BadResponse(status, text));
-        }
-        Ok(())
+        self.call_reducer_blocking("store_keyframe", &StoreKeyframeArgs::from(req))
     }
 
     /// Query the `agent_event` table (sync).
@@ -466,6 +562,7 @@ impl SpacetimeClient {
         let client = Self::blocking_client();
         let mut rb = client
             .post(self.sql_url())
+            .timeout(SPACETIME_QUERY_TIMEOUT)
             .header("Content-Type", "text/plain")
             .body(sql.to_string());
         if let Some(auth) = self.auth_header() {
@@ -621,15 +718,20 @@ impl vidarax_core::webrtc::workers::EventSink for SpacetimeClient {
         confidence: f32,
         description: &str,
     ) -> Result<(), String> {
-        self.emit_event(&EmitEventRequest {
-            run_id: run_id.to_string(),
-            session_id: session_id.to_string(),
-            frame_index,
-            pts_ms,
-            event_type: event_type.to_string(),
-            confidence,
-            description: description.to_string(),
-        })
+        // Serialize straight from the borrowed args; the worker thread copies no
+        // strings here, only the eventual HTTP body buffer.
+        self.call_reducer_blocking(
+            "emit_event",
+            &EmitEventArgs {
+                run_id,
+                session_id,
+                frame_index,
+                pts_ms,
+                event_type,
+                confidence,
+                description,
+            },
+        )
         .map_err(|e| e.to_string())
     }
 
@@ -642,14 +744,18 @@ impl vidarax_core::webrtc::workers::EventSink for SpacetimeClient {
         description: &str,
         jpeg_data: &[u8],
     ) -> Result<(), String> {
-        self.store_keyframe(&StoreKeyframeRequest {
-            run_id: run_id.to_string(),
-            frame_index,
-            pts_ms,
-            event_type: event_type.to_string(),
-            description: description.to_string(),
-            jpeg_data: jpeg_data.to_vec(),
-        })
+        // `jpeg_data` is borrowed into the body, not cloned into an owned Vec.
+        self.call_reducer_blocking(
+            "store_keyframe",
+            &StoreKeyframeArgs {
+                run_id,
+                frame_index,
+                pts_ms,
+                event_type,
+                description,
+                jpeg_data,
+            },
+        )
         .map_err(|e| e.to_string())
     }
 }
@@ -688,7 +794,13 @@ fn parse_feedback(row: Value) -> Result<FeedbackRow, SpacetimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::header::{HeaderMap, HeaderValue};
+    use reqwest::header::HeaderMap;
+
+    fn bearer(client: &SpacetimeClient) -> Option<String> {
+        client
+            .auth_header()
+            .and_then(|h| h.to_str().ok().map(str::to_owned))
+    }
 
     #[test]
     fn token_reader_observes_latest_stored_header_value() {
@@ -699,13 +811,28 @@ mod tests {
             HeaderValue::from_static("tok-a"),
         );
         client.store_token_from_headers(&headers);
-        assert_eq!(client.auth_header().as_deref(), Some("Bearer tok-a"));
+        assert_eq!(bearer(&client).as_deref(), Some("Bearer tok-a"));
 
         headers.insert(
             "spacetime-identity-token",
             HeaderValue::from_static("tok-b"),
         );
         client.store_token_from_headers(&headers);
-        assert_eq!(client.auth_header().as_deref(), Some("Bearer tok-b"));
+        assert_eq!(bearer(&client).as_deref(), Some("Bearer tok-b"));
+    }
+
+    #[test]
+    fn repeated_identical_token_keeps_header_stable() {
+        let client = SpacetimeClient::new("http://localhost:3000", "vidarax");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "spacetime-identity-token",
+            HeaderValue::from_static("tok-x"),
+        );
+        client.store_token_from_headers(&headers);
+        // The reducer echoes the same token on every response; re-storing it takes
+        // the rotation guard's early return and must leave the cached header intact.
+        client.store_token_from_headers(&headers);
+        assert_eq!(bearer(&client).as_deref(), Some("Bearer tok-x"));
     }
 }

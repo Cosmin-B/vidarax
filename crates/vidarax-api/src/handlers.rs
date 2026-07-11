@@ -14,13 +14,15 @@ use tokio::task::JoinSet;
 use vidarax_contracts::models::{
     fallback_candidates, REQUIRED_MEDIUM_MODELS, REQUIRED_SMALL_MODELS,
 };
-use vidarax_core::gate::{FrameSignal, GateConfig};
+use vidarax_core::gate::FrameSignal;
 use vidarax_core::ingest::{
-    compute_semantic_frame_indices, probe_source_fps, DecodedJpegFrame, InputSource,
-    Mp4DecodeConfig,
+    compute_semantic_frame_indices, prepare_source_for_reuse, probe_source_fps, DecodedJpegFrame,
+    InputSource, Mp4DecodeConfig,
 };
 use vidarax_core::pipeline::{TwoPassConfig, TwoPassPipeline};
-use vidarax_core::provider::{InferenceProvider, InferenceRequest, ProviderError, ProviderKind};
+use vidarax_core::provider::{
+    InferenceObserver, InferenceProvider, InferenceRequest, ProviderError, ProviderKind,
+};
 use vidarax_core::timeline::TimelineEvent;
 
 use crate::auth::{header_value, strong_hash_hex, HEADER_TENANT_ID};
@@ -31,7 +33,7 @@ use crate::models::{
     CreateRunRequest, CreateRunResponse, FieldError, InferBatchItemError, InferBatchItemResult,
     InferBatchRequest, InferBatchResponse, InferRequest, InferResponse, ModelCatalogItem,
     ModelCatalogResponse, RealtimeReasonRequest, RealtimeReasonResponse, SamplingPolicy, SearchHit,
-    SearchRequest, SearchResponse,
+    SearchRequest, SearchResponse, TokenMetrics,
 };
 use crate::response::{
     conflict_error, internal_error, not_found_error, ok, validation_error, ApiResponse,
@@ -256,7 +258,11 @@ pub async fn ingest_run(
         let requested_sample_fps = sample_fps.unwrap_or(2.0);
         let decode_pipeline = state.decode_pipeline();
         let decoded = match tokio::task::spawn_blocking(move || {
-            let source_fps = probe_source_fps(&decode_source);
+            // Fetch a remote source once so the probe and signal decode share the
+            // local copy rather than downloading it twice.
+            let prepared = prepare_source_for_reuse(&decode_source)?;
+            let decode_source = prepared.source();
+            let source_fps = probe_source_fps(decode_source);
             let effective_sample_fps = match sampling_policy {
                 SamplingPolicy::SourceFpsAdaptive => source_fps
                     .map(adaptive_sample_fps)
@@ -266,9 +272,13 @@ pub async fn ingest_run(
             let decode_config = Mp4DecodeConfig {
                 sample_fps: effective_sample_fps,
                 max_frames: max_frames as usize,
+                max_edge: None,
+                // The signals-only ingest endpoint does not expose a crop; the
+                // region-of-interest lever lives on the /reason analysis path.
+                crop: None,
             };
             decode_pipeline
-                .decode_signals(&decode_source, decode_config)
+                .decode_signals(decode_source, decode_config)
                 .map(|decoded| (decoded, source_fps, effective_sample_fps))
         })
         .await
@@ -295,7 +305,11 @@ pub async fn ingest_run(
                     "request_id": request_id,
                     "ingest": payload,
                     "decoded_frames": decoded.frame_signals.len(),
-                    "source_uri": decoded.source_uri,
+                    // Record what the caller asked to ingest. When the source is a
+                    // remote URL, decoded.source_uri holds the internal prefetch
+                    // temp path, which is deleted after decode and meaningless to
+                    // clients reading run metadata later.
+                    "source_uri": source_uri.as_str(),
                     "sampling_policy": sampling_policy.as_str(),
                     "sample_fps": effective_sample_fps
                 }),
@@ -326,7 +340,7 @@ pub async fn ingest_run(
                 "frames_decoded",
                 json!({
                     "request_id": request_id,
-                    "source_uri": decoded.source_uri,
+                    "source_uri": source_uri.as_str(),
                     "stream_id": stream_id,
                     "sampling_policy": sampling_policy.as_str(),
                     "source_fps": source_fps,
@@ -566,14 +580,13 @@ pub async fn query(
         .get("from_seq")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let events = match load_existing_events(&state, run_id).await {
+    let events = match state.read_run_events_from(run_id, from_seq).await {
         Ok(events) => events,
-        Err(error) => return error,
+        Err(err) => return internal_error(&state, format!("failed to read run events: {err}")),
     };
 
     let matches = events
         .into_iter()
-        .filter(|event| event.seq >= from_seq)
         .filter(|event| kind_filter.map(|kind| event.kind == kind).unwrap_or(true))
         .map(|event| {
             json!({
@@ -913,7 +926,7 @@ pub async fn analyze_run(
             segment_ms,
             confidence_weights: Default::default(),
         },
-        GateConfig::default(),
+        state.webrtc_config().gate_config.clone(),
     );
     let analyzed = pipeline.analyze_batch(&signals);
 
@@ -1010,6 +1023,8 @@ struct RealtimeReasonParams {
     segment_ms: u64,
     semantic_inference: bool,
     semantic_frames_per_chunk: usize,
+    semantic_frame_max_edge: Option<u32>,
+    crop: Option<vidarax_core::crop::CropRegion>,
     semantic_timeout_ms: u64,
     semantic_prompt: String,
     tiered_config: vidarax_core::tiered_vlm::TieredVlmConfig,
@@ -1103,6 +1118,29 @@ fn validate_realtime_reason_params(
             )],
         ));
     }
+    let semantic_frame_max_edge = payload.semantic_frame_max_edge;
+    if let Some(edge) = semantic_frame_max_edge {
+        if !(64..=4_096).contains(&edge) {
+            return Err(validation_error(
+                state,
+                "invalid realtime reason request",
+                vec![field_error(
+                    "semantic_frame_max_edge",
+                    "semantic_frame_max_edge must be in [64, 4096]".to_string(),
+                )],
+            ));
+        }
+    }
+    let crop = payload.crop;
+    if let Some(region) = crop {
+        if let Err(err) = region.validate() {
+            return Err(validation_error(
+                state,
+                "invalid realtime reason request",
+                vec![field_error("crop", err.to_string())],
+            ));
+        }
+    }
     let semantic_timeout_ms = payload.semantic_timeout_ms.unwrap_or(1_500);
     if !(100..=120_000).contains(&semantic_timeout_ms) {
         return Err(validation_error(
@@ -1190,6 +1228,8 @@ fn validate_realtime_reason_params(
         segment_ms,
         semantic_inference,
         semantic_frames_per_chunk,
+        semantic_frame_max_edge,
+        crop,
         semantic_timeout_ms,
         semantic_prompt,
         tiered_config,
@@ -1205,6 +1245,7 @@ struct RealtimeAssemblyOutput {
     markers: Vec<AnalyzeMarker>,
     lag_p95_ms: u64,
     lag_p99_ms: u64,
+    tokens: TokenMetrics,
 }
 
 fn marker_to_emit_event_request(
@@ -1252,6 +1293,7 @@ async fn assemble_realtime_reason_response(
     let mut metadata = Vec::with_capacity(decoded_frames);
     let mut marker_inputs = Vec::with_capacity(decoded_frames);
     let mut chunk_lags = Vec::new();
+    let mut token_metrics = TokenMetrics::default();
 
     for (chunk_idx, prep) in chunk_preps.into_iter().enumerate() {
         let semantic_overlay = semantic_results[chunk_idx].take().unwrap_or_default();
@@ -1302,6 +1344,15 @@ async fn assemble_realtime_reason_response(
         let lag_ms = process_ms.saturating_sub(source_span_ms);
         chunk_lags.push(lag_ms);
 
+        // e2e token/latency accounting: fold this chunk's model spend into the
+        // run total so the response reports the full cost of the analysis.
+        if semantic_overlay.attempted {
+            token_metrics.accumulate_chunk(
+                semantic_overlay.usage,
+                semantic_overlay.inference_latency_ms,
+            );
+        }
+
         if let Err(err) = state
             .append_run_event_async(
                 run_id,
@@ -1315,6 +1366,11 @@ async fn assemble_realtime_reason_response(
                     "source_span_ms": source_span_ms,
                     "lag_ms": lag_ms,
                     "index_name": index_name,
+                    "prompt_tokens": semantic_overlay.usage.prompt_tokens,
+                    "completion_tokens": semantic_overlay.usage.completion_tokens,
+                    "thinking_tokens": semantic_overlay.usage.thinking_tokens,
+                    "total_tokens": semantic_overlay.usage.total_tokens,
+                    "inference_latency_ms": semantic_overlay.inference_latency_ms,
                 }),
             )
             .await
@@ -1387,6 +1443,12 @@ async fn assemble_realtime_reason_response(
                 "mode": mode,
                 "model": model,
                 "index_name": index_name,
+                "prompt_tokens": token_metrics.prompt_tokens,
+                "completion_tokens": token_metrics.completion_tokens,
+                "thinking_tokens": token_metrics.thinking_tokens,
+                "total_tokens": token_metrics.total_tokens,
+                "inference_latency_ms": token_metrics.inference_latency_ms,
+                "chunks_analyzed": token_metrics.chunks_analyzed,
             }),
         )
         .await
@@ -1422,6 +1484,7 @@ async fn assemble_realtime_reason_response(
         markers,
         lag_p95_ms,
         lag_p99_ms,
+        tokens: token_metrics,
     })
 }
 
@@ -1474,6 +1537,8 @@ pub async fn reason_realtime_run(
     let segment_ms = params.segment_ms;
     let semantic_inference = params.semantic_inference;
     let semantic_frames_per_chunk = params.semantic_frames_per_chunk;
+    let semantic_frame_max_edge = params.semantic_frame_max_edge;
+    let crop = params.crop;
     let semantic_timeout_ms = params.semantic_timeout_ms;
     let semantic_prompt = params.semantic_prompt;
     let tiered_config = params.tiered_config;
@@ -1481,12 +1546,16 @@ pub async fn reason_realtime_run(
     let video_clip_duration_s = params.video_clip_duration_s;
     let fixed_fps = params.fixed_fps;
     let semantic_decode_enabled = semantic_inference && state.provider().is_some();
-    let decode_source_ref = params.decode_source.clone();
     let decode_source = params.decode_source;
     let decode_pipeline = state.decode_pipeline();
-    let (decoded, source_fps, sample_fps, decoded_jpegs) =
+    let (prepared_source, decoded, source_fps, sample_fps, decoded_jpegs) =
         match tokio::task::spawn_blocking(move || {
-            let source_fps = probe_source_fps(&decode_source);
+            // Fetch a remote source once here. The probe, signal decode, JPEG
+            // decode, and per-chunk clip extraction below all read the same local
+            // copy instead of re-downloading it on every call.
+            let prepared = prepare_source_for_reuse(&decode_source)?;
+            let decode_source = prepared.source();
+            let source_fps = probe_source_fps(decode_source);
             let sample_fps = match sampling_policy {
                 SamplingPolicy::SourceFpsAdaptive => {
                     source_fps.map(adaptive_sample_fps).unwrap_or(24.0)
@@ -1496,9 +1565,15 @@ pub async fn reason_realtime_run(
             let decode_config = Mp4DecodeConfig {
                 sample_fps,
                 max_frames: max_frames as usize,
+                // Signals stay at source resolution; only VLM-bound JPEGs are
+                // downscaled (below), so the gate engine keeps full detail.
+                max_edge: None,
+                // Crop applies to signals too: the gate should judge only the
+                // region the VLM will ultimately see, so both agree on the ROI.
+                crop,
             };
             // Pass 1: frame signals (cheap, no encoding)
-            let decoded = decode_pipeline.decode_signals(&decode_source, decode_config)?;
+            let decoded = decode_pipeline.decode_signals(decode_source, decode_config)?;
 
             // In video_clip_mode, JPEG decoding is skipped here; clips are
             // extracted per chunk below.
@@ -1509,10 +1584,12 @@ pub async fn reason_realtime_run(
                     semantic_frames_per_chunk,
                 );
                 let jpegs = decode_pipeline.decode_jpegs(
-                    &decode_source,
+                    decode_source,
                     sample_fps,
                     &indices,
                     max_frames as usize,
+                    semantic_frame_max_edge,
+                    crop,
                 )?;
                 let lookup: std::collections::HashMap<u64, DecodedJpegFrame> =
                     jpegs.into_iter().map(|f| (f.frame_index, f)).collect();
@@ -1520,7 +1597,7 @@ pub async fn reason_realtime_run(
             } else {
                 None
             };
-            Ok((decoded, source_fps, sample_fps, decoded_jpegs))
+            Ok((prepared, decoded, source_fps, sample_fps, decoded_jpegs))
         })
         .await
         {
@@ -1579,7 +1656,7 @@ pub async fn reason_realtime_run(
             segment_ms,
             confidence_weights: Default::default(),
         },
-        GateConfig::default(),
+        state.webrtc_config().gate_config.clone(),
     );
 
     let providers = state.provider().cloned();
@@ -1605,25 +1682,36 @@ pub async fn reason_realtime_run(
         }
     }
 
+    // Share the prepared source with each detached clip task so the prefetched
+    // temp file outlives request cancellation until every task finishes reading.
+    let prepared_source = Arc::new(prepared_source);
+    let clip_decode_pipeline = state.decode_pipeline();
     let chunk_preps = prepare_realtime_chunks(
         &decoded.frame_signals,
         chunk_size,
         decoded_jpegs.as_ref(),
         &mut pipeline,
-        &decode_source_ref,
+        &clip_decode_pipeline,
+        &prepared_source,
         video_clip_mode,
         semantic_decode_enabled,
         video_clip_duration_s,
+        crop,
     )
     .await;
 
     let visual_diff = payload.visual_diff.unwrap_or(false);
     let temporal_chain = visual_diff || payload.temporal_chain.unwrap_or(false);
-    let guided_json_str: Option<String> = payload
+    let guided_json_str: Option<Arc<str>> = payload
         .output_schema
         .as_ref()
-        .and_then(|s| serde_json::to_string(s).ok());
+        .and_then(|s| serde_json::to_string(s).ok())
+        .map(Arc::from);
     let vlm_concurrency = payload.vlm_concurrency.unwrap_or(4).clamp(1, 64);
+    // Same InferenceMetrics instance /metrics reads from, so analyze's tiered
+    // passes are attributed to their true provider the same way WHIP's are.
+    let analyze_observer: Option<Arc<dyn InferenceObserver>> =
+        Some(Arc::clone(state.inference_metrics_arc()) as Arc<dyn InferenceObserver>);
     let (semantic_results, task_end_times) = run_semantic_dispatch(
         &chunk_preps,
         providers,
@@ -1636,6 +1724,7 @@ pub async fn reason_realtime_run(
         visual_diff,
         temporal_chain,
         vlm_concurrency,
+        analyze_observer,
     )
     .await;
 
@@ -1673,6 +1762,7 @@ pub async fn reason_realtime_run(
         sample_fps,
         lag_p95_ms: assembled.lag_p95_ms,
         lag_p99_ms: assembled.lag_p99_ms,
+        tokens: assembled.tokens,
         metadata: assembled.metadata,
         markers: assembled.markers,
     }))
@@ -2259,6 +2349,7 @@ async fn execute_infer_request(
         result.provider,
         started.elapsed().as_millis() as u64,
         result.fallback_used,
+        result.usage,
     );
 
     if let Some(run_id) = prepared.run_id.as_deref() {
@@ -2290,6 +2381,7 @@ async fn execute_infer_request(
         output_text: result.output_text,
         finish_reason: result.finish_reason,
         inference_latency_ms: result.inference_latency_ms,
+        tokens: result.usage,
     })
 }
 

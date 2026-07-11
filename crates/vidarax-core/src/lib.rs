@@ -1,12 +1,15 @@
 pub mod backends;
+pub mod crop;
 pub mod dedup;
 pub mod gate;
 pub mod gemini;
 pub mod ingest;
 pub mod loop_detector;
 pub mod metrics;
+pub mod novelty;
 pub mod pipeline;
 pub mod provider;
+pub mod semantic_merge;
 pub mod tiered_vlm;
 pub mod timeline;
 #[cfg(feature = "training")]

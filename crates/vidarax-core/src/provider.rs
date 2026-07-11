@@ -10,6 +10,11 @@ pub enum ProviderKind {
     Vllm,
     Sglang,
     Gemini,
+    /// mlx-vlm running on Apple Silicon. Speaks the same OpenAI-compatible
+    /// protocol as vLLM/SGLang, so it reuses `OpenAiCompatProvider`; this
+    /// variant only exists to keep its telemetry and tiering label distinct
+    /// from the self-hosted GPU backends.
+    Mlx,
 }
 
 impl ProviderKind {
@@ -19,6 +24,7 @@ impl ProviderKind {
             ProviderKind::Vllm => "vllm",
             ProviderKind::Sglang => "sglang",
             ProviderKind::Gemini => "gemini",
+            ProviderKind::Mlx => "mlx",
         }
     }
 }
@@ -86,6 +92,33 @@ pub struct InferenceVideo {
     pub data_base64: String,
 }
 
+/// Provider-reported token usage for one inference. Zeroed when a provider does
+/// not report usage. `thinking_tokens` is non-zero only for models that emit
+/// hidden reasoning (e.g. Gemini `thoughtsTokenCount`); it is what lets the
+/// pipeline detect thinking without hardcoding model names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub thinking_tokens: u32,
+    pub total_tokens: u32,
+}
+
+impl TokenUsage {
+    /// Fold another usage into this one, saturating on overflow. Used to sum
+    /// token spend across multiple inference passes (e.g. tiered first+second
+    /// pass) so the surfaced total reflects the whole analysis, not just the
+    /// final call.
+    pub fn accumulate(&mut self, other: TokenUsage) {
+        self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(other.completion_tokens);
+        self.thinking_tokens = self.thinking_tokens.saturating_add(other.thinking_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct InferenceResult {
     pub provider: ProviderKind,
@@ -94,6 +127,7 @@ pub struct InferenceResult {
     pub fallback_used: bool,
     pub finish_reason: Option<String>,
     pub inference_latency_ms: u64,
+    pub usage: TokenUsage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +155,25 @@ pub trait Transport: Send + Sync {
 pub trait InferenceProvider: Send + Sync {
     fn kind(&self) -> ProviderKind;
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError>;
+}
+
+/// Records inference outcomes for `/metrics`, one call per inference pass.
+///
+/// `vidarax-core` defines this interface rather than depending on the metrics
+/// type itself, since `vidarax-api` (where the real recorder lives) depends on
+/// `vidarax-core` and not the other way around. Tiered inference calls this
+/// once per pass so each pass is attributed to the provider that actually
+/// served it, instead of folding a cheap local pass and an expensive escalated
+/// pass into one bucket.
+pub trait InferenceObserver: Send + Sync {
+    fn record_success(
+        &self,
+        provider: ProviderKind,
+        latency_ms: u64,
+        fallback_used: bool,
+        usage: TokenUsage,
+    );
+    fn record_error(&self, provider: ProviderKind, latency_ms: u64);
 }
 
 #[derive(Clone)]
@@ -210,7 +263,7 @@ impl<T: Transport> InferenceProvider for OpenAiCompatProvider<T> {
             .transport
             .call("/v1/chat/completions", body, request.timeout_ms)?;
         let inference_latency_ms = t0.elapsed().as_millis() as u64;
-        let (output_text, finish_reason) = parse_completion(&response)?;
+        let (output_text, finish_reason, usage) = parse_completion(&response)?;
 
         Ok(InferenceResult {
             provider: self.kind,
@@ -219,6 +272,7 @@ impl<T: Transport> InferenceProvider for OpenAiCompatProvider<T> {
             fallback_used: false,
             finish_reason,
             inference_latency_ms,
+            usage,
         })
     }
 }
@@ -291,6 +345,63 @@ pub fn infer_with_endpoints(
     request: &InferenceRequest,
 ) -> Result<InferenceResult, ProviderError> {
     provider.infer(request)
+}
+
+/// Dispatches an inference request to whichever backend was configured to
+/// serve `request.model`, falling back to `default` for any model id with no
+/// explicit route.
+///
+/// [`ProviderRouter`] answers a different question: given one request, which
+/// backend should try it first and which backend catches a retryable
+/// failure. This type answers "which backend actually speaks this model id",
+/// which is what tiered inference needs when it swaps `request.model` between
+/// a first pass and a second pass — the second pass has to land on the
+/// backend that serves *that* model, not just retry the same backend that
+/// already ran the first pass.
+///
+/// Routing keys are exact, explicitly configured model ids (see
+/// [`crate::backends::build_provider_with_model_routing`]). There is no
+/// name-substring or prefix matching here: a model is routable because some
+/// backend's config names it, not because its id looks a certain way.
+pub struct ModelRoutingProvider {
+    routes: std::collections::HashMap<String, Arc<dyn InferenceProvider + Send + Sync>>,
+    default: Arc<dyn InferenceProvider + Send + Sync>,
+}
+
+impl ModelRoutingProvider {
+    pub fn new(
+        routes: std::collections::HashMap<String, Arc<dyn InferenceProvider + Send + Sync>>,
+        default: Arc<dyn InferenceProvider + Send + Sync>,
+    ) -> Self {
+        Self { routes, default }
+    }
+
+    /// Model ids with an explicit route, sorted for stable diagnostics and
+    /// test assertions.
+    pub fn route_models(&self) -> Vec<&str> {
+        let mut models: Vec<&str> = self.routes.keys().map(String::as_str).collect();
+        models.sort_unstable();
+        models
+    }
+}
+
+impl InferenceProvider for ModelRoutingProvider {
+    fn kind(&self) -> ProviderKind {
+        self.default.kind()
+    }
+
+    fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+        // A HashMap lookup costs nanoseconds; the call it guards is a network
+        // round-trip to a model that takes hundreds of milliseconds. This is
+        // the same reasoning `build_provider_chain`'s doc comment gives for
+        // why virtual dispatch through `Arc<dyn InferenceProvider>` is fine
+        // here: it is the per-inference path, not the per-frame hot path, so
+        // the lookup is nowhere close to what bounds latency.
+        self.routes
+            .get(request.model.as_ref())
+            .unwrap_or(&self.default)
+            .infer(request)
+    }
 }
 
 fn canonical_model(model: &str) -> Result<&'static str, ProviderError> {
@@ -376,6 +487,20 @@ fn build_payload(model: &str, request: &InferenceRequest) -> String {
 #[derive(serde::Deserialize)]
 struct CompletionResponse {
     choices: Vec<CompletionChoice>,
+    #[serde(default)]
+    usage: Option<CompletionUsage>,
+}
+
+/// OpenAI-compatible `usage` block (vLLM/SGLang). Absent on servers that don't
+/// report it, in which case token counts stay zero.
+#[derive(serde::Deserialize)]
+struct CompletionUsage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
+    #[serde(default)]
+    total_tokens: u32,
 }
 
 #[derive(serde::Deserialize)]
@@ -390,11 +515,22 @@ struct CompletionMessage {
     content: Value,
 }
 
-/// Returns `(output_text, finish_reason)`.
-fn parse_completion(raw: &str) -> Result<(String, Option<String>), ProviderError> {
+/// Returns `(output_text, finish_reason, usage)`. `usage` is zeroed when the
+/// server does not report a `usage` block.
+fn parse_completion(raw: &str) -> Result<(String, Option<String>, TokenUsage), ProviderError> {
     let resp: CompletionResponse = serde_json::from_str(raw).map_err(|e| {
         ProviderError::InvalidResponse(format!("invalid json response: {e}").into())
     })?;
+
+    let usage = resp
+        .usage
+        .map(|u| TokenUsage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            thinking_tokens: 0,
+            total_tokens: u.total_tokens,
+        })
+        .unwrap_or_default();
 
     let first = resp
         .choices
@@ -415,7 +551,7 @@ fn parse_completion(raw: &str) -> Result<(String, Option<String>), ProviderError
                 "missing choices[0].message.content".into(),
             ))?;
 
-    parse_content_value(content).map(|text| (text, finish_reason))
+    parse_content_value(content).map(|text| (text, finish_reason, usage))
 }
 
 fn parse_content_value(value: Value) -> Result<String, ProviderError> {
@@ -453,15 +589,16 @@ fn parse_content_value(value: Value) -> Result<String, ProviderError> {
 mod tests {
     use super::{
         build_payload, infer_with_endpoints, HttpTransport, InferenceImage, InferenceProvider,
-        InferenceRequest, InferenceVideo, OpenAiCompatProvider, ProviderError, ProviderKind,
-        ProviderRouter, Transport,
+        InferenceRequest, InferenceResult, InferenceVideo, ModelRoutingProvider,
+        OpenAiCompatProvider, ProviderError, ProviderKind, ProviderRouter, TokenUsage, Transport,
     };
     use serde_json::Value;
+    use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
     use std::thread;
 
@@ -764,5 +901,108 @@ mod tests {
         let result = provider.infer(&request()).unwrap();
         // MockTransport returns instantly; just verify the field is present and >= 0.
         let _ = result.inference_latency_ms; // u64, always >= 0
+    }
+
+    // ── ModelRoutingProvider ─────────────────────────────────────────────────
+
+    /// Records the model id of every request it receives instead of talking
+    /// to a real transport, so tests can assert which provider a request
+    /// landed on.
+    struct RecordingModelProvider {
+        kind: ProviderKind,
+        seen_models: Mutex<Vec<String>>,
+    }
+
+    impl RecordingModelProvider {
+        fn new(kind: ProviderKind) -> Self {
+            Self {
+                kind,
+                seen_models: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl InferenceProvider for RecordingModelProvider {
+        fn kind(&self) -> ProviderKind {
+            self.kind
+        }
+
+        fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+            self.seen_models
+                .lock()
+                .unwrap()
+                .push(request.model.to_string());
+            Ok(InferenceResult {
+                provider: self.kind,
+                model: Arc::clone(&request.model),
+                output_text: "ok".to_string(),
+                fallback_used: false,
+                finish_reason: None,
+                inference_latency_ms: 0,
+                usage: TokenUsage::default(),
+            })
+        }
+    }
+
+    #[test]
+    fn model_routing_dispatches_to_mapped_provider_for_configured_model_id() {
+        let routed = Arc::new(RecordingModelProvider::new(ProviderKind::Gemini));
+        let default = Arc::new(RecordingModelProvider::new(ProviderKind::Vllm));
+        let mut routes: HashMap<String, Arc<dyn InferenceProvider + Send + Sync>> = HashMap::new();
+        routes.insert("gemini-3.1-flash-lite".to_string(), routed.clone());
+        let router = ModelRoutingProvider::new(routes, default.clone());
+
+        let mut req = request();
+        req.model = Arc::from("gemini-3.1-flash-lite");
+        router.infer(&req).expect("routed inference");
+
+        assert_eq!(
+            routed.seen_models.lock().unwrap().as_slice(),
+            ["gemini-3.1-flash-lite"]
+        );
+        assert!(default.seen_models.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn model_routing_falls_back_to_default_for_unmapped_model_id() {
+        let routed = Arc::new(RecordingModelProvider::new(ProviderKind::Gemini));
+        let default = Arc::new(RecordingModelProvider::new(ProviderKind::Vllm));
+        let mut routes: HashMap<String, Arc<dyn InferenceProvider + Send + Sync>> = HashMap::new();
+        routes.insert("gemini-3.1-flash-lite".to_string(), routed.clone());
+        let router = ModelRoutingProvider::new(routes, default.clone());
+
+        let mut req = request();
+        req.model = Arc::from("some/other-model");
+        router.infer(&req).expect("default inference");
+
+        assert!(routed.seen_models.lock().unwrap().is_empty());
+        assert_eq!(
+            default.seen_models.lock().unwrap().as_slice(),
+            ["some/other-model"]
+        );
+    }
+
+    #[test]
+    fn model_routing_route_models_lists_configured_keys_sorted() {
+        let default = Arc::new(RecordingModelProvider::new(ProviderKind::Vllm));
+        let mut routes: HashMap<String, Arc<dyn InferenceProvider + Send + Sync>> = HashMap::new();
+        routes.insert(
+            "zeta-model".to_string(),
+            Arc::new(RecordingModelProvider::new(ProviderKind::Gemini)) as _,
+        );
+        routes.insert(
+            "alpha-model".to_string(),
+            Arc::new(RecordingModelProvider::new(ProviderKind::Gemini)) as _,
+        );
+        let router = ModelRoutingProvider::new(routes, default);
+
+        assert_eq!(router.route_models(), vec!["alpha-model", "zeta-model"]);
+    }
+
+    #[test]
+    fn model_routing_kind_reflects_default_provider() {
+        let default = Arc::new(RecordingModelProvider::new(ProviderKind::Sglang));
+        let router = ModelRoutingProvider::new(HashMap::new(), default);
+        assert_eq!(router.kind(), ProviderKind::Sglang);
     }
 }

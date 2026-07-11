@@ -358,17 +358,22 @@ impl TrainingStore {
         for (_, label) in &neighbors {
             *counts.entry(label.as_str()).or_insert(0) += 1;
         }
-        let (winning_label, votes) = counts
-            .into_iter()
-            .max_by_key(|(_, c)| *c)
-            .expect("neighbors is non-empty");
-
-        Ok(Some(KnnResult {
-            label: winning_label.to_string(),
-            avg_distance,
-            votes,
-            total,
-        }))
+        // The guard above leaves at least one neighbour, so there is always a
+        // winner here; matching on the option rather than unwrapping keeps the
+        // function total, with the empty case folding back into "no match".
+        // Ties are broken by label so identical data returns the same winner
+        // every run, rather than following hash-map iteration order.
+        match counts.into_iter().max_by(|(a_label, a_c), (b_label, b_c)| {
+            a_c.cmp(b_c).then_with(|| b_label.cmp(a_label))
+        }) {
+            Some((winning_label, votes)) => Ok(Some(KnnResult {
+                label: winning_label.to_string(),
+                avg_distance,
+                votes,
+                total,
+            })),
+            None => Ok(None),
+        }
     }
 
     /// Export all pairs for a tenant as newline-delimited JSON.

@@ -5,7 +5,7 @@ pub const GATE_FLICKER_THRESHOLD: f32 = 0.55;
 pub const GATE_GHOSTING_THRESHOLD: f32 = 0.55;
 pub const GATE_NOISE_VARIANCE_THRESHOLD: f32 = 0.55;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GateConfig {
     pub keepalive_every_frames: u64,
     pub scene_cut_hamming_threshold: u32,
@@ -174,11 +174,6 @@ impl GateEngine {
             0.0,                                           // 7: no_trigger
         ];
 
-        // Capture keyframe for the three KeepKeyframe conditions (indices 0–2).
-        if idx < 3 {
-            self.capture_keyframe(s);
-        }
-
         GateEvent {
             event_type: EVENT_TYPES[idx],
             frame_index: s.frame_index,
@@ -188,7 +183,7 @@ impl GateEngine {
         }
     }
 
-    fn capture_keyframe(&mut self, s: FrameSignal) {
+    pub fn commit_keyframe(&mut self, s: FrameSignal) {
         self.initialized = true;
         self.last_kept_frame_index = s.frame_index;
         self.last_kept_hash = s.perceptual_hash;
@@ -220,7 +215,7 @@ mod tests {
         fn process_reference(&mut self, s: FrameSignal) -> super::GateEvent {
             use super::{GateEvent, GateEventType, GateReasonCode};
             if !self.initialized {
-                self.capture_keyframe(s);
+                self.commit_keyframe(s);
                 return GateEvent {
                     event_type: GateEventType::KeepKeyframe,
                     frame_index: s.frame_index,
@@ -231,7 +226,7 @@ mod tests {
             }
             let hash_distance = (self.last_kept_hash ^ s.perceptual_hash).count_ones();
             if hash_distance >= self.config.scene_cut_hamming_threshold {
-                self.capture_keyframe(s);
+                self.commit_keyframe(s);
                 return GateEvent {
                     event_type: GateEventType::KeepKeyframe,
                     frame_index: s.frame_index,
@@ -242,7 +237,7 @@ mod tests {
             }
             let frames_since_keep = s.frame_index.saturating_sub(self.last_kept_frame_index);
             if frames_since_keep >= self.config.keepalive_every_frames {
-                self.capture_keyframe(s);
+                self.commit_keyframe(s);
                 return GateEvent {
                     event_type: GateEventType::KeepKeyframe,
                     frame_index: s.frame_index,
@@ -313,7 +308,7 @@ mod tests {
             ..GateConfig::default()
         };
         let mut gate = GateEngine::new(cfg);
-        gate.process(s(0, 0));
+        gate.commit_keyframe(s(0, 0));
         let ev = gate.process(s(1, u64::MAX));
         assert_eq!(ev.event_type, GateEventType::KeepKeyframe);
         assert_eq!(ev.reason_code, GateReasonCode::SceneCut);
@@ -326,7 +321,7 @@ mod tests {
             ..GateConfig::default()
         };
         let mut gate = GateEngine::new(cfg);
-        gate.process(s(0, 123));
+        gate.commit_keyframe(s(0, 123));
         assert_eq!(gate.process(s(1, 123)).event_type, GateEventType::Skip);
         let ev = gate.process(s(2, 123));
         assert_eq!(ev.event_type, GateEventType::KeepKeyframe);
@@ -336,7 +331,7 @@ mod tests {
     #[test]
     fn flags_temporal_artifact_signal() {
         let mut gate = GateEngine::new(GateConfig::default());
-        gate.process(s(0, 1));
+        gate.commit_keyframe(s(0, 1));
         let mut sample = s(1, 1);
         sample.flicker_score = 0.8;
         let ev = gate.process(sample);
@@ -423,7 +418,34 @@ mod tests {
                     br_ev, ref_ev,
                     "path '{label}' frame={frame_index}: branchless={br_ev:?} vs reference={ref_ev:?}"
                 );
+                if br_ev.event_type == GateEventType::KeepKeyframe {
+                    branchless.commit_keyframe(sig);
+                }
             }
         }
+    }
+
+    #[test]
+    fn keep_decision_does_not_advance_reference_until_committed() {
+        let cfg = GateConfig {
+            scene_cut_hamming_threshold: 4,
+            ..GateConfig::default()
+        };
+        let mut gate = GateEngine::new(cfg);
+        let first = s(0, 0xAAAA);
+        assert_eq!(
+            gate.process(first).reason_code,
+            GateReasonCode::InitialFrame
+        );
+
+        let repeated = s(1, 0xAAAA);
+        assert_eq!(
+            gate.process(repeated).reason_code,
+            GateReasonCode::InitialFrame,
+            "an uncommitted initial keep must not become the reference frame"
+        );
+
+        gate.commit_keyframe(first);
+        assert_eq!(gate.process(repeated).event_type, GateEventType::Skip);
     }
 }

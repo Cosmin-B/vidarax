@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use vidarax_core::provider::ProviderKind;
+use vidarax_core::provider::{InferenceObserver, ProviderKind, TokenUsage};
 
 const LATENCY_BUCKETS_MS: [u64; 10] = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
 
@@ -8,6 +8,7 @@ pub struct InferenceMetrics {
     vllm: ProviderMetrics,
     sglang: ProviderMetrics,
     gemini: ProviderMetrics,
+    mlx: ProviderMetrics,
 }
 
 impl InferenceMetrics {
@@ -16,15 +17,31 @@ impl InferenceMetrics {
             vllm: ProviderMetrics::new(),
             sglang: ProviderMetrics::new(),
             gemini: ProviderMetrics::new(),
+            mlx: ProviderMetrics::new(),
         }
     }
 
-    pub fn record_success(&self, provider: ProviderKind, latency_ms: u64, fallback_used: bool) {
+    pub fn record_success(
+        &self,
+        provider: ProviderKind,
+        latency_ms: u64,
+        fallback_used: bool,
+        usage: TokenUsage,
+    ) {
         let metrics = self.provider(provider);
         metrics.success_total.fetch_add(1, Ordering::Relaxed);
         if fallback_used {
             metrics.fallback_total.fetch_add(1, Ordering::Relaxed);
         }
+        metrics
+            .prompt_tokens_total
+            .fetch_add(usage.prompt_tokens as u64, Ordering::Relaxed);
+        metrics
+            .completion_tokens_total
+            .fetch_add(usage.completion_tokens as u64, Ordering::Relaxed);
+        metrics
+            .thinking_tokens_total
+            .fetch_add(usage.thinking_tokens as u64, Ordering::Relaxed);
         metrics.record_latency(latency_ms);
     }
 
@@ -42,6 +59,7 @@ impl InferenceMetrics {
         self.vllm.is_high_latency()
             || self.sglang.is_high_latency()
             || self.gemini.is_high_latency()
+            || self.mlx.is_high_latency()
     }
 
     pub fn render_prometheus(&self) -> String {
@@ -49,6 +67,7 @@ impl InferenceMetrics {
         self.render_provider("vllm", &self.vllm, &mut out);
         self.render_provider("sglang", &self.sglang, &mut out);
         self.render_provider("gemini", &self.gemini, &mut out);
+        self.render_provider("mlx", &self.mlx, &mut out);
         out
     }
 
@@ -57,6 +76,9 @@ impl InferenceMetrics {
         let ok = p.success_total.load(Ordering::Relaxed);
         let err = p.error_total.load(Ordering::Relaxed);
         let fallback = p.fallback_total.load(Ordering::Relaxed);
+        let prompt_tokens = p.prompt_tokens_total.load(Ordering::Relaxed);
+        let completion_tokens = p.completion_tokens_total.load(Ordering::Relaxed);
+        let thinking_tokens = p.thinking_tokens_total.load(Ordering::Relaxed);
         let sum_ms = p.latency_sum_ms.load(Ordering::Relaxed);
         let count = p.latency_count.load(Ordering::Relaxed);
 
@@ -71,6 +93,18 @@ impl InferenceMetrics {
         let _ = writeln!(
             out,
             "vidarax_infer_fallback_total{{provider=\"{name}\"}} {fallback}"
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_tokens_total{{provider=\"{name}\",kind=\"prompt\"}} {prompt_tokens}"
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_tokens_total{{provider=\"{name}\",kind=\"completion\"}} {completion_tokens}"
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_tokens_total{{provider=\"{name}\",kind=\"thinking\"}} {thinking_tokens}"
         );
 
         let mut cumulative = 0u64;
@@ -114,6 +148,7 @@ impl InferenceMetrics {
             ProviderKind::Vllm => &self.vllm,
             ProviderKind::Sglang => &self.sglang,
             ProviderKind::Gemini => &self.gemini,
+            ProviderKind::Mlx => &self.mlx,
         }
     }
 }
@@ -124,10 +159,33 @@ impl Default for InferenceMetrics {
     }
 }
 
+/// Lets `vidarax-core` (the WHIP VLM workers, clip workers, and tiered
+/// inference router) record into `/metrics` without depending on
+/// `vidarax-api`. Delegates straight to the inherent methods above, which
+/// already have matching signatures.
+impl InferenceObserver for InferenceMetrics {
+    fn record_success(
+        &self,
+        provider: ProviderKind,
+        latency_ms: u64,
+        fallback_used: bool,
+        usage: TokenUsage,
+    ) {
+        InferenceMetrics::record_success(self, provider, latency_ms, fallback_used, usage)
+    }
+
+    fn record_error(&self, provider: ProviderKind, latency_ms: u64) {
+        InferenceMetrics::record_error(self, provider, latency_ms)
+    }
+}
+
 struct ProviderMetrics {
     success_total: AtomicU64,
     error_total: AtomicU64,
     fallback_total: AtomicU64,
+    prompt_tokens_total: AtomicU64,
+    completion_tokens_total: AtomicU64,
+    thinking_tokens_total: AtomicU64,
     latency_sum_ms: AtomicU64,
     latency_count: AtomicU64,
     latency_buckets: [AtomicU64; LATENCY_BUCKETS_MS.len()],
@@ -139,6 +197,9 @@ impl ProviderMetrics {
             success_total: AtomicU64::new(0),
             error_total: AtomicU64::new(0),
             fallback_total: AtomicU64::new(0),
+            prompt_tokens_total: AtomicU64::new(0),
+            completion_tokens_total: AtomicU64::new(0),
+            thinking_tokens_total: AtomicU64::new(0),
             latency_sum_ms: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -178,16 +239,77 @@ impl ProviderMetrics {
 #[cfg(test)]
 mod tests {
     use super::InferenceMetrics;
-    use vidarax_core::provider::ProviderKind;
+    use vidarax_core::provider::{ProviderKind, TokenUsage};
 
     #[test]
     fn renders_provider_metrics() {
         let metrics = InferenceMetrics::new();
-        metrics.record_success(ProviderKind::Vllm, 30, false);
+        metrics.record_success(
+            ProviderKind::Vllm,
+            30,
+            false,
+            TokenUsage {
+                prompt_tokens: 120,
+                completion_tokens: 45,
+                thinking_tokens: 0,
+                total_tokens: 165,
+            },
+        );
         metrics.record_error(ProviderKind::Vllm, 300);
         let text = metrics.render_prometheus();
         assert!(text.contains("vidarax_infer_requests_total{provider=\"vllm\",status=\"ok\"} 1"));
         assert!(text.contains("vidarax_infer_requests_total{provider=\"vllm\",status=\"error\"} 1"));
         assert!(text.contains("vidarax_infer_latency_ms_count{provider=\"vllm\"} 2"));
+        assert!(text.contains("vidarax_infer_tokens_total{provider=\"vllm\",kind=\"prompt\"} 120"));
+        assert!(
+            text.contains("vidarax_infer_tokens_total{provider=\"vllm\",kind=\"completion\"} 45")
+        );
+    }
+
+    #[test]
+    fn renders_mlx_metrics_under_its_own_label_distinct_from_vllm() {
+        // mlx is a distinct ProviderKind (on-device mlx-vlm), so its counters
+        // must land under the "mlx" series, not fold into "vllm".
+        let metrics = InferenceMetrics::new();
+        metrics.record_success(
+            ProviderKind::Mlx,
+            15,
+            false,
+            TokenUsage {
+                prompt_tokens: 80,
+                completion_tokens: 20,
+                thinking_tokens: 0,
+                total_tokens: 100,
+            },
+        );
+        let text = metrics.render_prometheus();
+        assert!(text.contains("vidarax_infer_requests_total{provider=\"mlx\",status=\"ok\"} 1"));
+        assert!(text.contains("vidarax_infer_tokens_total{provider=\"mlx\",kind=\"prompt\"} 80"));
+        assert!(text.contains("vidarax_infer_requests_total{provider=\"vllm\",status=\"ok\"} 0"));
+    }
+
+    #[test]
+    fn accumulates_tokens_across_calls() {
+        let metrics = InferenceMetrics::new();
+        for _ in 0..3 {
+            metrics.record_success(
+                ProviderKind::Gemini,
+                10,
+                false,
+                TokenUsage {
+                    prompt_tokens: 100,
+                    completion_tokens: 10,
+                    thinking_tokens: 50,
+                    total_tokens: 160,
+                },
+            );
+        }
+        let text = metrics.render_prometheus();
+        assert!(
+            text.contains("vidarax_infer_tokens_total{provider=\"gemini\",kind=\"prompt\"} 300")
+        );
+        assert!(
+            text.contains("vidarax_infer_tokens_total{provider=\"gemini\",kind=\"thinking\"} 150")
+        );
     }
 }
