@@ -531,8 +531,11 @@ impl WebRtcSession {
         let seq_counter = Arc::new(AtomicU64::new(0));
         let codec = self.codec;
         let rtp_nal_pool_slots = self.rtp_nal_pool_slots;
-        // Subscribe to the session shutdown latch here so a close() that lands
-        // before the first poll is already stored and observed below.
+        // Subscribe to the shutdown latch when run() is called, not at first
+        // poll. A close() between this call and the first poll bumps the latch,
+        // so the loop's top borrow sees it (and changed() is ready); a close()
+        // that already happened is retained by the keepalive receiver and read
+        // here as the current value.
         let mut shutdown = self.shutdown.subscribe();
 
         async move {
@@ -546,15 +549,15 @@ impl WebRtcSession {
             let mut track_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
             loop {
-                // Decide before waiting. A shutdown or terminal peer state
-                // published before run() first polled (the handler closing the
-                // session the instant a pipeline spawn failed, before this task
-                // was scheduled) is marked already-seen on a fresh receiver, so
-                // changed() would never fire for it and run() would hang. The
-                // top-of-loop borrow catches that; a signal raised afterwards
-                // makes the matching changed() ready in the usual way. The
-                // shutdown latch is monotonic and so cannot be lost to a late
-                // rustrtc republish, which the peer-state watch alone can.
+                // Decide before waiting. peer_state is subscribed inside this
+                // future, so a terminal state published before the first poll is
+                // already-seen on that fresh receiver and its changed() never
+                // fires; the borrow here is what catches it. The shutdown latch
+                // is subscribed when run() is called and is monotonic, so a
+                // close() can be neither lost nor overwritten by a late rustrtc
+                // republish (which the peer-state watch alone permits). A signal
+                // raised after this borrow makes the matching changed() ready in
+                // the usual way.
                 if should_stop(
                     *shutdown.borrow_and_update(),
                     *peer_state.borrow_and_update(),
@@ -1396,9 +1399,16 @@ a=rtpmap:111 opus/48000/2\r\n";
         use super::should_stop;
         use rustrtc::peer_connection::PeerConnectionState as S;
 
-        // A raised shutdown latch stops the loop for any peer state, including a
-        // Connected that a late rustrtc republish could put back after close().
-        for peer in [S::New, S::Connecting, S::Connected, S::Closed] {
+        // A raised shutdown latch stops the loop for every peer state, including
+        // a Connected that a late rustrtc republish could put back after close().
+        for peer in [
+            S::New,
+            S::Connecting,
+            S::Connected,
+            S::Disconnected,
+            S::Failed,
+            S::Closed,
+        ] {
             assert!(should_stop(true, peer), "shutdown must win over {peer:?}");
         }
 
@@ -1411,16 +1421,37 @@ a=rtpmap:111 opus/48000/2\r\n";
         assert!(!should_stop(false, S::Connected));
     }
 
-    /// A close that lands before run() first polls must still terminate run()
-    /// and release the RTP sender. run() subscribes to the shutdown latch and
-    /// peer state inside its own future, so a signal raised before that first
-    /// poll is marked already-seen on the fresh receivers and changed() never
-    /// fires for it. The top-of-loop check is what catches it; without it run()
-    /// would park on changed()/pc.recv() forever while holding the root
-    /// frame_tx, and the decode worker downstream would never see its channel
-    /// close. close() raises the monotonic latch synchronously, so this holds
-    /// regardless of how rustrtc happens to schedule its own peer-state
-    /// publications.
+    /// The latch must retain a close() that happens before anything subscribes
+    /// through run(). The session holds a keepalive receiver for exactly this:
+    /// without a live receiver, send(true) would not store the value, and a
+    /// later subscribe() would read the initial false. Checked directly against
+    /// the sender so it does not depend on rustrtc scheduling any state.
+    /// Async only because new_for_tests() builds a rustrtc peer, which spawns.
+    #[tokio::test]
+    async fn shutdown_latch_retains_a_close_before_any_run_subscription() {
+        let session = WebRtcSession::new_for_tests();
+
+        // Close before run() (and its subscribe) is ever called.
+        session.close();
+
+        // A fresh subscriber, as run()'s next call would create, reads the
+        // retained latch value rather than the initial false.
+        let mut rx = session.shutdown.subscribe();
+        assert!(
+            *rx.borrow_and_update(),
+            "a close() before any run subscription must still be visible"
+        );
+    }
+
+    /// A close that lands after run() is called but before its future is first
+    /// polled must still terminate run() and release the RTP sender. This is the
+    /// spawn-then-fail ordering: the run task is created, then the session is
+    /// closed before the task is scheduled. peer_state is subscribed inside the
+    /// future, so the Closed rustrtc publishes is already-seen by the first
+    /// poll and its changed() never fires; the top-of-loop check is what stops
+    /// the loop. Without it run() would park on changed()/pc.recv() forever
+    /// while holding the root frame_tx, and the decode worker downstream would
+    /// never see its channel close.
     #[tokio::test]
     async fn run_returns_when_closed_before_its_first_poll() {
         let session = WebRtcSession::new_for_tests();
@@ -1428,10 +1459,9 @@ a=rtpmap:111 opus/48000/2\r\n";
         let (frame_tx, frame_rx) = kanal::bounded::<RtpFrame>(RTP_FRAME_QUEUE_CAPACITY);
         let metrics = Arc::new(crate::metrics::PipelineMetrics::new());
 
-        // Build the future but do not poll it yet, then close. This is the
-        // spawn-fails-instantly ordering: the handler closes the session before
-        // the run task is ever scheduled, so the shutdown latch is raised while
-        // its watch channel still has no subscriber inside run().
+        // Build the future (which subscribes to the latch and takes the RTP
+        // sender) but do not poll it, then close. This mirrors the run task
+        // being created and the session then closed before it is scheduled.
         let run = session.run(frame_tx, metrics);
         session.close();
 
