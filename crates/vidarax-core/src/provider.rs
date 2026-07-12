@@ -344,6 +344,16 @@ impl InferenceProvider for Arc<dyn InferenceProvider + Send + Sync> {
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
         (**self).infer(request)
     }
+
+    // Must be forwarded, not left to the trait default. Production wires the
+    // provider as this exact `Arc<dyn ...>`, so a bare `provider.kind_for_model()`
+    // resolves to this impl. Without this line it would fall through to the
+    // default (`self.kind()`) and report the router's default backend, undoing
+    // the whole point of kind_for_model. `(**self)` reaches the inner trait
+    // object so a router's override actually runs.
+    fn kind_for_model(&self, model: &str) -> ProviderKind {
+        (**self).kind_for_model(model)
+    }
 }
 
 /// Forward `request` to `provider`, which holds pre-built transports.
@@ -1050,6 +1060,42 @@ mod tests {
         );
         // The bare kind() still reflects the default, unchanged.
         assert_eq!(router.kind(), ProviderKind::Vllm);
+    }
+
+    #[test]
+    fn kind_for_model_dispatches_through_arc_dyn_wrapper() {
+        // Regression: production wires the router as Arc<dyn InferenceProvider +
+        // Send + Sync> and calls kind_for_model on that Arc (clip.rs, workers.rs,
+        // semantic_infer.rs). The Arc forwarding impl must reach the router's
+        // override rather than fall through to the default kind, which would
+        // report the default backend and silently defeat the fix.
+        let routed = Arc::new(RecordingModelProvider::new(ProviderKind::Gemini));
+        let default = Arc::new(RecordingModelProvider::new(ProviderKind::Vllm));
+        let mut routes: HashMap<String, Arc<dyn InferenceProvider + Send + Sync>> = HashMap::new();
+        routes.insert("gemini-3.1-flash-lite".to_string(), routed);
+        let router: Arc<dyn InferenceProvider + Send + Sync> =
+            Arc::new(ModelRoutingProvider::new(routes, default));
+
+        assert_eq!(
+            router.kind_for_model("gemini-3.1-flash-lite"),
+            ProviderKind::Gemini
+        );
+        assert_eq!(
+            router.kind_for_model("some/local-model"),
+            ProviderKind::Vllm
+        );
+
+        // WebRTC's worker generic can leave the provider as an Arc wrapping an
+        // Arc<dyn>. The forwarding must survive that nesting too.
+        let nested: Arc<dyn InferenceProvider + Send + Sync> = Arc::new(Arc::clone(&router));
+        assert_eq!(
+            nested.kind_for_model("gemini-3.1-flash-lite"),
+            ProviderKind::Gemini
+        );
+        assert_eq!(
+            nested.kind_for_model("some/local-model"),
+            ProviderKind::Vllm
+        );
     }
 
     #[test]
