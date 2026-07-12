@@ -511,18 +511,27 @@ impl WebRtcSession {
             let mut track_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
             loop {
+                // Check the current state before waiting. A terminal state
+                // published before run() first polled (the handler closing the
+                // session the instant a pipeline spawn failed, before this task
+                // was scheduled) is marked already-seen on a fresh receiver, so
+                // changed() would never fire for it and run() would hang. The
+                // top-of-loop borrow catches that; a state published afterwards
+                // makes changed() ready in the usual way.
+                if matches!(
+                    *peer_state.borrow_and_update(),
+                    PeerConnectionState::Closed
+                        | PeerConnectionState::Failed
+                        | PeerConnectionState::Disconnected
+                ) {
+                    break;
+                }
+
                 tokio::select! {
+                    // Err means the peer-state sender was dropped, i.e. the
+                    // connection is gone; a non-Err change re-checks at the top.
                     changed = peer_state.changed() => {
-                        // Err means the peer-state sender was dropped, i.e. the
-                        // connection is gone; a terminal state means the same.
-                        if changed.is_err()
-                            || matches!(
-                                *peer_state.borrow_and_update(),
-                                PeerConnectionState::Closed
-                                    | PeerConnectionState::Failed
-                                    | PeerConnectionState::Disconnected
-                            )
-                        {
+                        if changed.is_err() {
                             break;
                         }
                     }
@@ -1338,6 +1347,52 @@ a=rtpmap:111 opus/48000/2\r\n";
                 .as_ref()
                 .map(|schema| schema.as_ref().as_ref()),
             Some(r#"{"type":"object"}"#)
+        );
+    }
+
+    /// A close that lands before run() first polls must still terminate run()
+    /// and release the RTP sender. run() subscribes to peer state inside its
+    /// own future, so a Closed published before that first poll is marked
+    /// already-seen on the fresh receiver and changed() never fires for it. The
+    /// top-of-loop state check is what catches it; without that check run()
+    /// would park on changed()/pc.recv() forever while holding the root
+    /// frame_tx, and the decode worker downstream would never see its channel
+    /// close.
+    #[tokio::test]
+    async fn run_returns_when_closed_before_its_first_poll() {
+        let session = WebRtcSession {
+            pc: rustrtc::peer_connection::PeerConnection::new(Default::default()),
+            prompt: Arc::new(arc_swap::ArcSwap::from(Arc::new(Arc::from("")))),
+            guided_json: Arc::new(arc_swap::ArcSwapOption::from(None::<Arc<Arc<str>>>)),
+            max_output_tokens_per_second: 128,
+            crop: None,
+            codec: VideoCodec::H264,
+            rtp_nal_pool_slots: super::rtp_nal_pool_slots(2),
+            close_calls: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        let (frame_tx, frame_rx) = kanal::bounded::<RtpFrame>(RTP_FRAME_QUEUE_CAPACITY);
+        let metrics = Arc::new(crate::metrics::PipelineMetrics::new());
+
+        // Build the future but do not poll it yet, then close. This is the
+        // spawn-fails-instantly ordering: the handler closes the session before
+        // the run task is ever scheduled, so Closed is published while the
+        // watch channel still has no subscriber.
+        let run = session.run(frame_tx, metrics);
+        session.close();
+
+        // run() must observe the already-published Closed on its first poll and
+        // return, rather than parking on changed()/pc.recv() forever.
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("run() must return after a close that precedes its first poll");
+
+        // run() owned the only RTP sender; once it returns that sender is
+        // dropped, so the decode worker's receiver now reports the channel
+        // closed instead of blocking on a peer that will never send frames.
+        assert!(
+            frame_rx.try_recv().is_err(),
+            "the RTP receiver should disconnect once run() drops its frame_tx"
         );
     }
 }
