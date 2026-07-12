@@ -818,6 +818,15 @@ mod tests {
 
     #[test]
     fn http_transport_roundtrip_and_router() {
+        // Hold the crate-wide env lock for the duration of the real HTTP call.
+        // `HttpTransport`'s reqwest client honors ambient proxy env vars, and
+        // the proxy-env tests in `ingest::fetch` set HTTP_PROXY globally while
+        // they hold this same lock. Without taking it here, one of those tests
+        // could set a proxy mid-call and reroute this request away from the
+        // local server, failing it. Serializing against them removes the race.
+        let _env_guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let body = completion_json("from-server");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();

@@ -949,8 +949,13 @@ mod tests {
         // fast. reqwest attaches the request URL to send() errors and its
         // Display embeds it, which is exactly how the ?key=... secret would
         // reach a log line; redact_url must drop it.
+        //
+        // no_proxy() keeps this hermetic: the proxy-env tests in ingest::fetch
+        // set HTTP_PROXY globally, and without this a concurrent one could
+        // reroute this request to its proxy and change the error we assert on.
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_millis(200))
+            .no_proxy()
             .build()
             .unwrap();
         let url = "http://127.0.0.1:1/v1beta/models/x:generateContent?key=SUPERSECRETKEY";
