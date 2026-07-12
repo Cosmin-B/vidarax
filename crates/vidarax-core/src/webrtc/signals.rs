@@ -344,10 +344,11 @@ pub(crate) fn yuv_to_frame_signal_unchecked(
 
 /// A frame that could not be turned into a JPEG.
 ///
-/// Two per-frame, recoverable conditions land here: a frame that fails
+/// Every reason is a per-frame, recoverable condition: a frame that fails
 /// [`check_frame`] before the encoder ever sees it (from the public
-/// [`yuv_to_jpeg`]), and a frame the encoder itself refuses. Either way the
-/// caller drops that one frame's thumbnail and the stream keeps running.
+/// [`yuv_to_jpeg`]), a frame whose dimensions exceed the encoder's `u16` size
+/// fields, or a frame the encoder itself refuses. Either way the caller drops
+/// that one frame's thumbnail and the stream keeps running.
 #[derive(Debug, Clone)]
 pub struct JpegEncodeError {
     pub width: u32,
@@ -389,9 +390,10 @@ impl From<MalformedFrame> for JpegEncodeError {
 ///
 /// # Errors
 ///
-/// Returns [`JpegEncodeError`] when the frame fails [`check_frame`] or the
-/// encoder rejects it; either way the caller drops the thumbnail and the stream
-/// keeps running.
+/// Returns [`JpegEncodeError`] when the frame fails [`check_frame`], exceeds the
+/// dimensions the encoder's `u16` size fields can hold, or is rejected by the
+/// encoder; in every case the caller drops the thumbnail and the stream keeps
+/// running.
 pub fn yuv_to_jpeg(
     yuv: &YuvFrame,
     quality: u8,
