@@ -311,7 +311,7 @@ pub fn spawn_clip_accumulator(
     session_id: Arc<str>,
     prompt: Arc<str>,
     session_span: tracing::Span,
-) {
+) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name("vx-clip-acc".to_string())
         .spawn(move || {
@@ -324,8 +324,9 @@ pub fn spawn_clip_accumulator(
                     }
                 }
             }
-        })
-        .expect("clip accumulator thread spawn failed");
+        })?;
+
+    Ok(())
 }
 
 // ─── spawn_clip_vlm_workers ───────────────────────────────────────────────────
@@ -355,7 +356,8 @@ pub fn spawn_clip_vlm_workers<I>(
     // Where tiered VLM inference outcomes are recorded for `/metrics`. `None`
     // when the caller has no metrics sink wired up (e.g. tests).
     observer: Option<Arc<dyn InferenceObserver>>,
-) where
+) -> std::io::Result<()>
+where
     I: InferenceProvider + 'static,
 {
     for i in 0..clip_vlm_worker_count(n) {
@@ -495,9 +497,10 @@ pub fn spawn_clip_vlm_workers<I>(
                         &last_jpeg,
                     );
                 }
-            })
-            .expect("clip vlm thread spawn failed");
+            })?;
     }
+
+    Ok(())
 }
 
 fn clip_vlm_worker_count(configured: usize) -> usize {

@@ -560,7 +560,7 @@ pub struct KeyframeSink {
 /// frame, and the decoder is rebuilt if a later session uses another codec on
 /// the same worker. `params.workers` is API-compatible only; parallelism is
 /// across sessions, not within one ordered stream.
-pub fn spawn_decode_workers(params: DecodeWorkerParams) {
+pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
     let DecodeWorkerParams {
         workers,
         gpu_available,
@@ -796,8 +796,9 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) {
                     }
                 }
             }
-        })
-        .expect("decode thread spawn failed");
+        })?;
+
+    Ok(())
 }
 
 // ─── Analysis workers ─────────────────────────────────────────────────────────
@@ -828,7 +829,7 @@ pub struct AnalysisWorkerParams {
     pub session_span: tracing::Span,
 }
 
-pub fn spawn_analysis_workers(params: AnalysisWorkerParams) {
+pub fn spawn_analysis_workers(params: AnalysisWorkerParams) -> std::io::Result<()> {
     let AnalysisWorkerParams {
         workers,
         gate_config,
@@ -887,9 +888,10 @@ pub fn spawn_analysis_workers(params: AnalysisWorkerParams) {
                     }
                     let _ = clip_tx.try_send(sf);
                 }
-            })
-            .expect("analysis thread spawn failed");
+            })?;
     }
+
+    Ok(())
 }
 
 // ─── VLM workers ──────────────────────────────────────────────────────────────
@@ -1049,7 +1051,7 @@ where
 /// in clip mode (analysis to clip accumulator to clip VLM); otherwise it runs
 /// the keyframe path (analysis to VLM). Every worker thread is detached and
 /// shuts down when its upstream channel closes.
-pub fn spawn_pipeline<I>(cfg: &WorkerPoolConfig, wiring: PipelineWiring<I>)
+pub fn spawn_pipeline<I>(cfg: &WorkerPoolConfig, wiring: PipelineWiring<I>) -> std::io::Result<()>
 where
     I: InferenceProvider + 'static,
 {
@@ -1096,7 +1098,7 @@ where
             crop: cfg.crop,
             metrics: Arc::clone(&metrics),
             session_span: session_span.clone(),
-        });
+        })?;
 
         let (clip_frame_tx, clip_frame_rx) =
             kanal::bounded::<StreamFrame>(CLIP_FRAME_QUEUE_CAPACITY);
@@ -1115,7 +1117,7 @@ where
             prompt: Arc::clone(&prompt),
             metrics: Arc::clone(&metrics),
             session_span: session_span.clone(),
-        });
+        })?;
         spawn_clip_accumulator(
             clip_frame_rx,
             clip_tx,
@@ -1125,7 +1127,7 @@ where
             // load_full yields Arc<Arc<str>>; deref once so the accumulator gets the inner Arc<str>.
             Arc::clone(&*prompt.load_full()),
             session_span.clone(),
-        );
+        )?;
         spawn_clip_vlm_workers(
             cfg.vlm_workers,
             clip_rx,
@@ -1137,7 +1139,7 @@ where
             cfg.max_output_tokens_per_second,
             guided_json,
             observer,
-        );
+        )?;
     } else {
         // Keyframe mode: the gate runs inline in the decoder, so a JPEG is
         // encoded only for the frames it keeps and handed straight to the VLM
@@ -1164,7 +1166,7 @@ where
             crop: cfg.crop,
             metrics: Arc::clone(&metrics),
             session_span: session_span.clone(),
-        });
+        })?;
         let _ = (stream_tx, stream_rx);
         spawn_vlm_workers(VlmWorkerParams {
             workers: cfg.vlm_workers,
@@ -1179,8 +1181,10 @@ where
             training_store,
             distillation,
             observer,
-        });
+        })?;
     }
+
+    Ok(())
 }
 
 pub struct VlmWorkerParams<I>
@@ -1249,7 +1253,7 @@ pub(super) fn token_budget_entry<'a>(
 /// order.  The worker count is therefore clamped to one per stream.  Future VLM
 /// parallelism must be stateless or explicitly batched, not racing workers with
 /// independent temporal context.
-pub fn spawn_vlm_workers<I>(params: VlmWorkerParams<I>)
+pub fn spawn_vlm_workers<I>(params: VlmWorkerParams<I>) -> std::io::Result<()>
 where
     I: InferenceProvider + 'static,
 {
@@ -1325,8 +1329,7 @@ where
                 let emit_ms = emit_start.elapsed().as_millis() as u64;
                 writer_metrics.stdb_emit_latency_ms.record(emit_ms);
             }
-        })
-        .expect("stdb writer thread spawn failed");
+        })?;
 
     let jpeg_sink_backlog = JpegSinkBacklog::new();
 
@@ -1665,9 +1668,10 @@ where
                 }
                 // event_tx clone is dropped here; once all worker clones drop,
                 // the outer event_tx also drops, closing the writer channel.
-            })
-            .expect("vlm thread spawn failed");
+            })?;
     }
+
+    Ok(())
 }
 
 // ─── VLM worker helpers ────────────────────────────────────────────────────────
