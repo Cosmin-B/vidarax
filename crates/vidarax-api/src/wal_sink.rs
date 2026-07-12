@@ -202,11 +202,27 @@ mod tests {
     use vidarax_core::webrtc::workers::EventSink;
 
     fn temp_wal() -> std::path::PathBuf {
+        // A per-call unique path. A bare nanosecond timestamp collided when two
+        // tests ran in the same clock tick under `cargo test`'s parallelism, so
+        // they shared one WAL file and clobbered each other's events (flaky
+        // event-count assertions). The atomic counter makes every call within a
+        // process distinct; the process id separates concurrent test binaries;
+        // the timestamp separates process lifetimes, so a crashed test that
+        // left its file behind cannot be reopened in append mode by a later run
+        // that reuses the pid and restarts the counter at zero.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("wal-sink-test-{nanos}.wal"))
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "wal-sink-test-{}-{}-{}.wal",
+            std::process::id(),
+            nanos,
+            seq
+        ))
     }
 
     fn make_state() -> (AppState, std::path::PathBuf) {

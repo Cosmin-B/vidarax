@@ -818,6 +818,29 @@ mod tests {
 
     #[test]
     fn http_transport_roundtrip_and_router() {
+        // Hold the crate-wide env lock for the duration of the real HTTP call.
+        // `HttpTransport`'s reqwest client honors ambient proxy env vars, and
+        // the proxy-env tests in `ingest::fetch` set HTTP_PROXY globally while
+        // they hold this same lock. Without taking it here, one of those tests
+        // could set a proxy mid-call and reroute this request away from the
+        // local server, failing it. Serializing against them removes the race.
+        let _env_guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // The lock stops a concurrent proxy-env test from hijacking this call,
+        // but HttpTransport also captures reqwest's proxy config when its client
+        // is built, so an HTTP_PROXY already exported into the environment (a CI
+        // host, a contributor behind a corporate proxy) could still reroute this
+        // request off the local listener. Bypass proxies for loopback while we
+        // hold the lock. Restored below; if an assertion panics the test has
+        // already failed, and a leaked NO_PROXY=127.0.0.1 only bypasses proxies
+        // for loopback, which the proxy-env tests set explicitly anyway.
+        let prev_no_proxy = std::env::var_os("NO_PROXY");
+        let prev_no_proxy_lower = std::env::var_os("no_proxy");
+        std::env::set_var("NO_PROXY", "127.0.0.1");
+        std::env::set_var("no_proxy", "127.0.0.1");
+
         let body = completion_json("from-server");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -843,6 +866,15 @@ mod tests {
         assert_eq!(result.output_text, "from-server");
         assert_eq!(result.provider, ProviderKind::Vllm);
         server.join().unwrap();
+
+        match prev_no_proxy {
+            Some(v) => std::env::set_var("NO_PROXY", v),
+            None => std::env::remove_var("NO_PROXY"),
+        }
+        match prev_no_proxy_lower {
+            Some(v) => std::env::set_var("no_proxy", v),
+            None => std::env::remove_var("no_proxy"),
+        }
     }
 
     #[test]
