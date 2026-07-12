@@ -264,6 +264,11 @@ fn build_gemini_provider(entry: &BackendEntry) -> Result<GeminiProvider, String>
 /// exact same model, the lower-priority-number one deterministically claims
 /// it, and the later duplicate is dropped here rather than left to whichever
 /// order a `HashMap` insert happens to run in.
+///
+/// Dropping the duplicate is intentional: routed models are single-target
+/// (see [`crate::provider::ModelRoutingProvider::infer`]), so a second backend
+/// naming the same model id adds no failover for routed traffic. That is not
+/// obvious from config, so each dropped entry is logged at warn.
 fn select_model_route_entries(entries: &[BackendEntry]) -> Vec<&BackendEntry> {
     let mut gemini_entries: Vec<&BackendEntry> = entries
         .iter()
@@ -277,6 +282,12 @@ fn select_model_route_entries(entries: &[BackendEntry]) -> Vec<&BackendEntry> {
         let model = entry.model.as_deref().unwrap_or("gemini-3.1-flash-lite");
         if claimed_models.insert(model) {
             selected.push(entry);
+        } else {
+            tracing::warn!(
+                backend = %entry.name,
+                model = %model,
+                "backend excluded from model routing: a lower-priority gemini backend already serves this model id, and routed models are single-target, so this backend will not receive routed traffic for it"
+            );
         }
     }
     selected
