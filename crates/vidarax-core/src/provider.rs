@@ -430,18 +430,20 @@ impl InferenceProvider for ModelRoutingProvider {
         // here: it is the per-inference path, not the per-frame hot path, so
         // the lookup is nowhere close to what bounds latency.
         //
-        // Contract: a routed model is single-target on purpose. The whole
-        // point of a route is to pin one specific model to the backend
-        // configured to serve it, so on failure this returns that backend's
-        // error rather than trying anything else. `request.allow_fallback`
-        // deliberately has no effect here: it governs the default chain's
-        // cross-backend retry, and letting it spill a routed call over to the
-        // default chain would answer with a *different* model than the one
-        // pinned, which defeats the pin. Redundancy across two backends
-        // serving the same model id is likewise not attempted: only one entry
-        // per model id survives `select_model_route_entries`, and the dropped
-        // one is logged there. An unrouted model still falls through to the
-        // default chain, which honors `allow_fallback` as usual.
+        // Contract: for a model it has a route for, this router never falls
+        // through to `default`. It forwards the request unchanged to the routed
+        // provider and returns whatever that provider returns, error included.
+        // `request.allow_fallback` is passed through untouched, so whether it
+        // does anything is the routed provider's call; the router itself never
+        // uses it to try `default` or another route.
+        //
+        // Routes built by `build_provider_with_model_routing` are single Gemini
+        // leaves (`select_model_route_entries` keeps one backend per model id
+        // and logs any dropped duplicate), so those routes are single-target by
+        // construction: on failure the caller gets that backend's error, never
+        // a silent hop to a backend that was not pinned for that model. An
+        // unrouted model id still falls through to `default`, which honors
+        // `allow_fallback` as usual.
         self.routes
             .get(request.model.as_ref())
             .unwrap_or(&self.default)
@@ -1032,7 +1034,8 @@ mod tests {
         // Contract: a routed model runs only on the backend it is pinned to.
         // When that backend errors, the router surfaces the error instead of
         // retrying the default chain, even with allow_fallback set. Falling
-        // through would answer with a different model than the one pinned.
+        // through could send the request to a backend that was not pinned for
+        // that model.
         struct Failing;
         impl InferenceProvider for Failing {
             fn kind(&self) -> ProviderKind {
