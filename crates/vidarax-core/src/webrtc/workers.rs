@@ -31,7 +31,9 @@ use crate::webrtc::decode::{
 };
 use crate::webrtc::recycle::{RecycledBytes, VecPool};
 use crate::webrtc::session::{RtpFrame, WebRtcConfig};
-use crate::webrtc::signals::{check_frame, crop_yuv, yuv_to_frame_signal, yuv_to_jpeg, CropPool};
+use crate::webrtc::signals::{
+    check_frame, crop_yuv, yuv_to_frame_signal_unchecked, yuv_to_jpeg_unchecked, CropPool,
+};
 
 pub const STREAM_FRAME_QUEUE_CAPACITY: usize = 64;
 pub const VLM_WORK_QUEUE_CAPACITY: usize = 32;
@@ -224,10 +226,10 @@ fn build_stream_frame_from_yuv(
         return None;
     }
 
-    let signal = yuv_to_frame_signal(yuv, seq, pts_ms, prev_signal.as_ref());
+    let signal = yuv_to_frame_signal_unchecked(yuv, seq, pts_ms, prev_signal.as_ref());
     // A frame the encoder rejects costs this one thumbnail, not the stream. Drop
     // it to None and keep decoding; the signal still flows to the gate engine.
-    let jpeg = match yuv_to_jpeg(yuv, 75, ycbcr_scratch, jpeg_pool) {
+    let jpeg = match yuv_to_jpeg_unchecked(yuv, 75, ycbcr_scratch, jpeg_pool) {
         Ok(bytes) => Some(bytes),
         Err(err) => {
             tracing::warn!(seq, %err, "dropping thumbnail for unencodable frame");
@@ -258,7 +260,7 @@ fn build_clip_stream_frame_from_yuv(
         return None;
     }
 
-    let signal = yuv_to_frame_signal(yuv, seq, pts_ms, prev_signal.as_ref());
+    let signal = yuv_to_frame_signal_unchecked(yuv, seq, pts_ms, prev_signal.as_ref());
     *prev_signal = Some(signal);
 
     let jpeg = if clip_rate_gate.should_keep(pts_ms) {
@@ -723,8 +725,12 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
                             tracing::warn!(seq, %err, "dropping malformed frame");
                             continue 'rtp_frames;
                         }
-                        let signal =
-                            yuv_to_frame_signal(&yuv, seq, pts_ms, prev_signal.as_ref());
+                        let signal = yuv_to_frame_signal_unchecked(
+                            &yuv,
+                            seq,
+                            pts_ms,
+                            prev_signal.as_ref(),
+                        );
                         prev_signal = Some(signal);
 
                         let ctx = KeyframeContext {
@@ -737,7 +743,7 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
                         // The encoder only runs if the gate keeps the frame. A
                         // rejected thumbnail costs this one frame, not the stream.
                         let work = gate.on_frame(signal, pts_ms, &ctx, || {
-                            match yuv_to_jpeg(&yuv, 75, &mut ycbcr_scratch, &jpeg_pool) {
+                            match yuv_to_jpeg_unchecked(&yuv, 75, &mut ycbcr_scratch, &jpeg_pool) {
                                 Ok(bytes) => Some(bytes),
                                 Err(err) => {
                                     tracing::warn!(
@@ -776,7 +782,7 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
                             pts_ms,
                             &mut prev_signal,
                             clip_rate_gate,
-                            || match yuv_to_jpeg(&yuv, 75, &mut ycbcr_scratch, &jpeg_pool) {
+                            || match yuv_to_jpeg_unchecked(&yuv, 75, &mut ycbcr_scratch, &jpeg_pool) {
                                 Ok(bytes) => Some(bytes),
                                 Err(err) => {
                                     tracing::warn!(
