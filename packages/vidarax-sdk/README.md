@@ -48,7 +48,7 @@ const v = new Vidarax(baseUrl, options?)
 | `ingestRun(id, opts)` | Attach a source and decode frames. |
 | `analyzeRun(id, opts)` | Run analysis on ingested frames. |
 | `reason(id, opts)` | Realtime inference over a stream. |
-| `streamEvents(id)` / `streamMarkers(id)` | Async iterators for results. |
+| `streamEvents(id)` / `streamMarkers(id)` | Async-iterate a one-time snapshot of results (not a live stream; the server has no SSE endpoint). |
 | `infer(opts)` / `inferBatch(items)` | Single or batch inference. |
 | `uploadFile(file, onProgress?)` | Upload a video file. |
 | `whipOffer(sdp, opts)` | WebRTC WHIP session (browser). |
