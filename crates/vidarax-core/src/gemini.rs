@@ -56,6 +56,16 @@ pub struct GeminiProvider {
     learned_thinking: ArcSwap<HashSet<Arc<str>>>,
 }
 
+/// Stringify a reqwest error with its URL stripped.
+///
+/// Gemini carries the API key in the request URL (`?key=...`), and reqwest's
+/// error Display embeds that URL, so stringifying the raw error would write the
+/// key into logs and error payloads. `without_url` drops the URL while keeping
+/// the useful cause (timeout, connect refused, decode failure).
+fn redact_url(e: reqwest::Error) -> String {
+    e.without_url().to_string()
+}
+
 impl GeminiProvider {
     /// Create a new [`GeminiProvider`].
     ///
@@ -184,7 +194,9 @@ impl GeminiProvider {
             .header("content-type", "application/json")
             .body(r#"{"file":{"display_name":"vidarax_upload"}}"#)
             .send()
-            .map_err(|e| ProviderError::Transport(format!("file API init failed: {e}")))?;
+            .map_err(|e| {
+                ProviderError::Transport(format!("file API init failed: {}", redact_url(e)))
+            })?;
 
         let status = init_resp.status();
         if !status.is_success() {
@@ -214,16 +226,18 @@ impl GeminiProvider {
             .header("content-type", video.media_type)
             .body(raw_bytes)
             .send()
-            .map_err(|e| ProviderError::Transport(format!("file API upload failed: {e}")))?;
+            .map_err(|e| {
+                ProviderError::Transport(format!("file API upload failed: {}", redact_url(e)))
+            })?;
 
         let up_status = upload_resp.status();
         if !up_status.is_success() {
             return Err(ProviderError::HttpStatus(up_status.as_u16()));
         }
 
-        let upload_json: Value = upload_resp
-            .json()
-            .map_err(|e| ProviderError::Transport(format!("file API upload JSON parse: {e}")))?;
+        let upload_json: Value = upload_resp.json().map_err(|e| {
+            ProviderError::Transport(format!("file API upload JSON parse: {}", redact_url(e)))
+        })?;
 
         let file_uri = upload_json["file"]["uri"]
             .as_str()
@@ -255,20 +269,18 @@ impl GeminiProvider {
         let deadline = Instant::now() + Duration::from_secs(60);
 
         loop {
-            let resp = self
-                .client
-                .get(&poll_url)
-                .send()
-                .map_err(|e| ProviderError::Transport(format!("file poll failed: {e}")))?;
+            let resp = self.client.get(&poll_url).send().map_err(|e| {
+                ProviderError::Transport(format!("file poll failed: {}", redact_url(e)))
+            })?;
 
             let st = resp.status();
             if !st.is_success() {
                 return Err(ProviderError::HttpStatus(st.as_u16()));
             }
 
-            let json: Value = resp
-                .json()
-                .map_err(|e| ProviderError::Transport(format!("file poll JSON: {e}")))?;
+            let json: Value = resp.json().map_err(|e| {
+                ProviderError::Transport(format!("file poll JSON: {}", redact_url(e)))
+            })?;
 
             let state = json["state"].as_str().unwrap_or("");
             match state {
@@ -322,7 +334,7 @@ impl GeminiProvider {
             .timeout(Duration::from_millis(request.timeout_ms.max(1)))
             .body(body)
             .send()
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+            .map_err(|e| ProviderError::Transport(redact_url(e)))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -331,7 +343,7 @@ impl GeminiProvider {
 
         let text = response
             .text()
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+            .map_err(|e| ProviderError::Transport(redact_url(e)))?;
 
         self.parse_response(&text, model, start)
     }
@@ -927,6 +939,38 @@ mod tests {
         println!(
             "structured: {} ({}ms)",
             r.output_text, r.inference_latency_ms
+        );
+    }
+
+    #[test]
+    fn redact_url_strips_the_api_key_from_transport_errors() {
+        // Build a genuine reqwest error carrying a key-bearing URL. Loopback
+        // port 1 refuses the connection immediately, so this stays offline and
+        // fast. reqwest attaches the request URL to send() errors and its
+        // Display embeds it, which is exactly how the ?key=... secret would
+        // reach a log line; redact_url must drop it.
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let url = "http://127.0.0.1:1/v1beta/models/x:generateContent?key=SUPERSECRETKEY";
+        let err = client.get(url).send().expect_err("connection must fail");
+
+        // Premise: the raw error really does carry the URL (and thus the key).
+        assert!(err.url().is_some(), "expected the URL to be attached");
+        assert!(
+            err.to_string().contains("SUPERSECRETKEY"),
+            "raw error unexpectedly hid the key, nothing to redact: {err}"
+        );
+
+        let redacted = redact_url(err);
+        assert!(
+            !redacted.contains("SUPERSECRETKEY"),
+            "redacted error still leaks the key: {redacted}"
+        );
+        assert!(
+            !redacted.contains("127.0.0.1"),
+            "redacted error still contains the URL: {redacted}"
         );
     }
 }
