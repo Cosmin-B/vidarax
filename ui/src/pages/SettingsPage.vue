@@ -113,7 +113,7 @@ function pingSpacetime(): Promise<void> {
 const saved = ref(false)
 
 function saveSettings(): void {
-  // Auth store (also persists to localStorage)
+  // Auth store persists the endpoints to localStorage and the key to sessionStorage.
   authStore.setApiEndpoint(form.apiEndpoint)
   authStore.setApiKey(form.apiKey)
   authStore.setSpacetimeEndpoint(form.spacetimeEndpoint)
