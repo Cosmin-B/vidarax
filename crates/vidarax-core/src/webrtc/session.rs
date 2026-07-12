@@ -501,61 +501,103 @@ impl WebRtcSession {
         let rtp_nal_pool_slots = self.rtp_nal_pool_slots;
 
         async move {
-            while let Some(event) = pc.recv().await {
-                match event {
-                    PeerConnectionEvent::Track(transceiver) => {
-                        let receiver = match transceiver.receiver() {
-                            Some(r) => r,
-                            None => continue,
-                        };
-                        let track = receiver.track();
+            // run() owns the per-track ingestion tasks so it can abort them when
+            // the connection goes away. A local close() publishes Closed but
+            // does not wake an in-flight pc.recv() or track.recv(), so without
+            // watching peer state and aborting the tasks, run() and each track
+            // task would block forever holding a frame_tx clone, and the decode
+            // worker reading that channel would never see it close.
+            let mut peer_state = pc.subscribe_peer_state();
+            let mut track_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-                        if track.kind() != MediaKind::Video {
-                            continue;
+            loop {
+                tokio::select! {
+                    changed = peer_state.changed() => {
+                        // Err means the peer-state sender was dropped, i.e. the
+                        // connection is gone; a terminal state means the same.
+                        if changed.is_err()
+                            || matches!(
+                                *peer_state.borrow_and_update(),
+                                PeerConnectionState::Closed
+                                    | PeerConnectionState::Failed
+                                    | PeerConnectionState::Disconnected
+                            )
+                        {
+                            break;
                         }
+                    }
+                    event = pc.recv() => {
+                        let Some(event) = event else { break };
+                        match event {
+                            PeerConnectionEvent::Track(transceiver) => {
+                                let receiver = match transceiver.receiver() {
+                                    Some(r) => r,
+                                    None => continue,
+                                };
+                                let track = receiver.track();
 
-                        let tx = frame_tx.clone();
-                        let seq = Arc::clone(&seq_counter);
-                        let metrics = Arc::clone(&metrics);
+                                if track.kind() != MediaKind::Video {
+                                    continue;
+                                }
 
-                        tokio::spawn(async move {
-                            let nals_pool = VecPool::with_slots(rtp_nal_pool_slots);
-                            loop {
-                                match track.recv().await {
-                                    Ok(MediaSample::Video(frame)) => {
-                                        let nal_seq = seq.fetch_add(1, Ordering::Relaxed);
+                                let tx = frame_tx.clone();
+                                let seq = Arc::clone(&seq_counter);
+                                let metrics = Arc::clone(&metrics);
 
-                                        let nals =
-                                            frame_payload_to_nals(codec, &frame.data, &nals_pool);
+                                track_tasks.push(tokio::spawn(async move {
+                                    let nals_pool = VecPool::with_slots(rtp_nal_pool_slots);
+                                    loop {
+                                        match track.recv().await {
+                                            Ok(MediaSample::Video(frame)) => {
+                                                let nal_seq =
+                                                    seq.fetch_add(1, Ordering::Relaxed);
 
-                                        // RTP timestamp is on a 90 kHz clock → ms.
-                                        let pts_ms = frame.rtp_timestamp as u64 / 90;
+                                                let nals = frame_payload_to_nals(
+                                                    codec,
+                                                    &frame.data,
+                                                    &nals_pool,
+                                                );
 
-                                        let rtp_frame = RtpFrame {
-                                            nals,
-                                            pts_ms,
-                                            seq: nal_seq,
-                                            codec,
-                                        };
+                                                // RTP timestamp is on a 90 kHz clock → ms.
+                                                let pts_ms = frame.rtp_timestamp as u64 / 90;
 
-                                        if !enqueue_rtp_frame_lossless(&tx, rtp_frame, &metrics)
-                                            .await
-                                        {
-                                            break;
+                                                let rtp_frame = RtpFrame {
+                                                    nals,
+                                                    pts_ms,
+                                                    seq: nal_seq,
+                                                    codec,
+                                                };
+
+                                                if !enqueue_rtp_frame_lossless(
+                                                    &tx, rtp_frame, &metrics,
+                                                )
+                                                .await
+                                                {
+                                                    break;
+                                                }
+                                            }
+                                            Ok(MediaSample::Audio(_)) => {
+                                                // Unexpected on a video track; ignore.
+                                            }
+                                            Err(_) => break,
                                         }
                                     }
-                                    Ok(MediaSample::Audio(_)) => {
-                                        // Unexpected on a video track; ignore.
-                                    }
-                                    Err(_) => break,
-                                }
+                                }));
                             }
-                        });
-                    }
-                    PeerConnectionEvent::DataChannel(_) => {
-                        // Not used; ignore.
+                            PeerConnectionEvent::DataChannel(_) => {
+                                // Not used; ignore.
+                            }
+                        }
                     }
                 }
+            }
+
+            // The connection is going away. Abort the track tasks so each
+            // frame_tx clone drops; together with frame_tx dropping here, the
+            // decode worker downstream sees its channel close and exits instead
+            // of blocking forever on a peer that no longer sends frames.
+            for handle in track_tasks {
+                handle.abort();
             }
         }
     }
