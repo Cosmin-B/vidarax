@@ -2,9 +2,48 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { STORAGE_KEYS, UI_DEFAULTS } from '@/lib/config'
 
+// Earlier builds kept these bearer secrets in localStorage, where they persist
+// on disk and stay readable long after a session ends. They now live in
+// sessionStorage, which is per-tab and cleared when the tab closes. Carry a
+// surviving localStorage value over once so an upgrading user keeps their
+// session, then delete the durable copy so the secret no longer outlives the
+// tab. Endpoints are not secret and stay in localStorage on purpose.
+function loadSecret(key: string): string {
+  const legacy = localStorage.getItem(key)
+  if (legacy !== null) {
+    try {
+      if (sessionStorage.getItem(key) === null) {
+        sessionStorage.setItem(key, legacy)
+      }
+      localStorage.removeItem(key)
+    } catch {
+      // sessionStorage can refuse writes (quota, private mode). Rather than let
+      // a convenience migration abort store construction and blank the app, use
+      // the legacy value for this session and leave it in place to retry later.
+      return legacy
+    }
+  }
+  return sessionStorage.getItem(key) ?? ''
+}
+
+// Remove a secret from both stores, tolerating either backend being
+// unavailable so one failure does not skip the other.
+function forgetSecret(key: string): void {
+  try {
+    sessionStorage.removeItem(key)
+  } catch {
+    // storage unavailable
+  }
+  try {
+    localStorage.removeItem(key)
+  } catch {
+    // storage unavailable
+  }
+}
+
 export const useAuthStore = defineStore('auth', () => {
-  const apiKey = ref<string>(localStorage.getItem(STORAGE_KEYS.apiKey) ?? '')
-  const spacetimeToken = ref<string>(localStorage.getItem(STORAGE_KEYS.spacetimeToken) ?? '')
+  const apiKey = ref<string>(loadSecret(STORAGE_KEYS.apiKey))
+  const spacetimeToken = ref<string>(loadSecret(STORAGE_KEYS.spacetimeToken))
   const apiEndpoint = ref<string>(
     localStorage.getItem(STORAGE_KEYS.apiEndpoint) ?? UI_DEFAULTS.apiEndpoint
   )
@@ -16,7 +55,7 @@ export const useAuthStore = defineStore('auth', () => {
 
   function setApiKey(key: string) {
     apiKey.value = key
-    localStorage.setItem(STORAGE_KEYS.apiKey, key)
+    sessionStorage.setItem(STORAGE_KEYS.apiKey, key)
   }
 
   function setApiEndpoint(url: string) {
@@ -39,14 +78,15 @@ export const useAuthStore = defineStore('auth', () => {
 
   function setSpacetimeToken(token: string) {
     spacetimeToken.value = token
-    localStorage.setItem(STORAGE_KEYS.spacetimeToken, token)
+    sessionStorage.setItem(STORAGE_KEYS.spacetimeToken, token)
   }
 
   function clearAuth() {
     apiKey.value = ''
     spacetimeToken.value = ''
-    localStorage.removeItem(STORAGE_KEYS.apiKey)
-    localStorage.removeItem(STORAGE_KEYS.spacetimeToken)
+    // Clears sessionStorage and any legacy localStorage copy the migration missed.
+    forgetSecret(STORAGE_KEYS.apiKey)
+    forgetSecret(STORAGE_KEYS.spacetimeToken)
   }
 
   function defaultHeaders(): Record<string, string> {

@@ -8,7 +8,8 @@ import { useAuthStore } from '@/stores/auth'
 const authStore = useAuthStore()
 
 onMounted(() => {
-  // Rehydrate auth from localStorage (already done in store init, but ensures reactivity)
+  // Touch the store on mount so it initializes (secrets from sessionStorage,
+  // endpoints from localStorage) and stays reactive.
   authStore.apiEndpoint
 })
 </script>
