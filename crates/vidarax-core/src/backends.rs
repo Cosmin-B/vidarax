@@ -259,11 +259,18 @@ fn build_gemini_provider(entry: &BackendEntry) -> Result<GeminiProvider, String>
 ///
 /// Entries are sorted ascending by `priority` first, matching the precedence
 /// convention [`build_provider_chain`] already uses (lowest priority number
-/// wins). Walking the sorted list and keeping only the first entry seen for
-/// each model id means that when two backends are configured to serve the
-/// exact same model, the lower-priority-number one deterministically claims
-/// it, and the later duplicate is dropped here rather than left to whichever
-/// order a `HashMap` insert happens to run in.
+/// wins). The sort is stable, so equal priorities keep their config order.
+/// Walking the sorted list and keeping only the first entry seen for each
+/// model id means that when two backends are configured to serve the exact
+/// same model, the higher-precedence one deterministically claims it (lower
+/// priority number, or the earlier config entry on a tie), and the later
+/// duplicate is dropped here rather than left to whichever order a `HashMap`
+/// insert happens to run in.
+///
+/// Dropping the duplicate is intentional: routed models are single-target
+/// (see [`crate::provider::ModelRoutingProvider::infer`]), so a second backend
+/// naming the same model id adds no failover for routed traffic. That is not
+/// obvious from config, so each dropped entry is logged at warn.
 fn select_model_route_entries(entries: &[BackendEntry]) -> Vec<&BackendEntry> {
     let mut gemini_entries: Vec<&BackendEntry> = entries
         .iter()
@@ -277,6 +284,12 @@ fn select_model_route_entries(entries: &[BackendEntry]) -> Vec<&BackendEntry> {
         let model = entry.model.as_deref().unwrap_or("gemini-3.1-flash-lite");
         if claimed_models.insert(model) {
             selected.push(entry);
+        } else {
+            tracing::warn!(
+                backend = %entry.name,
+                model = %model,
+                "backend excluded from model routing: a higher-precedence gemini backend already claims this model id (lower priority number, or the earlier config entry on a priority tie), and routed models are single-target, so this backend will not receive routed traffic for it"
+            );
         }
     }
     selected

@@ -429,6 +429,21 @@ impl InferenceProvider for ModelRoutingProvider {
         // why virtual dispatch through `Arc<dyn InferenceProvider>` is fine
         // here: it is the per-inference path, not the per-frame hot path, so
         // the lookup is nowhere close to what bounds latency.
+        //
+        // Contract: for a model it has a route for, this router never falls
+        // through to `default`. It forwards the request unchanged to the routed
+        // provider and returns whatever that provider returns, error included.
+        // `request.allow_fallback` is passed through untouched, so whether it
+        // does anything is the routed provider's call; the router itself never
+        // uses it to try `default` or another route.
+        //
+        // Routes built by `build_provider_with_model_routing` are single Gemini
+        // leaves (`select_model_route_entries` keeps one backend per model id
+        // and logs any dropped duplicate), so those routes are single-target by
+        // construction: on failure the caller gets that backend's error, never
+        // a silent hop to a backend that was not pinned for that model. An
+        // unrouted model id still falls through to `default`, which honors
+        // `allow_fallback` as usual.
         self.routes
             .get(request.model.as_ref())
             .unwrap_or(&self.default)
@@ -1011,6 +1026,43 @@ mod tests {
         assert_eq!(
             default.seen_models.lock().unwrap().as_slice(),
             ["some/other-model"]
+        );
+    }
+
+    #[test]
+    fn routed_model_failure_is_single_target_and_never_touches_default() {
+        // Contract: a routed model runs only on the backend it is pinned to.
+        // When that backend errors, the router surfaces the error instead of
+        // retrying the default chain, even with allow_fallback set. Falling
+        // through could send the request to a backend that was not pinned for
+        // that model.
+        struct Failing;
+        impl InferenceProvider for Failing {
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::Gemini
+            }
+            fn infer(&self, _request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+                Err(ProviderError::HttpStatus(429))
+            }
+        }
+
+        let routed = Arc::new(Failing);
+        let default = Arc::new(RecordingModelProvider::new(ProviderKind::Vllm));
+        let mut routes: HashMap<String, Arc<dyn InferenceProvider + Send + Sync>> = HashMap::new();
+        routes.insert("gemini-3.1-flash-lite".to_string(), routed);
+        let router = ModelRoutingProvider::new(routes, default.clone());
+
+        let mut req = request();
+        req.model = Arc::from("gemini-3.1-flash-lite");
+        req.allow_fallback = true; // must not spill a routed call to the default
+
+        let err = router
+            .infer(&req)
+            .expect_err("routed failure should surface");
+        assert_eq!(err, ProviderError::HttpStatus(429));
+        assert!(
+            default.seen_models.lock().unwrap().is_empty(),
+            "the default backend must never be consulted for a routed model"
         );
     }
 
