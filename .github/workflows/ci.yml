@@ -9,9 +9,18 @@ on:
 permissions:
   contents: read
 
+# These jobs run on a self-hosted runner. A pull request from a fork carries
+# untrusted code, so it must never execute here: it would run a stranger's code
+# on our own hardware. This guard lets pushes and same-repo (internal) PRs run
+# and skips fork PRs. It is a no-op while the repo is private (forks cannot
+# trigger workflows at all); it matters the moment the repo goes public. The
+# durable fix at that point is to move CI back to GitHub-hosted runners, which
+# are free and unlimited for public repos and carry no such exposure.
+
 jobs:
   test-and-gates:
     runs-on: [self-hosted, vidarax]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 30
 
     steps:
@@ -61,6 +70,7 @@ jobs:
 
   vidarax-core-vp8:
     runs-on: [self-hosted, vidarax]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 30
 
     steps:
@@ -90,6 +100,7 @@ jobs:
 
   web-sdk:
     runs-on: [self-hosted, vidarax]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 15
 
     steps:
@@ -121,6 +132,7 @@ jobs:
 
   web-ui:
     runs-on: [self-hosted, vidarax]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 15
 
     steps:
@@ -144,6 +156,7 @@ jobs:
 
   spacetime-wasm:
     runs-on: [self-hosted, vidarax]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 20
 
     steps:
@@ -167,6 +180,7 @@ jobs:
 
   web-ui-e2e:
     runs-on: [self-hosted, vidarax]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 20
 
     steps:
