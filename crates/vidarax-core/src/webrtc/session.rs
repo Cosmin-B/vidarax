@@ -236,8 +236,34 @@ pub struct WebRtcSession {
     /// Video codec negotiated from the SDP offer.
     pub codec: VideoCodec,
     rtp_nal_pool_slots: usize,
+    /// Monotonic shutdown latch owned by the session. rustrtc's peer-state
+    /// watch is not monotonic toward a terminal state: after close() publishes
+    /// Closed, a DTLS handshake that just won a scheduling race can still
+    /// publish Connected over it, so run() cannot rely on that watch alone to
+    /// latch shutdown. close() raises this before closing the peer, and run()
+    /// checks it first each iteration, so once set it can neither be missed nor
+    /// overwritten.
+    shutdown: tokio::sync::watch::Sender<bool>,
+    /// Holds a receiver open so `shutdown` retains its value even before run()
+    /// subscribes. Without a live receiver a `send(true)` would not be stored,
+    /// and a close() that precedes run()'s first poll would be lost.
+    _shutdown_rx: tokio::sync::watch::Receiver<bool>,
     #[cfg(any(test, debug_assertions))]
     close_calls: AtomicU64,
+}
+
+/// True when the session must stop ingesting: either the session-owned
+/// monotonic shutdown latch is set, or rustrtc reports a terminal peer state.
+/// Split out from run()'s loop so the stop decision is unit-testable without
+/// driving a live peer connection.
+fn should_stop(shutdown: bool, peer: PeerConnectionState) -> bool {
+    shutdown
+        || matches!(
+            peer,
+            PeerConnectionState::Closed
+                | PeerConnectionState::Failed
+                | PeerConnectionState::Disconnected
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +274,7 @@ impl WebRtcSession {
     #[cfg(any(test, debug_assertions))]
     #[doc(hidden)]
     pub fn new_for_tests() -> Self {
+        let (shutdown, _shutdown_rx) = tokio::sync::watch::channel(false);
         Self {
             pc: PeerConnection::new(Default::default()),
             prompt: Arc::new(ArcSwap::from(Arc::new(Arc::from("")))),
@@ -256,6 +283,8 @@ impl WebRtcSession {
             crop: None,
             codec: VideoCodec::H264,
             rtp_nal_pool_slots: rtp_nal_pool_slots(1),
+            shutdown,
+            _shutdown_rx,
             #[cfg(any(test, debug_assertions))]
             close_calls: AtomicU64::new(0),
         }
@@ -420,6 +449,7 @@ impl WebRtcSession {
         })?;
         let answer_sdp = local.to_sdp_string();
 
+        let (shutdown, _shutdown_rx) = tokio::sync::watch::channel(false);
         Ok((
             Self {
                 pc,
@@ -429,6 +459,8 @@ impl WebRtcSession {
                 crop: config.crop,
                 codec,
                 rtp_nal_pool_slots: rtp_nal_pool_slots(config.decode_workers),
+                shutdown,
+                _shutdown_rx,
                 #[cfg(any(test, debug_assertions))]
                 close_calls: AtomicU64::new(0),
             },
@@ -499,63 +531,127 @@ impl WebRtcSession {
         let seq_counter = Arc::new(AtomicU64::new(0));
         let codec = self.codec;
         let rtp_nal_pool_slots = self.rtp_nal_pool_slots;
+        // Subscribe to the shutdown latch when run() is called, not at first
+        // poll. A close() between this call and the first poll bumps the latch,
+        // so the loop's top borrow sees it (and changed() is ready); a close()
+        // that already happened is retained by the keepalive receiver and read
+        // here as the current value.
+        let mut shutdown = self.shutdown.subscribe();
 
         async move {
-            while let Some(event) = pc.recv().await {
-                match event {
-                    PeerConnectionEvent::Track(transceiver) => {
-                        let receiver = match transceiver.receiver() {
-                            Some(r) => r,
-                            None => continue,
-                        };
-                        let track = receiver.track();
+            // run() owns the per-track ingestion tasks so it can abort them when
+            // the connection goes away. A local close() publishes Closed but
+            // does not wake an in-flight pc.recv() or track.recv(), so without
+            // watching for shutdown and aborting the tasks, run() and each track
+            // task would block forever holding a frame_tx clone, and the decode
+            // worker reading that channel would never see it close.
+            let mut peer_state = pc.subscribe_peer_state();
+            let mut track_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-                        if track.kind() != MediaKind::Video {
-                            continue;
+            loop {
+                // Decide before waiting. peer_state is subscribed inside this
+                // future, so a terminal state published before the first poll is
+                // already-seen on that fresh receiver and its changed() never
+                // fires; the borrow here is what catches it. The shutdown latch
+                // is subscribed when run() is called and is monotonic, so a
+                // close() can be neither lost nor overwritten by a late rustrtc
+                // republish (which the peer-state watch alone permits). A signal
+                // raised after this borrow makes the matching changed() ready in
+                // the usual way.
+                if should_stop(
+                    *shutdown.borrow_and_update(),
+                    *peer_state.borrow_and_update(),
+                ) {
+                    break;
+                }
+
+                tokio::select! {
+                    // Err means the session (and its shutdown sender) is gone;
+                    // a non-Err change re-checks the latch at the top.
+                    res = shutdown.changed() => {
+                        if res.is_err() {
+                            break;
                         }
+                    }
+                    // Err means the peer-state sender was dropped, i.e. the
+                    // connection is gone; a non-Err change re-checks at the top.
+                    changed = peer_state.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                    event = pc.recv() => {
+                        let Some(event) = event else { break };
+                        match event {
+                            PeerConnectionEvent::Track(transceiver) => {
+                                let receiver = match transceiver.receiver() {
+                                    Some(r) => r,
+                                    None => continue,
+                                };
+                                let track = receiver.track();
 
-                        let tx = frame_tx.clone();
-                        let seq = Arc::clone(&seq_counter);
-                        let metrics = Arc::clone(&metrics);
+                                if track.kind() != MediaKind::Video {
+                                    continue;
+                                }
 
-                        tokio::spawn(async move {
-                            let nals_pool = VecPool::with_slots(rtp_nal_pool_slots);
-                            loop {
-                                match track.recv().await {
-                                    Ok(MediaSample::Video(frame)) => {
-                                        let nal_seq = seq.fetch_add(1, Ordering::Relaxed);
+                                let tx = frame_tx.clone();
+                                let seq = Arc::clone(&seq_counter);
+                                let metrics = Arc::clone(&metrics);
 
-                                        let nals =
-                                            frame_payload_to_nals(codec, &frame.data, &nals_pool);
+                                track_tasks.push(tokio::spawn(async move {
+                                    let nals_pool = VecPool::with_slots(rtp_nal_pool_slots);
+                                    loop {
+                                        match track.recv().await {
+                                            Ok(MediaSample::Video(frame)) => {
+                                                let nal_seq =
+                                                    seq.fetch_add(1, Ordering::Relaxed);
 
-                                        // RTP timestamp is on a 90 kHz clock → ms.
-                                        let pts_ms = frame.rtp_timestamp as u64 / 90;
+                                                let nals = frame_payload_to_nals(
+                                                    codec,
+                                                    &frame.data,
+                                                    &nals_pool,
+                                                );
 
-                                        let rtp_frame = RtpFrame {
-                                            nals,
-                                            pts_ms,
-                                            seq: nal_seq,
-                                            codec,
-                                        };
+                                                // RTP timestamp is on a 90 kHz clock → ms.
+                                                let pts_ms = frame.rtp_timestamp as u64 / 90;
 
-                                        if !enqueue_rtp_frame_lossless(&tx, rtp_frame, &metrics)
-                                            .await
-                                        {
-                                            break;
+                                                let rtp_frame = RtpFrame {
+                                                    nals,
+                                                    pts_ms,
+                                                    seq: nal_seq,
+                                                    codec,
+                                                };
+
+                                                if !enqueue_rtp_frame_lossless(
+                                                    &tx, rtp_frame, &metrics,
+                                                )
+                                                .await
+                                                {
+                                                    break;
+                                                }
+                                            }
+                                            Ok(MediaSample::Audio(_)) => {
+                                                // Unexpected on a video track; ignore.
+                                            }
+                                            Err(_) => break,
                                         }
                                     }
-                                    Ok(MediaSample::Audio(_)) => {
-                                        // Unexpected on a video track; ignore.
-                                    }
-                                    Err(_) => break,
-                                }
+                                }));
                             }
-                        });
-                    }
-                    PeerConnectionEvent::DataChannel(_) => {
-                        // Not used; ignore.
+                            PeerConnectionEvent::DataChannel(_) => {
+                                // Not used; ignore.
+                            }
+                        }
                     }
                 }
+            }
+
+            // The connection is going away. Abort the track tasks so each
+            // frame_tx clone drops; together with frame_tx dropping here, the
+            // decode worker downstream sees its channel close and exits instead
+            // of blocking forever on a peer that no longer sends frames.
+            for handle in track_tasks {
+                handle.abort();
             }
         }
     }
@@ -604,6 +700,10 @@ impl WebRtcSession {
     pub fn close(&self) {
         #[cfg(any(test, debug_assertions))]
         self.close_calls.fetch_add(1, Ordering::Relaxed);
+        // Raise the monotonic shutdown latch before closing the peer, so run()
+        // observes it even if rustrtc republishes a non-terminal state over the
+        // Closed this triggers.
+        let _ = self.shutdown.send(true);
         self.pc.close();
     }
 
@@ -1274,16 +1374,7 @@ a=rtpmap:111 opus/48000/2\r\n";
 
     #[tokio::test]
     async fn prompt_and_guided_json_read_latest_updates() {
-        let session = WebRtcSession {
-            pc: rustrtc::peer_connection::PeerConnection::new(Default::default()),
-            prompt: Arc::new(arc_swap::ArcSwap::from(Arc::new(Arc::from("")))),
-            guided_json: Arc::new(arc_swap::ArcSwapOption::from(None::<Arc<Arc<str>>>)),
-            max_output_tokens_per_second: 128,
-            crop: None,
-            codec: VideoCodec::H264,
-            rtp_nal_pool_slots: super::rtp_nal_pool_slots(2),
-            close_calls: std::sync::atomic::AtomicU64::new(0),
-        };
+        let session = WebRtcSession::new_for_tests();
 
         session.update_prompt("describe safety events".to_string());
         session.update_guided_json(Some(r#"{"type":"object"}"#.to_string()));
@@ -1296,6 +1387,96 @@ a=rtpmap:111 opus/48000/2\r\n";
                 .as_ref()
                 .map(|schema| schema.as_ref().as_ref()),
             Some(r#"{"type":"object"}"#)
+        );
+    }
+
+    /// The stop decision must latch on the session shutdown flag regardless of
+    /// peer state, and otherwise only on a terminal peer state. Driven directly
+    /// so the full truth table is covered without a live peer, whose transient
+    /// states are not deterministically reachable from a test.
+    #[test]
+    fn should_stop_latches_on_shutdown_and_terminal_peer_states() {
+        use super::should_stop;
+        use rustrtc::peer_connection::PeerConnectionState as S;
+
+        // A raised shutdown latch stops the loop for every peer state, including
+        // a Connected that a late rustrtc republish could put back after close().
+        for peer in [
+            S::New,
+            S::Connecting,
+            S::Connected,
+            S::Disconnected,
+            S::Failed,
+            S::Closed,
+        ] {
+            assert!(should_stop(true, peer), "shutdown must win over {peer:?}");
+        }
+
+        // Without shutdown, only the terminal peer states stop it.
+        assert!(should_stop(false, S::Closed));
+        assert!(should_stop(false, S::Failed));
+        assert!(should_stop(false, S::Disconnected));
+        assert!(!should_stop(false, S::New));
+        assert!(!should_stop(false, S::Connecting));
+        assert!(!should_stop(false, S::Connected));
+    }
+
+    /// The latch must retain a close() that happens before anything subscribes
+    /// through run(). The session holds a keepalive receiver for exactly this:
+    /// without a live receiver, send(true) would not store the value, and a
+    /// later subscribe() would read the initial false. Checked directly against
+    /// the sender so it does not depend on rustrtc scheduling any state.
+    /// Async only because new_for_tests() builds a rustrtc peer, which spawns.
+    #[tokio::test]
+    async fn shutdown_latch_retains_a_close_before_any_run_subscription() {
+        let session = WebRtcSession::new_for_tests();
+
+        // Close before run() (and its subscribe) is ever called.
+        session.close();
+
+        // A fresh subscriber, as run()'s next call would create, reads the
+        // retained latch value rather than the initial false.
+        let mut rx = session.shutdown.subscribe();
+        assert!(
+            *rx.borrow_and_update(),
+            "a close() before any run subscription must still be visible"
+        );
+    }
+
+    /// A close that lands after run() is called but before its future is first
+    /// polled must still terminate run() and release the RTP sender. This is the
+    /// spawn-then-fail ordering: the run task is created, then the session is
+    /// closed before the task is scheduled. peer_state is subscribed inside the
+    /// future, so the Closed rustrtc publishes is already-seen by the first
+    /// poll and its changed() never fires; the top-of-loop check is what stops
+    /// the loop. Without it run() would park on changed()/pc.recv() forever
+    /// while holding the root frame_tx, and the decode worker downstream would
+    /// never see its channel close.
+    #[tokio::test]
+    async fn run_returns_when_closed_before_its_first_poll() {
+        let session = WebRtcSession::new_for_tests();
+
+        let (frame_tx, frame_rx) = kanal::bounded::<RtpFrame>(RTP_FRAME_QUEUE_CAPACITY);
+        let metrics = Arc::new(crate::metrics::PipelineMetrics::new());
+
+        // Build the future (which subscribes to the latch and takes the RTP
+        // sender) but do not poll it, then close. This mirrors the run task
+        // being created and the session then closed before it is scheduled.
+        let run = session.run(frame_tx, metrics);
+        session.close();
+
+        // run() must observe the already-raised latch on its first poll and
+        // return, rather than parking on changed()/pc.recv() forever.
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("run() must return after a close that precedes its first poll");
+
+        // run() owned the only RTP sender; once it returns that sender is
+        // dropped, so the decode worker's receiver now reports the channel
+        // closed instead of blocking on a peer that will never send frames.
+        assert!(
+            frame_rx.try_recv().is_err(),
+            "the RTP receiver should disconnect once run() drops its frame_tx"
         );
     }
 }

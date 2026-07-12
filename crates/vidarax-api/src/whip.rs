@@ -456,6 +456,10 @@ async fn start_whip_session_transaction(
     // Worker threads are long-running OS threads (not tokio tasks).
     // Use spawn_blocking as a bridge from async context to the thread spawns;
     // the actual worker threads are spawned inside and run independently.
+    //
+    // A copy of the session id for the failure log inside the detached task;
+    // the wiring below consumes the shared session-id handle.
+    let session_id_for_log = sess_id.clone();
     tokio::task::spawn_blocking(move || {
         let vlm_provider: Arc<dyn InferenceProvider + Send + Sync> = match provider {
             Some(p) => p,
@@ -469,7 +473,7 @@ async fn start_whip_session_transaction(
         pool_config.max_output_tokens_per_second = max_output_tokens_per_second;
         pool_config.crop = session_crop;
 
-        spawn_pipeline(
+        if let Err(err) = spawn_pipeline(
             &pool_config,
             PipelineWiring {
                 rtp_rx: frame_rx,
@@ -492,7 +496,19 @@ async fn start_whip_session_transaction(
                 session_span: session_span_for_workers,
                 observer: observer_for_workers,
             },
-        );
+        ) {
+            // A worker thread failed to spawn, e.g. OS thread-resource
+            // exhaustion (EAGAIN). The offer was already answered, so the
+            // client sees a live session, but its media pipeline is incomplete
+            // and will never produce events. Close the session so the reclaimer
+            // removes it and tombstones the run, instead of leaving a zombie.
+            tracing::error!(
+                session_id = %session_id_for_log,
+                error = %err,
+                "WHIP media pipeline failed to start; closing session"
+            );
+            session.close();
+        }
     });
 
     Ok(WhipSessionStarted {
