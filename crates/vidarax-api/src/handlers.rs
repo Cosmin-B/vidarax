@@ -2420,9 +2420,10 @@ fn infer_execution_error_to_response(state: &AppState, err: InferExecutionError)
 #[cfg(test)]
 mod tests {
     use super::{
-        feedback_rows_to_json_for_owned_runs, marker_to_emit_event_request,
+        feedback_payload_error, feedback_rows_to_json_for_owned_runs, marker_to_emit_event_request,
         owned_run_ids_from_events, parse_provider, run_command_with_timeout,
         validate_infer_request, AnalyzeMarker, InferRequest, ProviderKind,
+        MAX_FEEDBACK_CATEGORY_LEN, MAX_FEEDBACK_TEXT_LEN,
     };
     use crate::spacetime_client::FeedbackRow;
     use crate::state::AppState;
@@ -2445,6 +2446,38 @@ mod tests {
         assert_eq!(parse_provider(Some("MLX")), Ok(ProviderKind::Mlx));
         assert_eq!(parse_provider(None), Ok(ProviderKind::Vllm));
         assert!(parse_provider(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn feedback_payload_error_bounds_category_and_feedback() {
+        // Within bounds.
+        assert!(feedback_payload_error(7, "accuracy", Some("solid")).is_none());
+        assert!(feedback_payload_error(0, "quality", None).is_none());
+        // Inclusive upper bounds are accepted.
+        assert!(feedback_payload_error(10, &"a".repeat(MAX_FEEDBACK_CATEGORY_LEN), None).is_none());
+        assert!(
+            feedback_payload_error(5, "accuracy", Some(&"a".repeat(MAX_FEEDBACK_TEXT_LEN)))
+                .is_none()
+        );
+        // Pre-existing rules still hold.
+        assert_eq!(
+            feedback_payload_error(11, "accuracy", None).unwrap().0,
+            "rating"
+        );
+        assert_eq!(feedback_payload_error(5, "", None).unwrap().0, "category");
+        // New length caps reject over-long fields (would otherwise 500 at the reducer).
+        assert_eq!(
+            feedback_payload_error(5, &"a".repeat(MAX_FEEDBACK_CATEGORY_LEN + 1), None)
+                .unwrap()
+                .0,
+            "category"
+        );
+        assert_eq!(
+            feedback_payload_error(5, "accuracy", Some(&"a".repeat(MAX_FEEDBACK_TEXT_LEN + 1)))
+                .unwrap()
+                .0,
+            "feedback"
+        );
     }
 
     static WAL_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2629,6 +2662,42 @@ mod tests {
     }
 }
 
+/// Byte caps for feedback fields, mirroring the SpacetimeDB module's reducer
+/// limits (spacetime-module). Enforcing them here turns oversized input into a
+/// clear 400 instead of letting the reducer reject it and surface an opaque 500.
+const MAX_FEEDBACK_CATEGORY_LEN: usize = 64;
+const MAX_FEEDBACK_TEXT_LEN: usize = 64 * 1024;
+
+/// First feedback field that fails validation, as (field, message), or None
+/// when the payload is within bounds.
+fn feedback_payload_error(
+    rating: u32,
+    category: &str,
+    feedback: Option<&str>,
+) -> Option<(&'static str, String)> {
+    if rating > 10 {
+        return Some(("rating", "rating must be between 0 and 10".to_string()));
+    }
+    if category.is_empty() {
+        return Some(("category", "category must not be empty".to_string()));
+    }
+    if category.len() > MAX_FEEDBACK_CATEGORY_LEN {
+        return Some((
+            "category",
+            format!("category must be at most {MAX_FEEDBACK_CATEGORY_LEN} bytes"),
+        ));
+    }
+    if let Some(feedback) = feedback {
+        if feedback.len() > MAX_FEEDBACK_TEXT_LEN {
+            return Some((
+                "feedback",
+                format!("feedback must be at most {MAX_FEEDBACK_TEXT_LEN} bytes"),
+            ));
+        }
+    }
+    None
+}
+
 #[tracing::instrument(name = "api.submit_feedback", skip_all)]
 pub async fn submit_feedback(
     State(state): State<AppState>,
@@ -2640,24 +2709,15 @@ pub async fn submit_feedback(
         return error;
     }
 
-    if payload.rating > 10 {
+    if let Some((field, message)) = feedback_payload_error(
+        payload.rating,
+        &payload.category,
+        payload.feedback.as_deref(),
+    ) {
         return validation_error(
             &state,
             "invalid feedback payload",
-            vec![field_error(
-                "rating",
-                "rating must be between 0 and 10".to_string(),
-            )],
-        );
-    }
-    if payload.category.is_empty() {
-        return validation_error(
-            &state,
-            "invalid feedback payload",
-            vec![field_error(
-                "category",
-                "category must not be empty".to_string(),
-            )],
+            vec![field_error(field, message)],
         );
     }
     if let Err(error) = load_run_snapshot(&state, &headers, &run_id) {
