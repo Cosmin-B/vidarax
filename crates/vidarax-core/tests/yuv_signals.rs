@@ -15,7 +15,7 @@ fn make_gray_frame(luma: u8, width: u32, height: u32) -> YuvFrame {
 #[test]
 fn luma_mean_matches_uniform_frame() {
     let frame = make_gray_frame(200, 64, 64);
-    let signal = yuv_to_frame_signal(&frame, 0, 0, None);
+    let signal = yuv_to_frame_signal(&frame, 0, 0, None).expect("well-formed frame");
     let expected = 200.0_f32 / 255.0;
     assert!(
         (signal.luma_mean - expected).abs() < 0.01,
@@ -28,8 +28,8 @@ fn luma_mean_matches_uniform_frame() {
 #[test]
 fn identical_frames_have_zero_flicker() {
     let frame = make_gray_frame(128, 64, 64);
-    let first = yuv_to_frame_signal(&frame, 0, 0, None);
-    let second = yuv_to_frame_signal(&frame, 1, 33, Some(&first));
+    let first = yuv_to_frame_signal(&frame, 0, 0, None).expect("well-formed frame");
+    let second = yuv_to_frame_signal(&frame, 1, 33, Some(&first)).expect("well-formed frame");
     assert!(
         second.flicker_score < 0.01,
         "flicker={} (expected < 0.01)",
@@ -46,8 +46,8 @@ fn identical_frames_have_zero_flicker() {
 fn different_frames_have_nonzero_flicker() {
     let dark = make_gray_frame(50, 64, 64);
     let bright = make_gray_frame(200, 64, 64);
-    let first = yuv_to_frame_signal(&dark, 0, 0, None);
-    let second = yuv_to_frame_signal(&bright, 1, 33, Some(&first));
+    let first = yuv_to_frame_signal(&dark, 0, 0, None).expect("well-formed frame");
+    let second = yuv_to_frame_signal(&bright, 1, 33, Some(&first)).expect("well-formed frame");
     assert!(
         second.flicker_score > 0.3,
         "flicker={} (expected > 0.3)",

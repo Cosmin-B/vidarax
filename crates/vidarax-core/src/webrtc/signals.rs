@@ -121,7 +121,13 @@ pub fn check_frame(yuv: &YuvFrame) -> Result<(), MalformedFrame> {
         return reject("dimensions must be even and non-zero for 4:2:0".to_string());
     }
 
-    let luma = w * h;
+    // checked_mul so a 32-bit usize can't wrap w*h down to a small value and
+    // wave a truncated frame through the length check; on such a target an
+    // overflowing frame is itself malformed. chroma is at most luma/4, so once
+    // luma has not overflowed its plain product cannot either.
+    let Some(luma) = w.checked_mul(h) else {
+        return reject(format!("dimensions {w}x{h} overflow a usize"));
+    };
     let chroma = (w / 2) * (h / 2);
     if yuv.y.len() < luma || yuv.u.len() < chroma || yuv.v.len() < chroma {
         return reject(format!(
@@ -230,8 +236,10 @@ pub fn crop_yuv(yuv: &YuvFrame, rect: PixelCrop, pool: &CropPool) -> Option<YuvF
 
 /// Compute a [`FrameSignal`] from a decoded YUV 4:2:0 frame.
 ///
-/// The frame must have already cleared [`check_frame`]; this reads both planes
-/// by dimension and does no bounds guarding of its own.
+/// Validates the frame with [`check_frame`] first, so a `YuvFrame` whose planes
+/// are shorter than its claimed dimensions returns [`MalformedFrame`] instead of
+/// panicking out of bounds. Callers already on the validated hot path use
+/// `yuv_to_frame_signal_unchecked` (crate-internal) to skip the re-check.
 ///
 /// When `prev` is `None` (first frame), `flicker_score` and `ghosting_score`
 /// are set to `0.0`. Subsequent calls should pass the previous `FrameSignal`
@@ -243,7 +251,33 @@ pub fn crop_yuv(yuv: &YuvFrame, rect: PixelCrop, pool: &CropPool) -> Option<YuvF
 /// * `frame_index` - Monotonically increasing frame counter from the stream.
 /// * `pts_ms` - Presentation timestamp in milliseconds.
 /// * `prev` - Optional previous frame signal for delta computation.
+///
+/// # Errors
+///
+/// Returns [`MalformedFrame`] when the frame fails [`check_frame`].
 pub fn yuv_to_frame_signal(
+    yuv: &YuvFrame,
+    frame_index: u64,
+    pts_ms: u64,
+    prev: Option<&FrameSignal>,
+) -> Result<FrameSignal, MalformedFrame> {
+    check_frame(yuv)?;
+    Ok(yuv_to_frame_signal_unchecked(
+        yuv,
+        frame_index,
+        pts_ms,
+        prev,
+    ))
+}
+
+/// Compute a [`FrameSignal`] from a frame that has *already* cleared
+/// [`check_frame`].
+///
+/// This reads both planes by dimension and does no bounds guarding of its own,
+/// so passing a frame with planes shorter than `width * height` panics. The
+/// worker path validates once per frame and then calls this directly; external
+/// callers should prefer the checked [`yuv_to_frame_signal`].
+pub(crate) fn yuv_to_frame_signal_unchecked(
     yuv: &YuvFrame,
     frame_index: u64,
     pts_ms: u64,
@@ -308,12 +342,13 @@ pub fn yuv_to_frame_signal(
     }
 }
 
-/// A frame the JPEG encoder refused.
+/// A frame that could not be turned into a JPEG.
 ///
-/// This only comes up when the encoder is handed dimensions it can't work with
-/// — a zero-sized or mismatched plane off a glitched decode. It's a per-frame,
-/// recoverable condition: the caller drops that one frame's thumbnail and the
-/// stream keeps running.
+/// Every reason is a per-frame, recoverable condition: a frame that fails
+/// [`check_frame`] before the encoder ever sees it (from the public
+/// [`yuv_to_jpeg`]), a frame whose dimensions exceed the encoder's `u16` size
+/// fields, or a frame the encoder itself refuses. Either way the caller drops
+/// that one frame's thumbnail and the stream keeps running.
 #[derive(Debug, Clone)]
 pub struct JpegEncodeError {
     pub width: u32,
@@ -333,7 +368,43 @@ impl std::fmt::Display for JpegEncodeError {
 
 impl std::error::Error for JpegEncodeError {}
 
+impl From<MalformedFrame> for JpegEncodeError {
+    fn from(err: MalformedFrame) -> Self {
+        JpegEncodeError {
+            width: err.width,
+            height: err.height,
+            detail: err.detail,
+        }
+    }
+}
+
 /// Encode a decoded YUV 4:2:0 frame into a pooled JPEG buffer.
+///
+/// Validates the frame with [`check_frame`] first, so a `YuvFrame` with planes
+/// shorter than its claimed dimensions returns [`JpegEncodeError`] instead of
+/// panicking on the interleave. Callers already on the validated hot path use
+/// `yuv_to_jpeg_unchecked` (crate-internal) to skip the re-check.
+///
+/// See `yuv_to_jpeg_unchecked` (crate-internal) for the `scratch`/`output_pool`
+/// contract.
+///
+/// # Errors
+///
+/// Returns [`JpegEncodeError`] when the frame fails [`check_frame`], exceeds the
+/// dimensions the encoder's `u16` size fields can hold, or is rejected by the
+/// encoder; in every case the caller drops the thumbnail and the stream keeps
+/// running.
+pub fn yuv_to_jpeg(
+    yuv: &YuvFrame,
+    quality: u8,
+    scratch: &mut Vec<u8>,
+    output_pool: &VecPool,
+) -> Result<RecycledBytes, JpegEncodeError> {
+    check_frame(yuv)?;
+    yuv_to_jpeg_unchecked(yuv, quality, scratch, output_pool)
+}
+
+/// Encode a frame that has *already* cleared [`check_frame`] into a pooled JPEG.
 ///
 /// The planar YUV is interleaved straight into YCbCr, which the encoder accepts
 /// natively — so neither side pays for a BT.601 float conversion, and the chroma
@@ -343,21 +414,38 @@ impl std::error::Error for JpegEncodeError {}
 /// large YCbCr staging area isn't reallocated every call. The finished JPEG
 /// lands in a buffer drawn from `output_pool` and returns to it on drop.
 ///
-/// The frame must have already cleared [`check_frame`]; the interleave below
-/// indexes the planes by dimension with no bounds guarding.
+/// The interleave below indexes the planes by dimension with no bounds guarding,
+/// so a frame that has not cleared [`check_frame`] panics. The worker path
+/// validates once per frame and then calls this directly; external callers
+/// should prefer the checked [`yuv_to_jpeg`].
 ///
 /// # Errors
 ///
-/// Returns [`JpegEncodeError`] if the encoder itself rejects the frame. On a
-/// validated frame that path is effectively unreachable, but it stays typed so
-/// the caller can drop the thumbnail and keep the stream running rather than
-/// take the encoder's word on faith.
-pub fn yuv_to_jpeg(
+/// Returns [`JpegEncodeError`] when the dimensions exceed what the encoder's
+/// `u16` size fields can hold, or if the encoder itself rejects an in-range
+/// frame. On a validated, in-range frame the latter is effectively unreachable,
+/// but it stays typed so the caller can drop the thumbnail and keep the stream
+/// running rather than take the encoder's word on faith.
+pub(crate) fn yuv_to_jpeg_unchecked(
     yuv: &YuvFrame,
     quality: u8,
     scratch: &mut Vec<u8>,
     output_pool: &VecPool,
 ) -> Result<RecycledBytes, JpegEncodeError> {
+    // The encoder takes width and height as u16. A larger frame would be
+    // truncated in the encode call and produce a valid-looking jpeg at the
+    // wrong size, so reject it here before interleaving anything.
+    if yuv.width > u16::MAX as u32 || yuv.height > u16::MAX as u32 {
+        return Err(JpegEncodeError {
+            width: yuv.width,
+            height: yuv.height,
+            detail: format!(
+                "dimensions exceed the {}px the jpeg encoder accepts",
+                u16::MAX
+            ),
+        });
+    }
+
     let w = yuv.width as usize;
     let h = yuv.height as usize;
     let half_w = w / 2;
@@ -532,5 +620,52 @@ mod tests {
             "pooled buffer lost its reservation: {} < {JPEG_TYPICAL_CAPACITY}",
             recycled.capacity(),
         );
+    }
+
+    #[test]
+    fn yuv_to_frame_signal_rejects_a_malformed_frame_instead_of_panicking() {
+        // The stride-4 luma stats loop reads index 252 of a 16x16 frame, so a Y
+        // plane of 252 bytes (16*16 - 4) is genuinely short enough to index out
+        // of bounds in the unchecked body. The checked wrapper must reject it
+        // instead: if the check regressed, this would panic on that read.
+        let mut short = solid_frame(16, 16);
+        short.y = vec![128u8; 16 * 16 - 4].into();
+        assert!(
+            yuv_to_frame_signal(&short, 0, 0, None).is_err(),
+            "the checked helper must reject a short frame, not panic on it"
+        );
+        // A well-formed frame still yields a signal.
+        assert!(yuv_to_frame_signal(&solid_frame(16, 16), 7, 33, None).is_ok());
+    }
+
+    #[test]
+    fn yuv_to_jpeg_rejects_a_malformed_frame_instead_of_panicking() {
+        // A chroma plane one sample short would index past its end in the
+        // interleave loop, before the encoder ever runs.
+        let mut short = solid_frame(16, 16);
+        short.u = vec![128u8; (16 / 2) * (16 / 2) - 1].into();
+        let mut scratch = Vec::new();
+        let pool = VecPool::with_slots(1);
+        let err = yuv_to_jpeg(&short, 75, &mut scratch, &pool)
+            .expect_err("the checked helper must reject a short frame, not panic on it");
+        // The MalformedFrame reason is folded into the JpegEncodeError, keeping
+        // the frame's dimensions so the drop is attributable.
+        assert_eq!(err.width, 16);
+        assert_eq!(err.height, 16);
+    }
+
+    #[test]
+    fn yuv_to_jpeg_rejects_dimensions_larger_than_the_encoder_accepts() {
+        // The encoder's width/height are u16. 65538 would truncate to 2 in that
+        // cast and encode a valid-looking jpeg at the wrong size, so an in-range
+        // planar frame at those dims must be rejected rather than silently
+        // mis-encoded. The planes are sized for the claimed dims so check_frame
+        // passes and the u16 guard is what catches it.
+        let frame = solid_frame(65538, 2);
+        let mut scratch = Vec::new();
+        let pool = VecPool::with_slots(1);
+        let err = yuv_to_jpeg(&frame, 75, &mut scratch, &pool)
+            .expect_err("dimensions past u16 must be rejected, not truncated");
+        assert_eq!(err.width, 65538);
     }
 }
