@@ -434,8 +434,12 @@ pub fn spawn_clip_vlm_workers<I>(
                         Ok(output) => (output.result.output_text, output.used_second_pass),
                         Err(err) => {
                             if let Some(o) = observer.as_deref() {
+                                // run_tiered only returns Err on a first-pass
+                                // failure, so err.request.model is the model
+                                // that actually failed; attribute the error to
+                                // its backend, not the router's default.
                                 o.record_error(
-                                    provider.kind(),
+                                    provider.kind_for_model(err.request.model.as_ref()),
                                     clip_call_start.elapsed().as_millis() as u64,
                                 );
                             }

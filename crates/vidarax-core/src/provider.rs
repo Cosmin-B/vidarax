@@ -155,6 +155,17 @@ pub trait Transport: Send + Sync {
 pub trait InferenceProvider: Send + Sync {
     fn kind(&self) -> ProviderKind;
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError>;
+
+    /// Which provider kind actually serves `model`.
+    ///
+    /// A leaf provider serves everything itself, so the default is `kind()`.
+    /// `ModelRoutingProvider` overrides this so an error recorded after a
+    /// routed call lands on the backend that ran the model rather than on the
+    /// default leaf. Callers that record a failure use this instead of `kind()`
+    /// when they know which model failed.
+    fn kind_for_model(&self, _model: &str) -> ProviderKind {
+        self.kind()
+    }
 }
 
 /// Records inference outcomes for `/metrics`, one call per inference pass.
@@ -388,6 +399,17 @@ impl ModelRoutingProvider {
 impl InferenceProvider for ModelRoutingProvider {
     fn kind(&self) -> ProviderKind {
         self.default.kind()
+    }
+
+    fn kind_for_model(&self, model: &str) -> ProviderKind {
+        // Mirror the routing `infer` does: a mapped model is served by its
+        // route's backend, everything else by the default. Reporting the wrong
+        // one here is exactly the bug this override fixes, so the two lookups
+        // must stay in lockstep.
+        self.routes
+            .get(model)
+            .map(|p| p.kind())
+            .unwrap_or_else(|| self.default.kind())
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
@@ -1004,5 +1026,41 @@ mod tests {
         let default = Arc::new(RecordingModelProvider::new(ProviderKind::Sglang));
         let router = ModelRoutingProvider::new(HashMap::new(), default);
         assert_eq!(router.kind(), ProviderKind::Sglang);
+    }
+
+    #[test]
+    fn model_routing_kind_for_model_reports_the_serving_backend() {
+        // kind_for_model must track infer's routing so a recorded error lands
+        // on the backend that ran the model. A routed id reports its route's
+        // kind; an unmapped id reports the default's, same as the router's
+        // bare kind().
+        let routed = Arc::new(RecordingModelProvider::new(ProviderKind::Gemini));
+        let default = Arc::new(RecordingModelProvider::new(ProviderKind::Vllm));
+        let mut routes: HashMap<String, Arc<dyn InferenceProvider + Send + Sync>> = HashMap::new();
+        routes.insert("gemini-3.1-flash-lite".to_string(), routed);
+        let router = ModelRoutingProvider::new(routes, default);
+
+        assert_eq!(
+            router.kind_for_model("gemini-3.1-flash-lite"),
+            ProviderKind::Gemini
+        );
+        assert_eq!(
+            router.kind_for_model("some/local-model"),
+            ProviderKind::Vllm
+        );
+        // The bare kind() still reflects the default, unchanged.
+        assert_eq!(router.kind(), ProviderKind::Vllm);
+    }
+
+    #[test]
+    fn leaf_provider_kind_for_model_is_just_its_kind() {
+        // The trait default: a leaf serves everything itself, so every model
+        // maps to its own kind regardless of the id.
+        let leaf = RecordingModelProvider::new(ProviderKind::Sglang);
+        assert_eq!(leaf.kind_for_model("anything"), ProviderKind::Sglang);
+        assert_eq!(
+            leaf.kind_for_model("gemini-3.1-flash-lite"),
+            ProviderKind::Sglang
+        );
     }
 }

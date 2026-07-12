@@ -1536,8 +1536,12 @@ where
                             }
                             Err(err) => {
                                 if let Some(o) = observer.as_deref() {
+                                    // First-pass failure: err.request.model is
+                                    // the failed model, so attribute the error
+                                    // to its backend rather than the router's
+                                    // default kind.
                                     o.record_error(
-                                        provider.kind(),
+                                        provider.kind_for_model(err.request.model.as_ref()),
                                         tiered_call_start.elapsed().as_millis() as u64,
                                     );
                                 }

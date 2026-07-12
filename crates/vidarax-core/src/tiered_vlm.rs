@@ -124,6 +124,7 @@ where
         request.max_tokens = config.second_pass_max_tokens;
         request.timeout_ms = second_pass_timeout_ms;
         request.guided_json = Some(Arc::from(teacher_label_schema()));
+        let second_pass_started = std::time::Instant::now();
         match provider.infer(&request) {
             Ok(mut result) => {
                 // Record the second pass under its own provider with its own
@@ -151,11 +152,24 @@ where
                     request,
                 });
             }
-            Err(_) => {
-                // The first pass was already recorded above; a failed second
-                // pass has no successful outcome of its own to attribute, and
-                // the caller only sees the first-pass result here, so nothing
-                // further is recorded.
+            Err(error) => {
+                // The escalated pass failed. The caller still gets the
+                // first-pass result (functionally unchanged), but the failure
+                // is a real provider error that error-rate metrics must see,
+                // attributed to whichever backend the second-pass model routes
+                // to rather than swallowed. Record it against the second pass's
+                // own elapsed time, not the first pass's.
+                if let Some(o) = observer {
+                    o.record_error(
+                        provider.kind_for_model(config.second_pass_model.as_ref()),
+                        second_pass_started.elapsed().as_millis() as u64,
+                    );
+                }
+                tracing::warn!(
+                    model = %config.second_pass_model,
+                    error = ?error,
+                    "tiered second pass failed; returning first-pass result"
+                );
                 return Ok(TieredVlmRun {
                     result: first_result,
                     used_second_pass: false,
@@ -468,6 +482,83 @@ mod tests {
         assert_eq!(output.result.usage.total_tokens, 90);
         assert_eq!(output.result.inference_latency_ms, 240);
         assert!(observer.errors.lock().unwrap().is_empty());
+    }
+
+    /// Low-confidence first pass to force escalation, then a hard error on the
+    /// second-pass model so the escalated pass fails.
+    struct SecondPassFailsProvider {
+        second_pass_model: Arc<str>,
+    }
+
+    impl InferenceProvider for SecondPassFailsProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Vllm
+        }
+
+        fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+            if request.model == self.second_pass_model {
+                Err(ProviderError::HttpStatus(503))
+            } else {
+                Ok(InferenceResult {
+                    provider: ProviderKind::Sglang,
+                    model: request.model.clone(),
+                    output_text: r#"{"confidence":0.1,"description":"first"}"#.to_string(),
+                    fallback_used: false,
+                    finish_reason: Some("stop".to_string()),
+                    inference_latency_ms: 40,
+                    usage: TokenUsage {
+                        prompt_tokens: 10,
+                        completion_tokens: 5,
+                        thinking_tokens: 0,
+                        total_tokens: 15,
+                    },
+                })
+            }
+        }
+    }
+
+    #[test]
+    fn failed_second_pass_records_an_error_and_returns_the_first_pass() {
+        // Regression (audit M1): a failed escalation used to be swallowed —
+        // neither logged nor recorded — so second-pass provider error rates
+        // never saw it. It must now record_error while still returning the
+        // first-pass result the caller depends on.
+        let provider = SecondPassFailsProvider {
+            second_pass_model: Arc::from("teacher"),
+        };
+        let config = TieredVlmConfig {
+            first_pass_model: Arc::from("small"),
+            second_pass_model: Arc::from("teacher"),
+            second_pass_threshold: 0.7,
+            second_pass_max_tokens: 512,
+        };
+        let observer = RecordingObserver::default();
+
+        let output = run_tiered(
+            &provider,
+            &config,
+            observer_test_request(),
+            1024,
+            1000,
+            Some(&observer),
+        )
+        .unwrap();
+
+        // Functionally unchanged: caller still gets the first-pass result and
+        // sees no second pass.
+        assert!(!output.used_second_pass);
+        assert!(output.result.output_text.contains("first"));
+
+        // The first pass is still recorded as a success.
+        let successes = observer.successes.lock().unwrap();
+        assert_eq!(successes.len(), 1);
+        assert_eq!(successes[0].0, ProviderKind::Sglang);
+
+        // The failed second pass is now recorded exactly once. A leaf provider
+        // serves every model itself, so kind_for_model is its own kind.
+        let errors = observer.errors.lock().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, ProviderKind::Vllm);
     }
 
     #[test]

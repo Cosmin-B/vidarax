@@ -609,6 +609,11 @@ pub async fn infer_chunk_semantics(
         guided_json: guided_json.as_ref().map(Arc::clone),
     };
 
+    // Capture the failing model's backend kind before the closure moves
+    // tiered_config. run_tiered only surfaces Err on a first-pass failure, so
+    // this attributes any recorded error to the first-pass model's backend
+    // instead of the router's default kind.
+    let first_pass_kind = provider.kind_for_model(tiered_config.first_pass_model.as_ref());
     let call_started = Instant::now();
     let provider_result = match tokio::task::spawn_blocking({
         let provider = Arc::clone(&provider);
@@ -632,7 +637,7 @@ pub async fn infer_chunk_semantics(
             // failing; a failed first pass records nothing internally, so the
             // caller (here) is where that error lands in /metrics.
             if let Some(o) = observer.as_deref() {
-                o.record_error(provider.kind(), call_started.elapsed().as_millis() as u64);
+                o.record_error(first_pass_kind, call_started.elapsed().as_millis() as u64);
             }
             result.used_fallback = true;
             result.error = Some(match err.error {
@@ -645,7 +650,7 @@ pub async fn infer_chunk_semantics(
         }
         Err(err) => {
             if let Some(o) = observer.as_deref() {
-                o.record_error(provider.kind(), call_started.elapsed().as_millis() as u64);
+                o.record_error(first_pass_kind, call_started.elapsed().as_millis() as u64);
             }
             result.used_fallback = true;
             result.error = Some(format!("join_error:{err}"));
