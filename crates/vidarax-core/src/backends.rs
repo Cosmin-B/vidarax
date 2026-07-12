@@ -259,11 +259,11 @@ fn build_gemini_provider(entry: &BackendEntry) -> Result<GeminiProvider, String>
 ///
 /// Entries are sorted ascending by `priority` first, matching the precedence
 /// convention [`build_provider_chain`] already uses (lowest priority number
-/// wins). The sort is stable, so equal priorities keep their config order.
-/// Walking the sorted list and keeping only the first entry seen for each
-/// model id means that when two backends are configured to serve the exact
-/// same model, the higher-precedence one deterministically claims it (lower
-/// priority number, or the earlier config entry on a tie), and the later
+/// wins), then by backend name to break priority ties. Walking the sorted list
+/// and keeping only the first entry seen for each model id means that when two
+/// backends are configured to serve the exact same model, the higher-precedence
+/// one deterministically claims it (lower priority number, or the
+/// alphabetically-earlier backend name on a priority tie), and the later
 /// duplicate is dropped here rather than left to whichever order a `HashMap`
 /// insert happens to run in.
 ///
@@ -276,7 +276,17 @@ fn select_model_route_entries(entries: &[BackendEntry]) -> Vec<&BackendEntry> {
         .iter()
         .filter(|entry| entry.backend_type == "gemini")
         .collect();
-    gemini_entries.sort_by_key(|entry| entry.priority);
+    // Ascending by priority (lowest number wins), then by backend name as a
+    // total tie-breaker. A plain sort on priority is stable, so two backends
+    // claiming the same model id at the same priority would resolve by config
+    // order, and reordering the same TOML would silently change which backend
+    // (and api key) serves that model. Breaking the tie on the name makes the
+    // winner deterministic regardless of input order.
+    gemini_entries.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
     let mut claimed_models: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut selected = Vec::with_capacity(gemini_entries.len());
@@ -288,7 +298,7 @@ fn select_model_route_entries(entries: &[BackendEntry]) -> Vec<&BackendEntry> {
             tracing::warn!(
                 backend = %entry.name,
                 model = %model,
-                "backend excluded from model routing: a higher-precedence gemini backend already claims this model id (lower priority number, or the earlier config entry on a priority tie), and routed models are single-target, so this backend will not receive routed traffic for it"
+                "backend excluded from model routing: a higher-precedence gemini backend already claims this model id (lower priority number, or the alphabetically-earlier backend name on a priority tie), and routed models are single-target, so this backend will not receive routed traffic for it"
             );
         }
     }
@@ -884,6 +894,42 @@ base_url = "${_VDX_TEST_URL}"
             winners.get("gemini-3.1-flash-lite").map(String::as_str),
             Some("gemini-primary"),
         );
+    }
+
+    #[test]
+    fn model_routing_equal_priority_duplicate_breaks_tie_on_name_not_input_order() {
+        // Two gemini backends claim the same model id at the SAME priority. A
+        // stable priority-only sort would let config order pick the winner, so
+        // reordering the TOML would silently swap which backend (and api key)
+        // serves the model. The name tie-break must pick the same winner
+        // ("gemini-alpha", alphabetically first) whichever order they appear in.
+        let alpha = || BackendEntry {
+            name: "gemini-alpha".into(),
+            backend_type: "gemini".into(),
+            base_url: None,
+            api_key: Some("key-alpha".into()),
+            model: Some("gemini-3.1-flash-lite".into()),
+            openai_kind: None,
+            priority: 5,
+        };
+        let omega = || BackendEntry {
+            name: "gemini-omega".into(),
+            backend_type: "gemini".into(),
+            base_url: None,
+            api_key: Some("key-omega".into()),
+            model: Some("gemini-3.1-flash-lite".into()),
+            openai_kind: None,
+            priority: 5,
+        };
+
+        for entries in [vec![alpha(), omega()], vec![omega(), alpha()]] {
+            let winners = model_route_winners_for_tests(&entries);
+            assert_eq!(
+                winners.get("gemini-3.1-flash-lite").map(String::as_str),
+                Some("gemini-alpha"),
+                "the equal-priority tie must break on backend name, not input order"
+            );
+        }
     }
 
     #[test]
