@@ -4,6 +4,12 @@
 //! openh264 in-process. Software H.265 uses the ffmpeg sidecar. With
 //! `--features vp8`, VP8 uses libvpx in-process.
 
+// The crate denies unsafe (see lib.rs). The libvpx VP8 path calls a C API
+// through raw pointers, so it needs unsafe; the allow is scoped to this module
+// and gated on the same `vp8` feature that compiles that FFI, so with VP8 off
+// the deny still covers every line here too.
+#![cfg_attr(feature = "vp8", allow(unsafe_code))]
+
 use std::collections::VecDeque;
 #[cfg(feature = "vp8")]
 use std::ffi::CStr;
