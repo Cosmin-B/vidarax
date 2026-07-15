@@ -14,10 +14,10 @@ Requires Node.js 18+ or any modern browser.
 
 ```typescript
 import { Vidarax } from 'vidarax'
-const v = new Vidarax('http://localhost:8080')
+const v = new Vidarax('http://localhost:8080', { apiKey: 'dev-key' })
 // analyze() runs the deterministic frame-signal pipeline; it takes no prompt.
-const run = await v.analyze('video.mp4')
-for await (const event of run.events()) {
+const run = await v.analyze('/srv/vidarax-media/video.mp4')
+for (const event of await v.getEvents(run.runId)) {
   console.log(event.kind, event.payload)
 }
 ```
@@ -42,16 +42,20 @@ const v = new Vidarax(baseUrl, options?)
 
 | Method | Description |
 |---|---|
-| `analyze(source, opts?)` | High-level: ingest + analyze + stream results. |
+| `analyze(source, opts?)` | High-level: ingest and analyze, then return a run handle. |
 | `createRun(opts)` / `listRuns()` | Create or list runs. |
 | `getRun(id)` / `deleteRun(id)` / `stopRun(id)` | Manage individual runs. |
 | `ingestRun(id, opts)` | Attach a source and decode frames. |
 | `analyzeRun(id, opts)` | Run analysis on ingested frames. |
 | `reason(id, opts)` | Realtime inference over a stream. |
+| `getEvents(id, index?)` / `getMarkers(id, query?)` | Fetch one snapshot of events or markers. |
+| `getInteractions(id, index?)` | Fetch guided semantic interactions. |
+| `getKeyframe(id, sha256)` | Fetch a run-owned keyframe as a raw JPEG `Blob`. |
 | `streamEvents(id)` / `streamMarkers(id)` | Async-iterate a one-time snapshot of results (not a live stream; the server has no SSE endpoint). |
 | `infer(opts)` / `inferBatch(items)` | Single or batch inference. |
 | `uploadFile(file, onProgress?)` | Upload a video file. |
 | `whipOffer(sdp, opts)` | WebRTC WHIP session (browser). |
+| `whipUpdatePrompt(id, request)` | Update the prompt and optional JSON Schema object. |
 | `listModels()` / `health()` | Models and health checks. |
 
 ## Error handling

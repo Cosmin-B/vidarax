@@ -21,8 +21,8 @@ static DROPPED_DETACHED_TIMELINE_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 use vidarax_contracts::lifecycle::StreamState;
 use vidarax_core::ingest::pipeline::{create_pipeline, DecodePipeline, PipelineBackend};
+use vidarax_core::novelty::LiveNoveltyConfig;
 use vidarax_core::provider::InferenceProvider;
-use vidarax_core::tiered_vlm::DistillationConfig;
 #[cfg(test)]
 use vidarax_core::timeline::append_event;
 use vidarax_core::timeline::{read_all_events, TimelineEvent, WalWriter};
@@ -170,7 +170,7 @@ pub struct AppStateInner {
     // without borrowing from AppState.
     inference_metrics: Arc<InferenceMetrics>,
     pipeline_metrics: Arc<PipelineMetrics>,
-    distillation_config: DistillationConfig,
+    novelty_config: LiveNoveltyConfig,
     run_registry: Arc<RunRegistry>,
     timeline_tx: mpsc::Sender<TimelineCommand>,
     timeline_snapshot: Arc<ArcSwap<RingSnapshot>>,
@@ -267,7 +267,7 @@ impl AppStateConfig {
                 security_policy: self.security_policy,
                 inference_metrics: Arc::new(InferenceMetrics::new()),
                 pipeline_metrics: Arc::new(PipelineMetrics::new()),
-                distillation_config: DistillationConfig::default(),
+                novelty_config: LiveNoveltyConfig::default(),
                 run_registry,
                 timeline_tx,
                 timeline_snapshot,
@@ -298,7 +298,7 @@ impl AppState {
         stream_ttl_secs: u64,
         active_stream_limit: usize,
         webrtc_config: WebRtcConfig,
-        distillation: DistillationConfig,
+        novelty: LiveNoveltyConfig,
     ) -> Result<Self, String> {
         let existing_events = read_all_events(&wal_path).map_err(|err| err.to_string())?;
         let run_registry = build_run_registry(&existing_events);
@@ -350,7 +350,7 @@ impl AppState {
                 security_policy,
                 inference_metrics: Arc::new(InferenceMetrics::new()),
                 pipeline_metrics: Arc::new(PipelineMetrics::new()),
-                distillation_config: distillation,
+                novelty_config: novelty,
                 run_registry,
                 timeline_tx,
                 timeline_snapshot,
@@ -954,8 +954,16 @@ impl AppState {
         &self.webrtc_config
     }
 
-    pub fn distillation_config(&self) -> &DistillationConfig {
-        &self.distillation_config
+    pub fn novelty_config(&self) -> &LiveNoveltyConfig {
+        &self.novelty_config
+    }
+
+    pub(crate) fn keyframe_blob_root(&self) -> PathBuf {
+        self.wal_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("keyframes")
+            .join("blobs")
     }
 
     pub fn map_event_label(&self, tenant_id: Option<&str>, label: &str) -> LabelMapResult {

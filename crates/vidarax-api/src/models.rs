@@ -10,6 +10,7 @@ use vidarax_core::crop::CropRegion;
 /// into temporal windows and submitted as multi-image VLM calls instead of
 /// being processed one keyframe at a time.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClipConfig {
     /// Frames per second to sample from the stream (1–30, default 6).
     #[serde(default = "default_target_fps")]
@@ -44,12 +45,14 @@ impl ClipConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateRunRequest {
     pub mode: Option<String>,
     pub model: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct InferRequest {
     pub run_id: Option<String>,
     pub model: String,
@@ -64,12 +67,14 @@ pub struct InferRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InferBatchRequest {
     pub requests: Vec<InferRequest>,
     pub max_parallel: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AnalyzeFrameInput {
     pub frame_index: u64,
     pub pts_ms: u64,
@@ -81,6 +86,7 @@ pub struct AnalyzeFrameInput {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AnalyzeFramesRequest {
     pub mode: Option<String>,
     pub model: String,
@@ -95,6 +101,7 @@ pub struct AnalyzeFramesRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RealtimeReasonRequest {
     pub source_uri: String,
     pub mode: Option<String>,
@@ -119,9 +126,6 @@ pub struct RealtimeReasonRequest {
     /// analyzed. `None` analyzes the whole frame.
     pub crop: Option<CropRegion>,
     pub semantic_timeout_ms: Option<u64>,
-    // Deserialized for request-shape compatibility; not consumed on the realtime path.
-    #[allow(dead_code)]
-    pub primary_provider: Option<String>,
     pub semantic_prompt: Option<String>,
     pub first_pass_model: Option<String>,
     pub second_pass_model: Option<String>,
@@ -129,11 +133,6 @@ pub struct RealtimeReasonRequest {
     pub trace_id: Option<String>,
     #[serde(default)]
     pub output_schema: Option<Value>,
-    /// Optional clip-mode config. When set, frames are accumulated into
-    /// temporal windows for multi-image VLM inference.
-    // Deserialized for request-shape compatibility; not consumed on the realtime path.
-    #[allow(dead_code)]
-    pub clip_mode: Option<ClipConfig>,
     /// Optional index name for this analysis pass.
     ///
     /// Tagging a run with an `index_name` allows multiple analysis passes over
@@ -156,12 +155,6 @@ pub struct RealtimeReasonRequest {
     /// Implies temporal_chain=true. Default: false.
     #[serde(default)]
     pub visual_diff: Option<bool>,
-    /// When true, only chunks containing a gate-detected scene cut are sent
-    /// to VLM. Skips static chunks entirely. Default: false.
-    #[serde(default)]
-    // Deserialized for request-shape compatibility; not consumed on the realtime path.
-    #[allow(dead_code)]
-    pub gate_filter: Option<bool>,
     /// When true, extract short MP4 clips instead of JPEG frames for VLM
     /// input.  Each chunk becomes one video segment sent via `input_videos`.
     /// Default: false (JPEG frame mode).
@@ -174,6 +167,25 @@ pub struct RealtimeReasonRequest {
     /// Higher values increase throughput but may cause queueing on the GPU.
     /// Default: 4.
     pub vlm_concurrency: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IngestRequest {
+    pub source_uri: String,
+    pub sampling_policy: Option<String>,
+    pub fixed_fps: Option<f32>,
+    pub sample_fps: Option<f32>,
+    pub max_frames: Option<u64>,
+    pub stream_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryRequest {
+    pub run_id: String,
+    pub kind: Option<String>,
+    pub from_seq: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -363,6 +375,7 @@ pub struct CreateRunResponse {
 /// { "query": "person walking", "run_id": "run-abc123", "limit": 10 }
 /// ```
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SearchRequest {
     /// Query string.  All WAL events whose VLM description contains this
     /// substring (case-insensitive) are returned.
@@ -436,6 +449,7 @@ impl SamplingPolicy {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeedbackRequest {
     pub rating: u32,
     pub category: String,
@@ -463,6 +477,7 @@ pub struct ModelCatalogResponse {
 ///
 /// Used to set the initial VLM prompt, token rate cap, and clip mode.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttachStreamRequest {
     /// Initial VLM analysis prompt for this session.
     pub prompt: Option<String>,
@@ -478,12 +493,6 @@ pub struct AttachStreamRequest {
     /// live client can point analysis at part of its screen. Absent keeps the
     /// server default.
     pub crop: Option<CropRegion>,
-    /// Optional index name for this streaming session.
-    ///
-    /// When set, all VLM events emitted during this session are tagged with the
-    /// given index name so they can be filtered independently from other
-    /// analysis passes on the same run via `GET /v1/runs/{id}/events?index=…`.
-    pub index_name: Option<String>,
 }
 
 #[cfg(test)]
@@ -643,19 +652,5 @@ mod tests {
         let crop = parsed.crop.expect("crop parsed");
         assert_eq!(crop.width, 0.5);
         assert_eq!(crop.height, 1.0);
-    }
-
-    #[test]
-    fn attach_stream_request_parses_index_name() {
-        let raw = r#"{"index_name": "crowd"}"#;
-        let parsed: AttachStreamRequest = serde_json::from_str(raw).unwrap();
-        assert_eq!(parsed.index_name.as_deref(), Some("crowd"));
-    }
-
-    #[test]
-    fn attach_stream_request_index_name_absent_is_none() {
-        let raw = r#"{}"#;
-        let parsed: AttachStreamRequest = serde_json::from_str(raw).unwrap();
-        assert!(parsed.index_name.is_none());
     }
 }

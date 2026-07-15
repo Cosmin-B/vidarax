@@ -1,4 +1,4 @@
-# Vidarax -- Product Pitch
+# Vidarax product brief
 
 ## SLIDE 1: The Problem
 
@@ -11,11 +11,11 @@
 
 ## SLIDE 2: How It Works
 
-**Any stream in, semantic events out.** Three steps:
+Three steps:
 
 1. **Ingest** -- File upload or WebRTC live stream. ffmpeg decode with adaptive sampling.
-2. **Analyze** -- Deterministic gate engine (scene cuts, artifacts, novelty) at O(1) per frame, plus per-chunk sampling. Only a fraction of frames reach the VLM. Tiered routing: fast model first, larger model when uncertain.
-3. **Emit** -- Structured events into SpacetimeDB in real time. Queryable and searchable.
+2. **Analyze** -- A deterministic frame gate selects candidates. On live capture, an optional embedding gate can reuse recent descriptions within bounded time and drift limits. Tiered routing sends uncertain first-pass results to a second model.
+3. **Emit** -- Structured events commit to the local WAL. Selected JPEGs are stored as content-addressed blobs; SpacetimeDB can mirror description events.
 
 Result: most frames never reach a VLM, so inference cost tracks the sampled
 frames rather than the full frame rate.
@@ -29,7 +29,7 @@ frames rather than the full frame rate.
 
 ## SLIDE 4: Differentiators
 
-**Self-hosted.** Video never leaves your infrastructure. Deploy on-prem, cloud, or edge.
+**Self-hosted.** With a local model and embedding sidecar, video stays on infrastructure you control. Gemini remains an optional configured backend.
 
 **Deterministic gate engine.** A two-pass sliding window in Rust flags redundant frames so the analyze path can skip them.
 
@@ -37,7 +37,7 @@ frames rather than the full frame rate.
 
 **Chunked real-time reasoning.** Bounded-lag chunking keeps results flowing while a stream is still live. Prometheus metrics built in.
 
-**Full observability.** WAL-backed timeline, SpacetimeDB sync, pipeline tracing, Vue 3 command center.
+**Operational evidence.** Prometheus metrics cover gate decisions, novelty reuse, embedding latency, inference, and keyframe durability. Calibration and provider/hardware measurements are run per deployment.
 
 ## Use Cases
 
@@ -55,4 +55,4 @@ Runs entirely on your hardware with open-source models. Only a sampled subset of
 Economics. Continuous multi-camera inference is dominated by model calls. Vidarax filters first, infers second, and routes between model tiers.
 
 **"Business model?"**
-Open-source engine with commercial support. Managed cloud for teams that prefer not to self-host.
+The current repository is the self-hosted engine. Any commercial packaging or managed service is a product decision, not an implemented deployment mode.

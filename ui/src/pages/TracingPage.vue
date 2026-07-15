@@ -1,33 +1,14 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { computed, onMounted } from 'vue'
 import { RefreshCw, Activity, AlertCircle } from 'lucide-vue-next'
 import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
 import PipelineOverview from '@/components/tracing/PipelineOverview.vue'
 import MetricsGrid from '@/components/tracing/MetricsGrid.vue'
-import TraceTimeline from '@/components/tracing/TraceTimeline.vue'
-import { useMetrics, generateMockTrace } from '@/composables/useMetrics'
-import type { Trace } from '@/composables/useMetrics'
+import { useMetrics } from '@/composables/useMetrics'
 
 // ─── Metrics polling ──────────────────────────────────────────────────────────
 
-const { metrics, error, loading, usingMock, start, refetch } = useMetrics(2000)
-
-// ─── Trace buffer ─────────────────────────────────────────────────────────────
-
-const MAX_TRACES = 20
-const traces = ref<Trace[]>([])
-
-// Each time metrics refresh, add 1-2 new mock traces (simulating keyframe rate)
-watch(metrics, (newMetrics) => {
-  if (!newMetrics) return
-  const count = Math.random() < 0.4 ? 2 : 1
-  for (let i = 0; i < count; i++) {
-    traces.value.unshift(generateMockTrace(newMetrics))
-  }
-  if (traces.value.length > MAX_TRACES) {
-    traces.value = traces.value.slice(0, MAX_TRACES)
-  }
-})
+const { metrics, error, loading, start, refetch } = useMetrics(2000)
 
 // ─── Last updated display ─────────────────────────────────────────────────────
 
@@ -65,11 +46,12 @@ onMounted(() => {
             />
           </div>
           <h2 class="text-[#e2e8f0] font-semibold text-xl">Pipeline Observability</h2>
-          <span v-if="usingMock" class="badge badge-amber">MOCK DATA</span>
-          <span v-else class="badge badge-teal">LIVE</span>
+          <span v-if="metrics && !error" class="badge badge-teal">LIVE</span>
+          <span v-else-if="metrics" class="badge badge-amber">STALE</span>
+          <span v-else class="badge badge-muted">UNAVAILABLE</span>
         </div>
         <p class="text-[#475569] text-sm">
-          Real-time telemetry — WebRTC → Decode → Gate → VLM → SpacetimeDB
+          Pipeline telemetry — live streams and recorded-file runs
         </p>
       </div>
 
@@ -86,7 +68,7 @@ onMounted(() => {
 
         <!-- Refresh button -->
         <button
-          class="w-9 h-9 flex items-center justify-center rounded-[8px] text-[#64748b] transition-colors duration-200 hover:text-[#94a3b8] icon-hover-parent"
+          class="w-11 h-11 flex items-center justify-center rounded-[8px] text-[#64748b] transition-colors duration-200 hover:text-[#94a3b8] icon-hover-parent"
           style="background: rgba(255,255,255,0.04); border: 1px solid #1e2633;"
           :disabled="loading"
           :class="loading ? 'opacity-50' : ''"
@@ -118,7 +100,7 @@ onMounted(() => {
         class="text-[#ef4444] shrink-0"
       />
       <span class="text-[#ef4444] flex-1">{{ error }}</span>
-      <button class="text-[#ef4444] text-xs underline hover:text-[#fca5a5]" @click="refetch">
+      <button class="min-h-11 px-2 text-[#ef4444] text-xs underline hover:text-[#fca5a5]" @click="refetch">
         Retry
       </button>
     </div>
@@ -156,28 +138,23 @@ onMounted(() => {
       <!-- 2. Live Metrics Grid -->
       <section aria-label="Live pipeline metrics">
         <div class="flex items-center gap-2 mb-3">
-          <h3 class="text-[#64748b] text-xs font-medium uppercase tracking-wider">Live Metrics</h3>
+          <h3 class="text-[#64748b] text-xs font-medium uppercase tracking-wider">Pipeline Metrics</h3>
           <div class="flex-1 h-px" style="background: #1e2633;" />
           <span class="mono text-[#2d3748] text-[10px]">2s refresh</span>
         </div>
         <MetricsGrid :metrics="metrics" />
       </section>
 
-      <!-- 3. Trace Timeline -->
-      <section aria-label="Trace waterfall timeline">
-        <div class="flex items-center gap-2 mb-1.5">
-          <h3 class="text-[#64748b] text-xs font-medium uppercase tracking-wider">Trace Timeline</h3>
-          <span class="badge badge-amber">SYNTHETIC</span>
-          <div class="flex-1 h-px" style="background: #1e2633;" />
-          <span class="mono text-[#2d3748] text-[10px]">keyframe traces only</span>
-        </div>
-        <p class="text-[#475569] text-xs mb-3">
-          These traces are illustrative sample data because per-span tracing is not exposed by the API yet.
-        </p>
-        <TraceTimeline :traces="traces" />
-      </section>
-
     </template>
+
+    <div
+      v-else
+      class="card-skeuo flex flex-col items-center justify-center gap-2 px-6 py-16 text-center"
+    >
+      <AnimatedIcon :icon="AlertCircle" :size="22" :stroke-width="1.5" class="text-[#475569]" />
+      <p class="text-[#94a3b8] text-sm">No telemetry available</p>
+      <p class="text-[#475569] text-xs">Connect the UI to a running Vidarax API and retry.</p>
+    </div>
 
   </div>
 </template>

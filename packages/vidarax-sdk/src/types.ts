@@ -17,6 +17,14 @@ export type IsoTimestamp = string;
 /** Sampling strategy for frame extraction. */
 export type SamplingPolicy = "source_fps_adaptive" | "fixed";
 
+/** Fractional region of interest within a video frame. */
+export interface CropRegion {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 /** Run lifecycle state (lowercased Debug repr from Rust). */
 export type RunStatus = "pending" | "processing" | "completed" | "cancelled" | "failed";
 
@@ -268,15 +276,31 @@ export interface RealtimeReasonRequest {
   marker_correction_window_frames?: number;
   semantic_inference?: boolean;
   semantic_frames_per_chunk?: number;
+  semantic_frame_max_edge?: number;
+  crop?: CropRegion;
   semantic_timeout_ms?: number;
-  primary_provider?: string;
   semantic_prompt?: string;
   first_pass_model?: string;
   second_pass_model?: string;
   second_pass_threshold?: number;
   trace_id?: string;
   output_schema?: Record<string, unknown>;
-  clip_mode?: ClipConfig;
+  index_name?: string;
+  temporal_chain?: boolean;
+  visual_diff?: boolean;
+  video_clip_mode?: boolean;
+  video_clip_duration_s?: number;
+  vlm_concurrency?: number;
+}
+
+/** Token and model-time totals for a realtime reasoning run. */
+export interface TokenMetrics {
+  prompt_tokens: number;
+  completion_tokens: number;
+  thinking_tokens: number;
+  total_tokens: number;
+  inference_latency_ms: number;
+  chunks_analyzed: number;
 }
 
 /** Response body from POST /v1/runs/{id}/reason. Maps to `RealtimeReasonResponse`. */
@@ -289,6 +313,7 @@ export interface RealtimeReasonResponse {
   sample_fps: number;
   lag_p95_ms: number;
   lag_p99_ms: number;
+  tokens: TokenMetrics;
   metadata: AnalyzeFrameMetadata[];
   markers: Marker[];
 }
@@ -318,6 +343,15 @@ export interface InferResponse {
   output_text: string;
   finish_reason: string | null;
   inference_latency_ms: number;
+  tokens: TokenUsage;
+}
+
+/** Token usage returned by inference endpoints. */
+export interface TokenUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  thinking_tokens: number;
+  total_tokens: number;
 }
 
 /**
@@ -378,6 +412,9 @@ export class InferResult {
   /** Associated run ID when the inference was tied to a run, otherwise `null`. */
   readonly run_id: string | null;
 
+  /** Provider-reported token usage. */
+  readonly tokens: TokenUsage;
+
   constructor(fields: {
     result: string;
     ok: boolean;
@@ -391,6 +428,7 @@ export class InferResult {
     prompt: string;
     fallback_used: boolean;
     run_id: string | null;
+    tokens: TokenUsage;
   }) {
     this.result = fields.result;
     this.ok = fields.ok;
@@ -405,6 +443,7 @@ export class InferResult {
     this.prompt = fields.prompt;
     this.fallback_used = fields.fallback_used;
     this.run_id = fields.run_id;
+    this.tokens = fields.tokens;
   }
 
   /**
@@ -494,6 +533,16 @@ export interface QueryResponse {
   matches: AgentEvent[];
 }
 
+/** User-defined interaction object returned by a guided semantic pass. */
+export type Interaction = Record<string, unknown>;
+
+/** Response body from GET /v1/runs/{id}/interactions. */
+export interface InteractionsResponse {
+  run_id: string;
+  count: number;
+  interactions: Interaction[];
+}
+
 // ─── Feedback ────────────────────────────────────────────────────────────────
 
 /** Request body for POST /v1/runs/{id}/feedback. Maps to `FeedbackRequest`. */
@@ -528,6 +577,20 @@ export interface AttachStreamRequest {
   prompt?: string;
   max_output_tokens_per_second?: number;
   clip_mode?: ClipConfig;
+  crop?: CropRegion;
+}
+
+/** Request body for PATCH /v1/stream/whip/{session}/prompt. */
+export interface WhipPromptUpdateRequest {
+  prompt: string;
+  output_schema?: Record<string, unknown> | null;
+}
+
+/** Response body from PATCH /v1/stream/whip/{session}/prompt. */
+export interface WhipPromptUpdateResponse {
+  session_id: string;
+  prompt: string;
+  output_schema: Record<string, unknown> | null;
 }
 
 /** An active WHIP session returned after a successful offer exchange. */
@@ -648,17 +711,14 @@ export type ProgressCallback = (loaded: number, total: number) => void;
 /**
  * High-level result handle returned by `Vidarax.analyze()`.
  *
- * Provides convenience async-iterable access to events and markers stored
- * against the underlying run.  Each metadata item in `analyzeResponse` carries
- * the same rich result fields (`finish_reason`, `model`, etc.) that are
- * available on `InferResult` so callers can handle success and failure paths
- * uniformly.
+ * Provides convenience async-iterable access to the current event and marker
+ * snapshots stored against the underlying run.
  */
 export interface AnalysisResult {
   runId: string;
   analyzeResponse: AnalyzeFramesResponse;
-  /** Stream all timeline events for this run. */
+  /** Iterate over the current event snapshot for this run. */
   events(): AsyncGenerator<AgentEvent>;
-  /** Stream all markers for this run. */
+  /** Iterate over the current marker snapshot for this run. */
   markers(): AsyncGenerator<Marker>;
 }

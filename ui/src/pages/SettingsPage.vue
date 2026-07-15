@@ -178,7 +178,7 @@ function toggle(section: SectionKey): void {
       </div>
       <div class="flex gap-2">
         <button
-          class="px-4 py-2 rounded-[10px] text-sm font-medium text-[#64748b] transition-all duration-200"
+          class="min-h-11 px-4 py-2 rounded-[10px] text-sm font-medium text-[#64748b] transition-all duration-200"
           style="background: rgba(255,255,255,0.04); border: 1px solid #1e2633;"
           @click="resetToDefaults"
         >
@@ -186,7 +186,7 @@ function toggle(section: SectionKey): void {
         </button>
         <button
           data-testid="save-button"
-          class="flex items-center gap-2 px-5 py-2 rounded-[10px] text-sm font-semibold transition-all duration-200"
+          class="flex min-h-11 items-center gap-2 px-5 py-2 rounded-[10px] text-sm font-semibold transition-all duration-200"
           :class="saved ? 'text-[#22c55e]' : 'text-[#08090d]'"
           :style="saved
             ? 'background: rgba(34,197,94,0.12); border: 1px solid rgba(34,197,94,0.2);'
@@ -252,7 +252,7 @@ function toggle(section: SectionKey): void {
             data-testid="api-endpoint"
             type="url"
             :placeholder="UI_DEFAULTS.apiEndpoint"
-            class="w-full px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] placeholder-[#475569] outline-none transition-colors duration-200 focus:border-[#2dd4bf44]"
+            class="w-full min-h-11 px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] placeholder-[#475569] outline-none transition-colors duration-200 focus:border-[#2dd4bf44]"
             style="background: #050507; border: 1px solid #1e2633;"
           />
         </div>
@@ -266,7 +266,7 @@ function toggle(section: SectionKey): void {
             data-testid="api-key"
             type="password"
             placeholder="Leave blank if VIDARAX_REQUIRE_API_KEY=false"
-            class="w-full px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] placeholder-[#475569] outline-none transition-colors duration-200"
+            class="w-full min-h-11 px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] placeholder-[#475569] outline-none transition-colors duration-200"
             style="background: #050507; border: 1px solid #1e2633;"
           />
         </div>
@@ -280,7 +280,7 @@ function toggle(section: SectionKey): void {
             data-testid="spacetime-endpoint"
             type="url"
             :placeholder="UI_DEFAULTS.spacetimeEndpoint"
-            class="w-full px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] placeholder-[#475569] outline-none transition-colors duration-200"
+            class="w-full min-h-11 px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] placeholder-[#475569] outline-none transition-colors duration-200"
             style="background: #050507; border: 1px solid #1e2633;"
           />
         </div>
@@ -295,7 +295,7 @@ function toggle(section: SectionKey): void {
             data-testid="turn-url"
             type="url"
             placeholder="turn:turn.example.com:3478?transport=tcp"
-            class="w-full px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] placeholder-[#475569] outline-none transition-colors duration-200"
+            class="w-full min-h-11 px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] placeholder-[#475569] outline-none transition-colors duration-200"
             style="background: #050507; border: 1px solid #1e2633;"
           />
         </div>
@@ -303,7 +303,7 @@ function toggle(section: SectionKey): void {
         <div class="flex items-center gap-3 flex-wrap">
           <button
             data-testid="test-connection"
-            class="px-4 py-2 rounded-[8px] text-sm font-medium transition-all duration-200"
+            class="min-h-11 px-4 py-2 rounded-[8px] text-sm font-medium transition-all duration-200"
             style="background: rgba(255,255,255,0.04); border: 1px solid #1e2633;"
             :class="{
               'text-[#94a3b8]': apiTestState === 'idle' || apiTestState === 'testing',
@@ -354,7 +354,7 @@ function toggle(section: SectionKey): void {
             id="default-model"
             v-model="form.defaultModel"
             data-testid="default-model"
-            class="w-full px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] outline-none"
+            class="w-full min-h-11 px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] outline-none"
             style="background: #050507; border: 1px solid #1e2633;"
           >
             <option v-for="m in availableModels" :key="m.id" :value="m.id">{{ m.name }}</option>
@@ -381,7 +381,7 @@ function toggle(section: SectionKey): void {
                 id="first-pass"
                 v-model="form.firstPassModel"
                 data-testid="first-pass-model"
-                class="w-full px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] outline-none"
+                class="w-full min-h-11 px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] outline-none"
                 style="background: #050507; border: 1px solid #1e2633;"
               >
                 <option v-for="m in availableModels" :key="m.id" :value="m.id">{{ m.name }}</option>
@@ -394,7 +394,7 @@ function toggle(section: SectionKey): void {
                 id="second-pass"
                 v-model="form.secondPassModel"
                 data-testid="second-pass-model"
-                class="w-full px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] outline-none"
+                class="w-full min-h-11 px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] outline-none"
                 style="background: #050507; border: 1px solid #1e2633;"
               >
                 <option v-for="m in availableModels" :key="m.id" :value="m.id">{{ m.name }}</option>
@@ -404,7 +404,7 @@ function toggle(section: SectionKey): void {
         </div>
 
         <button
-          class="flex items-center gap-1.5 text-xs text-[#2dd4bf] hover:text-[#5eead4] transition-colors icon-scale-hover"
+          class="flex min-h-11 items-center gap-1.5 px-2 -ml-2 text-xs text-[#2dd4bf] hover:text-[#5eead4] transition-colors icon-scale-hover"
           :disabled="modelsLoading"
           @click="fetchModels"
         >
@@ -523,19 +523,21 @@ function toggle(section: SectionKey): void {
           </div>
           <button
             data-testid="semantic-inference-toggle"
-            class="relative rounded-full transition-colors duration-200 shrink-0"
-            style="width:40px;height:22px;"
-            :style="form.semanticInference ? 'background:#2dd4bf;' : 'background:#1e2633;'"
-            :aria-pressed="form.semanticInference"
+            class="flex h-11 w-11 items-center justify-center shrink-0"
             role="switch"
             :aria-checked="form.semanticInference"
             @click="form.semanticInference = !form.semanticInference"
           >
-            <div
-              class="absolute rounded-full bg-white transition-transform duration-200"
-              style="top:3px;width:16px;height:16px;"
-              :style="form.semanticInference ? 'transform:translateX(21px)' : 'transform:translateX(3px)'"
-            />
+            <span
+              aria-hidden="true"
+              class="relative block h-[22px] w-10 rounded-full transition-colors duration-200"
+              :style="form.semanticInference ? 'background:#2dd4bf;' : 'background:#1e2633;'"
+            >
+              <span
+                class="absolute top-[3px] h-4 w-4 rounded-full bg-white transition-transform duration-200"
+                :style="form.semanticInference ? 'transform:translateX(21px)' : 'transform:translateX(3px)'"
+              />
+            </span>
           </button>
         </div>
 
@@ -703,7 +705,7 @@ function toggle(section: SectionKey): void {
             v-model="form.gpuDecode"
             data-testid="gpu-decode"
             disabled
-            class="w-full px-3 py-2 rounded-[8px] mono text-sm text-[#64748b] outline-none cursor-not-allowed opacity-70"
+            class="w-full min-h-11 px-3 py-2 rounded-[8px] mono text-sm text-[#64748b] outline-none cursor-not-allowed opacity-70"
             style="background: #050507; border: 1px solid #1e2633;"
           >
             <option value="auto">auto (detect nvidia-smi)</option>

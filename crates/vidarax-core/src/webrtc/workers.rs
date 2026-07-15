@@ -4,24 +4,21 @@
 //! sender propagates shutdown to downstream worker threads.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use base64::Engine as _;
 
 use crate::crop::{CropRegion, ResolvedCrop};
 use crate::dedup::DedupFilter;
+use crate::embedding_sidecar::EmbeddingSidecarClient;
 use crate::gate::{FrameSignal, GateConfig, GateEventType};
 use crate::loop_detector::LoopDetector;
 use crate::metrics::PipelineMetrics;
+use crate::novelty::{LiveNoveltyConfig, LiveNoveltyGate, LiveNoveltyOutcome};
 use crate::pipeline::{TwoPassConfig, TwoPassPipeline};
 use crate::provider::{InferenceImage, InferenceObserver, InferenceProvider, InferenceRequest};
-use crate::tiered_vlm::{run_tiered, DistillationConfig, TieredVlmConfig};
-#[cfg(feature = "training")]
-use crate::training_data::TrainingStore;
-#[cfg(not(feature = "training"))]
-#[allow(dead_code)]
-pub struct TrainingStore;
+use crate::tiered_vlm::{run_tiered, TieredVlmConfig};
 use crate::webrtc::clip::{
     spawn_clip_accumulator, spawn_clip_vlm_workers, ClipConfig, ClipRateGate, ClipWork,
 };
@@ -196,7 +193,8 @@ pub struct KeyframeWork {
     pub novelty_score: f32,
     /// Gate-derived motion score (0=static, 1=high motion).
     pub motion_score: f32,
-    /// Raw JPEG bytes — base64-encoded on-demand for VLM, stored raw in SpacetimeDB.
+    /// Raw JPEG bytes — base64-encoded only at provider boundaries and stored raw
+    /// in the local content-addressed sidecar.
     ///
     /// Recycled buffer moved through VLM and storage without copying the payload.
     pub jpeg_bytes: RecycledBytes,
@@ -387,11 +385,13 @@ impl GateStreamState {
         ctx.metrics
             .gate_latency_us
             .record(gate_start.elapsed().as_micros() as u64);
+        ctx.metrics.inc_gate_frame_analyzed();
         let meta = *metas.first()?;
 
         if meta.gate_event != GateEventType::KeepKeyframe {
             return None;
         }
+        ctx.metrics.inc_gate_keyframe_selected();
 
         let jpeg_bytes = encode().filter(|b| !b.is_empty())?;
         self.pipeline.commit_gate_keyframe(signal);
@@ -1038,8 +1038,7 @@ where
     /// Optional guided-JSON schema handle.
     pub guided_json: Arc<ArcSwapOption<Arc<str>>>,
     pub vlm_config: TieredVlmConfig,
-    pub distillation: DistillationConfig,
-    pub training_store: Option<Arc<Mutex<TrainingStore>>>,
+    pub novelty: LiveNoveltyConfig,
     /// When set, run the stream in clip mode instead of the keyframe path.
     pub clip_config: Option<ClipConfig>,
     /// Negotiated codec, used to size the decoder output pool.
@@ -1074,8 +1073,7 @@ where
         prompt,
         guided_json,
         vlm_config,
-        distillation,
-        training_store,
+        novelty,
         clip_config,
         codec,
         metrics,
@@ -1184,8 +1182,7 @@ where
             session_span,
             max_output_tokens_per_second: cfg.max_output_tokens_per_second,
             guided_json,
-            training_store,
-            distillation,
+            novelty,
             observer,
         })?;
     }
@@ -1206,8 +1203,7 @@ where
     pub session_span: tracing::Span,
     pub max_output_tokens_per_second: u32,
     pub guided_json: Arc<ArcSwapOption<Arc<str>>>,
-    pub training_store: Option<Arc<Mutex<TrainingStore>>>,
-    pub distillation: DistillationConfig,
+    pub novelty: LiveNoveltyConfig,
     /// Where tiered VLM inference outcomes are recorded for `/metrics`. `None`
     /// when the caller has no metrics sink wired up (e.g. tests).
     pub observer: Option<Arc<dyn InferenceObserver>>,
@@ -1232,23 +1228,12 @@ pub(super) fn token_budget_entry<'a>(
     budget.entry(Arc::clone(session)).or_insert((now, 0))
 }
 
-/// Spawn VLM inference worker threads with 3-tier routing + training pair collection.
+/// Spawn VLM inference workers with live novelty reuse and optional second-pass routing.
 ///
-/// **Tier 1 — KNN cache** (when `distillation.enabled` and embedding server is reachable):
-/// Fetches a SigLIP2 embedding for the frame, then asks the `TrainingStore` for the
-/// nearest-neighbour label.  If a confident match is found, the KNN result is used
-/// directly and the VLM call is skipped.
-///
-/// **Tier 2 — specialist / fast VLM** (`config.first_pass_model`):
-/// Called when KNN misses or is disabled.  Quick, low-cost inference.
-///
-/// **Tier 3 — teacher / accurate VLM** (`config.second_pass_model`):
-/// Called when the specialist confidence is below `config.second_pass_threshold`.
-///
-/// **Training pair collection**: After any inference, if `distillation.enabled`,
-/// the frame embedding and label are stored in the `TrainingStore` according to
-/// `collection_rate` (deterministic per-frame sampling).  Oldest pairs are
-/// evicted automatically when `max_pairs_per_tenant` is exceeded.
+/// The semantic-novelty gate can skip redundant frames before inference. Frames
+/// that reach inference use `config.first_pass_model`, with the distinct
+/// `config.second_pass_model` only when confidence falls below the configured
+/// threshold.
 ///
 /// SpacetimeDB writes are fire-and-forget: VLM threads send [`SinkEvent`]s to
 /// a bounded kanal channel; a dedicated writer thread drains it sequentially,
@@ -1273,12 +1258,9 @@ where
         session_span,
         max_output_tokens_per_second,
         guided_json,
-        training_store,
-        distillation,
+        novelty,
         observer,
     } = params;
-    #[cfg(not(feature = "training"))]
-    let _training_store = training_store;
 
     // FIFO channel between VLM workers and the SpacetimeDB writer.
     let (event_tx, event_rx) = kanal::bounded::<SinkEvent>(SINK_EVENT_QUEUE_CAPACITY);
@@ -1289,7 +1271,7 @@ where
 
     // Dedicated writer thread: drains the FIFO and calls blocking sink methods.
     std::thread::Builder::new()
-        .name("vx-stdb-writer".to_string())
+        .name("vx-event-writer".to_string())
         .spawn(move || {
             while let Ok(event) = event_rx.recv() {
                 let emit_start = std::time::Instant::now();
@@ -1349,12 +1331,7 @@ where
         let session_span = session_span.clone();
         let guided_json = Arc::clone(&guided_json);
         let observer = observer.clone();
-        #[cfg(feature = "training")]
-        let training_store = training_store.clone();
-        #[cfg(feature = "training")]
-        let distillation = distillation.clone();
-        #[cfg(not(feature = "training"))]
-        let _distillation = distillation.clone();
+        let novelty = novelty.clone();
 
         std::thread::Builder::new()
             .name(format!("vx-vlm-{i}"))
@@ -1366,19 +1343,34 @@ where
                     (std::time::Instant, u32),
                 > = std::collections::HashMap::new();
 
-                // One HTTP client per thread for embedding calls (training feature only).
-                #[cfg(feature = "training")]
-                let embed_url = distillation.embedding_server_url.clone();
-                #[cfg(feature = "training")]
-                let http_client: Option<reqwest::blocking::Client> =
-                    if embed_url.is_some() {
-                        reqwest::blocking::Client::builder()
-                            .timeout(std::time::Duration::from_secs(2))
-                            .build()
-                            .ok()
-                    } else {
-                        None
-                    };
+                let novelty_enabled = novelty.embedding_sidecar_addr.is_some();
+                let mut embedding_client = if novelty_enabled {
+                    novelty.embedding_sidecar_addr.as_deref().and_then(|address| {
+                        match EmbeddingSidecarClient::new(
+                            address,
+                            novelty.embedding_timeout_ms,
+                        ) {
+                            Ok(client) => Some(client),
+                            Err(err) => {
+                                tracing::warn!(%err, "invalid embedding sidecar address; admitting all frames");
+                                None
+                            }
+                        }
+                    })
+                } else {
+                    None
+                };
+                let mut novelty_gate = if novelty_enabled {
+                    match LiveNoveltyGate::try_new(&novelty) {
+                        Ok(gate) => Some(gate),
+                        Err(err) => {
+                            tracing::warn!(%err, "invalid live novelty config; admitting all frames");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
 
                 // Per-worker dedup filter: suppresses emitting identical VLM
                 // descriptions so that a stuck loop doesn't pollute the store
@@ -1422,7 +1414,48 @@ where
                         }
                     }
 
+                    let embedding_started = std::time::Instant::now();
+                    let embedding = embedding_client
+                        .as_mut()
+                        .and_then(|client| client.embed(&work.jpeg_bytes).ok());
+                    if novelty_enabled && embedding_client.is_some() {
+                        metrics
+                            .novelty_embedding_latency_ms
+                            .record(embedding_started.elapsed().as_millis() as u64);
+                    }
+
+                    let mut commit_novelty_anchor = false;
+                    let mut shadow_novelty_probe = false;
+                    if let Some(gate) = novelty_gate.as_mut() {
+                        if let Some(embedding) = embedding.as_ref() {
+                            metrics.inc_novelty_evaluated();
+                            match gate.evaluate(embedding, work.pts_ms) {
+                                LiveNoveltyOutcome::Reuse => {
+                                    if sample_novelty_shadow(work.frame_index, novelty.shadow_sample_rate) {
+                                        shadow_novelty_probe = true;
+                                        metrics.inc_novelty_shadow_sampled();
+                                    } else {
+                                        metrics.inc_novelty_reused();
+                                        metrics.inc_keyframes_dropped();
+                                        continue;
+                                    }
+                                }
+                                LiveNoveltyOutcome::ForcedRefresh => {
+                                    metrics.inc_novelty_forced_refresh();
+                                    commit_novelty_anchor = true;
+                                }
+                                LiveNoveltyOutcome::Run => commit_novelty_anchor = true,
+                            }
+                        } else {
+                            metrics.inc_novelty_embedding_unavailable();
+                        }
+                    }
+
                     metrics.inc_vlm_inferences();
+
+                    jpeg_b64.clear();
+                    base64::engine::general_purpose::STANDARD
+                        .encode_string(&work.jpeg_bytes, &mut jpeg_b64);
 
                     // State diffs are computed server-side below, so the
                     // default prompt only asks for a scene description.
@@ -1451,54 +1484,9 @@ where
                         );
                     }
 
-                    // Base64-encode the JPEG once for both embedding and VLM calls.
-                    jpeg_b64.clear();
-                    base64::engine::general_purpose::STANDARD
-                        .encode_string(&work.jpeg_bytes, &mut jpeg_b64);
-
-                    // ── Step 1 (training only): fetch embedding for KNN + pair collection ──
-                    #[cfg(feature = "training")]
-                    let embedding = fetch_frame_embedding(
-                        http_client.as_ref(),
-                        embed_url.as_deref(),
-                        &jpeg_b64,
-                    );
-
-                    // ── Tier 1 (training only): KNN classification ──────────────────
-                    #[cfg(feature = "training")]
-                    let knn_hit: Option<(String, bool)> = if distillation.enabled {
-                        embedding.as_ref().and_then(|emb| {
-                            let result = training_store.as_ref()?.lock().ok().and_then(|store| {
-                                store
-                                    .knn_classify(
-                                        &work.run_id,
-                                        emb,
-                                        distillation.knn_k,
-                                        distillation.distance_threshold,
-                                    )
-                                    .unwrap_or(None)
-                            })?;
-                            tracing::info!(
-                                run_id = %work.run_id,
-                                label = %result.label,
-                                avg_distance = result.avg_distance,
-                                votes = result.votes,
-                                total = result.total,
-                                "tier1_knn_hit: skipping vlm inference"
-                            );
-                            Some((result.label, false))
-                        })
-                    } else {
-                        None
-                    };
-                    #[cfg(not(feature = "training"))]
-                    let knn_hit: Option<(String, bool)> = None;
-
-                    // ── Tiers 2+3: VLM inference (when KNN misses or disabled) ──────
+                    // First-pass VLM with optional second-pass escalation.
                     let vlm_start = std::time::Instant::now();
-                    let inference_outcome = if let Some(hit) = knn_hit {
-                        Some(hit)
-                    } else {
+                    let inference_outcome = {
                         // Snapshot the current guided_json schema once per inference.
                         let current_guided_json: Option<Arc<str>> =
                             guided_json.load_full().map(|schema| Arc::clone(&*schema));
@@ -1569,6 +1557,15 @@ where
                         continue;
                     };
 
+                    // Failed or empty descriptions must not become reuse anchors.
+                    if commit_novelty_anchor && !description_str.trim().is_empty() {
+                        if let (Some(gate), Some(embedding)) =
+                            (novelty_gate.as_mut(), embedding.as_ref())
+                        {
+                            gate.commit(embedding, work.pts_ms);
+                        }
+                    }
+
                     // Charge output tokens against the session budget.
                     // Approximate: 4 bytes per token (UTF-8 average).
                     if max_output_tokens_per_second > 0 {
@@ -1598,6 +1595,18 @@ where
                         jaccard_word_overlap(&last_description, &description)
                             < STATE_CHANGE_JACCARD_MAX
                     };
+
+                    // Shadow probes do not update state or emit events.
+                    if shadow_novelty_probe {
+                        if description.trim().is_empty() {
+                            continue;
+                        }
+                        metrics.inc_novelty_shadow_completed();
+                        if state_changed {
+                            metrics.inc_novelty_shadow_changed();
+                        }
+                        continue;
+                    }
 
                     // Update temporal context for the next keyframe, keeping the
                     // outgoing description for the transition event below.
@@ -1642,23 +1651,6 @@ where
                             description: Arc::from(transition_desc),
                         });
                     }
-                    // ── Training pair collection ─────────────────────────────────────
-                    #[cfg(feature = "training")]
-                    if distillation.enabled {
-                        if let Some(emb) = &embedding {
-                            if sample_frame(work.frame_index, distillation.collection_rate) {
-                                collect_training_pair(
-                                    &work,
-                                    emb,
-                                    &description,
-                                    event_type,
-                                    &distillation,
-                                    training_store.as_ref(),
-                                );
-                            }
-                        }
-                    }
-
                     if let Some(event) = store_keyframe_event_with_backlog(
                         &jpeg_sink_backlog,
                         &metrics,
@@ -1784,103 +1776,18 @@ fn jaccard_word_overlap(prev: &str, curr: &str) -> f32 {
     }
 }
 
-/// POST `jpeg_b64` to the SigLIP2 embedding server and return a 768-dim vector.
-///
-/// Returns `None` on any error (unreachable server, timeout, malformed response).
-/// Callers should treat `None` as "embedding unavailable" and skip KNN / training
-/// collection gracefully.
-#[cfg(feature = "training")]
-fn fetch_frame_embedding(
-    client: Option<&reqwest::blocking::Client>,
-    url: Option<&str>,
-    jpeg_b64: &str,
-) -> Option<[f32; 768]> {
-    let (client, url) = (client?, url?);
-    let endpoint = format!("{url}/embed");
-    let resp: serde_json::Value = client
-        .post(&endpoint)
-        .json(&serde_json::json!({"image_b64": jpeg_b64}))
-        .send()
-        .ok()?
-        .json()
-        .ok()?;
-    let arr = resp.get("embedding")?.as_array()?;
-    if arr.len() != 768 {
-        return None;
-    }
-    let mut emb = [0f32; 768];
-    for (i, v) in arr.iter().enumerate() {
-        emb[i] = v.as_f64()? as f32;
-    }
-    Some(emb)
-}
-
-/// Deterministic per-frame sampling: returns `true` for approximately
-/// `rate * 100%` of frames, determined by `frame_index % 1000`.
-#[cfg(feature = "training")]
-fn sample_frame(frame_index: u64, rate: f32) -> bool {
+fn sample_novelty_shadow(frame_index: u64, rate: f32) -> bool {
     if rate <= 0.0 {
         return false;
     }
     if rate >= 1.0 {
         return true;
     }
-    (frame_index % 1000) < (rate * 1000.0) as u64
-}
-
-/// Write one `(frame, label, embedding)` training triple to the store.
-///
-/// Evicts the oldest pairs when the tenant's count exceeds `max_pairs_per_tenant`.
-/// All errors are logged as warnings rather than propagated — training collection
-/// must never interrupt the real-time pipeline.
-#[cfg(feature = "training")]
-fn collect_training_pair(
-    work: &KeyframeWork,
-    embedding: &[f32; 768],
-    description: &str,
-    event_type: &str,
-    distillation: &DistillationConfig,
-    training_store: Option<&Arc<Mutex<TrainingStore>>>,
-) {
-    let store = match training_store {
-        Some(s) => s,
-        None => return,
-    };
-    let jpeg_bytes = work.jpeg_bytes.as_ref();
-    let label_json = serde_json::json!({
-        "event_type": event_type,
-        "description": description,
-    })
-    .to_string();
-
-    match store.lock() {
-        Ok(guard) => {
-            match guard.store_pair(
-                &work.run_id,
-                jpeg_bytes,
-                &label_json,
-                &distillation.teacher_model,
-                work.confidence,
-                embedding,
-            ) {
-                Ok(_row_id) => {
-                    let _ = guard.evict_oldest(&work.run_id, distillation.max_pairs_per_tenant);
-                    let pairs_count = guard.pair_count(&work.run_id).unwrap_or(0);
-                    tracing::info!(
-                        tenant_id = %work.run_id,
-                        pairs_count,
-                        "training pair stored"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!("failed to store training pair: {e}");
-                }
-            }
-        }
-        Err(_) => {
-            tracing::warn!("training store mutex poisoned; skipping pair collection");
-        }
-    }
+    const DENOMINATOR: u64 = 10_000;
+    let mixed = frame_index
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .rotate_left(17);
+    mixed % DENOMINATOR < (rate * DENOMINATOR as f32) as u64
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

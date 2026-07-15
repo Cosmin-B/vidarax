@@ -3,9 +3,9 @@
  *
  * ```typescript
  * import { Vidarax } from 'vidarax'
- * const v = new Vidarax('http://localhost:8080')
- * const run = await v.analyze('video.mp4', { mode: 'balanced' })
- * for await (const event of run.events()) {
+ * const v = new Vidarax('http://localhost:8080', { apiKey: 'dev-key' })
+ * const run = await v.analyze('/srv/vidarax-media/video.mp4', { mode: 'balanced' })
+ * for (const event of await v.getEvents(run.runId)) {
  *   console.log(event.kind, event.payload)
  * }
  * ```
@@ -17,6 +17,7 @@ import {
   ParseError,
   RetryExhaustedError,
   UploadError,
+  VidaraxError,
   type ApiErrorBody,
 } from "./errors.js";
 
@@ -36,6 +37,8 @@ import type {
   FeedbackListResponse,
   FeedbackRequest,
   HealthStatus,
+  Interaction,
+  InteractionsResponse,
   InferBatchOptions,
   InferBatchRequest,
   InferBatchResponse,
@@ -59,6 +62,8 @@ import type {
   UploadResponse,
   VidaraxOptions,
   WhipSession,
+  WhipPromptUpdateRequest,
+  WhipPromptUpdateResponse,
 } from "./types.js";
 
 // Default model used when a caller does not specify one. Must be a model id
@@ -236,6 +241,55 @@ export class Vidarax {
     }
   }
 
+  private async requestBlob(path: string): Promise<Blob> {
+    let lastError!: NetworkError | HttpError;
+    const maxAttempts = this.maxRetries + 1;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const controller = new AbortController();
+      const timerId = setTimeout(() => controller.abort(), this.timeoutMs);
+      try {
+        const response = await fetch(`${this.baseUrl}${path}`, {
+          headers: this.headers({ Accept: "image/jpeg" }),
+          signal: controller.signal,
+        });
+        if (response.ok) return await response.blob();
+
+        let apiError: ApiErrorBody | null = null;
+        try {
+          const parsed = JSON.parse(await response.text()) as { error?: ApiErrorBody };
+          apiError = parsed.error ?? null;
+        } catch {
+          // Raw routes do not always return JSON errors.
+        }
+        const error = new HttpError(
+          response.status,
+          apiError?.message ?? `HTTP ${response.status} ${response.statusText} on GET ${path}`,
+          apiError,
+        );
+        if (!isRetryable(error.status)) throw error;
+        lastError = error;
+      } catch (err: unknown) {
+        if (err instanceof HttpError) throw err;
+        lastError = new NetworkError(
+          err instanceof Error && err.name === "AbortError"
+            ? `Request to ${path} timed out after ${this.timeoutMs}ms`
+            : `Network error on ${path}: ${err instanceof Error ? err.message : String(err)}`,
+          err,
+        );
+      } finally {
+        clearTimeout(timerId);
+      }
+
+      if (attempt < maxAttempts) {
+        const jitter = Math.random() * this.retryBaseDelayMs;
+        await sleep(clamp(this.retryBaseDelayMs * 2 ** (attempt - 1) + jitter, 0, 30_000));
+      }
+    }
+
+    throw new RetryExhaustedError(maxAttempts, lastError);
+  }
+
   /**
    * Execute a request with automatic exponential back-off retry.
    *
@@ -291,13 +345,17 @@ export class Vidarax {
     return this.requestWithRetry<T>("DELETE", path);
   }
 
+  private patch<T>(path: string, body?: unknown): Promise<T> {
+    return this.requestWithRetry<T>("PATCH", path, body);
+  }
+
   // ─── Runs ─────────────────────────────────────────────────────────────────
 
   /**
    * Create a new run resource.
    *
    * @example
-   * const { run_id } = await v.createRun({ mode: 'analysis', model: 'Qwen/Qwen3-VL-2B-Instruct' })
+   * const { run_id } = await v.createRun({ mode: 'balanced', model: 'Qwen/Qwen3-VL-2B-Instruct' })
    */
   async createRun(options: CreateRunRequest = {}): Promise<CreateRunResponse> {
     return this.post<CreateRunResponse>("/v1/runs", options);
@@ -376,9 +434,12 @@ export class Vidarax {
    * (it fetches a one-time snapshot, not a live stream and not repeated
    * polling; the server has no SSE endpoint).
    */
-  async getEvents(runId: string): Promise<AgentEvent[]> {
+  async getEvents(runId: string, index?: string): Promise<AgentEvent[]> {
+    const params = new URLSearchParams();
+    if (index !== undefined) params.set("index", index);
+    const query = params.toString();
     const res = await this.get<EventsResponse>(
-      `/v1/runs/${encodeURIComponent(runId)}/events`,
+      `/v1/runs/${encodeURIComponent(runId)}/events${query ? `?${query}` : ""}`,
     );
     return res.events;
   }
@@ -410,6 +471,27 @@ export class Vidarax {
       `/v1/runs/${encodeURIComponent(runId)}/state`,
     );
     return res.state;
+  }
+
+  /** Retrieve guided semantic interactions for a run. */
+  async getInteractions(runId: string, index?: string): Promise<Interaction[]> {
+    const params = new URLSearchParams();
+    if (index !== undefined) params.set("index", index);
+    const query = params.toString();
+    const response = await this.get<InteractionsResponse>(
+      `/v1/runs/${encodeURIComponent(runId)}/interactions${query ? `?${query}` : ""}`,
+    );
+    return response.interactions;
+  }
+
+  /** Fetch a durable keyframe as raw JPEG bytes. */
+  async getKeyframe(runId: string, sha256: string): Promise<Blob> {
+    if (!/^[0-9a-fA-F]{64}$/.test(sha256)) {
+      throw new VidaraxError("sha256 must be 64 hexadecimal characters", "validation_error");
+    }
+    return this.requestBlob(
+      `/v1/runs/${encodeURIComponent(runId)}/keyframes/${sha256.toLowerCase()}`,
+    );
   }
 
   // ─── High-level analyze ───────────────────────────────────────────────────
@@ -570,6 +652,7 @@ export class Vidarax {
       prompt,
       fallback_used: raw.fallback_used,
       run_id: raw.run_id,
+      tokens: raw.tokens,
     });
   }
 
@@ -595,7 +678,7 @@ export class Vidarax {
     return this.post<InferBatchResponse>("/v1/infer/batch", body);
   }
 
-  // ─── Polling iterables (not live streams) ─────────────────────────────────
+  // ─── Snapshot iterators ───────────────────────────────────────────────────
   //
   // The server has no SSE / long-lived streaming route for events or markers
   // — GET /v1/runs/{id}/events and GET /v1/runs/{id}/markers each return a
@@ -617,8 +700,8 @@ export class Vidarax {
    *   console.log(event.kind)
    * }
    */
-  async *streamEvents(runId: string): AsyncGenerator<AgentEvent> {
-    const events = await this.getEvents(runId);
+  async *streamEvents(runId: string, index?: string): AsyncGenerator<AgentEvent> {
+    const events = await this.getEvents(runId, index);
     for (const event of events) {
       yield event;
     }
@@ -965,41 +1048,16 @@ export class Vidarax {
    * Update the VLM prompt for a live WHIP session without renegotiation.
    *
    * @param sessionId  The session ID returned from `whipOffer()`.
-   * @param config     New prompt and optional clip configuration.
+   * @param update     New prompt and optional structured-output schema.
    */
   async whipUpdatePrompt(
     sessionId: string,
-    config: AttachStreamRequest,
-  ): Promise<void> {
-    const url = `${this.baseUrl}/v1/stream/whip/${encodeURIComponent(sessionId)}/prompt`;
-    const controller = new AbortController();
-    const timerId = setTimeout(() => controller.abort(), this.timeoutMs);
-    try {
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      };
-      if (this.apiKey !== undefined) {
-        headers["x-api-key"] = this.apiKey;
-      }
-      const response = await fetch(url, {
-        method: "PATCH",
-        headers,
-        body: JSON.stringify(config),
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        throw new HttpError(
-          response.status,
-          `WHIP prompt update failed with HTTP ${response.status}`,
-        );
-      }
-    } catch (err: unknown) {
-      if (err instanceof HttpError) throw err;
-      throw new NetworkError(`WHIP prompt update network error: ${String(err)}`, err);
-    } finally {
-      clearTimeout(timerId);
-    }
+    update: WhipPromptUpdateRequest,
+  ): Promise<WhipPromptUpdateResponse> {
+    return this.patch<WhipPromptUpdateResponse>(
+      `/v1/stream/whip/${encodeURIComponent(sessionId)}/prompt`,
+      update,
+    );
   }
 
   /**

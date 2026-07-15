@@ -1,8 +1,8 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 
-export type RunStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'stopped'
-export type RunMode = 'batch' | 'stream' | 'webrtc'
+export type RunStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled' | 'expired'
+export type RunMode = 'balanced' | 'detailed' | 'efficiency' | 'custom'
 
 export interface Run {
   run_id: string

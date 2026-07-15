@@ -1,16 +1,14 @@
 //! HTTP client for the SpacetimeDB module deployed at `http://<host>:3000`.
 //!
-//! Provides both async (tokio/reqwest) and sync (reqwest::blocking) methods
-//! that mirror the two reducers and two public tables defined in `spacetime-module/src/lib.rs`.
+//! Provides async and sync methods for the optional event/feedback mirror in
+//! `spacetime-module/src/lib.rs`. Keyframe bytes stay in the local blob sidecar.
 //!
 //! # Endpoint mapping
 //!
 //! | Operation         | HTTP                                              |
 //! |-------------------|---------------------------------------------------|
 //! | emit_event        | `POST /v1/database/{db}/call/emit_event`          |
-//! | store_keyframe    | `POST /v1/database/{db}/call/store_keyframe`      |
 //! | query agent_event | `POST /v1/database/{db}/sql` (plain-text SQL)     |
-//! | query keyframe_store | `POST /v1/database/{db}/sql` (plain-text SQL)  |
 //!
 //! # Identity persistence
 //!
@@ -32,9 +30,8 @@ use serde_json::Value;
 const SPACETIME_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default per-request ceiling, sized for reducer writes, which are tiny.
 const SPACETIME_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-/// A `SELECT * FROM keyframe_store` pulls a whole run's rows, JPEG bytes and all,
-/// so the read path overrides the default with a much larger ceiling. Still bounded
-/// so a stuck query cannot hang a caller forever.
+/// SQL reads are allowed longer than reducer writes, but remain bounded so a
+/// stalled mirror cannot hang a caller forever.
 const SPACETIME_QUERY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// One shared blocking client for every `SpacetimeClient` instance and call.
@@ -96,18 +93,6 @@ pub struct SubmitFeedbackRequest {
     pub feedback: String,
 }
 
-/// Arguments for the `store_keyframe` reducer.
-#[derive(Debug, Clone)]
-pub struct StoreKeyframeRequest {
-    pub run_id: String,
-    pub frame_index: u64,
-    pub pts_ms: u64,
-    pub event_type: String,
-    pub description: String,
-    /// Base64-encoded JPEG bytes.
-    pub jpeg_data: Vec<u8>,
-}
-
 // ─── Reducer argument wires ─────────────────────────────────────────────────────
 //
 // SpacetimeDB reducer arguments travel as a positional JSON array. These
@@ -115,14 +100,14 @@ pub struct StoreKeyframeRequest {
 // body, with no owned `String`s, no `jpeg_data` copy, and no intermediate
 // `serde_json::Value` tree. Element order must match each reducer's signature.
 
-struct EmitEventArgs<'a> {
-    run_id: &'a str,
-    session_id: &'a str,
-    frame_index: u64,
-    pts_ms: u64,
-    event_type: &'a str,
-    confidence: f32,
-    description: &'a str,
+pub(crate) struct EmitEventArgs<'a> {
+    pub(crate) run_id: &'a str,
+    pub(crate) session_id: &'a str,
+    pub(crate) frame_index: u64,
+    pub(crate) pts_ms: u64,
+    pub(crate) event_type: &'a str,
+    pub(crate) confidence: f32,
+    pub(crate) description: &'a str,
 }
 
 impl Serialize for EmitEventArgs<'_> {
@@ -149,41 +134,6 @@ impl<'a> From<&'a EmitEventRequest> for EmitEventArgs<'a> {
             event_type: &r.event_type,
             confidence: r.confidence,
             description: &r.description,
-        }
-    }
-}
-
-struct StoreKeyframeArgs<'a> {
-    run_id: &'a str,
-    frame_index: u64,
-    pts_ms: u64,
-    event_type: &'a str,
-    description: &'a str,
-    jpeg_data: &'a [u8],
-}
-
-impl Serialize for StoreKeyframeArgs<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut seq = serializer.serialize_seq(Some(6))?;
-        seq.serialize_element(self.run_id)?;
-        seq.serialize_element(&self.frame_index)?;
-        seq.serialize_element(&self.pts_ms)?;
-        seq.serialize_element(self.event_type)?;
-        seq.serialize_element(self.description)?;
-        seq.serialize_element(self.jpeg_data)?;
-        seq.end()
-    }
-}
-
-impl<'a> From<&'a StoreKeyframeRequest> for StoreKeyframeArgs<'a> {
-    fn from(r: &'a StoreKeyframeRequest) -> Self {
-        Self {
-            run_id: &r.run_id,
-            frame_index: r.frame_index,
-            pts_ms: r.pts_ms,
-            event_type: &r.event_type,
-            description: &r.description,
-            jpeg_data: &r.jpeg_data,
         }
     }
 }
@@ -249,20 +199,6 @@ pub struct FeedbackRow {
     pub rating: u64,
     pub category: String,
     pub feedback: String,
-    pub timestamp_micros: i64,
-}
-
-/// Row from the `keyframe_store` table.
-#[derive(Debug, Clone)]
-pub struct StoredKeyframe {
-    pub id: u64,
-    pub agent_id: String,
-    pub run_id: String,
-    pub frame_index: u64,
-    pub pts_ms: u64,
-    pub event_type: String,
-    pub description: String,
-    pub jpeg_data: Vec<u8>,
     pub timestamp_micros: i64,
 }
 
@@ -438,15 +374,6 @@ impl SpacetimeClient {
             .await
     }
 
-    /// Call the `store_keyframe` reducer (async).
-    pub async fn store_keyframe_async(
-        &self,
-        req: &StoreKeyframeRequest,
-    ) -> Result<(), SpacetimeError> {
-        self.call_reducer_async("store_keyframe", &StoreKeyframeArgs::from(req))
-            .await
-    }
-
     /// Query the `agent_event` table (async).
     ///
     /// If `run_id` is `Some`, only rows for that run are returned.
@@ -457,18 +384,6 @@ impl SpacetimeClient {
         let sql = build_select("agent_event", run_id);
         let rows = self.sql_async(&sql).await?;
         rows.into_iter().map(parse_agent_event).collect()
-    }
-
-    /// Query the `keyframe_store` table (async).
-    ///
-    /// If `run_id` is `Some`, only rows for that run are returned.
-    pub async fn query_keyframes_async(
-        &self,
-        run_id: Option<&str>,
-    ) -> Result<Vec<StoredKeyframe>, SpacetimeError> {
-        let sql = build_select("keyframe_store", run_id);
-        let rows = self.sql_async(&sql).await?;
-        rows.into_iter().map(parse_keyframe).collect()
     }
 
     /// Call the `submit_feedback` reducer (async).
@@ -526,12 +441,12 @@ impl SpacetimeClient {
 
     /// Call the `emit_event` reducer (sync).
     pub fn emit_event(&self, req: &EmitEventRequest) -> Result<(), SpacetimeError> {
-        self.call_reducer_blocking("emit_event", &EmitEventArgs::from(req))
+        self.emit_event_sync(&EmitEventArgs::from(req))
     }
 
-    /// Call the `store_keyframe` reducer (sync).
-    pub fn store_keyframe(&self, req: &StoreKeyframeRequest) -> Result<(), SpacetimeError> {
-        self.call_reducer_blocking("store_keyframe", &StoreKeyframeArgs::from(req))
+    /// Borrowing sync variant used by the WAL mirror after its local commit.
+    pub(crate) fn emit_event_sync(&self, args: &EmitEventArgs<'_>) -> Result<(), SpacetimeError> {
+        self.call_reducer_blocking("emit_event", args)
     }
 
     /// Query the `agent_event` table (sync).
@@ -544,18 +459,6 @@ impl SpacetimeClient {
         let sql = build_select("agent_event", run_id);
         let rows = self.sql_sync(&sql)?;
         rows.into_iter().map(parse_agent_event).collect()
-    }
-
-    /// Query the `keyframe_store` table (sync).
-    ///
-    /// If `run_id` is `Some`, only rows for that run are returned.
-    pub fn query_keyframes(
-        &self,
-        run_id: Option<&str>,
-    ) -> Result<Vec<StoredKeyframe>, SpacetimeError> {
-        let sql = build_select("keyframe_store", run_id);
-        let rows = self.sql_sync(&sql)?;
-        rows.into_iter().map(parse_keyframe).collect()
     }
 
     fn sql_sync(&self, sql: &str) -> Result<Vec<Value>, SpacetimeError> {
@@ -638,19 +541,6 @@ fn col_str(row: &Value, idx: usize) -> Result<String, SpacetimeError> {
         .ok_or_else(|| SpacetimeError::Parse(format!("col {idx}: expected string")))
 }
 
-/// SpacetimeDB encodes `Vec<u8>` as a JSON array of numbers `[255, 216, ...]`.
-fn col_bytes(row: &Value, idx: usize) -> Result<Vec<u8>, SpacetimeError> {
-    row.get(idx)
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_u64)
-                .map(|v| v as u8)
-                .collect()
-        })
-        .ok_or_else(|| SpacetimeError::Parse(format!("col {idx}: expected byte array")))
-}
-
 fn col_u64(row: &Value, idx: usize) -> Result<u64, SpacetimeError> {
     row.get(idx)
         .and_then(Value::as_u64)
@@ -698,81 +588,6 @@ fn parse_agent_event(row: Value) -> Result<AgentEvent, SpacetimeError> {
         confidence: col_f64(&row, 7)? as f32,
         description: col_str(&row, 8)?,
         timestamp_micros: col_timestamp(&row, 9)?,
-    })
-}
-
-// ─── EventSink impl ───────────────────────────────────────────────────────────
-
-/// Bridges `SpacetimeClient` into the `vidarax_core` worker pool interface.
-///
-/// Worker threads hold `Arc<dyn EventSink>` and call these sync methods from
-/// non-async contexts.
-impl vidarax_core::webrtc::workers::EventSink for SpacetimeClient {
-    fn emit_event_sync(
-        &self,
-        run_id: &str,
-        session_id: &str,
-        frame_index: u64,
-        pts_ms: u64,
-        event_type: &str,
-        confidence: f32,
-        description: &str,
-    ) -> Result<(), String> {
-        // Serialize straight from the borrowed args; the worker thread copies no
-        // strings here, only the eventual HTTP body buffer.
-        self.call_reducer_blocking(
-            "emit_event",
-            &EmitEventArgs {
-                run_id,
-                session_id,
-                frame_index,
-                pts_ms,
-                event_type,
-                confidence,
-                description,
-            },
-        )
-        .map_err(|e| e.to_string())
-    }
-
-    fn store_keyframe_sync(
-        &self,
-        run_id: &str,
-        frame_index: u64,
-        pts_ms: u64,
-        event_type: &str,
-        description: &str,
-        jpeg_data: &[u8],
-    ) -> Result<(), String> {
-        // `jpeg_data` is borrowed into the body, not cloned into an owned Vec.
-        self.call_reducer_blocking(
-            "store_keyframe",
-            &StoreKeyframeArgs {
-                run_id,
-                frame_index,
-                pts_ms,
-                event_type,
-                description,
-                jpeg_data,
-            },
-        )
-        .map_err(|e| e.to_string())
-    }
-}
-
-/// Column order from `SELECT * FROM keyframe_store`:
-/// id | agent_id | run_id | frame_index | pts_ms | event_type | description | jpeg_b_64 | timestamp
-fn parse_keyframe(row: Value) -> Result<StoredKeyframe, SpacetimeError> {
-    Ok(StoredKeyframe {
-        id: col_u64(&row, 0)?,
-        agent_id: col_identity(&row, 1)?,
-        run_id: col_str(&row, 2)?,
-        frame_index: col_u64(&row, 3)?,
-        pts_ms: col_u64(&row, 4)?,
-        event_type: col_str(&row, 5)?,
-        description: col_str(&row, 6)?,
-        jpeg_data: col_bytes(&row, 7)?,
-        timestamp_micros: col_timestamp(&row, 8)?,
     })
 }
 

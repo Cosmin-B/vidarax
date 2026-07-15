@@ -19,7 +19,7 @@ const STAGE_CONFIG: Record<string, StageConfig> = {
   Decode:      { icon: Cpu },
   Gate:        { icon: SlidersHorizontal },
   VLM:         { icon: Zap },
-  SpacetimeDB: { icon: Database },
+  'Keyframe store': { icon: Database },
 }
 
 // ─── Status helpers ───────────────────────────────────────────────────────────
@@ -49,12 +49,13 @@ function iconAnimation(status: PipelineStageMetrics['status']) {
 }
 
 const connectorActive = computed(() =>
-  props.stages.some(s => s.status === 'healthy' || s.status === 'slow')
+  props.stages.find(s => s.name === 'WebRTC')?.status === 'healthy'
 )
 
-function formatFps(fps: number): string {
-  return fps.toFixed(1)
-}
+const flowState = computed(() => {
+  if (connectorActive.value) return 'STREAMING'
+  return props.stages.some(stage => stage.itemsTotal > 0) ? 'RECORDED' : 'IDLE'
+})
 
 function formatLatency(ms: number): string {
   if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`
@@ -64,12 +65,13 @@ function formatLatency(ms: number): string {
 
 /**
  * Return the best latency value to display for a stage card.
- * Prefers p50 from real histogram data; falls back to the mean/estimate.
+ * Prefers p50 from real histogram data; falls back to the measured mean.
  */
 function displayLatency(stage: PipelineStageMetrics): string {
   if (stage.percentiles) {
     return formatLatency(stage.percentiles.p50)
   }
+  if (stage.latencyMs === 0) return '—'
   return formatLatency(stage.latencyMs)
 }
 
@@ -89,9 +91,9 @@ function p95Label(percentiles: HistogramPercentiles | undefined): string | null 
     <div class="flex items-center gap-3 mb-6">
       <div class="live-dot" />
       <h3 class="text-[#e2e8f0] font-medium text-sm">Pipeline Flow</h3>
-      <span class="badge badge-teal ml-1">LIVE</span>
+      <span class="badge badge-muted ml-1">METRICS</span>
       <span class="ml-auto text-[#475569] text-xs mono">
-        {{ stages.find(s => s.status !== 'idle') ? 'STREAMING' : 'IDLE' }}
+        {{ flowState }}
       </span>
     </div>
 
@@ -136,15 +138,15 @@ function p95Label(percentiles: HistogramPercentiles | undefined): string | null 
               {{ stage.name }}
             </div>
 
-            <!-- Throughput -->
+            <!-- Durable backend counter -->
             <div class="text-center">
               <div
                 class="mono font-semibold text-sm"
                 :style="{ color: statusColor(stage.status) }"
               >
-                {{ formatFps(stage.throughputFps) }}
-                <span class="text-[10px] font-normal text-[#475569]">fps</span>
+                {{ stage.itemsTotal.toLocaleString() }}
               </div>
+              <div class="text-[#475569] text-[10px]">{{ stage.itemLabel }}</div>
             </div>
 
             <!-- Latency (p50 from histogram when available, else mean/estimate) -->
@@ -162,14 +164,6 @@ function p95Label(percentiles: HistogramPercentiles | undefined): string | null 
               >
                 {{ p95Label(stage.percentiles) }}
               </div>
-            </div>
-
-            <!-- Total frames (compact) -->
-            <div class="text-center">
-              <div class="mono text-[#475569] text-[10px]">
-                {{ stage.totalFrames.toLocaleString() }}
-              </div>
-              <div class="text-[#2d3748] text-[10px]">frames</div>
             </div>
 
             <!-- Status badge -->

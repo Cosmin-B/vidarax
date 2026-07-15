@@ -1,10 +1,12 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
 @import "tailwindcss";
 
 @theme {
   /* Colors */
-  --color-base: #08090d;
-  --color-base-deep: #050507;
+  /* Keep canvas tokens out of Tailwind's --color-* namespace. A
+     --color-base token turns the typography utility `text-base` into a
+     near-black text color utility. */
+  --app-color-canvas: #08090d;
+  --app-color-canvas-deep: #050507;
 
   --color-surface: #0f1117;
   --color-surface-raised: #151a22;
@@ -28,8 +30,8 @@
   --color-text-dim: #475569;
 
   /* Font families */
-  --font-family-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
-  --font-family-sans: 'Inter', system-ui, sans-serif;
+  --font-family-mono: ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, monospace;
+  --font-family-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 
   /* Box shadows */
   --shadow-skeuo: inset 0 1px 0 rgba(255,255,255,0.03), 0 4px 12px rgba(0,0,0,0.5);
@@ -57,7 +59,7 @@ html, body, #app {
 body {
   background-color: #08090d;
   color: #e2e8f0;
-  font-family: 'Inter', system-ui, sans-serif;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   line-height: 1.5;
@@ -147,7 +149,7 @@ body {
 
 /* Monospace helper */
 .mono {
-  font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, monospace;
 }
 
 /* Live dot pulse animation */

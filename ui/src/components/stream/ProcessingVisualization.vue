@@ -469,7 +469,7 @@ const durationLabel = computed(() => {
   top: -18px;
   left: 50%;
   transform: translateX(-50%);
-  font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, monospace;
   font-size: 9px;
   font-weight: 600;
   letter-spacing: 0.12em;
@@ -532,7 +532,7 @@ const durationLabel = computed(() => {
 .pv-time-label {
   position: absolute;
   top: 3px;
-  font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, monospace;
   font-size: 9px;
   color: #334155;
   letter-spacing: 0.04em;

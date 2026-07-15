@@ -42,7 +42,9 @@ async function fetchRuns(): Promise<void> {
   } catch (err) {
     fetchError.value = err instanceof ApiError
       ? `API error ${err.status}: ${err.message}`
-      : err instanceof Error ? err.message : 'Failed to fetch runs'
+      : err instanceof TypeError
+        ? 'Cannot reach the Vidarax API. Check the endpoint in Settings.'
+        : err instanceof Error ? err.message : 'Failed to fetch runs'
   } finally {
     loading.value = false
   }
@@ -68,7 +70,8 @@ function statusConfig(status: RunStatus) {
     completed:  { label: 'Completed',  cls: 'badge-green' },
     failed:     { label: 'Failed',     cls: 'badge-red'   },
     pending:    { label: 'Pending',    cls: 'badge-muted' },
-    stopped:    { label: 'Stopped',   cls: 'badge-muted' },
+    cancelled:  { label: 'Cancelled', cls: 'badge-muted' },
+    expired:    { label: 'Expired',   cls: 'badge-muted' },
   }
   return map[status] ?? { label: status, cls: 'badge-muted' }
 }
@@ -102,7 +105,7 @@ function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
       <div class="flex gap-3">
         <!-- Refresh -->
         <button
-          class="w-9 h-9 flex items-center justify-center rounded-[8px] text-[#64748b] transition-colors duration-200 hover:text-[#94a3b8] icon-hover-parent"
+          class="w-11 h-11 flex items-center justify-center rounded-[8px] text-[#64748b] transition-colors duration-200 hover:text-[#94a3b8] icon-hover-parent"
           style="background: rgba(255,255,255,0.04); border: 1px solid #1e2633;"
           :disabled="loading"
           :class="loading ? 'opacity-50' : ''"
@@ -119,7 +122,7 @@ function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
         </button>
         <RouterLink
           to="/stream"
-          class="flex items-center gap-2 px-4 py-2 rounded-[10px] text-sm font-medium text-[#08090d] transition-all duration-200 icon-hover-parent"
+          class="flex min-h-11 items-center gap-2 px-4 py-2 rounded-[10px] text-sm font-medium text-[#08090d] transition-all duration-200 icon-hover-parent"
           style="background: linear-gradient(135deg, #0d9488 0%, #2dd4bf 100%);
                  box-shadow: 0 0 20px rgba(45,212,191,0.2);"
         >
@@ -128,7 +131,7 @@ function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
         </RouterLink>
         <RouterLink
           to="/upload"
-          class="flex items-center gap-2 px-4 py-2 rounded-[10px] text-sm font-medium text-[#94a3b8] transition-all duration-200 icon-hover-parent"
+          class="flex min-h-11 items-center gap-2 px-4 py-2 rounded-[10px] text-sm font-medium text-[#94a3b8] transition-all duration-200 icon-hover-parent"
           style="background: rgba(255,255,255,0.04); border: 1px solid #1e2633;"
         >
           <AnimatedIcon :icon="Upload" :size="14" :stroke-width="2" />
@@ -151,7 +154,7 @@ function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
         class="text-[#ef4444] shrink-0"
       />
       <span class="text-[#ef4444] flex-1">{{ fetchError }}</span>
-      <button class="text-[#ef4444] text-xs underline" @click="fetchRuns">Retry</button>
+      <button class="min-h-11 px-2 text-[#ef4444] text-xs underline" @click="fetchRuns">Retry</button>
     </div>
 
     <!-- Stats row -->
@@ -160,7 +163,7 @@ function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
         v-for="stat in [
           { label: 'Total Runs',  value: String(runs.length),                                                  accent: 'teal'  },
           { label: 'Processing',  value: String(runs.filter(r => r.status === 'processing').length),           accent: 'amber' },
-          { label: 'Events',      value: String(runs.reduce((a, r) => a + (r.event_count ?? 0), 0)),           accent: 'warm'  },
+          { label: 'Failed',      value: String(runs.filter(r => r.status === 'failed').length),               accent: 'red'   },
           { label: 'Completed',   value: String(runs.filter(r => r.status === 'completed').length),            accent: 'green' },
         ]"
         :key="stat.label"
@@ -171,8 +174,9 @@ function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
           class="mono text-2xl font-semibold"
           :class="{
             'text-[#2dd4bf]': stat.accent === 'teal',
-            'text-[#f59e0b]': stat.accent === 'amber' || stat.accent === 'warm',
+            'text-[#f59e0b]': stat.accent === 'amber',
             'text-[#22c55e]': stat.accent === 'green',
+            'text-[#ef4444]': stat.accent === 'red',
           }"
         >{{ stat.value }}</div>
       </div>
@@ -196,6 +200,17 @@ function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
         </RouterLink>
       </div>
 
+      <div v-else-if="fetchError && runs.length === 0" class="py-12 px-5 text-center">
+        <p class="text-[#94a3b8] text-sm">Recent runs are unavailable.</p>
+        <p class="text-[#64748b] text-xs mt-1">Connect a running API, then retry this page.</p>
+        <RouterLink
+          to="/settings"
+          class="inline-flex min-h-11 items-center text-[#2dd4bf] text-sm mt-3 px-2 hover:text-[#5eead4]"
+        >
+          Open connection settings →
+        </RouterLink>
+      </div>
+
       <div v-else class="divide-y divide-[#1e2633]">
         <button
           v-for="run in runs"
@@ -210,7 +225,7 @@ function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
               'bg-[#f59e0b]': run.status === 'processing',
               'bg-[#22c55e]': run.status === 'completed',
               'bg-[#ef4444]': run.status === 'failed',
-              'bg-[#475569]': run.status === 'pending' || run.status === 'stopped',
+              'bg-[#475569]': run.status === 'pending' || run.status === 'cancelled' || run.status === 'expired',
             }"
             :style="run.status === 'processing'
               ? 'animation: pulse-teal 2s infinite; box-shadow: 0 0 6px rgba(245,158,11,0.5)'
@@ -225,11 +240,6 @@ function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
             <div class="text-[#475569] text-xs mt-0.5 truncate">
               {{ run.model }} &middot; {{ run.created_at ? formatRelative(run.created_at) : '—' }}
             </div>
-          </div>
-          <!-- Event count -->
-          <div class="text-right shrink-0 hidden sm:block">
-            <div class="mono text-[#f59e0b] text-sm">{{ run.event_count ?? 0 }}</div>
-            <div class="text-[#475569] text-xs">events</div>
           </div>
           <!-- Status badge -->
           <span :class="['badge shrink-0', statusConfig(run.status).cls]">
@@ -246,7 +256,7 @@ function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
       </div>
     </div>
 
-    <!-- Recent SpacetimeDB events -->
+    <!-- Recent timeline events -->
     <div v-if="recentEvents.length > 0" class="card-skeuo overflow-hidden">
       <div class="px-5 py-4 border-b border-[#1e2633] flex items-center gap-2">
         <AnimatedIcon

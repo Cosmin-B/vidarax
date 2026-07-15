@@ -1,0 +1,115 @@
+---
+title: Quickstart
+description: Build the server, analyze a video, and read its events.
+---
+
+Build the API server, analyze a local video, and read the resulting event snapshot.
+
+## Prerequisites
+
+- A Rust toolchain.
+- `ffmpeg` and `ffprobe` on `PATH` (or paths set through `VIDARAX_FFMPEG_PATH` and `VIDARAX_FFPROBE_PATH`).
+- `jq`, used below to pull the run ID out of JSON responses.
+- An OpenAI-compatible VLM backend, usually vLLM or SGLang, reachable at a URL you control (Gemini can be configured through the TOML backend file instead). Without a backend, inference routes fail.
+- A video file to analyze. The examples below assume `demo.mp4` in a directory the server is allowed to read.
+
+## Run the server
+
+The server only reads local files from directories listed in `VIDARAX_INGEST_FILE_ROOTS` (the list defaults to empty, so local paths are rejected unless you set it or upload the file through `POST /v1/upload`). Create a root and put a video in it:
+
+```bash
+mkdir -p /srv/vidarax-media
+cp demo.mp4 /srv/vidarax-media/
+```
+
+```bash
+git clone https://github.com/Cosmin-B/vidarax.git && cd vidarax
+cargo build --release -p vidarax-api
+VIDARAX_API_KEYS=dev-key \
+VIDARAX_VLLM_BASE_URL=http://localhost:8000 \
+VIDARAX_INGEST_FILE_ROOTS=/srv/vidarax-media \
+cargo run --release -p vidarax-api
+```
+
+The server binds `127.0.0.1:8080` by default. Check readiness:
+
+```bash
+curl -fsS http://127.0.0.1:8080/v1/health
+```
+
+{% aside type="note" title="API keys are on by default" %}
+`VIDARAX_REQUIRE_API_KEY` defaults to `true`, so `VIDARAX_API_KEYS` must contain at least one key and every request except `/v1/health` needs an `x-api-key` header. For local open-mode development you can disable checks explicitly with `VIDARAX_REQUIRE_API_KEY=false` and `VIDARAX_METRICS_REQUIRE_API_KEY=false`.
+{% /aside %}
+
+To run the Vue 3 frontend in a separate terminal:
+
+```bash
+cd ui && npm install && npm run dev
+```
+
+## Analyze a file
+
+The TypeScript SDK wraps the whole flow. It lives in `packages/vidarax-sdk/` in the repository; build it and link it into your project:
+
+```bash
+cd packages/vidarax-sdk && npm install && npm run build && npm link
+cd /path/to/your-project && npm link vidarax
+```
+
+```typescript
+import { Vidarax } from 'vidarax'
+
+const v = new Vidarax('http://localhost:8080', { apiKey: 'dev-key' })
+
+const run = await v.analyze('/srv/vidarax-media/demo.mp4')
+
+for (const event of await v.getEvents(run.runId)) {
+  console.log(event.kind, event.payload)
+}
+```
+
+The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via `output_schema`, interactions, and snapshot reads of events and markers. See [Events and SDK](/events/#the-typescript-sdk) for the method list.
+
+The same flow over plain HTTP: create a run and capture its ID, then run semantic reasoning against a source the server can read.
+
+```bash
+RUN_ID=$(curl -s -X POST http://127.0.0.1:8080/v1/runs \
+  -H 'x-api-key: dev-key' \
+  -H 'content-type: application/json' \
+  -d '{ "mode": "balanced", "model": "Qwen/Qwen3-VL-4B-Instruct" }' \
+  | jq -r .run_id)
+echo "$RUN_ID"
+```
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/v1/runs/$RUN_ID/reason \
+  -H 'x-api-key: dev-key' \
+  -H 'content-type: application/json' \
+  -d '{
+    "source_uri": "/srv/vidarax-media/demo.mp4",
+    "model": "Qwen/Qwen3-VL-4B-Instruct",
+    "semantic_inference": true,
+    "semantic_frames_per_chunk": 2,
+    "chunk_size": 30,
+    "fixed_fps": 5.0,
+    "sampling_policy": "fixed"
+  }'
+```
+
+`mode` must be one of `balanced`, `detailed`, `efficiency`, or `custom`, and `model` must be in the supported model contract (see `GET /v1/models`). Local file paths are only readable when they sit under a directory listed in `VIDARAX_INGEST_FILE_ROOTS`, or when the file was uploaded through `POST /v1/upload` (the upload response returns the server-side `file_path` to use as `source_uri`).
+
+## Read events
+
+Every run writes sequence-numbered events to its timeline. This endpoint returns the current snapshot; poll `POST /v1/query` with `from_seq` when you need incremental updates.
+
+```bash
+curl -s http://127.0.0.1:8080/v1/runs/$RUN_ID/events -H 'x-api-key: dev-key'
+```
+
+Markers (frame-range annotations derived from the analysis pass) have their own endpoint with filters:
+
+```bash
+curl -s "http://127.0.0.1:8080/v1/runs/$RUN_ID/markers?event_type=scene_cut" -H 'x-api-key: dev-key'
+```
+
+See [Events and SDK](/events/) for the event shapes and kinds, and [API reference](/api/) for the route contracts and selected configuration variables.

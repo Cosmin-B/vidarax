@@ -1,0 +1,75 @@
+---
+title: Operations
+description: Deployment, observability, hardening, and the release gates.
+---
+
+This page covers what a deployment consists of, what the server exposes for observability, and the release-gate practice the project uses before shipping.
+
+## What a deployment needs
+
+- A VLM backend: an OpenAI-compatible endpoint (usually vLLM or SGLang) reachable at the configured base URL, or Gemini declared through the TOML backend file. Without a backend, inference routes fail and WHIP live sessions emit an explicit no-provider result.
+- `ffmpeg` and `ffprobe` on `PATH`, or paths set through `VIDARAX_FFMPEG_PATH` and `VIDARAX_FFPROBE_PATH`.
+- Network egress controls for untrusted remote media (see below).
+- Optionally, a TLS certificate and key when running the experimental HTTP/3 transport; the binary must be built with `--features h3-experimental`, otherwise the server rejects H3 transport at startup.
+- Optionally, the SigLIP2 embedding sidecar: setting `VIDARAX_NOVELTY_EMBEDDING_ADDR` enables live semantic novelty. It uses raw binary JPEG and embedding payloads over TCP.
+- Optionally, SpacetimeDB: setting `VIDARAX_SPACETIMEDB_URL` enables feedback and mirrors blocking WHIP description events after their local WAL commit. Nonblocking events and keyframe blobs stay local.
+
+## Docker and compose
+
+The `deploy/` directory contains:
+
+| File | Purpose |
+|------|---------|
+| `Dockerfile.api` | Builds `vidarax-api` in a Rust builder image and copies the binary into a Debian runtime image. The runtime image binds `0.0.0.0:8080` (and `0.0.0.0:8443` for H3) and sets `VIDARAX_DATA_DIR=/var/lib/vidarax`. |
+| `docker-compose.local.yml` | Local stack: the API container plus VictoriaMetrics, VictoriaLogs, and VictoriaTraces, all bound to `127.0.0.1`. A named volume backs `/var/lib/vidarax`, and the API is pointed at the VictoriaTraces OTLP endpoint. |
+| `vm-scrape.yml` | The VictoriaMetrics scrape configuration mounted into the metrics container. |
+| `certs/` | Development TLS certificate and key used by the experimental HTTP/3 transport defaults. |
+
+{% aside type="caution" title="Local compose boundaries" %}
+`docker-compose.local.yml` includes a local-only API key, authenticated metric scraping, ffmpeg in the runtime image, and persistent WAL storage. It still expects an inference service reachable from the API container; set the backend URL or edit `vidarax.toml` for that network. VictoriaLogs is present but no log shipper is configured, so structured logs remain on container stderr until you add one.
+{% /aside %}
+
+Check readiness with:
+
+```bash
+curl -fsS http://127.0.0.1:8080/v1/health
+```
+
+## Observability
+
+Three signals come out of the server:
+
+- Metrics. `GET /v1/metrics` serves Prometheus-format metrics covering runs, events, inference, novelty decisions, embedding latency, and keyframe-blob durability. Live WHIP traffic and recorded-file `ingest`, `analyze`, and `reason` work contribute to the shared decode and gate series. `vidarax_pipeline_gate_frames_analyzed_total` counts gate inputs, while `vidarax_pipeline_gate_keyframes_selected_total` counts gate decisions before downstream queueing; `vidarax_pipeline_keyframes_total` remains the number actually forwarded to VLM workers. Metrics require an API key by default (`VIDARAX_METRICS_REQUIRE_API_KEY`); the checked-in compose scraper sends its local development key.
+- Browser dashboards. When the UI and API use different origins, include the exact UI origin in `VIDARAX_CORS_ALLOWED_ORIGINS`. A healthy `curl` response does not imply that a browser may read the endpoint without the matching CORS response header.
+- Logs. Tracing output goes to stdout in human-readable form and to stderr as structured JSON. The filter is `RUST_LOG` (default `info`). Shipping the stderr stream to a log store is left to the deployment; the compose stack runs VictoriaLogs but does not wire a shipper.
+- Traces. An OpenTelemetry layer bridges tracing spans to OTLP over gRPC when `VIDARAX_TRACES_ENDPOINT` is set; when unset, spans are dropped. The compose stack points this at VictoriaTraces.
+
+## Security and hardening
+
+Read `docs/security.md` in the repository before exposing a deployment to untrusted callers or untrusted media. The main knobs:
+
+- Keep `VIDARAX_REQUIRE_API_KEY=true` and issue separate API keys per isolated principal. Ownership of runs and uploaded files derives from the authenticated principal; `x-tenant-id` is metadata, not an authorization boundary.
+- Set `VIDARAX_CORS_ALLOWED_ORIGINS` to exact browser origins. `*` is rejected when API keys are required.
+- Configure `VIDARAX_RATE_LIMIT_GLOBAL_RPS` and `VIDARAX_RATE_LIMIT_TENANT_RPS` for public endpoints; despite the historical name, the per-limit bucket key is the resolved principal.
+- Terminate TLS at a proxy, or use the experimental HTTP/3 TLS settings.
+- Keep the insecure media toggles (`VIDARAX_ALLOW_INSECURE_HTTP`, `VIDARAX_ALLOW_UNENCRYPTED_RTSP`, `VIDARAX_ALLOW_REMOTE_HLS`, `VIDARAX_ALLOW_INSECURE_TLS`) disabled unless the source network is trusted.
+- Remote ingest applies application-level SSRF mitigations, but redirects or nested playlist resources that resolve to private addresses over an allowed scheme cannot be fully blocked in the application. Deployments that ingest untrusted sources need network-level egress controls: an egress proxy or resolver that enforces a public-IP policy on every connection.
+
+## Release gates
+
+Before a release, `scripts/release_gates.sh` runs a fixed sequence of checks. Each check compares an observed value against a configured ceiling and fails the gate on regression; the ceilings live in environment variables (`VIDARAX_MAX_CLI_SIZE_BYTES`, `VIDARAX_MAX_API_SIZE_BYTES`, `VIDARAX_MAX_ALLOC_PER_FRAME`, and a timing ceiling) so they can be tightened or relaxed without editing the script.
+
+Conceptually, the gates check four things:
+
+1. Correctness is reproducible. `scripts/validate_replay_and_schema.sh` runs the deterministic replay and schema tests: the same input must produce the same events, and the published JSON Schemas must accept their reference fixtures and reject invalid ones.
+2. The hot path does not silently start allocating. `scripts/bench_regression.sh` runs an allocation probe and fails if per-frame allocations exceed the configured budget.
+3. The shipped binaries do not silently grow. The script builds release binaries for the CLI and the API server and compares their sizes against configured ceilings.
+4. The gate engine's hot path is covered by an automated timing regression gate.
+
+Run the full sequence from the repository root:
+
+```bash
+scripts/release_gates.sh
+```
+
+The individual scripts can also be run alone. Beyond the gates, `scripts/` contains smoke and integration harnesses: `smoke_v1.sh` and `smoke_mp4_pipeline.sh` boot the server and exercise the API path, `e2e_integration_test.sh` runs an end-to-end pass over a generated test video (`generate_test_video.sh`), and `staging_provider_e2e.sh` runs the live provider integration test when the staging backend URLs are set. Throughput depends on hardware, models, and input, so the repository publishes no headline numbers; measure on your own setup with the harnesses in `benchmarks/`, the bench binaries under `crates/*/src/bin`, and the scripts in `scripts/`.

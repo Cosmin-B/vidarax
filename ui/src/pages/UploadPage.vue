@@ -16,7 +16,7 @@ const router = useRouter()
 const runsStore = useRunsStore()
 const eventsStore = useEventsStore()
 const authStore = useAuthStore()
-const { connect: connectEvents, disconnect: disconnectEvents, isConnected: stdbConnected } = useEventStream()
+const { connect: connectEvents, disconnect: disconnectEvents, isConnected: timelineConnected } = useEventStream()
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -223,12 +223,8 @@ async function startUpload(): Promise<void> {
     const effectivePrompt = prompt.value.trim() || DEFAULT_ANALYSIS_PROMPT
 
     const run = await api.runs.create({
-      source_uri: filePath,
+      mode: 'balanced',
       model: selectedModel.value,
-      prompt: effectivePrompt,
-      semantic_inference: semanticInference.value,
-      fps,
-      chunk_size: chunkSize,
     })
 
     createdRunId.value = run.run_id
@@ -237,12 +233,12 @@ async function startUpload(): Promise<void> {
     runsStore.upsertRun({
       run_id: run.run_id,
       status: run.status as RunStatus,
-      mode: run.mode as 'batch',
+      mode: run.mode as 'balanced',
       model: run.model,
       created_at: run.created_at,
     })
 
-    // ── Step 3: Subscribe to SpacetimeDB events ───────────────────────────
+    // ── Step 3: Follow the local event timeline ───────────────────────────
     eventsStore.setActiveRunId(run.run_id)
     connectEvents(run.run_id)
 
@@ -354,7 +350,11 @@ function formatPts(ms: number) {
 
     <!-- Header -->
     <div class="flex items-center gap-3">
-      <RouterLink to="/" class="text-[#475569] hover:text-[#64748b] transition-colors icon-hover-parent" aria-label="Back">
+      <RouterLink
+        to="/"
+        class="-ml-3 flex h-11 w-11 items-center justify-center text-[#475569] hover:text-[#64748b] transition-colors icon-hover-parent"
+        aria-label="Back to Dashboard"
+      >
         <AnimatedIcon :icon="ChevronLeft" :size="16" :stroke-width="2" />
       </RouterLink>
       <div>
@@ -385,7 +385,7 @@ function formatPts(ms: number) {
         <div class="flex gap-3 justify-center">
           <button
             v-if="createdRunId"
-            class="px-4 py-2 rounded-[10px] text-sm font-medium text-[#08090d]"
+            class="min-h-11 px-4 py-2 rounded-[10px] text-sm font-medium text-[#08090d]"
             style="background: linear-gradient(135deg, #0d9488 0%, #2dd4bf 100%);"
             @click="router.push(`/runs/${createdRunId}`)"
           >
@@ -393,13 +393,13 @@ function formatPts(ms: number) {
           </button>
           <RouterLink
             to="/"
-            class="px-4 py-2 rounded-[10px] text-sm font-medium text-[#94a3b8]"
+            class="inline-flex min-h-11 items-center px-4 py-2 rounded-[10px] text-sm font-medium text-[#94a3b8]"
             style="background: rgba(255,255,255,0.04); border: 1px solid #1e2633;"
           >
             Dashboard
           </RouterLink>
           <button
-            class="px-4 py-2 rounded-[10px] text-sm font-medium text-[#64748b]"
+            class="min-h-11 px-4 py-2 rounded-[10px] text-sm font-medium text-[#64748b]"
             style="background: rgba(255,255,255,0.04); border: 1px solid #1e2633;"
             @click="reset"
           >
@@ -451,8 +451,8 @@ function formatPts(ms: number) {
               style="background: #050507; border: 1px solid #1e2633; aspect-ratio: 16/9;"
             >
               <img
-                v-if="kf.jpeg_b64"
-                :src="`data:image/jpeg;base64,${kf.jpeg_b64}`"
+                v-if="kf.image_url"
+                :src="kf.image_url"
                 :alt="`Keyframe ${kf.frame_index}`"
                 class="w-full h-full object-cover"
                 loading="lazy"
@@ -492,6 +492,7 @@ function formatPts(ms: number) {
         @drop="onDrop"
         @click="!isProcessing && fileInputRef?.click()"
         @keydown.enter="!isProcessing && fileInputRef?.click()"
+        @keydown.space.prevent="!isProcessing && fileInputRef?.click()"
       >
         <input
           ref="fileInputRef"
@@ -528,7 +529,7 @@ function formatPts(ms: number) {
             <div class="mono text-[#64748b] text-sm mt-1">{{ fileSize }}</div>
             <button
               v-if="!isProcessing"
-              class="text-xs text-[#475569] hover:text-[#64748b] mt-2 underline"
+              class="min-h-11 px-2 text-xs text-[#475569] hover:text-[#64748b] mt-2 underline"
               @click.stop="reset"
             >
               Remove
@@ -551,7 +552,7 @@ function formatPts(ms: number) {
           class="text-[#ef4444] shrink-0"
         />
         <span class="text-[#ef4444] flex-1">{{ uploadError }}</span>
-        <button class="text-xs text-[#ef4444] underline ml-2" @click="reset">Reset</button>
+        <button class="min-h-11 px-2 text-xs text-[#ef4444] underline ml-2" @click="reset">Reset</button>
       </div>
 
       <!-- Settings panel -->
@@ -564,7 +565,7 @@ function formatPts(ms: number) {
             <label class="text-xs text-[#64748b] uppercase tracking-wide">Model</label>
             <select
               v-model="selectedModel"
-              class="w-full px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] transition-colors duration-200"
+              class="w-full min-h-11 px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] transition-colors duration-200"
               style="background: #0f1117; border: 1px solid #1e2633; outline: none;"
             >
               <option v-for="m in MODELS" :key="m.id" :value="m.id">{{ m.label }}</option>
@@ -587,22 +588,28 @@ function formatPts(ms: number) {
         </div>
 
         <!-- Semantic inference toggle -->
-        <label class="flex items-center gap-3 cursor-pointer w-fit">
-          <div
+        <button
+          type="button"
+          role="switch"
+          :aria-checked="semanticInference"
+          class="flex min-h-11 items-center gap-3 cursor-pointer w-fit text-left"
+          @click="semanticInference = !semanticInference"
+        >
+          <span
+            aria-hidden="true"
             class="relative w-9 h-5 rounded-full transition-colors duration-200"
             :style="semanticInference
               ? 'background: #0d9488;'
               : 'background: #1e2633;'"
-            @click="semanticInference = !semanticInference"
           >
-            <div
+            <span
               class="absolute top-0.5 w-4 h-4 rounded-full transition-all duration-200"
               style="background: #e2e8f0;"
               :style="semanticInference ? 'left: 18px;' : 'left: 2px;'"
             />
-          </div>
+          </span>
           <span class="text-sm text-[#94a3b8]">Semantic inference</span>
-        </label>
+        </button>
       </div>
 
       <!-- Progress card -->
@@ -640,7 +647,7 @@ function formatPts(ms: number) {
           <span v-else-if="uploadState === 'creating'">Setting up analysis run…</span>
           <span v-else>
             Running semantic analysis.
-            {{ stdbConnected ? 'Events streaming in real-time via SpacetimeDB.' : 'Events will appear when connected.' }}
+            {{ timelineConnected ? 'Events are updating from the local timeline.' : 'Connecting to the local timeline…' }}
           </span>
         </p>
 
@@ -702,7 +709,7 @@ function formatPts(ms: number) {
       <!-- Submit button -->
       <div v-if="selectedFile && !isProcessing && uploadState !== 'error'" class="flex justify-end">
         <button
-          class="flex items-center gap-2 px-6 py-2.5 rounded-[10px] text-sm font-semibold text-[#08090d] transition-all duration-200 icon-hover-parent"
+          class="flex min-h-11 items-center gap-2 px-6 py-2.5 rounded-[10px] text-sm font-semibold text-[#08090d] transition-all duration-200 icon-hover-parent"
           style="background: linear-gradient(135deg, #0d9488 0%, #2dd4bf 100%);
                  box-shadow: 0 0 20px rgba(45,212,191,0.2);"
           @click="startUpload"

@@ -1,332 +1,134 @@
-/**
- * useEventStream — SpacetimeDB real-time subscription composable.
- *
- * Connects to the SpacetimeDB module via WebSocket (v1.json.spacetimedb protocol)
- * and subscribes to AgentEvents + KeyframeStore for the active run.
- *
- * No generated bindings required — rows are mapped directly from the JSON
- * representation produced by the SATS type system (snake_case field names).
- *
- * Usage:
- *   const { connect, disconnect, isConnected, connectionError } = useEventStream()
- *   await connect(runId)
- */
-
-import { ref, onUnmounted } from 'vue'
-import { useEventsStore } from '@/stores/events'
-import { useAuthStore } from '@/stores/auth'
-import { buildSpacetimeSubscribeUrl, SPACETIME_PROTOCOLS, UI_DEFAULTS } from '@/lib/config'
+import { ref } from 'vue'
+import { api, type RawRunEvent } from '@/lib/api'
+import { useEventsStore, type AgentEvent, type KeyframeEntry } from '@/stores/events'
 import { logger } from '@/lib/logger'
-import type { AgentEvent, KeyframeEntry } from '@/stores/events'
 
-// ── SpacetimeDB v1 JSON protocol types ────────────────────────────────────────
+const POLL_INTERVAL_MS = 1000
 
-interface StdbTableUpdate {
-  table_id?: number
-  table_name: string
-  updates: {
-    deletes: Array<{ row: unknown }>
-    inserts: Array<{ row: unknown }>
-  }
-}
+function mapEvent(raw: RawRunEvent, runId: string): AgentEvent | null {
+  if (raw.kind === 'keyframe_stored') return null
+  const payload = raw.payload
+  const workerKinds = new Set([
+    'vlm',
+    'vlm_tiered',
+    'clip_vlm',
+    'clip_vlm_tiered',
+    'state_transition',
+    'loop_detected',
+  ])
+  if (raw.kind !== 'marker_emitted' && !workerKinds.has(raw.kind)) return null
 
-interface StdbDatabaseUpdate {
-  tables: StdbTableUpdate[]
-}
+  const workerDescription = workerKinds.has(raw.kind)
+  const eventType = raw.kind === 'marker_emitted'
+    ? String(payload.event_type ?? 'context_observation')
+    : raw.kind === 'loop_detected'
+      ? 'loop_detected'
+      : 'vlm_description'
 
-type ServerMessage =
-  | { IdentityToken: { identity: string; token: string; address: string } }
-  | {
-      InitialSubscription: {
-        database_update: StdbDatabaseUpdate
-        request_id: number
-        total_host_execution_duration_micros: number
-      }
-    }
-  | {
-      TransactionUpdate: {
-        status: string | { Committed: StdbDatabaseUpdate }
-        timestamp: { microseconds: number }
-        caller_identity: string
-        caller_address: string
-        reducer_call?: unknown
-        database_update?: StdbDatabaseUpdate
-      }
-    }
-  | { SubscribeError: { request_id: number; message: string } }
-  | { ErrorMessage: { message: string } }
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/** Returns true when the endpoint is the default localhost value (not user-configured). */
-function isDefaultLocalhostEndpoint(endpoint: string): boolean {
-  try {
-    const url = new URL(endpoint)
-    const defaultUrl = new URL(UI_DEFAULTS.spacetimeEndpoint)
-    return (url.hostname === 'localhost' || url.hostname === '127.0.0.1') && url.port === defaultUrl.port
-  } catch {
-    return false
-  }
-}
-
-/** Extract database_update from TransactionUpdate (handles both shapes). */
-function extractDbUpdate(msg: ServerMessage & { TransactionUpdate: unknown }): StdbDatabaseUpdate | null {
-  const tu = (msg as { TransactionUpdate: { status: unknown; database_update?: StdbDatabaseUpdate } })
-    .TransactionUpdate
-  // Shape A: database_update is a top-level field
-  if (tu.database_update) return tu.database_update
-  // Shape B: status.Committed holds the tables
-  const committed = (tu.status as { Committed?: StdbDatabaseUpdate })?.Committed
-  if (committed) return committed
-  return null
-}
-
-/** Safely parse a raw row object into AgentEvent. */
-function parseAgentEvent(row: unknown): AgentEvent | null {
-  if (!row || typeof row !== 'object') return null
-  const r = row as Record<string, unknown>
-  if (typeof r.run_id !== 'string') return null
   return {
-    run_id: r.run_id as string,
-    session_id: (r.session_id as string) ?? '',
-    frame_index: Number(r.frame_index ?? 0),
-    pts_ms: Number(r.pts_ms ?? 0),
-    event_type: (r.event_type as AgentEvent['event_type']) ?? 'vlm_description',
-    confidence: Number(r.confidence ?? 0),
-    description: (r.description as string) ?? '',
-    timestamp_ms: Number(r.timestamp_ms ?? 0),
+    run_id: runId,
+    session_id: String(payload.session_id ?? payload.stream_id ?? ''),
+    frame_index: Number(payload.frame_index ?? payload.start_frame ?? 0),
+    pts_ms: Number(payload.pts_ms ?? payload.start_pts_ms ?? 0),
+    event_type: eventType as AgentEvent['event_type'],
+    confidence: Number(payload.confidence ?? 0),
+    description: workerDescription
+      ? String(payload.description ?? '')
+      : String(payload.description ?? payload.summary ?? ''),
+    timestamp_ms: raw.pts_ms,
   }
 }
 
-/** Safely parse a raw row object into KeyframeEntry. */
-function parseKeyframeEntry(row: unknown): KeyframeEntry | null {
-  if (!row || typeof row !== 'object') return null
-  const r = row as Record<string, unknown>
-  if (typeof r.run_id !== 'string') return null
+async function loadKeyframe(raw: RawRunEvent, runId: string): Promise<KeyframeEntry | null> {
+  if (raw.kind !== 'keyframe_stored') return null
+  const sha256 = raw.payload.image_sha256
+  if (typeof sha256 !== 'string' || !/^[0-9a-fA-F]{64}$/.test(sha256)) return null
+
+  const blob = await api.runs.keyframe(runId, sha256)
   return {
-    id: Number(r.id ?? 0),
-    run_id: r.run_id as string,
-    frame_index: Number(r.frame_index ?? 0),
-    pts_ms: Number(r.pts_ms ?? 0),
-    event_type: (r.event_type as string) ?? '',
-    description: (r.description as string) ?? '',
-    jpeg_b64: (r.jpeg_b64 as string) ?? '',
-    timestamp_ms: Number(r.timestamp_ms ?? 0),
+    id: raw.seq,
+    run_id: runId,
+    frame_index: Number(raw.payload.frame_index ?? 0),
+    pts_ms: Number(raw.payload.pts_ms ?? 0),
+    event_type: String(raw.payload.event_type ?? ''),
+    description: String(raw.payload.description ?? ''),
+    image_sha256: sha256.toLowerCase(),
+    image_url: URL.createObjectURL(blob),
+    timestamp_ms: raw.pts_ms,
   }
 }
-
-// ── Reconnect config ──────────────────────────────────────────────────────────
-const MAX_RECONNECT_ATTEMPTS = 3
-const RECONNECT_BASE_DELAY_MS = 3000
-
-// ── Composable ────────────────────────────────────────────────────────────────
 
 export function useEventStream() {
   const eventsStore = useEventsStore()
-  const authStore = useAuthStore()
-
   const isConnected = ref(false)
   const connectionError = ref<string | null>(null)
 
-  let ws: WebSocket | null = null
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null
   let activeRunId: string | null = null
-  let reqId = 1
-  let reconnectAttempts = 0
+  let pollTimer: ReturnType<typeof setInterval> | null = null
+  let pollInFlight = false
+  const seenSequences = new Set<number>()
+  const loadedKeyframes = new Set<string>()
 
-  function applyTableInserts(dbUpdate: StdbDatabaseUpdate, runIdFilter?: string): void {
-    for (const table of dbUpdate.tables) {
-      for (const { row } of table.updates.inserts) {
-        if (table.table_name === 'AgentEvents' || table.table_name === 'agent_events') {
-          const event = parseAgentEvent(row)
-          if (event && (!runIdFilter || event.run_id === runIdFilter)) {
-            eventsStore.addEvent(event)
-          }
-        } else if (table.table_name === 'KeyframeStore' || table.table_name === 'keyframe_store') {
-          const kf = parseKeyframeEntry(row)
-          if (kf && (!runIdFilter || kf.run_id === runIdFilter)) {
-            eventsStore.addKeyframe(kf)
+  async function poll(): Promise<void> {
+    if (!activeRunId || pollInFlight) return
+    pollInFlight = true
+    try {
+      const response = await api.runs.events(activeRunId)
+      for (const raw of response.events) {
+        if (seenSequences.has(raw.seq)) continue
+        const event = mapEvent(raw, activeRunId)
+        if (event) eventsStore.addEvent(event)
+
+        if (raw.kind === 'keyframe_stored') {
+          const sha = raw.payload.image_sha256
+          if (typeof sha === 'string' && !loadedKeyframes.has(sha)) {
+            const keyframe = await loadKeyframe(raw, activeRunId)
+            if (keyframe) {
+              eventsStore.addKeyframe(keyframe)
+              loadedKeyframes.add(keyframe.image_sha256)
+            }
           }
         }
+        seenSequences.add(raw.seq)
       }
+      isConnected.value = true
+      connectionError.value = null
+      eventsStore.setConnectionStatus(true)
+    } catch (error) {
+      isConnected.value = false
+      connectionError.value = error instanceof Error ? error.message : 'Timeline polling failed'
+      eventsStore.setConnectionStatus(false, connectionError.value)
+      logger.warn('[Timeline] Poll failed:', connectionError.value)
+    } finally {
+      pollInFlight = false
     }
-  }
-
-  function handleMessage(raw: string): void {
-    let msg: ServerMessage
-    try {
-      msg = JSON.parse(raw) as ServerMessage
-    } catch {
-      logger.warn('[SpacetimeDB] Failed to parse message:', raw.slice(0, 200))
-      return
-    }
-
-    if ('IdentityToken' in msg) {
-      const { token } = msg.IdentityToken
-      authStore.setSpacetimeToken(token)
-      // Send subscription query once authenticated
-      sendSubscribe()
-      return
-    }
-
-    if ('InitialSubscription' in msg) {
-      const { database_update } = msg.InitialSubscription
-      applyTableInserts(database_update, activeRunId ?? undefined)
-      return
-    }
-
-    if ('TransactionUpdate' in msg) {
-      // Cast to avoid TS narrowing issues with discriminated union here
-      const dbUpdate = extractDbUpdate(msg as Parameters<typeof extractDbUpdate>[0])
-      if (dbUpdate) applyTableInserts(dbUpdate, activeRunId ?? undefined)
-      return
-    }
-
-    if ('SubscribeError' in msg) {
-      logger.warn('[SpacetimeDB] SubscribeError:', msg.SubscribeError.message)
-      connectionError.value = msg.SubscribeError.message
-      return
-    }
-
-    if ('ErrorMessage' in msg) {
-      logger.warn('[SpacetimeDB] ErrorMessage:', msg.ErrorMessage.message)
-      connectionError.value = msg.ErrorMessage.message
-    }
-  }
-
-  function sendSubscribe(): void {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return
-    const runFilter = activeRunId ? ` WHERE run_id = '${activeRunId}'` : ''
-    const payload = {
-      Subscribe: {
-        query_strings: [
-          `SELECT * FROM AgentEvents${runFilter}`,
-          `SELECT * FROM KeyframeStore${runFilter}`,
-        ],
-        request_id: reqId++,
-      },
-    }
-    ws.send(JSON.stringify(payload))
   }
 
   async function connect(runId: string): Promise<void> {
-    // C-1: Validate runId to prevent SQL injection in SpacetimeDB subscription queries.
     if (!/^[a-zA-Z0-9_-]+$/.test(runId)) {
       connectionError.value = 'Invalid run ID format'
       return
     }
-
-    // Do not auto-connect when SpacetimeDB endpoint is the unconfigured default localhost:3000.
-    // The user must explicitly configure a reachable endpoint in Settings.
-    if (isDefaultLocalhostEndpoint(authStore.spacetimeEndpoint)) {
-      connectionError.value = 'SpacetimeDB not connected'
-      eventsStore.setConnectionStatus(false, 'SpacetimeDB not connected')
-      logger.info('[SpacetimeDB] Skipping connection — endpoint is default localhost:3000 (not configured)')
-      return
-    }
-
+    disconnect()
     activeRunId = runId
+    seenSequences.clear()
+    loadedKeyframes.clear()
     eventsStore.setActiveRunId(runId)
-    reconnectAttempts = 0
-
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      // Already connected — re-subscribe for the new runId
-      sendSubscribe()
-      return
-    }
-
-    _openWebSocket()
-  }
-
-  function _openWebSocket(): void {
-    if (ws) {
-      ws.onclose = null
-      ws.onerror = null
-      ws.close()
-      ws = null
-    }
-
-    const wsUrl = buildSpacetimeSubscribeUrl(authStore.spacetimeEndpoint)
-    const protocols = [...SPACETIME_PROTOCOLS]
-
-    try {
-      ws = new WebSocket(wsUrl, protocols)
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'WebSocket open failed'
-      connectionError.value = msg
-      eventsStore.setConnectionStatus(false, msg)
-      return
-    }
-
-    ws.onopen = () => {
-      isConnected.value = true
-      connectionError.value = null
-      reconnectAttempts = 0
-      eventsStore.setConnectionStatus(true)
-      logger.info('[SpacetimeDB] Connected to', wsUrl)
-
-      // If the server doesn't send IdentityToken (no-auth mode), subscribe now
-      // A real server will send IdentityToken first, which triggers sendSubscribe
-      if (!authStore.spacetimeToken) {
-        sendSubscribe()
-      }
-    }
-
-    ws.onmessage = (ev) => {
-      if (typeof ev.data === 'string') {
-        handleMessage(ev.data)
-      }
-      // Binary BSATN frames are ignored (should not arrive with json protocol)
-    }
-
-    ws.onerror = () => {
-      // Suppress the noisy browser WebSocket error event — the close event
-      // fires immediately after with the reason, which we handle below.
-    }
-
-    ws.onclose = (ev) => {
-      isConnected.value = false
-      eventsStore.setConnectionStatus(false)
-
-      // Only attempt reconnect if we have an active run and haven't exceeded the limit
-      if (activeRunId && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-        reconnectAttempts++
-        const delay = RECONNECT_BASE_DELAY_MS * Math.pow(2, reconnectAttempts - 1)
-        logger.info(`[SpacetimeDB] Disconnected (code=${ev.code}). Reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delay}ms…`)
-        reconnectTimer = setTimeout(() => {
-          _openWebSocket()
-        }, delay)
-      } else if (activeRunId && reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-        logger.info(`[SpacetimeDB] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Giving up.`)
-        connectionError.value = 'SpacetimeDB not connected'
-        eventsStore.setConnectionStatus(false, 'SpacetimeDB not connected')
-        activeRunId = null
-      } else {
-        logger.info(`[SpacetimeDB] Disconnected (code=${ev.code})`)
-      }
-    }
+    await poll()
+    pollTimer = setInterval(poll, POLL_INTERVAL_MS)
   }
 
   function disconnect(): void {
-    if (reconnectTimer !== null) {
-      clearTimeout(reconnectTimer)
-      reconnectTimer = null
-    }
+    if (pollTimer) clearInterval(pollTimer)
+    pollTimer = null
     activeRunId = null
-    reconnectAttempts = 0
-    eventsStore.setActiveRunId(null)
-
-    if (ws) {
-      ws.onclose = null
-      ws.close(1000, 'User disconnected')
-      ws = null
-    }
-
     isConnected.value = false
-    eventsStore.setConnectionStatus(false)
   }
 
-  onUnmounted(disconnect)
-
-  return { isConnected, connectionError, connect, disconnect }
+  return {
+    isConnected,
+    connectionError,
+    connect,
+    disconnect,
+  }
 }

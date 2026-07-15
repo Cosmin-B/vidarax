@@ -44,27 +44,24 @@ paths. Values below come from the current Rust source, mainly
 | `VIDARAX_WEBRTC_SECOND_PASS_MODEL` | unset | Escalation model id. Set to a distinct supported id (e.g. a `gemini` backend's model) to enable tiering; unset or equal to the first pass keeps sessions local-only. |
 | `VIDARAX_WEBRTC_SECOND_PASS_THRESHOLD` | `0.7` | Escalate when first-pass confidence is below this. Clamped to `[0.0, 1.0]`; non-finite values fall back to the default. |
 | `VIDARAX_WEBRTC_SECOND_PASS_MAX_TOKENS` | `256` | Output token cap for the escalation pass. |
-| `VIDARAX_DISTILL_ENABLED` | `false` | Enable distillation sample collection. |
-| `VIDARAX_DISTILL_EMBEDDING_URL` | unset | Optional embedding server URL. |
-| `VIDARAX_DISTILL_TEACHER_MODEL` | `Qwen/Qwen3-VL-8B-Instruct` | Teacher VLM model used for distillation labels. |
-| `VIDARAX_DISTILL_MAX_PAIRS` | `10000` | Max distillation pairs per tenant. Clamped to `[100, 1000000]`. |
-| `VIDARAX_DISTILL_COLLECTION_RATE` | `0.1` | Fraction of keyframes sampled for distillation. Clamped to `[0.0, 1.0]`. |
-| `VIDARAX_DISTILL_DISTANCE_THRESHOLD` | `0.2` | KNN distance accept threshold. Clamped to `[0.0, 2.0]`. |
-| `VIDARAX_DISTILL_KNN_K` | `7` | K for KNN classification. Clamped to `[1, 100]`. |
+| `VIDARAX_NOVELTY_EMBEDDING_ADDR` | unset | Binary TCP embedding sidecar (`host:port` or `tcp://host:port`). Setting it enables live novelty. |
+| `VIDARAX_NOVELTY_MAX_REUSE_MS` | `2000` | Maximum capture-time gap from the last described frame. `0` disables reuse. |
+| `VIDARAX_NOVELTY_MAX_CUMULATIVE_DRIFT` | `0.50` | Refresh after reuse scores accumulate to this value. |
+| `VIDARAX_NOVELTY_SHADOW_SAMPLE_RATE` | `0.01` | Fraction of reuse decisions sampled through the VLM. |
+| `VIDARAX_NOVELTY_EMBEDDING_TIMEOUT_MS` | `2000` | Sidecar deadline. Failure runs the VLM. |
+| `VIDARAX_NOVELTY_REUSE_THRESHOLD` | `0.12` | Reuse at or below this embedding-distance score. Must be in `[0,1)`. |
 | `VIDARAX_ALLOW_REMOTE_HLS` | `false` | Allow remote HLS manifests. Keep disabled unless manifests are trusted. |
 | `VIDARAX_ALLOW_INSECURE_HTTP` | `false` | Allow `http://` media sources and redirects. |
 | `VIDARAX_ALLOW_UNENCRYPTED_RTSP` | `false` | Allow `rtsp://` camera sources. |
 | `VIDARAX_ALLOW_INSECURE_TLS` | `false` | Omit ffmpeg TLS verification arguments for supported live sources. |
 | `VIDARAX_TENANT_LABEL_MAPS_PATH` | unset | Optional JSON file for event and object label mapping by tenant metadata. |
-| `VIDARAX_SPACETIMEDB_URL` | unset | SpacetimeDB base URL (for example `http://127.0.0.1:3000`). When set, the feedback endpoints are enabled and WHIP stream events are written to SpacetimeDB; when unset, stream events use the local WAL and the feedback endpoints return an error. |
+| `VIDARAX_SPACETIMEDB_URL` | unset | Enables feedback endpoints and mirrors blocking WHIP description events after local WAL commit. Raw keyframes stay local. |
 | `VIDARAX_SPACETIMEDB_MODULE` | `vidarax` | SpacetimeDB database/module name. Only used when `VIDARAX_SPACETIMEDB_URL` is set. |
 | `RUST_LOG` | `info` | Tracing filter used by `tracing_subscriber`. |
 | `VIDARAX_TRACES_ENDPOINT` | unset | Optional OTLP gRPC endpoint for trace export. |
 
-The `VIDARAX_STAGING_*` names in the repository are live-test fixtures, not
-server deployment configuration. Set `VIDARAX_SPACETIMEDB_URL` to enable the
-SpacetimeDB feedback endpoints and route WHIP stream events to SpacetimeDB;
-leave it unset to keep events in the local WAL.
+The `VIDARAX_STAGING_*` names are live-test fixtures, not server settings.
+WHIP events always commit locally. SpacetimeDB receives descriptions only.
 
 ## Build and run
 
@@ -96,6 +93,78 @@ at `timeline.wal`. Uploaded files are stored under a dedicated upload directory
 below the process temp directory. Shared local media paths are not enabled by
 default; set `VIDARAX_INGEST_FILE_ROOTS` to the directories operators trust.
 
+Keyframe JPEGs are stored at
+`keyframes/blobs/<sha-prefix>/<sha256>.jpg` through an atomic rename before the
+`keyframe_stored` event is appended. `image_ref` is relative to
+`VIDARAX_DATA_DIR`; the event also records media type, byte count, and SHA-256.
+Identical JPEGs share a blob. Writes are flushed but not fsynced per keyframe.
+
+## Live semantic novelty and evidence
+
+Start the bundled SigLIP2 sidecar on the embedding accelerator:
+
+```bash
+python3 scripts/embedding_server.py \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --device auto \
+  --batch-size 8 \
+  --batch-wait-ms 3 \
+  --max-queue-mb 64
+```
+
+Set `VIDARAX_NOVELTY_EMBEDDING_ADDR=127.0.0.1:8765`. The client sends raw JPEGs
+and receives 768 little-endian f32 values over a persistent TCP connection.
+The sidecar batches requests across streams. Any sidecar error runs the VLM.
+Reuse is limited by capture time and cumulative drift.
+
+The default 1% shadow sample checks reuse decisions without updating state or
+emitting events. `vidarax_pipeline_novelty_shadow_change_ratio` is a warning
+signal, not ground truth: description overlap can treat paraphrases as changes.
+Compare sampled and completed totals to spot provider failures.
+
+Activation is not calibration. Label at least 30 ordered JPEGs as `novel` or
+`redundant`, measure the deployment's VLM p50, and run:
+
+```bash
+CARGO_TARGET_DIR=/tmp/vidarax-calibration-target \
+cargo run -p vidarax-core --release --example novelty_live_calibration -- \
+  127.0.0.1:8765 \
+  /tmp/vidarax-novelty-labels.tsv \
+  800 2000 0.50 0.98 1.10 \
+  > /tmp/vidarax-novelty-calibration.txt
+```
+
+The final values are VLM p50 ms, maximum reuse ms, drift budget, minimum recall,
+and minimum speedup. The command fails if no threshold meets both floors. Set
+`VIDARAX_NOVELTY_REUSE_THRESHOLD` to the selected value.
+
+Provider and hardware results must remain separate. Create a TSV outside the
+repository with one configured deployment per row:
+
+```text
+name<TAB>provider<TAB>hardware<TAB>decode_backend<TAB>api<TAB>model<TAB>resolution
+```
+
+Then run:
+
+```bash
+VIDARAX_API_KEY='deployment-specific-key' \
+python3 benchmarks/provider_hardware_matrix.py \
+  --matrix /tmp/vidarax-provider-hardware.tsv \
+  --preset clip_balanced \
+  --warmups 1 \
+  --repeats 3 \
+  --min-f1 0.50 \
+  --max-errors 0 \
+  --output /tmp/vidarax-provider-hardware-matrix.json
+```
+
+Omit `VIDARAX_API_KEY` only for an explicitly open local server. The output
+keeps every measured run plus aggregate quality, tokens, wall-clock p50/p95,
+provider-latency histogram bounds, request counts, and errors for each row. The
+command fails on missing provider calls, excess errors, or low mean F1.
+
 `GET /v1/health` returns readiness for the running HTTP server. It does not
 check model backend availability.
 
@@ -124,9 +193,10 @@ JPEG phase. `mlx`, `apple`, `metal`, and `videotoolbox` are aliases for the
 same backend, which uses ffmpeg's `-hwaccel videotoolbox` for the JPEG phase
 on Apple Silicon. As with `nvdec-cuda`, the frame-signal phase runs on CPU
 regardless of backend: it decodes to `framemd5` text output, which has no
-hardware-decode benefit. This backend requires an ffmpeg binary built with
-VideoToolbox support; if the configured `ffmpeg` lacks it, decode fails at
-runtime with an error rather than silently falling back to the CPU pipeline.
+hardware-decode benefit. This backend requires an ffmpeg build with VideoToolbox
+support to accelerate the selective JPEG phase. ffmpeg may fall back to software
+decode when VideoToolbox recognizes the accelerator but cannot initialize it for
+the current input; the server records that fallback in logs.
 
 ## Deployment dependencies
 
@@ -142,10 +212,8 @@ A useful deployment needs:
 - Optional HTTP/3 TLS certificate and key when `VIDARAX_TRANSPORT=h3`. The
   binary must be built with `--features h3-experimental`; otherwise the server
   rejects H3 transport at startup.
-- Optional SpacetimeDB. Set `VIDARAX_SPACETIMEDB_URL` to attach a client at
-  startup: feedback endpoints are enabled and WHIP stream events go to
-  SpacetimeDB. Leave it unset and `run()` keeps events in the local WAL with the
-  feedback endpoints disabled.
+- Optional SpacetimeDB for feedback and description mirroring. The local WAL
+  and JPEG blobs remain the source of record.
 
 ## Docker and compose
 

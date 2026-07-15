@@ -23,7 +23,7 @@ const eventsStore  = useEventsStore()
 const authStore    = useAuthStore()
 
 const { localStream, startStream, stopStream: stopWhip } = useWhip()
-const { isConnected: stdbConnected, connect: connectEvents, disconnect: disconnectEvents } = useEventStream()
+const { isConnected: timelineConnected, connect: connectEvents, disconnect: disconnectEvents } = useEventStream()
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -168,15 +168,7 @@ async function patchPrompt(value: string) {
   const sessionId = streamStore.activeSession?.sessionId
   if (!sessionId) return
   try {
-    const response = await fetch(`${authStore.apiEndpoint}/v1/stream/whip/${sessionId}/prompt`, {
-      method: 'PATCH',
-      headers: { ...authStore.defaultHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: value }),
-    })
-    if (!response.ok) {
-      const text = await response.text().catch(() => response.statusText)
-      throw new Error(text || `Prompt update failed with HTTP ${response.status}`)
-    }
+    await api.stream.whipUpdatePrompt(sessionId, { prompt: value })
   } catch (err) {
     streamStore.setError(err instanceof Error ? err.message : 'Prompt update failed')
   }
@@ -286,7 +278,7 @@ watch(localStream, (stream) => {
   }
 })
 
-// ── SpacetimeDB ───────────────────────────────────────────────────────────────
+// ── Local event timeline ─────────────────────────────────────────────────────
 
 watch(
   () => streamStore.activeSession?.runId,
@@ -706,7 +698,7 @@ function modelDisplayName(id: string): string {
               avg latency:
               <span class="text-[#2dd4bf]">{{ avgLatency }}ms</span>
             </span>
-            <span v-if="stdbConnected" class="badge badge-green" style="font-size:10px;padding:1px 6px;">
+            <span v-if="timelineConnected" class="badge badge-green" style="font-size:10px;padding:1px 6px;">
               Live
             </span>
           </div>
@@ -893,7 +885,7 @@ function modelDisplayName(id: string): string {
   gap: 5px;
   padding: 3px 8px;
   border-radius: 5px;
-  font-family: 'JetBrains Mono', 'SF Mono', monospace;
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, monospace;
   font-size: 10px;
   font-weight: 600;
   background: rgba(0,0,0,0.75);
@@ -1092,13 +1084,14 @@ function modelDisplayName(id: string): string {
 }
 
 .sp-textarea--mono {
-  font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, monospace;
   font-size: 11px;
   tab-size: 2;
 }
 
 .sp-select {
   width: 100%;
+  min-height: 44px;
   padding: 7px 10px;
   padding-right: 28px;
   border-radius: 8px;
@@ -1126,6 +1119,7 @@ function modelDisplayName(id: string): string {
 .sp-advanced-toggle {
   display: flex;
   align-items: center;
+  min-height: 44px;
   gap: 7px;
   font-size: 11px;
   font-weight: 500;
@@ -1192,6 +1186,7 @@ function modelDisplayName(id: string): string {
 
 .sp-num-input {
   width: 64px;
+  min-height: 44px;
   padding: 4px 8px;
   border-radius: 6px;
   font-size: 12px;
@@ -1200,7 +1195,7 @@ function modelDisplayName(id: string): string {
   border: 1px solid #1e2633;
   outline: none;
   text-align: right;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, monospace;
 }
 
 .sp-num-input:focus {
@@ -1217,6 +1212,7 @@ function modelDisplayName(id: string): string {
 }
 
 .sp-toggle-btn {
+  min-height: 44px;
   padding: 4px 12px;
   font-size: 11px;
   font-weight: 500;
@@ -1245,6 +1241,7 @@ function modelDisplayName(id: string): string {
 
 .sp-start-btn {
   margin: 14px 16px;
+  min-height: 44px;
   padding: 10px 16px;
   border-radius: 10px;
   font-size: 13px;
@@ -1429,13 +1426,13 @@ function modelDisplayName(id: string): string {
 }
 
 .sp-result-timestamp {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, monospace;
   font-size: 10px;
   color: #475569;
 }
 
 .sp-result-latency {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, monospace;
   font-size: 10px;
   color: #2dd4bf;
 }
@@ -1449,7 +1446,7 @@ function modelDisplayName(id: string): string {
 }
 
 .sp-result-json {
-  font-family: 'JetBrains Mono', 'SF Mono', monospace;
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, monospace;
   font-size: 10px;
   color: #64748b;
   line-height: 1.55;
@@ -1513,7 +1510,7 @@ function modelDisplayName(id: string): string {
 .sp-modal-code {
   padding: 16px;
   margin: 0;
-  font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, monospace;
   font-size: 11.5px;
   line-height: 1.65;
   color: #94a3b8;

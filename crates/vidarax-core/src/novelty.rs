@@ -1,57 +1,9 @@
-//! T2 semantic-novelty gate.
+//! Pre-VLM semantic novelty policies.
 //!
-//! Designed to sit between the T1 perceptual-frame gate ([`crate::gate`]) and
-//! the VLM. Where T1 answers "did the pixels change enough to look at?", T2
-//! answers the more expensive question "did the *meaning* change enough to
-//! spend VLM tokens on?" — without calling the VLM to find out.
-//!
-//! # Status
-//!
-//! This module is currently library-only. It is exported for calibration and
-//! unit testing, but nothing in the live capture pipeline calls it yet, so it
-//! is not deciding anything in production. The reductions in VLM calls implied
-//! by the decision math below are projections from that math, not savings
-//! measured against a real stream. Treat them as a design target until the
-//! gate is wired in and observed end to end.
-//!
-//! It fuses three cheap distances between the candidate chunk and a rolling
-//! window of the last `K` **kept** chunks:
-//!
-//! | signal | what it measures                         | default weight |
-//! |--------|------------------------------------------|----------------|
-//! | `n_t`  | OCR text change (1 − MinHash Jaccard)    | 0.50           |
-//! | `n_e`  | embedding change (1 − max cosine)        | 0.40           |
-//! | `n_v`  | perceptual-hash change (min Hamming/64)  | 0.10           |
-//!
-//! The fused novelty `n ∈ [0,1]` maps to one of three outcomes:
-//!
-//! * `n ≥ τ_hi` → [`NoveltyDecision::Admit`]  — clearly new; run the full VLM.
-//! * `n ≤ τ_lo` → [`NoveltyDecision::Drop`]   — clearly redundant; spend nothing.
-//! * otherwise  → [`NoveltyDecision::Escalate`] — ambiguous; the caller runs a
-//!   cheap yes/no gate (e.g. flash-lite) to break the tie.
-//!
-//! Only chunks the caller decides to **keep** (every `Admit`, plus the
-//! `Escalate` chunks the cheap gate confirms) are [`commit`](NoveltyGate::commit)ted
-//! back into the window. Novelty is deliberately *local*: the window holds the
-//! last `K` kept signatures, not the whole session.
-//!
-//! # Memory
-//!
-//! State is signatures, never pixels. The window is a fixed-capacity ring
-//! allocated once at construction and overwritten in place; its footprint is
-//! `K · (256 B MinHash + dim B int8 embedding + 8 B phash + 4 B scale)` and
-//! does **not** grow with session length. After construction the gate performs
-//! no heap allocation on either [`evaluate`](NoveltyGate::evaluate) or
-//! [`commit`](NoveltyGate::commit).
-//!
-//! # Calibration
-//!
-//! Weights and thresholds are [`NoveltyConfig`] fields, not constants baked
-//! into the decision. They are meant to be fitted on a labelled set and tuned
-//! for high recall (a false drop is a silently missing note; a false admit is
-//! only bounded wasted tokens). [`NoveltyGate::admit_rate`] and the other
-//! counters exist so drift can be watched once the gate is running against a
-//! real stream.
+//! [`NoveltyGate`] is the generic three-signal gate. [`LiveNoveltyGate`] is the
+//! embedding-only live policy with bounded reuse time and cumulative drift.
+
+use crate::embedding_sidecar::EMBEDDING_DIM;
 
 /// FNV-1a 64-bit constants (public-domain algorithm).
 const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
@@ -61,8 +13,6 @@ const FNV_PRIME: u64 = 1_099_511_628_211;
 /// estimate with standard error ≈ `1/sqrt(64)` ≈ 0.125 — enough to separate
 /// "same screen" from "new screen" without a heavyweight set representation.
 pub const MINHASH_SLOTS: usize = 64;
-
-// ---- default calibration -------------------------------------------------
 
 /// Default weight on the OCR text-distance signal.
 pub const DEFAULT_W_TEXT: f32 = 0.50;
@@ -76,6 +26,15 @@ pub const DEFAULT_TAU_HI: f32 = 0.45;
 pub const DEFAULT_TAU_LO: f32 = 0.12;
 /// Default rolling-window size (kept chunks retained for comparison).
 pub const DEFAULT_WINDOW: usize = 8;
+
+/// Longest time live capture may reuse its last semantic anchor.
+pub const LIVE_MAX_REUSE_MS: u64 = 2_000;
+/// Deadline for a live embedding request. Failure is admit-on-doubt.
+pub const LIVE_EMBEDDING_TIMEOUT_MS: u64 = 2_000;
+/// Sum of individually-reusable scores allowed before a safety refresh.
+pub const LIVE_MAX_CUMULATIVE_DRIFT: f32 = 0.50;
+/// Default invisible sampling rate for online false-drop evidence.
+pub const LIVE_SHADOW_SAMPLE_RATE: f32 = 0.01;
 
 /// splitmix64 — a fast, well-distributed integer mixer. Used both to derive the
 /// per-slot MinHash seeds and to spread a token's base hash across the slots.
@@ -240,6 +199,30 @@ impl Default for NoveltyConfig {
             tau_hi: DEFAULT_TAU_HI,
             tau_lo: DEFAULT_TAU_LO,
             window: DEFAULT_WINDOW,
+        }
+    }
+}
+
+/// Live semantic-novelty settings. No sidecar address means disabled.
+#[derive(Debug, Clone)]
+pub struct LiveNoveltyConfig {
+    pub embedding_sidecar_addr: Option<String>,
+    pub max_reuse_ms: u64,
+    pub max_cumulative_drift: f32,
+    pub shadow_sample_rate: f32,
+    pub embedding_timeout_ms: u64,
+    pub reuse_threshold: f32,
+}
+
+impl Default for LiveNoveltyConfig {
+    fn default() -> Self {
+        Self {
+            embedding_sidecar_addr: None,
+            max_reuse_ms: LIVE_MAX_REUSE_MS,
+            max_cumulative_drift: LIVE_MAX_CUMULATIVE_DRIFT,
+            shadow_sample_rate: LIVE_SHADOW_SAMPLE_RATE,
+            embedding_timeout_ms: LIVE_EMBEDDING_TIMEOUT_MS,
+            reuse_threshold: DEFAULT_TAU_LO,
         }
     }
 }
@@ -445,14 +428,13 @@ pub(crate) fn quantize_unit_into(src: &[f32], dst: &mut [i8]) -> f32 {
     scale
 }
 
-/// The T2 semantic-novelty gate. One instance per stream; not `Sync`.
+/// Generic semantic-novelty gate. One instance per stream; not `Sync`.
 pub struct NoveltyGate {
     cfg: NoveltyConfig,
     ring: KeptRing,
     /// Reused quantisation scratch for the candidate under evaluation. Written
     /// and consumed within a single `evaluate` call; never read across calls.
     scratch_q: Vec<i8>,
-    // ---- telemetry ----
     evaluated: u64,
     dropped: u64,
     escalated: u64,
@@ -650,6 +632,73 @@ impl NoveltyGate {
         } else {
             self.admitted as f32 / self.evaluated as f32
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveNoveltyOutcome {
+    Reuse,
+    Run,
+    ForcedRefresh,
+}
+
+/// Production reuse policy shared by live capture and calibration.
+pub struct LiveNoveltyGate {
+    gate: NoveltyGate,
+    max_reuse_ms: u64,
+    max_cumulative_drift: f32,
+    last_commit_pts_ms: Option<u64>,
+    cumulative_drift: f32,
+}
+
+impl LiveNoveltyGate {
+    pub fn try_new(config: &LiveNoveltyConfig) -> Result<Self, NoveltyConfigError> {
+        let gate = NoveltyConfig {
+            w_text: 0.0,
+            w_embed: 1.0,
+            w_phash: 0.0,
+            tau_hi: (config.reuse_threshold + 1.0) * 0.5,
+            tau_lo: config.reuse_threshold,
+            window: 1,
+        };
+        Ok(Self {
+            gate: NoveltyGate::try_new(gate, EMBEDDING_DIM)?,
+            max_reuse_ms: config.max_reuse_ms,
+            max_cumulative_drift: config.max_cumulative_drift,
+            last_commit_pts_ms: None,
+            cumulative_drift: 0.0,
+        })
+    }
+
+    pub fn evaluate(
+        &mut self,
+        embedding: &[f32; EMBEDDING_DIM],
+        pts_ms: u64,
+    ) -> LiveNoveltyOutcome {
+        let (decision, breakdown) = self
+            .gate
+            .evaluate_detailed(&MinHashSig::empty(), embedding, 0);
+        if !matches!(decision, NoveltyDecision::Drop) {
+            return LiveNoveltyOutcome::Run;
+        }
+
+        self.cumulative_drift = (self.cumulative_drift + breakdown.fused).min(f32::MAX);
+        let refresh_due = self
+            .last_commit_pts_ms
+            .is_some_and(|last| pts_ms < last || pts_ms - last >= self.max_reuse_ms)
+            || self.cumulative_drift >= self.max_cumulative_drift;
+        if refresh_due {
+            LiveNoveltyOutcome::ForcedRefresh
+        } else {
+            LiveNoveltyOutcome::Reuse
+        }
+    }
+
+    /// Commit after the VLM returns a usable description.
+    pub fn commit(&mut self, embedding: &[f32; EMBEDDING_DIM], pts_ms: u64) {
+        self.gate.commit(&MinHashSig::empty(), embedding, 0);
+        self.last_commit_pts_ms = Some(pts_ms);
+        self.cumulative_drift = 0.0;
     }
 }
 

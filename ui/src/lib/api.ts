@@ -80,15 +80,23 @@ async function request<T>(
   return res.text() as unknown as Promise<T>
 }
 
+async function requestBlob(path: string): Promise<Blob> {
+  const auth = useAuthStore()
+  const res = await fetch(`${auth.apiEndpoint}${path}`, {
+    headers: { ...auth.defaultHeaders(), Accept: 'image/jpeg' },
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText)
+    throw new ApiError(res.status, text)
+  }
+  return res.blob()
+}
+
 // ------- Type definitions -------
 
 export interface CreateRunRequest {
-  source_uri: string
+  mode?: 'balanced' | 'detailed' | 'efficiency' | 'custom'
   model?: string
-  prompt?: string
-  semantic_inference?: boolean
-  fps?: number
-  chunk_size?: number
 }
 
 export interface RunResponse {
@@ -102,8 +110,8 @@ export interface RunResponse {
 }
 
 export interface ReasonRequest {
-  source_uri?: string
-  model?: string
+  source_uri: string
+  model: string
   prompt?: string
   semantic_inference?: boolean
   fps?: number
@@ -111,7 +119,23 @@ export interface ReasonRequest {
   firstPassModel?: string
   secondPassModel?: string
   semanticFramesPerChunk?: number
-  semantic_frames_per_chunk?: number
+}
+
+export interface ReasonResponse {
+  request_id: string
+  run_id: string
+  generated: number
+  markers_emitted: number
+  decoded_frames: number
+  sample_fps: number
+  lag_p95_ms: number
+  lag_p99_ms: number
+  tokens: {
+    prompt_tokens: number
+    completion_tokens: number
+    thinking_tokens: number
+    total_tokens: number
+  }
 }
 
 export interface ModelInfo {
@@ -170,8 +194,6 @@ export interface FeedbackListResponse {
 
 export interface HealthResponse {
   status: string
-  version: string
-  gpu: boolean
 }
 
 // ------- API methods -------
@@ -195,7 +217,7 @@ export const api = {
     create(data: CreateRunRequest): Promise<RunResponse> {
       return request<RunResponse>('POST', '/v1/runs', data)
     },
-    reason(runId: string, data: ReasonRequest): Promise<RunResponse> {
+    reason(runId: string, data: ReasonRequest): Promise<ReasonResponse> {
       // Map frontend-friendly names to backend field names.
       const body: Record<string, unknown> = {
         source_uri: data.source_uri,
@@ -209,7 +231,7 @@ export const api = {
       const semanticFramesPerChunk = validSemanticFramesPerChunk(
         data.semanticFramesPerChunk !== undefined
           ? data.semanticFramesPerChunk
-          : data.semantic_frames_per_chunk,
+          : undefined,
       )
       if (semanticFramesPerChunk !== undefined) {
         body.semantic_frames_per_chunk = semanticFramesPerChunk
@@ -218,7 +240,7 @@ export const api = {
         body.fixed_fps = data.fps
         body.sampling_policy = 'fixed'
       }
-      return request<RunResponse>('POST', `/v1/runs/${validateId(runId)}/reason`, body)
+      return request<ReasonResponse>('POST', `/v1/runs/${validateId(runId)}/reason`, body)
     },
     stop(runId: string): Promise<void> {
       return request<void>('POST', `/v1/runs/${validateId(runId)}/stop`)
@@ -234,6 +256,12 @@ export const api = {
     },
     events(runId: string): Promise<RunEventsResponse> {
       return request<RunEventsResponse>('GET', `/v1/runs/${validateId(runId)}/events`)
+    },
+    keyframe(runId: string, sha256: string): Promise<Blob> {
+      if (!/^[0-9a-fA-F]{64}$/.test(sha256)) throw new Error('Invalid keyframe SHA-256')
+      return requestBlob(
+        `/v1/runs/${validateId(runId)}/keyframes/${sha256.toLowerCase()}`,
+      )
     },
   },
 
@@ -286,6 +314,12 @@ export const api = {
     },
     whipTerminate(sessionId: string): Promise<void> {
       return request<void>('DELETE', `/v1/stream/whip/${validateId(sessionId)}`)
+    },
+    whipUpdatePrompt(
+      sessionId: string,
+      data: { prompt: string; output_schema?: Record<string, unknown> | null },
+    ): Promise<{ session_id: string; prompt: string; output_schema: Record<string, unknown> | null }> {
+      return request('PATCH', `/v1/stream/whip/${validateId(sessionId)}/prompt`, data)
     },
     uploadFile(file: File): Promise<{ file_path: string }> {
       const auth = useAuthStore()
