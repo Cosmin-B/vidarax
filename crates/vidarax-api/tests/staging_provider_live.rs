@@ -6,7 +6,7 @@ use reqwest::StatusCode;
 use serde_json::Value;
 use vidarax_api::{run, ServerConfig, TransportMode};
 use vidarax_core::gate::GateConfig;
-use vidarax_core::tiered_vlm::DistillationConfig;
+use vidarax_core::novelty::LiveNoveltyConfig;
 
 #[tokio::test]
 async fn staging_live_provider_e2e_opt_in() {
@@ -60,7 +60,7 @@ async fn staging_live_provider_e2e_opt_in() {
         webrtc_second_pass_max_tokens: 256,
         webrtc_crop: None,
         gate_config: GateConfig::default(),
-        distillation: DistillationConfig::default(),
+        novelty: LiveNoveltyConfig::default(),
     };
 
     let server_task = tokio::spawn(async move { run(config).await.map_err(|e| e.to_string()) });

@@ -16,6 +16,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 DEFAULT_API = os.environ.get("VIDARAX_API", "http://localhost:8080")
+DEFAULT_API_KEY = os.environ.get("VIDARAX_API_KEY", "")
 DEFAULT_GT = str(Path(__file__).parent / "wiki_ground_truth.json")
 DEFAULT_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 
@@ -242,15 +243,22 @@ PRESETS = {
 }
 
 
+def api_headers(content_type=False):
+    headers = {"Content-Type": "application/json"} if content_type else {}
+    if DEFAULT_API_KEY:
+        headers["x-api-key"] = DEFAULT_API_KEY
+    return headers
+
+
 def http_post(url, body, timeout=300):
     data = json.dumps(body).encode()
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(url, data=data, headers=api_headers(content_type=True))
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
 
 
 def http_get(url, timeout=30):
-    req = urllib.request.Request(url)
+    req = urllib.request.Request(url, headers=api_headers())
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
 

@@ -59,13 +59,12 @@ echo ""
 echo "--- Step 4: Run /reason (model=$MODEL, tiered: $FIRST_PASS → $SECOND_PASS) ---"
 start_ms=$(python3 -c "import time; print(int(time.time() * 1000))")
 
-# Include tiered fields in payload — ignored by current API, honoured once x12.3 lands.
+# Exercise the tiered provider path with the public /reason contract.
 reason_resp=$(curl -sS -X POST "$VIDARAX_API/v1/runs/$run_id/reason" \
     -H "Content-Type: application/json" \
     -d "{
         \"source_uri\": \"file:///tmp/vidarax-e2e-test.mp4\",
         \"model\": \"$MODEL\",
-        \"mode\": \"balanced\",
         \"semantic_inference\": true,
         \"semantic_frames_per_chunk\": 2,
         \"chunk_size\": 25,
@@ -113,7 +112,7 @@ else
     exit 1
 fi
 
-# --- Step 6: Check SpacetimeDB events ---
+# --- Step 6: Check the optional SpacetimeDB event mirror ---
 echo ""
 echo "--- Step 6: Check SpacetimeDB events ---"
 stdb_events=$(curl -sS --max-time 10 -X POST "$SPACETIMEDB_URL/v1/database/$SPACETIMEDB_DB/sql" \
@@ -121,10 +120,6 @@ stdb_events=$(curl -sS --max-time 10 -X POST "$SPACETIMEDB_URL/v1/database/$SPAC
     -d "SELECT COUNT(*) FROM agent_event" 2>&1) || stdb_events="WARN: query failed"
 echo "  SpacetimeDB events: $stdb_events"
 
-stdb_kf=$(curl -sS --max-time 10 -X POST "$SPACETIMEDB_URL/v1/database/$SPACETIMEDB_DB/sql" \
-    -H "Content-Type: text/plain" \
-    -d "SELECT COUNT(*) FROM keyframe_store" 2>&1) || stdb_kf="WARN: query failed"
-echo "  SpacetimeDB keyframes: $stdb_kf"
 echo ""
 
 # --- Summary ---

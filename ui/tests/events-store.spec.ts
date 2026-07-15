@@ -15,7 +15,8 @@ test('keyframe replay is idempotent and keeps the per-run index consistent', asy
       pts_ms: 1000,
       event_type: 'scene_cut',
       description: 'first',
-      jpeg_b64: 'aaa',
+      image_sha256: 'aaa',
+      image_url: 'blob:first',
       timestamp_ms: 100,
     }
 
@@ -24,7 +25,7 @@ test('keyframe replay is idempotent and keeps the per-run index consistent', asy
     const duplicateCount = store.keyframes.length
     const duplicateRunCount = store.keyframesForRun('run-replay').length
 
-    store.addKeyframe({ ...base, description: 'updated', jpeg_b64: 'bbb' })
+    store.addKeyframe({ ...base, description: 'updated', image_url: 'blob:updated' })
     const replaced = store.keyframesForRun('run-replay')[0]
 
     for (let id = 2; id <= MAX_KEYFRAMES + 1; id++) {
@@ -35,7 +36,8 @@ test('keyframe replay is idempotent and keeps the per-run index consistent', asy
         pts_ms: id * 100,
         event_type: 'scene_cut',
         description: `kf-${id}`,
-        jpeg_b64: `jpeg-${id}`,
+        image_sha256: `sha-${id}`,
+        image_url: `blob:${id}`,
         timestamp_ms: id * 1000,
       })
     }
@@ -45,7 +47,7 @@ test('keyframe replay is idempotent and keeps the per-run index consistent', asy
       duplicateCount,
       duplicateRunCount,
       replacedDescription: replaced?.description,
-      replacedJpeg: replaced?.jpeg_b64,
+      replacedImageUrl: replaced?.image_url,
       total: store.keyframes.length,
       runTotal: runKeyframes.length,
       firstId: runKeyframes[0]?.id,
@@ -57,7 +59,7 @@ test('keyframe replay is idempotent and keeps the per-run index consistent', asy
   expect(result.duplicateCount).toBe(1)
   expect(result.duplicateRunCount).toBe(1)
   expect(result.replacedDescription).toBe('updated')
-  expect(result.replacedJpeg).toBe('bbb')
+  expect(result.replacedImageUrl).toBe('blob:updated')
   expect(result.total).toBe(256)
   expect(result.runTotal).toBe(256)
   expect(result.firstId).toBe(2)
