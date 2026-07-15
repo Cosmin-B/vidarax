@@ -28,7 +28,8 @@ export interface KeyframeEntry {
   pts_ms: number
   event_type: string
   description: string
-  jpeg_b64: string
+  image_sha256: string
+  image_url: string
   timestamp_ms: number
 }
 
@@ -141,7 +142,7 @@ export const useEventsStore = defineStore('events', () => {
     return keyframeIdentityMatches(a, b)
       && a.event_type === b.event_type
       && a.description === b.description
-      && a.jpeg_b64 === b.jpeg_b64
+      && a.image_sha256 === b.image_sha256
       && a.timestamp_ms === b.timestamp_ms
   }
 
@@ -211,7 +212,11 @@ export const useEventsStore = defineStore('events', () => {
   function addKeyframe(kf: KeyframeEntry) {
     const existing = keyframes.value.find(keyframe => keyframeIdentityMatches(keyframe, kf))
     if (existing) {
-      if (keyframeContentMatches(existing, kf)) return
+      if (keyframeContentMatches(existing, kf)) {
+        URL.revokeObjectURL(kf.image_url)
+        return
+      }
+      URL.revokeObjectURL(existing.image_url)
       removeMatching(keyframes.value, keyframe => keyframeIdentityMatches(keyframe, kf))
       const indexed = keyframesByRunId.value.get(existing.run_id)
       if (indexed) {
@@ -233,6 +238,7 @@ export const useEventsStore = defineStore('events', () => {
     if (keyframes.value.length > MAX_KEYFRAMES) {
       const dropped = keyframes.value.splice(0, keyframes.value.length - MAX_KEYFRAMES)
       for (const keyframe of dropped) {
+        URL.revokeObjectURL(keyframe.image_url)
         const indexed = keyframesByRunId.value.get(keyframe.run_id)
         if (indexed) {
           removeByIdentity(indexed, keyframe)
@@ -259,6 +265,9 @@ export const useEventsStore = defineStore('events', () => {
     events.value = events.value.filter(e => e.run_id !== runId)
     latestEventsIndex.value = latestEventsIndex.value.filter(e => e.run_id !== runId)
     eventsByRunId.value.delete(runId)
+    for (const keyframe of keyframes.value) {
+      if (keyframe.run_id === runId) URL.revokeObjectURL(keyframe.image_url)
+    }
     keyframes.value = keyframes.value.filter(k => k.run_id !== runId)
     keyframesByRunId.value.delete(runId)
     touchEvents()
@@ -266,6 +275,7 @@ export const useEventsStore = defineStore('events', () => {
   }
 
   function clearAll() {
+    for (const keyframe of keyframes.value) URL.revokeObjectURL(keyframe.image_url)
     events.value = []
     keyframes.value = []
     eventsByRunId.value = markRaw(new Map())

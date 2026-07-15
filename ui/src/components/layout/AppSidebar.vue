@@ -91,7 +91,7 @@ const spacetimeConnected = computed(() => eventsStore.isConnected)
         v-for="item in navItems"
         :key="item.name"
         :to="item.path"
-        class="group flex items-center gap-3 px-2 py-2.5 rounded-[8px] transition-all duration-200 relative"
+        class="group flex min-h-11 items-center gap-3 px-2 py-2.5 rounded-[8px] transition-all duration-200 relative"
         :class="isActive(item)
           ? 'bg-[rgba(45,212,191,0.08)] text-[#2dd4bf]'
           : 'text-[#64748b] hover:text-[#94a3b8] hover:bg-[rgba(255,255,255,0.03)]'"
@@ -164,7 +164,7 @@ const spacetimeConnected = computed(() => eventsStore.isConnected)
       v-for="item in navItems"
       :key="item.name"
       :to="item.path"
-      class="flex flex-col items-center gap-0.5 px-4 py-2 rounded-lg transition-all duration-200"
+      class="flex min-h-11 flex-col items-center justify-center gap-0.5 px-4 py-2 rounded-lg transition-all duration-200"
       :class="isActive(item) ? 'text-[#2dd4bf]' : 'text-[#475569]'"
       :aria-current="isActive(item) ? 'page' : undefined"
     >

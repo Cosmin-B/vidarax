@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
+use vidarax_core::metrics::PipelineMetrics;
 use vidarax_core::provider::{InferenceObserver, ProviderKind, TokenUsage};
 
 const LATENCY_BUCKETS_MS: [u64; 10] = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
@@ -176,6 +178,47 @@ impl InferenceObserver for InferenceMetrics {
 
     fn record_error(&self, provider: ProviderKind, latency_ms: u64) {
         InferenceMetrics::record_error(self, provider, latency_ms)
+    }
+}
+
+/// Records provider detail and the provider-agnostic pipeline totals from the
+/// same inference outcome. The recorded-file reasoning path uses this observer
+/// so its VLM stage is visible in the same dashboard as live WHIP traffic.
+pub struct PipelineInferenceObserver {
+    inference: Arc<InferenceMetrics>,
+    pipeline: Arc<PipelineMetrics>,
+}
+
+impl PipelineInferenceObserver {
+    pub fn new(inference: Arc<InferenceMetrics>, pipeline: Arc<PipelineMetrics>) -> Self {
+        Self {
+            inference,
+            pipeline,
+        }
+    }
+
+    fn record_pipeline_outcome(&self, latency_ms: u64) {
+        self.pipeline.inc_vlm_inferences();
+        self.pipeline.vlm_latency_ms.record(latency_ms);
+    }
+}
+
+impl InferenceObserver for PipelineInferenceObserver {
+    fn record_success(
+        &self,
+        provider: ProviderKind,
+        latency_ms: u64,
+        fallback_used: bool,
+        usage: TokenUsage,
+    ) {
+        self.inference
+            .record_success(provider, latency_ms, fallback_used, usage);
+        self.record_pipeline_outcome(latency_ms);
+    }
+
+    fn record_error(&self, provider: ProviderKind, latency_ms: u64) {
+        self.inference.record_error(provider, latency_ms);
+        self.record_pipeline_outcome(latency_ms);
     }
 }
 

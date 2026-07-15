@@ -47,8 +47,8 @@ export class VidaraxError extends Error {
  * Raised when the server returns a non-2xx HTTP status.
  *
  * The full structured error body is attached as `apiError` when the server
- * returned a JSON `{ "error": … }` envelope (which is always the case for
- * 4xx / 5xx responses from the Vidarax API).
+ * returned a JSON `{ "error": … }` envelope. WHIP, file-serving, malformed
+ * body, and unknown-route failures may instead have a plain response body.
  */
 export class HttpError extends VidaraxError {
   readonly status: number;

@@ -14,9 +14,13 @@ const passRatePct = computed(() =>
   (props.metrics.gatePassRate * 100).toFixed(1)
 )
 
-const vlmQueueFill = computed(() =>
-  Math.min(100, (props.metrics.vlmQueueDepth / 16) * 100)
-)
+const noveltyReusePct = computed(() => props.metrics.noveltyReuseRatio * 100)
+
+const blobSuccessPct = computed(() => {
+  const successes = props.metrics.keyframeBlobsWrittenTotal + props.metrics.keyframeBlobsReusedTotal
+  const attempts = successes + props.metrics.keyframeBlobFailuresTotal
+  return attempts > 0 ? (successes / attempts) * 100 : 0
+})
 
 const decodeLatencyColor = computed(() => {
   const ms = props.metrics.decodeLatencyMs
@@ -32,18 +36,22 @@ const vlmLatencyColor = computed(() => {
   return '#f59e0b'  // amber is the "data number" color for VLM
 })
 
-function fmt(n: number, decimals = 1): string {
-  return n.toFixed(decimals)
-}
-
 function fmtInt(n: number): string {
   return Math.floor(n).toLocaleString()
 }
 
 function formatLatency(ms: number): string {
+  if (ms === 0) return '—'
   if (ms >= 1000) return `${(ms / 1000).toFixed(2)}s`
   if (ms >= 1)    return `${ms.toFixed(1)}ms`
   return `${(ms * 1000).toFixed(0)}µs`
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${fmtInt(bytes)} B`
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`
+  return `${(bytes / 1024 ** 3).toFixed(2)} GiB`
 }
 
 /** Shorthand formatter for histogram percentile rows. */
@@ -65,25 +73,22 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
                         animation="glow-teal" class="text-[#2dd4bf]" />
         </div>
         <h4 class="text-[#94a3b8] text-xs font-medium uppercase tracking-wider">Decode</h4>
-        <span class="badge badge-teal ml-auto text-[9px]">GPU</span>
+        <span class="badge badge-teal ml-auto text-[9px]">MEASURED</span>
       </div>
 
       <!-- Primary metric -->
       <div>
-        <div class="text-[#475569] text-[10px] uppercase tracking-wider mb-1">Throughput</div>
+        <div class="text-[#475569] text-[10px] uppercase tracking-wider mb-1">Mean latency</div>
         <div class="mono text-3xl font-semibold" :style="{ color: decodeLatencyColor }">
-          {{ fmt(metrics.decodeFps) }}
-          <span class="text-sm font-normal text-[#475569]">fps</span>
+          {{ formatLatency(metrics.decodeLatencyMs) }}
         </div>
       </div>
 
       <!-- Secondary rows -->
       <div class="space-y-2 border-t border-[#1e2633] pt-3">
         <div class="flex items-center justify-between">
-          <span class="text-[#475569] text-xs">Mean latency</span>
-          <span class="mono text-xs" :style="{ color: decodeLatencyColor }">
-            {{ formatLatency(metrics.decodeLatencyMs) }}
-          </span>
+          <span class="text-[#475569] text-xs">Dropped frames</span>
+          <span class="mono text-[#f59e0b] text-xs">{{ fmtInt(metrics.droppedFramesTotal) }}</span>
         </div>
         <div class="flex items-center justify-between">
           <span class="text-[#475569] text-xs">Total frames</span>
@@ -174,8 +179,12 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
           <span class="mono text-[#f59e0b] text-xs">{{ fmtInt(metrics.gateKeyframesTotal) }}</span>
         </div>
         <div class="flex items-center justify-between">
-          <span class="text-[#475569] text-xs">Scene cuts</span>
-          <span class="mono text-[#f59e0b] text-xs">{{ fmtInt(metrics.sceneCuts) }}</span>
+          <span class="text-[#475569] text-xs">Dropped keyframes</span>
+          <span class="mono text-[#f59e0b] text-xs">{{ fmtInt(metrics.keyframesDroppedTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Loops detected</span>
+          <span class="mono text-[#f59e0b] text-xs">{{ fmtInt(metrics.loopDetectedTotal) }}</span>
         </div>
       </div>
 
@@ -251,15 +260,22 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
           <span class="mono text-[#f59e0b] text-xs">{{ fmtInt(metrics.vlmInferencesTotal) }}</span>
         </div>
         <div class="flex items-center justify-between">
-          <span class="text-[#475569] text-xs">Queue depth</span>
-          <span class="mono text-xs"
-                :class="metrics.vlmQueueDepth > 8 ? 'text-[#ef4444]' : metrics.vlmQueueDepth > 4 ? 'text-[#f59e0b]' : 'text-[#22c55e]'">
-            {{ metrics.vlmQueueDepth }} / 16
-          </span>
+          <span class="text-[#475569] text-xs">Novelty evaluated</span>
+          <span class="mono text-[#22c55e] text-xs">{{ fmtInt(metrics.noveltyEvaluatedTotal) }}</span>
         </div>
         <div class="flex items-center justify-between">
-          <span class="text-[#475569] text-xs">Workers</span>
-          <span class="mono text-[#22c55e] text-xs">4 active</span>
+          <span class="text-[#475569] text-xs">Descriptions reused</span>
+          <span class="mono text-[#22c55e] text-xs">{{ fmtInt(metrics.noveltyReusedTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Forced refreshes</span>
+          <span class="mono text-[#22c55e] text-xs">{{ fmtInt(metrics.noveltyForcedRefreshTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Embedding unavailable</span>
+          <span class="mono text-xs" :class="metrics.noveltyEmbeddingUnavailableTotal ? 'text-[#f59e0b]' : 'text-[#22c55e]'">
+            {{ fmtInt(metrics.noveltyEmbeddingUnavailableTotal) }}
+          </span>
         </div>
       </div>
 
@@ -289,26 +305,26 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
         </div>
       </div>
 
-      <!-- Queue depth bar -->
+      <!-- Semantic reuse bar -->
       <div>
         <div class="flex justify-between text-[10px] text-[#475569] mb-1">
-          <span>Queue utilization</span>
-          <span class="mono">{{ metrics.vlmQueueDepth }}/16</span>
+          <span>Semantic reuse</span>
+          <span class="mono">{{ noveltyReusePct.toFixed(1) }}%</span>
         </div>
         <div class="h-1 rounded-full" style="background: #1e2633;">
           <div
             class="h-full rounded-full transition-all duration-500"
             :style="{
-              width: `${vlmQueueFill}%`,
-              background: vlmQueueFill > 75 ? '#ef4444' : vlmQueueFill > 50 ? '#f59e0b' : '#22c55e',
-              boxShadow: `0 0 8px ${vlmQueueFill > 75 ? 'rgba(239,68,68,0.4)' : 'rgba(34,197,94,0.3)'}`,
+              width: `${Math.min(100, noveltyReusePct)}%`,
+              background: '#22c55e',
+              boxShadow: '0 0 8px rgba(34,197,94,0.3)',
             }"
           />
         </div>
       </div>
     </div>
 
-    <!-- Card 4: SpacetimeDB -->
+    <!-- Card 4: durable binary keyframe sidecar -->
     <div class="card-skeuo p-5 flex flex-col gap-4">
       <div class="flex items-center gap-2">
         <div class="w-7 h-7 rounded-lg flex items-center justify-center"
@@ -316,72 +332,73 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
           <AnimatedIcon :icon="Database" :size="14" :stroke-width="1.75"
                         class="text-[#2dd4bf]" />
         </div>
-        <h4 class="text-[#94a3b8] text-xs font-medium uppercase tracking-wider">SpacetimeDB</h4>
-        <span class="badge badge-teal ml-auto text-[9px]">LIVE</span>
+        <h4 class="text-[#94a3b8] text-xs font-medium uppercase tracking-wider">Keyframe sidecar</h4>
+        <span class="badge badge-teal ml-auto text-[9px]">BINARY</span>
       </div>
 
       <!-- Primary metric -->
       <div>
-        <div class="text-[#475569] text-[10px] uppercase tracking-wider mb-1">Emit Rate</div>
+        <div class="text-[#475569] text-[10px] uppercase tracking-wider mb-1">Bytes stored</div>
         <div class="mono text-3xl font-semibold text-[#2dd4bf]">
-          {{ fmt(metrics.spacetimeEmitRate) }}
-          <span class="text-sm font-normal text-[#475569]">evt/s</span>
+          {{ formatBytes(metrics.keyframeBlobBytesTotal) }}
         </div>
       </div>
 
       <!-- Stats -->
       <div class="space-y-2 border-t border-[#1e2633] pt-3">
         <div class="flex items-center justify-between">
-          <span class="text-[#475569] text-xs">Total events</span>
-          <span class="mono text-[#f59e0b] text-xs">{{ fmtInt(metrics.spacetimeEventsTotal) }}</span>
+          <span class="text-[#475569] text-xs">Blobs written</span>
+          <span class="mono text-[#f59e0b] text-xs">{{ fmtInt(metrics.keyframeBlobsWrittenTotal) }}</span>
         </div>
         <div class="flex items-center justify-between">
-          <span class="text-[#475569] text-xs">Connection</span>
-          <span class="mono text-[#2dd4bf] text-xs">STABLE</span>
+          <span class="text-[#475569] text-xs">Content-addressed reuse</span>
+          <span class="mono text-[#2dd4bf] text-xs">{{ fmtInt(metrics.keyframeBlobsReusedTotal) }}</span>
         </div>
         <div class="flex items-center justify-between">
-          <span class="text-[#475569] text-xs">Table</span>
-          <span class="mono text-[#475569] text-xs">agent_events</span>
+          <span class="text-[#475569] text-xs">Write failures</span>
+          <span class="mono text-xs" :class="metrics.keyframeBlobFailuresTotal ? 'text-[#ef4444]' : 'text-[#2dd4bf]'">
+            {{ fmtInt(metrics.keyframeBlobFailuresTotal) }}
+          </span>
         </div>
       </div>
 
       <!-- Percentile rows (real histogram data) -->
       <div
-        v-if="metrics.histograms['SpacetimeDB']"
+        v-if="metrics.histograms['Keyframe store']"
         class="space-y-1.5 border-t border-[#1e2633] pt-3"
       >
-        <div class="text-[#2d3748] text-[10px] uppercase tracking-wider mb-1">Emit latency</div>
+        <div class="text-[#2d3748] text-[10px] uppercase tracking-wider mb-1">Write latency</div>
         <div class="flex items-center justify-between">
           <span class="text-[#475569] text-[11px]">p50</span>
           <span class="mono text-[11px] text-[#2dd4bf]">
-            {{ fmtPct(metrics.histograms['SpacetimeDB'], 'p50') }}
+            {{ fmtPct(metrics.histograms['Keyframe store'], 'p50') }}
           </span>
         </div>
         <div class="flex items-center justify-between">
           <span class="text-[#475569] text-[11px]">p95</span>
           <span class="mono text-[11px] text-[#2dd4bf]">
-            {{ fmtPct(metrics.histograms['SpacetimeDB'], 'p95') }}
+            {{ fmtPct(metrics.histograms['Keyframe store'], 'p95') }}
           </span>
         </div>
         <div class="flex items-center justify-between">
           <span class="text-[#475569] text-[11px]">p99</span>
           <span class="mono text-[11px] text-[#2dd4bf]">
-            {{ fmtPct(metrics.histograms['SpacetimeDB'], 'p99') }}
+            {{ fmtPct(metrics.histograms['Keyframe store'], 'p99') }}
           </span>
         </div>
       </div>
 
-      <!-- Emit rate bar -->
+      <!-- Sidecar success bar -->
       <div>
         <div class="flex justify-between text-[10px] text-[#475569] mb-1">
-          <span>Event throughput</span>
-          <span class="mono text-[#2dd4bf]">{{ fmt(metrics.spacetimeEmitRate) }}/s</span>
+          <span>Write success</span>
+          <span class="mono text-[#2dd4bf]">{{ blobSuccessPct.toFixed(1) }}%</span>
         </div>
         <div class="h-1 rounded-full" style="background: #1e2633;">
           <div
             class="h-full rounded-full transition-all duration-500 progress-bar-active"
             :style="{
-              width: `${Math.min(100, (metrics.spacetimeEmitRate / 10) * 100)}%`,
+              width: `${Math.min(100, blobSuccessPct)}%`,
               background: 'linear-gradient(90deg, #0d9488, #2dd4bf)',
               boxShadow: '0 0 8px rgba(45,212,191,0.35)',
             }"

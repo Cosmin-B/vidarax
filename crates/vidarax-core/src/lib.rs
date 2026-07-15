@@ -8,6 +8,7 @@
 pub mod backends;
 pub mod crop;
 pub mod dedup;
+pub mod embedding_sidecar;
 pub mod gate;
 pub mod gemini;
 pub mod ingest;
@@ -19,8 +20,6 @@ pub mod provider;
 pub mod semantic_merge;
 pub mod tiered_vlm;
 pub mod timeline;
-#[cfg(feature = "training")]
-pub mod training_data;
 pub mod webrtc;
 
 #[cfg(test)]

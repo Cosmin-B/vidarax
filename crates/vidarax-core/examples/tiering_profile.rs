@@ -33,14 +33,6 @@
 //!     local-only, `vlm_tiered`/`clip_vlm_tiered` as escalated. A WAL with
 //!     only clip-mode events (no `vlm`/`vlm_tiered`) still produces a
 //!     non-empty funnel.
-//!   - "tier1_knn_hit" is NOT a WAL event kind. The only place that string
-//!     appears in the codebase is inside a
-//!     `tracing::info!(..., "tier1_knn_hit: skipping vlm inference")` call in
-//!     workers.rs, gated behind `#[cfg(feature = "training")]`. That call
-//!     never touches `event_tx` or the WAL writer, so a KNN cache hit
-//!     produces a log line and nothing else durable. This tool does not
-//!     invent a WAL count for it: cache hits are reported below as
-//!     "not in WAL".
 //!   - The Prometheus metric names come straight from `render_prometheus` in
 //!     crates/vidarax-api/src/inference_metrics.rs (not a markdown list, just
 //!     the four exact metric names, one per line, for grep-ability):
@@ -167,7 +159,6 @@ fn print_funnel_row(label: &str, funnel: &RunFunnel) {
 fn print_wal_funnel(path: &Path, events: &[TimelineEvent]) {
     println!("=== WAL funnel: {} ===", path.display());
     println!("  events read (all kinds): {}", events.len());
-    println!("  cache hits (tier1_knn_hit): not in WAL -- log-only, see module doc comment");
 
     let (overall, per_run) = compute_funnel(events);
     if overall.inferred() == 0 {

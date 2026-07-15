@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use vidarax_core::crop::CropRegion;
 use vidarax_core::gate::GateConfig;
-use vidarax_core::tiered_vlm::{DistillationConfig, TieredVlmConfig};
+use vidarax_core::novelty::LiveNoveltyConfig;
+use vidarax_core::tiered_vlm::TieredVlmConfig;
 
 pub(crate) const UPLOAD_DIR_NAME: &str = "vidarax-uploads";
 
@@ -107,9 +108,7 @@ pub struct ServerConfig {
     pub webrtc_turn_username: Option<String>,
     /// TURN credential (`VIDARAX_WEBRTC_TURN_CREDENTIAL`).
     pub webrtc_turn_credential: Option<String>,
-    /// Optional SpacetimeDB base URL (`VIDARAX_SPACETIMEDB_URL`). When set, the
-    /// feedback endpoints and the WHIP event sink use SpacetimeDB; when unset,
-    /// stream events use the local WAL and the feedback endpoints are disabled.
+    /// Optional SpacetimeDB mirror and feedback endpoint.
     pub spacetimedb_url: Option<String>,
     /// SpacetimeDB database/module name (`VIDARAX_SPACETIMEDB_MODULE`). Only
     /// used when `spacetimedb_url` is set; defaults to "vidarax".
@@ -140,7 +139,7 @@ pub struct ServerConfig {
     /// whole frame.
     pub webrtc_crop: Option<CropRegion>,
     pub gate_config: GateConfig,
-    pub distillation: DistillationConfig,
+    pub novelty: LiveNoveltyConfig,
 }
 
 impl ServerConfig {
@@ -218,7 +217,7 @@ impl ServerConfig {
         ) = parse_webrtc_vlm_tiering()?;
         let webrtc_crop = parse_crop_env("VIDARAX_WEBRTC_CROP")?;
         let gate_config = parse_gate_config()?;
-        let distillation = parse_distillation_config()?;
+        let novelty = parse_live_novelty_config()?;
         Ok(Self {
             bind_addr,
             h3_bind_addr,
@@ -256,7 +255,7 @@ impl ServerConfig {
             webrtc_second_pass_max_tokens,
             webrtc_crop,
             gate_config,
-            distillation,
+            novelty,
         })
     }
 }
@@ -440,27 +439,67 @@ fn parse_u32_env_with_default(var: &str, default: u32) -> Result<u32, String> {
     }
 }
 
-fn parse_distillation_config() -> Result<DistillationConfig, String> {
-    let enabled = parse_bool_env("VIDARAX_DISTILL_ENABLED", false)?;
-    let embedding_server_url = env::var("VIDARAX_DISTILL_EMBEDDING_URL").ok();
-    let teacher_model = env::var("VIDARAX_DISTILL_TEACHER_MODEL")
-        .unwrap_or_else(|_| "Qwen/Qwen3-VL-8B-Instruct".to_string());
-    let max_pairs_per_tenant =
-        parse_usize_env("VIDARAX_DISTILL_MAX_PAIRS", 10_000)?.clamp(100, 1_000_000);
-    let collection_rate = parse_f32_env("VIDARAX_DISTILL_COLLECTION_RATE", 0.1)?.clamp(0.0, 1.0);
-    let distance_threshold =
-        parse_f32_env("VIDARAX_DISTILL_DISTANCE_THRESHOLD", 0.2)?.clamp(0.0, 2.0);
-    let knn_k = parse_usize_env("VIDARAX_DISTILL_KNN_K", 7)?.clamp(1, 100);
+fn parse_live_novelty_config() -> Result<LiveNoveltyConfig, String> {
+    let mut novelty = LiveNoveltyConfig::default();
+    novelty.embedding_sidecar_addr =
+        parse_embedding_sidecar_addr("VIDARAX_NOVELTY_EMBEDDING_ADDR", None)?;
+    novelty.max_reuse_ms =
+        parse_u64_env_with_default("VIDARAX_NOVELTY_MAX_REUSE_MS", novelty.max_reuse_ms)?;
+    novelty.max_cumulative_drift = parse_f32_env(
+        "VIDARAX_NOVELTY_MAX_CUMULATIVE_DRIFT",
+        novelty.max_cumulative_drift,
+    )?;
+    if !novelty.max_cumulative_drift.is_finite() || novelty.max_cumulative_drift <= 0.0 {
+        return Err(
+            "VIDARAX_NOVELTY_MAX_CUMULATIVE_DRIFT must be finite and greater than zero".to_string(),
+        );
+    }
+    novelty.shadow_sample_rate = parse_f32_env(
+        "VIDARAX_NOVELTY_SHADOW_SAMPLE_RATE",
+        novelty.shadow_sample_rate,
+    )?;
+    if !novelty.shadow_sample_rate.is_finite() || !(0.0..=1.0).contains(&novelty.shadow_sample_rate)
+    {
+        return Err("VIDARAX_NOVELTY_SHADOW_SAMPLE_RATE must be finite and in [0, 1]".to_string());
+    }
+    novelty.embedding_timeout_ms = parse_u64_env_with_default(
+        "VIDARAX_NOVELTY_EMBEDDING_TIMEOUT_MS",
+        novelty.embedding_timeout_ms,
+    )?;
+    if novelty.embedding_timeout_ms == 0 {
+        return Err("VIDARAX_NOVELTY_EMBEDDING_TIMEOUT_MS must be greater than zero".to_string());
+    }
+    let reuse_threshold =
+        parse_f32_env("VIDARAX_NOVELTY_REUSE_THRESHOLD", novelty.reuse_threshold)?;
+    if !reuse_threshold.is_finite() || !(0.0..1.0).contains(&reuse_threshold) {
+        return Err("VIDARAX_NOVELTY_REUSE_THRESHOLD must be finite and in [0, 1)".to_string());
+    }
+    novelty.reuse_threshold = reuse_threshold;
 
-    Ok(DistillationConfig {
-        enabled,
-        embedding_server_url,
-        teacher_model: Arc::from(teacher_model),
-        max_pairs_per_tenant,
-        collection_rate,
-        distance_threshold,
-        knn_k,
-    })
+    Ok(novelty)
+}
+
+fn parse_embedding_sidecar_addr(
+    primary: &str,
+    legacy: Option<&str>,
+) -> Result<Option<String>, String> {
+    let value = env::var(primary)
+        .ok()
+        .map(|value| (primary, value))
+        .or_else(|| legacy.and_then(|name| env::var(name).ok().map(|value| (name, value))));
+    let Some((source, address)) = value else {
+        return Ok(None);
+    };
+    let address = address.trim().trim_end_matches('/').to_string();
+    if address.is_empty() {
+        return Ok(None);
+    }
+    if address.starts_with("http://") || address.starts_with("https://") {
+        return Err(format!(
+            "{source} must use host:port or tcp://host:port, not HTTP"
+        ));
+    }
+    Ok(Some(address))
 }
 
 /// Parse the WHIP VLM tiering knobs from environment variables. This is the
@@ -832,7 +871,7 @@ mod tests {
             webrtc_second_pass_max_tokens: 256,
             webrtc_crop: None,
             gate_config: GateConfig::default(),
-            distillation: DistillationConfig::default(),
+            novelty: vidarax_core::novelty::LiveNoveltyConfig::default(),
         };
 
         assert_eq!(
@@ -890,7 +929,7 @@ mod tests {
             webrtc_second_pass_max_tokens: 256,
             webrtc_crop: None,
             gate_config: GateConfig::default(),
-            distillation: DistillationConfig::default(),
+            novelty: vidarax_core::novelty::LiveNoveltyConfig::default(),
         };
 
         assert!(cfg.webrtc_turn_url.is_none(), "turn_url should be None");
@@ -1158,7 +1197,7 @@ mod tests {
             webrtc_second_pass_max_tokens: 256,
             webrtc_crop: None,
             gate_config: GateConfig::default(),
-            distillation: DistillationConfig::default(),
+            novelty: vidarax_core::novelty::LiveNoveltyConfig::default(),
         }
     }
 }

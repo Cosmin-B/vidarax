@@ -4,9 +4,9 @@
  * ```typescript
  * import { Vidarax } from 'vidarax'
  *
- * const v = new Vidarax('http://localhost:8080')
- * const result = await v.analyze('video.mp4', { mode: 'balanced' })
- * for await (const event of result.events()) {
+ * const v = new Vidarax('http://localhost:8080', { apiKey: 'dev-key' })
+ * const result = await v.analyze('/srv/vidarax-media/video.mp4', { mode: 'balanced' })
+ * for (const event of await v.getEvents(result.runId)) {
  *   console.log(event.kind, event.payload)
  * }
  * ```
@@ -39,6 +39,7 @@ export type {
   EpochMs,
   IsoTimestamp,
   SamplingPolicy,
+  CropRegion,
   RunStatus,
   ModelTier,
   ProgressCallback,
@@ -87,6 +88,7 @@ export type {
   // Realtime reason
   RealtimeReasonRequest,
   RealtimeReasonResponse,
+  TokenMetrics,
 
   // Inference
   InferRequest,
@@ -94,6 +96,7 @@ export type {
   InferBatchRequest,
   InferBatchResponse,
   InferBatchItemResult,
+  TokenUsage,
 
   // Models
   Model,
@@ -108,6 +111,8 @@ export type {
   // Query
   QueryRequest,
   QueryResponse,
+  Interaction,
+  InteractionsResponse,
 
   // Feedback
   FeedbackRequest,
@@ -117,6 +122,8 @@ export type {
   // WHIP
   AttachStreamRequest,
   WhipSession,
+  WhipPromptUpdateRequest,
+  WhipPromptUpdateResponse,
 
   // Search
   SearchHit,

@@ -1,0 +1,17 @@
+{
+  "name": "vidarax-docs",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview"
+  },
+  "dependencies": {
+    "@astrojs/markdoc": "^2.0.3",
+    "@astrojs/starlight": "^0.41.3",
+    "@astrojs/starlight-markdoc": "^0.7.0",
+    "astro": "^7.0.7"
+  }
+}

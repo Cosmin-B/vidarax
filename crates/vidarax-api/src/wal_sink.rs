@@ -1,122 +1,136 @@
 //! WAL-backed [`EventSink`] implementation.
 //!
-//! [`WalEventSink`] bridges the worker-thread [`EventSink`] trait into the
-//! REST API's WAL/timeline store so that streaming VLM results emitted by
-//! the real-time pipeline appear in `GET /v1/runs/{id}/events` without any
-//! SpacetimeDB dependency.
-//!
-//! # Thread safety
-//!
-//! [`WalEventSink`] is `Send + Sync`.  All mutable state lives inside
-//! [`AppState`] which uses lock-free atomics for the sequence counter and an
-//! `ArcSwap`-guarded registry — both are safe to access from multiple worker
-//! threads simultaneously.
-//!
-//! # Event kinds written to the WAL
-//!
-//! | EventSink method     | WAL `kind`        | Payload fields                                    |
-//! |----------------------|-------------------|---------------------------------------------------|
-//! | `emit_event_sync`    | `<event_type>`    | `session_id`, `frame_index`, `pts_ms`, `confidence`, `description` |
-//! | `store_keyframe_sync`| `keyframe_stored` | `frame_index`, `pts_ms`, `event_type`, `description` |
-//!
-//! JPEG bytes are intentionally not stored in the WAL (the WAL is
-//! a plain-text append log).  A future improvement could write the JPEG to a
-//! side-car object store and record the URI in the payload.
-//!
-//! # Example
-//!
-//! ```no_run
-//! use std::sync::Arc;
-//! use vidarax_api::wal_sink::WalEventSink;
-//! use vidarax_api::AppState;
-//! use vidarax_core::webrtc::workers::EventSink;
-//!
-//! # fn example(state: AppState) {
-//! let sink: Arc<dyn EventSink> = Arc::new(WalEventSink::new(state, "run-abc123".to_string()));
-//! # }
-//! ```
+//! Events go to the local WAL. Keyframe JPEGs are written first to a
+//! content-addressed blob directory and referenced from event metadata.
 
+use std::fmt::Write as _;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use vidarax_core::webrtc::workers::EventSink;
 
+use crate::spacetime_client::{EmitEventArgs, SpacetimeClient};
 use crate::state::AppState;
 
-// ── WalEventSink ──────────────────────────────────────────────────────────────
-
-/// An [`EventSink`] that persists events to the run's WAL timeline.
-///
-/// Construct one per WebRTC session and pass `Arc<WalEventSink>` (upcast to
-/// `Arc<dyn EventSink>`) to the worker spawn functions.
-///
-/// All methods are synchronous and call [`AppState::append_run_event`], which
-/// is safe to call from `std::thread` workers (no async runtime required).
+/// Synchronous sink for worker threads.
 pub struct WalEventSink {
-    /// Shared application state — holds the WAL path, event sequence counter,
-    /// and the in-memory run registry.
     state: AppState,
-    /// The run ID this sink is scoped to.  Stored here so the sink can be
-    /// constructed once and reused across many worker threads without
-    /// re-allocating the string on every call.
-    run_id: String,
+    keyframe_blob_root: PathBuf,
+    spacetime_event_mirror: Option<SpacetimeClient>,
 }
 
 impl WalEventSink {
-    /// Create a new sink bound to `run_id`.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use vidarax_api::wal_sink::WalEventSink;
-    /// use vidarax_api::AppState;
-    ///
-    /// # fn example(state: AppState) {
-    /// let sink = WalEventSink::new(state, "run-abc123".to_string());
-    /// # }
-    /// ```
-    pub fn new(state: AppState, run_id: String) -> Self {
-        Self { state, run_id }
+    pub fn new(state: AppState) -> Self {
+        let keyframe_blob_root = state.keyframe_blob_root();
+        let spacetime_event_mirror = state.spacetime_client().cloned();
+        Self {
+            state,
+            keyframe_blob_root,
+            spacetime_event_mirror,
+        }
     }
 
-    /// Convenience constructor that wraps `self` in an `Arc<dyn EventSink>`.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use std::sync::Arc;
-    /// use vidarax_core::webrtc::workers::EventSink;
-    /// use vidarax_api::wal_sink::WalEventSink;
-    /// use vidarax_api::AppState;
-    ///
-    /// # fn example(state: AppState) {
-    /// let sink: Arc<dyn EventSink> = WalEventSink::arc(state, "run-abc123".to_string());
-    /// # }
-    /// ```
-    pub fn arc(state: AppState, run_id: String) -> Arc<dyn EventSink> {
-        Arc::new(Self::new(state, run_id))
+    pub fn arc(state: AppState) -> Arc<dyn EventSink> {
+        Arc::new(Self::new(state))
     }
 
-    /// The run ID this sink is bound to.
-    pub fn run_id(&self) -> &str {
-        &self.run_id
+    fn persist_keyframe_blob(&self, jpeg_data: &[u8]) -> Result<KeyframeBlob, String> {
+        let digest = Sha256::digest(jpeg_data);
+        let mut sha256 = String::with_capacity(64);
+        for byte in digest {
+            let _ = write!(sha256, "{byte:02x}");
+        }
+        let shard = &sha256[..2];
+        let directory = self.keyframe_blob_root.join(shard);
+        std::fs::create_dir_all(&directory).map_err(|err| {
+            format!(
+                "create keyframe sidecar directory {}: {err}",
+                directory.display()
+            )
+        })?;
+        let final_path = directory.join(format!("{sha256}.jpg"));
+        let created = if final_path.exists() {
+            false
+        } else {
+            write_blob_atomically(&final_path, jpeg_data)?
+        };
+        Ok(KeyframeBlob {
+            image_ref: format!("keyframes/blobs/{shard}/{sha256}.jpg"),
+            sha256,
+            bytes: jpeg_data.len(),
+            created,
+        })
     }
 }
 
-// ── EventSink impl ────────────────────────────────────────────────────────────
+struct KeyframeBlob {
+    image_ref: String,
+    sha256: String,
+    bytes: usize,
+    created: bool,
+}
+
+static NEXT_BLOB_TEMP: AtomicU64 = AtomicU64::new(0);
+
+fn write_blob_atomically(final_path: &Path, data: &[u8]) -> Result<bool, String> {
+    let sequence = NEXT_BLOB_TEMP.fetch_add(1, Ordering::Relaxed);
+    let file_name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid keyframe sidecar path {}", final_path.display()))?;
+    let temp_path = final_path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    let result = (|| -> Result<bool, String> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        apply_blob_permissions(&mut options);
+        let mut file = options
+            .open(&temp_path)
+            .map_err(|err| format!("create keyframe sidecar {}: {err}", temp_path.display()))?;
+        file.write_all(data)
+            .map_err(|err| format!("write keyframe sidecar {}: {err}", temp_path.display()))?;
+        // Match the WAL policy: flush, but do not fsync each keyframe.
+        file.flush()
+            .map_err(|err| format!("flush keyframe sidecar {}: {err}", temp_path.display()))?;
+        drop(file);
+        if let Err(err) = std::fs::rename(&temp_path, final_path) {
+            // Another writer may have committed the same hash first.
+            if final_path.exists() {
+                let _ = std::fs::remove_file(&temp_path);
+                return Ok(false);
+            }
+            return Err(format!(
+                "commit keyframe sidecar {} -> {}: {err}",
+                temp_path.display(),
+                final_path.display()
+            ));
+        }
+        Ok(true)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn apply_blob_permissions(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
+}
+
+#[cfg(not(unix))]
+fn apply_blob_permissions(_options: &mut OpenOptions) {}
 
 impl EventSink for WalEventSink {
-    /// Append a real-time agent event to the WAL.
-    ///
-    /// The WAL event `kind` is set to `event_type` (e.g. `"vlm"`,
-    /// `"vlm_tiered"`, `"loop_detected"`, `"scene_cut"`).  The `run_id`
-    /// argument from the trait call is preferred over the stored `self.run_id`
-    /// so that the method stays correct even when the caller provides a
-    /// different run_id (though in practice they will always match for a
-    /// single-session sink).
-    ///
-    /// Errors are returned as `String` per the trait contract; the worker
-    /// pool logs them as warnings and continues.
     fn emit_event_sync(
         &self,
         run_id: &str,
@@ -135,9 +149,21 @@ impl EventSink for WalEventSink {
             "description": description,
         });
 
-        self.state
-            .append_run_event(run_id, event_type, payload)
-            .map(|_| ())
+        self.state.append_run_event(run_id, event_type, payload)?;
+        if let Some(mirror) = &self.spacetime_event_mirror {
+            if let Err(err) = mirror.emit_event_sync(&EmitEventArgs {
+                run_id,
+                session_id,
+                frame_index,
+                pts_ms,
+                event_type,
+                confidence,
+                description,
+            }) {
+                tracing::warn!(%err, "SpacetimeDB event mirror failed after local WAL commit");
+            }
+        }
+        Ok(())
     }
 
     fn emit_event_nonblocking(
@@ -158,18 +184,12 @@ impl EventSink for WalEventSink {
             "description": description,
         });
 
+        // Mirroring would violate this method's nonblocking contract.
         self.state
             .append_run_event_nonblocking(run_id, event_type, payload)
     }
 
-    /// Append a keyframe metadata record to the WAL.
-    ///
-    /// JPEG bytes are not stored in the WAL (the WAL is a plain-text log).
-    /// The `jpeg_data` slice is intentionally ignored; only the metadata fields
-    /// are persisted so the `/events` endpoint can surface timing information.
-    ///
-    /// A future improvement may write JPEG bytes to a side-car blob store and
-    /// record the resulting URI in the payload under `"jpeg_uri"`.
+    /// Write the JPEG before appending its metadata event.
     fn store_keyframe_sync(
         &self,
         run_id: &str,
@@ -177,13 +197,40 @@ impl EventSink for WalEventSink {
         pts_ms: u64,
         event_type: &str,
         description: &str,
-        _jpeg_data: &[u8],
+        jpeg_data: &[u8],
     ) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let blob = match self.persist_keyframe_blob(jpeg_data) {
+            Ok(blob) => blob,
+            Err(err) => {
+                self.state.pipeline_metrics().inc_keyframe_blob_failure();
+                self.state
+                    .pipeline_metrics()
+                    .keyframe_blob_latency_ms
+                    .record(started.elapsed().as_millis() as u64);
+                return Err(err);
+            }
+        };
+        self.state
+            .pipeline_metrics()
+            .keyframe_blob_latency_ms
+            .record(started.elapsed().as_millis() as u64);
+        if blob.created {
+            self.state
+                .pipeline_metrics()
+                .record_keyframe_blob_written(blob.bytes as u64);
+        } else {
+            self.state.pipeline_metrics().inc_keyframe_blob_reused();
+        }
         let payload = json!({
             "frame_index": frame_index,
             "pts_ms": pts_ms,
             "event_type": event_type,
             "description": description,
+            "image_ref": blob.image_ref,
+            "image_media_type": "image/jpeg",
+            "image_bytes": blob.bytes,
+            "image_sha256": blob.sha256,
         });
 
         self.state
@@ -236,7 +283,7 @@ mod tests {
         let (state, path) = make_state();
         let run_id = "run-abcdef1234567890";
 
-        let sink = WalEventSink::new(state.clone(), run_id.to_string());
+        let sink = WalEventSink::new(state.clone());
         sink.emit_event_sync(run_id, "sess-01", 42, 1400, "vlm", 0.92, "a dog is running")
             .expect("emit_event_sync should succeed");
 
@@ -263,7 +310,7 @@ mod tests {
         let (state, path) = make_state();
         let run_id = "run-feedface12345678";
 
-        let sink = WalEventSink::new(state.clone(), run_id.to_string());
+        let sink = WalEventSink::new(state.clone());
         let start = std::time::Instant::now();
         sink.emit_event_nonblocking(
             run_id,
@@ -301,7 +348,7 @@ mod tests {
         let (state, path) = make_state();
         let run_id = "run-deadbeef00000000";
 
-        let sink = WalEventSink::new(state.clone(), run_id.to_string());
+        let sink = WalEventSink::new(state.clone());
         sink.store_keyframe_sync(
             run_id,
             7,
@@ -329,7 +376,7 @@ mod tests {
         let (state, path) = make_state();
         let run_id = "run-cafebabe12345678";
 
-        let sink = WalEventSink::new(state.clone(), run_id.to_string());
+        let sink = WalEventSink::new(state.clone());
         for i in 0..5u64 {
             sink.emit_event_sync(
                 run_id,
@@ -358,21 +405,11 @@ mod tests {
     #[test]
     fn wal_sink_is_send_sync_and_arc_compatible() {
         let (state, path) = make_state();
-        let run_id = "run-aabbccdd11223344";
 
         // Verify Arc<dyn EventSink> construction compiles and can be cloned.
-        let sink: Arc<dyn EventSink> = WalEventSink::arc(state, run_id.to_string());
+        let sink: Arc<dyn EventSink> = WalEventSink::arc(state);
         let _clone = Arc::clone(&sink);
 
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn run_id_accessor_returns_correct_value() {
-        let (state, path) = make_state();
-        let run_id = "run-0011223344556677";
-        let sink = WalEventSink::new(state, run_id.to_string());
-        assert_eq!(sink.run_id(), run_id);
         let _ = std::fs::remove_file(path);
     }
 }

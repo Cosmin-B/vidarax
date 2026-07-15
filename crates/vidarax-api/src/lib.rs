@@ -80,7 +80,7 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
         config.stream_ttl_secs,
         config.active_stream_limit,
         webrtc_config,
-        config.distillation.clone(),
+        config.novelty.clone(),
     )
     .map_err(invalid_input)?;
     let state = attach_spacetime_client(state, &config);
@@ -217,7 +217,6 @@ mod tests {
     use vidarax_core::ingest::pipeline::{
         register_decode_backend, CpuFfmpegPipeline, PipelineBackend,
     };
-    use vidarax_core::tiered_vlm::DistillationConfig;
     use vidarax_core::webrtc::session::WebRtcConfig;
     #[cfg(feature = "h3-experimental")]
     use {
@@ -268,7 +267,7 @@ mod tests {
             webrtc_second_pass_max_tokens: 256,
             webrtc_crop: None,
             gate_config: GateConfig::default(),
-            distillation: DistillationConfig::default(),
+            novelty: vidarax_core::novelty::LiveNoveltyConfig::default(),
         }
     }
 
@@ -530,7 +529,7 @@ mod tests {
             webrtc_second_pass_max_tokens: 256,
             webrtc_crop: None,
             gate_config: GateConfig::default(),
-            distillation: DistillationConfig::default(),
+            novelty: vidarax_core::novelty::LiveNoveltyConfig::default(),
         };
 
         let entries = super::backend_entries_from_explicit_urls(&config).unwrap();
@@ -866,7 +865,7 @@ mod tests {
             3600,
             5,
             WebRtcConfig::default(),
-            DistillationConfig::default(),
+            vidarax_core::novelty::LiveNoveltyConfig::default(),
         )
         .unwrap();
         let app = app_router(state);
@@ -943,7 +942,7 @@ mod tests {
             3600,
             5,
             WebRtcConfig::default(),
-            DistillationConfig::default(),
+            vidarax_core::novelty::LiveNoveltyConfig::default(),
         )
         .unwrap();
         let app = app_router(state);
@@ -1010,7 +1009,7 @@ mod tests {
             3600,
             5,
             WebRtcConfig::default(),
-            DistillationConfig::default(),
+            vidarax_core::novelty::LiveNoveltyConfig::default(),
         )
         .unwrap();
         let app = app_router(state);
@@ -1324,7 +1323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingest_transitions_state_to_processing() {
+    async fn ingest_rejects_unknown_fields_and_missing_source() {
         let app = app_router(test_state());
 
         let create_req = Request::builder()
@@ -1350,7 +1349,7 @@ mod tests {
             .body(Body::from(r#"{"frame_index":1}"#))
             .unwrap();
         let ingest_response = app.clone().oneshot(ingest_req).await.unwrap();
-        assert_eq!(ingest_response.status(), StatusCode::OK);
+        assert_eq!(ingest_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         let state_req = Request::builder()
             .uri(format!("/v1/runs/{run_id}/state"))
@@ -1366,7 +1365,7 @@ mod tests {
             .unwrap()
             .to_bytes();
         let text = std::str::from_utf8(&state_body).unwrap();
-        assert!(text.contains("\"state\":\"processing\""));
+        assert!(text.contains("\"state\":\"pending\""));
     }
 
     #[tokio::test]
@@ -1560,7 +1559,7 @@ mod tests {
             .uri(format!("/v1/runs/{run_id}/ingest"))
             .method("POST")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"frame_index":1}"#))
+            .body(Body::from(r#"{"source_uri":"/tmp/not-present.mp4"}"#))
             .unwrap();
         let ingest_response = app.clone().oneshot(ingest).await.unwrap();
         assert_eq!(ingest_response.status(), StatusCode::NOT_FOUND);
@@ -2439,7 +2438,7 @@ mod tests {
             webrtc_second_pass_max_tokens: 256,
             webrtc_crop: None,
             gate_config: GateConfig::default(),
-            distillation: DistillationConfig::default(),
+            novelty: vidarax_core::novelty::LiveNoveltyConfig::default(),
         })
         .unwrap();
         let app = app_router(test_state_with_provider_and_policy(None, policy));
@@ -2502,7 +2501,7 @@ mod tests {
             webrtc_second_pass_max_tokens: 256,
             webrtc_crop: None,
             gate_config: GateConfig::default(),
-            distillation: DistillationConfig::default(),
+            novelty: vidarax_core::novelty::LiveNoveltyConfig::default(),
         })
         .unwrap();
         let app = app_router(test_state_with_provider_and_policy(None, policy));
@@ -2562,7 +2561,7 @@ mod tests {
             webrtc_second_pass_max_tokens: 256,
             webrtc_crop: None,
             gate_config: GateConfig::default(),
-            distillation: DistillationConfig::default(),
+            novelty: vidarax_core::novelty::LiveNoveltyConfig::default(),
         })
         .unwrap();
         let app = app_router(test_state_with_provider_and_policy(None, policy));
@@ -2648,7 +2647,7 @@ mod tests {
             webrtc_second_pass_max_tokens: 256,
             webrtc_crop: None,
             gate_config: GateConfig::default(),
-            distillation: DistillationConfig::default(),
+            novelty: vidarax_core::novelty::LiveNoveltyConfig::default(),
         })
         .unwrap();
         let app = app_router(test_state_with_provider_and_policy(None, policy));
@@ -2714,7 +2713,7 @@ mod tests {
             webrtc_second_pass_max_tokens: 256,
             webrtc_crop: None,
             gate_config: GateConfig::default(),
-            distillation: DistillationConfig::default(),
+            novelty: vidarax_core::novelty::LiveNoveltyConfig::default(),
         }) {
             Ok(_) => panic!("required-tenant without required API keys should be rejected"),
             Err(err) => err,
@@ -2765,7 +2764,7 @@ mod tests {
             webrtc_second_pass_max_tokens: 256,
             webrtc_crop: None,
             gate_config: GateConfig::default(),
-            distillation: DistillationConfig::default(),
+            novelty: vidarax_core::novelty::LiveNoveltyConfig::default(),
         })
         .unwrap();
         let app = app_router(test_state_with_provider_and_policy(None, policy));
@@ -3003,7 +3002,7 @@ mod tests {
             webrtc_second_pass_max_tokens: 256,
             webrtc_crop: None,
             gate_config: GateConfig::default(),
-            distillation: DistillationConfig::default(),
+            novelty: vidarax_core::novelty::LiveNoveltyConfig::default(),
         };
 
         let server_task =
@@ -3143,7 +3142,7 @@ mod tests {
             webrtc_second_pass_max_tokens: 256,
             webrtc_crop: None,
             gate_config: GateConfig::default(),
-            distillation: DistillationConfig::default(),
+            novelty: vidarax_core::novelty::LiveNoveltyConfig::default(),
         };
 
         let server_task =

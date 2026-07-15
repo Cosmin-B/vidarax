@@ -14,7 +14,7 @@ use tokio::task::JoinSet;
 use vidarax_contracts::models::{
     fallback_candidates, REQUIRED_MEDIUM_MODELS, REQUIRED_SMALL_MODELS,
 };
-use vidarax_core::gate::FrameSignal;
+use vidarax_core::gate::{FrameSignal, GateEventType};
 use vidarax_core::ingest::{
     compute_semantic_frame_indices, prepare_source_for_reuse, probe_source_fps, DecodedJpegFrame,
     InputSource, Mp4DecodeConfig,
@@ -28,12 +28,13 @@ use vidarax_core::timeline::TimelineEvent;
 use crate::auth::{header_value, strong_hash_hex, HEADER_TENANT_ID};
 use crate::config::UPLOAD_DIR_NAME;
 use crate::ids::validate_run_id;
+use crate::inference_metrics::PipelineInferenceObserver;
 use crate::models::{
     AnalyzeFrameMetadata, AnalyzeFramesRequest, AnalyzeFramesResponse, AnalyzeMarker,
     CreateRunRequest, CreateRunResponse, FieldError, InferBatchItemError, InferBatchItemResult,
-    InferBatchRequest, InferBatchResponse, InferRequest, InferResponse, ModelCatalogItem,
-    ModelCatalogResponse, RealtimeReasonRequest, RealtimeReasonResponse, SamplingPolicy, SearchHit,
-    SearchRequest, SearchResponse, TokenMetrics,
+    InferBatchRequest, InferBatchResponse, InferRequest, InferResponse, IngestRequest,
+    ModelCatalogItem, ModelCatalogResponse, QueryRequest, RealtimeReasonRequest,
+    RealtimeReasonResponse, SamplingPolicy, SearchHit, SearchRequest, SearchResponse, TokenMetrics,
 };
 use crate::response::{
     conflict_error, internal_error, not_found_error, ok, validation_error, ApiResponse,
@@ -144,7 +145,7 @@ pub async fn ingest_run(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
     headers: HeaderMap,
-    Json(payload): Json<Value>,
+    Json(payload): Json<IngestRequest>,
 ) -> impl IntoResponse {
     if let Some(error) = validate_run_id_or_error(&state, &run_id, "invalid ingest request") {
         return error;
@@ -166,211 +167,140 @@ pub async fn ingest_run(
     }
 
     let request_id = state.next_request_id();
-    let source_uri = payload
-        .get("source_uri")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
+    let source_uri = payload.source_uri.trim().to_string();
+    if source_uri.is_empty() {
+        return validation_error(
+            &state,
+            "invalid ingest request",
+            vec![field_error(
+                "source_uri",
+                "source_uri must not be empty".to_string(),
+            )],
+        );
+    }
 
-    if let Some(source_uri) = source_uri {
-        let sampling_policy = match SamplingPolicy::parse(
-            payload
-                .get("sampling_policy")
-                .and_then(|value| value.as_str()),
-        ) {
-            Ok(policy) => policy,
-            Err(message) => {
-                return validation_error(
-                    &state,
-                    "invalid ingest request",
-                    vec![field_error("sampling_policy", message.to_string())],
-                );
-            }
-        };
-        let fixed_fps = payload.get("fixed_fps").and_then(|value| value.as_f64());
-        let sample_fps = payload
-            .get("sample_fps")
-            .and_then(|value| value.as_f64())
-            .or(fixed_fps);
-        if sampling_policy == SamplingPolicy::Fixed {
-            let Some(sample_fps) = sample_fps else {
-                return validation_error(
-                    &state,
-                    "invalid ingest request",
-                    vec![field_error(
-                        "fixed_fps",
-                        "fixed_fps (or sample_fps) is required when sampling_policy=fixed"
-                            .to_string(),
-                    )],
-                );
-            };
-            if !(0.2..=120.0).contains(&sample_fps) {
-                return validation_error(
-                    &state,
-                    "invalid ingest request",
-                    vec![field_error(
-                        "fixed_fps",
-                        "fixed_fps must be in [0.2, 120.0]".to_string(),
-                    )],
-                );
-            }
+    let sampling_policy = match SamplingPolicy::parse(payload.sampling_policy.as_deref()) {
+        Ok(policy) => policy,
+        Err(message) => {
+            return validation_error(
+                &state,
+                "invalid ingest request",
+                vec![field_error("sampling_policy", message.to_string())],
+            );
         }
-        let max_frames = payload
-            .get("max_frames")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(512);
-        if !(1..=500_000).contains(&max_frames) {
+    };
+    let fixed_fps = payload.fixed_fps;
+    let sample_fps = payload.sample_fps.or(fixed_fps);
+    if sampling_policy == SamplingPolicy::Fixed {
+        let Some(sample_fps) = sample_fps else {
             return validation_error(
                 &state,
                 "invalid ingest request",
                 vec![field_error(
-                    "max_frames",
-                    "max_frames must be in [1, 500000]".to_string(),
+                    "fixed_fps",
+                    "fixed_fps (or sample_fps) is required when sampling_policy=fixed".to_string(),
+                )],
+            );
+        };
+        if !(0.2..=120.0).contains(&sample_fps) {
+            return validation_error(
+                &state,
+                "invalid ingest request",
+                vec![field_error(
+                    "fixed_fps",
+                    "fixed_fps must be in [0.2, 120.0]".to_string(),
                 )],
             );
         }
-        let stream_id = payload
-            .get("stream_id")
-            .and_then(|value| value.as_str())
-            .unwrap_or("stream-0")
-            .to_string();
-        let allowed_roots = ingest_file_roots_with_upload_root(&state);
-        let decode_source = match InputSource::parse_and_validate(&source_uri, &allowed_roots) {
-            Ok(source) => source,
-            Err(message) => {
-                return validation_error(
-                    &state,
-                    "invalid ingest request",
-                    vec![field_error("source_uri", message)],
-                );
-            }
-        };
-        if let Err(error) = enforce_file_source_visibility(
+    }
+    let max_frames = payload.max_frames.unwrap_or(512);
+    if !(1..=500_000).contains(&max_frames) {
+        return validation_error(
             &state,
-            &headers,
-            &source_uri,
-            &decode_source,
             "invalid ingest request",
-        ) {
-            return error;
-        }
-        let requested_sample_fps = sample_fps.unwrap_or(2.0);
-        let decode_pipeline = state.decode_pipeline();
-        let decoded = match tokio::task::spawn_blocking(move || {
-            // Fetch a remote source once so the probe and signal decode share the
-            // local copy rather than downloading it twice.
-            let prepared = prepare_source_for_reuse(&decode_source)?;
-            let decode_source = prepared.source();
-            let source_fps = probe_source_fps(decode_source);
-            let effective_sample_fps = match sampling_policy {
-                SamplingPolicy::SourceFpsAdaptive => source_fps
-                    .map(adaptive_sample_fps)
-                    .unwrap_or(requested_sample_fps as f32),
-                SamplingPolicy::Fixed => requested_sample_fps as f32,
-            };
-            let decode_config = Mp4DecodeConfig {
-                sample_fps: effective_sample_fps,
-                max_frames: max_frames as usize,
-                max_edge: None,
-                // The signals-only ingest endpoint does not expose a crop; the
-                // region-of-interest lever lives on the /reason analysis path.
-                crop: None,
-            };
-            decode_pipeline
-                .decode_signals(decode_source, decode_config)
-                .map(|decoded| (decoded, source_fps, effective_sample_fps))
-        })
-        .await
-        {
-            Ok(Ok(decoded)) => decoded,
-            Ok(Err(err)) => {
-                return validation_error(
-                    &state,
-                    "invalid ingest request",
-                    vec![field_error("source_uri", err)],
-                );
-            }
-            Err(err) => {
-                return internal_error(&state, format!("ingest decode worker join failure: {err}"));
-            }
-        };
-        let (decoded, source_fps, effective_sample_fps) = decoded;
-
-        if let Err(err) = state
-            .append_run_event_async(
-                &run_id,
-                "ingest_received",
-                json!({
-                    "request_id": request_id,
-                    "ingest": payload,
-                    "decoded_frames": decoded.frame_signals.len(),
-                    // Record what the caller asked to ingest. When the source is a
-                    // remote URL, decoded.source_uri holds the internal prefetch
-                    // temp path, which is deleted after decode and meaningless to
-                    // clients reading run metadata later.
-                    "source_uri": source_uri.as_str(),
-                    "sampling_policy": sampling_policy.as_str(),
-                    "sample_fps": effective_sample_fps
-                }),
-            )
-            .await
-        {
-            return internal_error(&state, format!("failed to append ingest event: {err}"));
-        }
-
-        let signals = decoded
-            .frame_signals
-            .iter()
-            .map(|signal| {
-                json!({
-                    "frame_index": signal.frame_index,
-                    "pts_ms": signal.pts_ms,
-                    "perceptual_hash": signal.perceptual_hash,
-                    "luma_mean": signal.luma_mean,
-                    "flicker_score": signal.flicker_score,
-                    "ghosting_score": signal.ghosting_score,
-                    "noise_variance_score": signal.noise_variance_score
-                })
-            })
-            .collect::<Vec<_>>();
-        if let Err(err) = state
-            .append_run_event_async(
-                &run_id,
-                "frames_decoded",
-                json!({
-                    "request_id": request_id,
-                    "source_uri": source_uri.as_str(),
-                    "stream_id": stream_id,
-                    "sampling_policy": sampling_policy.as_str(),
-                    "source_fps": source_fps,
-                    "sample_fps": effective_sample_fps,
-                    "decoded_frames": signals.len(),
-                    "width": decoded.width,
-                    "height": decoded.height,
-                    "pixel_format": decoded.pixel_format,
-                    "signals": signals
-                }),
-            )
-            .await
-        {
-            return internal_error(
+            vec![field_error(
+                "max_frames",
+                "max_frames must be in [1, 500000]".to_string(),
+            )],
+        );
+    }
+    let stream_id = payload
+        .stream_id
+        .as_deref()
+        .unwrap_or("stream-0")
+        .to_string();
+    let allowed_roots = ingest_file_roots_with_upload_root(&state);
+    let decode_source = match InputSource::parse_and_validate(&source_uri, &allowed_roots) {
+        Ok(source) => source,
+        Err(message) => {
+            return validation_error(
                 &state,
-                format!("failed to append frames_decoded event: {err}"),
+                "invalid ingest request",
+                vec![field_error("source_uri", message)],
             );
         }
-
-        return ok(json!({
-            "request_id": request_id,
-            "run_id": run_id,
-            "status": "processing",
-            "decoded_frames": decoded.frame_signals.len(),
-            "source_uri": source_uri,
-            "sampling_policy": sampling_policy.as_str(),
-            "source_fps": source_fps,
-            "sample_fps": effective_sample_fps
-        }));
+    };
+    if let Err(error) = enforce_file_source_visibility(
+        &state,
+        &headers,
+        &source_uri,
+        &decode_source,
+        "invalid ingest request",
+    ) {
+        return error;
     }
+    let requested_sample_fps = sample_fps.unwrap_or(2.0);
+    let decode_pipeline = state.decode_pipeline();
+    let decoded = match tokio::task::spawn_blocking(move || {
+        // Fetch a remote source once so the probe and signal decode share the
+        // local copy rather than downloading it twice.
+        let prepared = prepare_source_for_reuse(&decode_source)?;
+        let decode_source = prepared.source();
+        let source_fps = probe_source_fps(decode_source);
+        let effective_sample_fps = match sampling_policy {
+            SamplingPolicy::SourceFpsAdaptive => source_fps
+                .map(adaptive_sample_fps)
+                .unwrap_or(requested_sample_fps),
+            SamplingPolicy::Fixed => requested_sample_fps,
+        };
+        let decode_config = Mp4DecodeConfig {
+            sample_fps: effective_sample_fps,
+            max_frames: max_frames as usize,
+            max_edge: None,
+            // The signals-only ingest endpoint does not expose a crop; the
+            // region-of-interest lever lives on the /reason analysis path.
+            crop: None,
+        };
+        let decode_started = Instant::now();
+        decode_pipeline
+            .decode_signals(decode_source, decode_config)
+            .map(|decoded| {
+                (
+                    decoded,
+                    source_fps,
+                    effective_sample_fps,
+                    decode_started.elapsed().as_micros() as u64,
+                )
+            })
+    })
+    .await
+    {
+        Ok(Ok(decoded)) => decoded,
+        Ok(Err(err)) => {
+            return validation_error(
+                &state,
+                "invalid ingest request",
+                vec![field_error("source_uri", err)],
+            );
+        }
+        Err(err) => {
+            return internal_error(&state, format!("ingest decode worker join failure: {err}"));
+        }
+    };
+    let (decoded, source_fps, effective_sample_fps, decode_elapsed_us) = decoded;
+    state
+        .pipeline_metrics()
+        .record_decoded_batch(decoded.frame_signals.len() as u64, decode_elapsed_us);
 
     if let Err(err) = state
         .append_run_event_async(
@@ -378,7 +308,15 @@ pub async fn ingest_run(
             "ingest_received",
             json!({
                 "request_id": request_id,
-                "ingest": payload
+                "ingest": payload,
+                "decoded_frames": decoded.frame_signals.len(),
+                // Record what the caller asked to ingest. When the source is a
+                // remote URL, decoded.source_uri holds the internal prefetch
+                // temp path, which is deleted after decode and meaningless to
+                // clients reading run metadata later.
+                "source_uri": source_uri.as_str(),
+                "sampling_policy": sampling_policy.as_str(),
+                "sample_fps": effective_sample_fps
             }),
         )
         .await
@@ -386,10 +324,56 @@ pub async fn ingest_run(
         return internal_error(&state, format!("failed to append ingest event: {err}"));
     }
 
+    let signals = decoded
+        .frame_signals
+        .iter()
+        .map(|signal| {
+            json!({
+                "frame_index": signal.frame_index,
+                "pts_ms": signal.pts_ms,
+                "perceptual_hash": signal.perceptual_hash,
+                "luma_mean": signal.luma_mean,
+                "flicker_score": signal.flicker_score,
+                "ghosting_score": signal.ghosting_score,
+                "noise_variance_score": signal.noise_variance_score
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Err(err) = state
+        .append_run_event_async(
+            &run_id,
+            "frames_decoded",
+            json!({
+                "request_id": request_id,
+                "source_uri": source_uri.as_str(),
+                "stream_id": stream_id,
+                "sampling_policy": sampling_policy.as_str(),
+                "source_fps": source_fps,
+                "sample_fps": effective_sample_fps,
+                "decoded_frames": signals.len(),
+                "width": decoded.width,
+                "height": decoded.height,
+                "pixel_format": decoded.pixel_format,
+                "signals": signals
+            }),
+        )
+        .await
+    {
+        return internal_error(
+            &state,
+            format!("failed to append frames_decoded event: {err}"),
+        );
+    }
+
     ok(json!({
         "request_id": request_id,
         "run_id": run_id,
-        "status": "processing"
+        "status": "processing",
+        "decoded_frames": decoded.frame_signals.len(),
+        "source_uri": source_uri,
+        "sampling_policy": sampling_policy.as_str(),
+        "source_fps": source_fps,
+        "sample_fps": effective_sample_fps
     }))
 }
 
@@ -565,22 +549,19 @@ pub async fn get_state(
 pub async fn query(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(payload): Json<Value>,
+    Json(payload): Json<QueryRequest>,
 ) -> impl IntoResponse {
-    let run_id = payload.get("run_id").and_then(|v| v.as_str()).unwrap_or("");
-    if let Some(error) = validate_run_id_or_error(&state, run_id, "invalid query payload") {
+    if let Some(error) = validate_run_id_or_error(&state, &payload.run_id, "invalid query payload")
+    {
         return error;
     }
-    if let Err(error) = load_run_snapshot(&state, &headers, run_id) {
+    if let Err(error) = load_run_snapshot(&state, &headers, &payload.run_id) {
         return error;
     }
 
-    let kind_filter = payload.get("kind").and_then(|v| v.as_str());
-    let from_seq = payload
-        .get("from_seq")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let events = match state.read_run_events_from(run_id, from_seq).await {
+    let kind_filter = payload.kind.as_deref();
+    let from_seq = payload.from_seq.unwrap_or(0);
+    let events = match state.read_run_events_from(&payload.run_id, from_seq).await {
         Ok(events) => events,
         Err(err) => return internal_error(&state, format!("failed to read run events: {err}")),
     };
@@ -928,7 +909,16 @@ pub async fn analyze_run(
         },
         state.webrtc_config().gate_config.clone(),
     );
+    let gate_started = Instant::now();
     let analyzed = pipeline.analyze_batch(&signals);
+    let gate_elapsed_us = gate_started.elapsed().as_micros() as u64;
+    let selected = analyzed
+        .iter()
+        .filter(|frame| frame.gate_event == GateEventType::KeepKeyframe)
+        .count() as u64;
+    state
+        .pipeline_metrics()
+        .record_gate_batch(analyzed.len() as u64, selected, gate_elapsed_us);
 
     let mut marker_inputs = Vec::with_capacity(analyzed.len());
     let metadata = analyzed
@@ -1548,7 +1538,7 @@ pub async fn reason_realtime_run(
     let semantic_decode_enabled = semantic_inference && state.provider().is_some();
     let decode_source = params.decode_source;
     let decode_pipeline = state.decode_pipeline();
-    let (prepared_source, decoded, source_fps, sample_fps, decoded_jpegs) =
+    let (prepared_source, decoded, source_fps, sample_fps, decoded_jpegs, decode_elapsed_us) =
         match tokio::task::spawn_blocking(move || {
             // Fetch a remote source once here. The probe, signal decode, JPEG
             // decode, and per-chunk clip extraction below all read the same local
@@ -1573,7 +1563,9 @@ pub async fn reason_realtime_run(
                 crop,
             };
             // Pass 1: frame signals (cheap, no encoding)
+            let decode_started = Instant::now();
             let decoded = decode_pipeline.decode_signals(decode_source, decode_config)?;
+            let decode_elapsed_us = decode_started.elapsed().as_micros() as u64;
 
             // In video_clip_mode, JPEG decoding is skipped here; clips are
             // extracted per chunk below.
@@ -1597,7 +1589,14 @@ pub async fn reason_realtime_run(
             } else {
                 None
             };
-            Ok((prepared, decoded, source_fps, sample_fps, decoded_jpegs))
+            Ok((
+                prepared,
+                decoded,
+                source_fps,
+                sample_fps,
+                decoded_jpegs,
+                decode_elapsed_us,
+            ))
         })
         .await
         {
@@ -1616,6 +1615,9 @@ pub async fn reason_realtime_run(
                 );
             }
         };
+    state
+        .pipeline_metrics()
+        .record_decoded_batch(decoded.frame_signals.len() as u64, decode_elapsed_us);
 
     let request_id = state.next_request_id();
     let trace_id = payload
@@ -1686,6 +1688,7 @@ pub async fn reason_realtime_run(
     // temp file outlives request cancellation until every task finishes reading.
     let prepared_source = Arc::new(prepared_source);
     let clip_decode_pipeline = state.decode_pipeline();
+    let gate_started = Instant::now();
     let chunk_preps = prepare_realtime_chunks(
         &decoded.frame_signals,
         chunk_size,
@@ -1699,6 +1702,19 @@ pub async fn reason_realtime_run(
         crop,
     )
     .await;
+    let gate_elapsed_us = gate_started.elapsed().as_micros() as u64;
+    let gate_analyzed = chunk_preps
+        .iter()
+        .map(|chunk| chunk.analyzed.len() as u64)
+        .sum::<u64>();
+    let gate_selected = chunk_preps
+        .iter()
+        .flat_map(|chunk| chunk.analyzed.iter())
+        .filter(|frame| frame.gate_event == GateEventType::KeepKeyframe)
+        .count() as u64;
+    state
+        .pipeline_metrics()
+        .record_gate_batch(gate_analyzed, gate_selected, gate_elapsed_us);
 
     let visual_diff = payload.visual_diff.unwrap_or(false);
     let temporal_chain = visual_diff || payload.temporal_chain.unwrap_or(false);
@@ -1711,7 +1727,10 @@ pub async fn reason_realtime_run(
     // Same InferenceMetrics instance /metrics reads from, so analyze's tiered
     // passes are attributed to their true provider the same way WHIP's are.
     let analyze_observer: Option<Arc<dyn InferenceObserver>> =
-        Some(Arc::clone(state.inference_metrics_arc()) as Arc<dyn InferenceObserver>);
+        Some(Arc::new(PipelineInferenceObserver::new(
+            Arc::clone(state.inference_metrics_arc()),
+            Arc::clone(state.pipeline_metrics_arc()),
+        )));
     let (semantic_results, task_end_times) = run_semantic_dispatch(
         &chunk_preps,
         providers,
@@ -2320,6 +2339,7 @@ async fn execute_infer_request(
 
     let request_id = state.next_request_id();
     let started = Instant::now();
+    state.pipeline_metrics().inc_vlm_inferences();
     let primary_provider_for_metrics = prepared.primary_provider;
     let request_for_provider = prepared.request.clone();
     let result =
@@ -2327,6 +2347,10 @@ async fn execute_infer_request(
             Ok(result) => match result {
                 Ok(result) => result,
                 Err(err) => {
+                    state
+                        .pipeline_metrics()
+                        .vlm_latency_ms
+                        .record(started.elapsed().as_millis() as u64);
                     state.inference_metrics().record_error(
                         primary_provider_for_metrics,
                         started.elapsed().as_millis() as u64,
@@ -2335,6 +2359,10 @@ async fn execute_infer_request(
                 }
             },
             Err(err) => {
+                state
+                    .pipeline_metrics()
+                    .vlm_latency_ms
+                    .record(started.elapsed().as_millis() as u64);
                 state.inference_metrics().record_error(
                     primary_provider_for_metrics,
                     started.elapsed().as_millis() as u64,
@@ -2351,6 +2379,10 @@ async fn execute_infer_request(
         result.fallback_used,
         result.usage,
     );
+    state
+        .pipeline_metrics()
+        .vlm_latency_ms
+        .record(started.elapsed().as_millis() as u64);
 
     if let Some(run_id) = prepared.run_id.as_deref() {
         let event_payload = json!({
@@ -2980,6 +3012,96 @@ pub async fn serve_file(
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .body(Body::from("file not found"))
+        .unwrap()
+}
+
+/// Return a raw JPEG referenced by a `keyframe_stored` event on an owned run.
+pub async fn serve_keyframe(
+    State(state): State<AppState>,
+    Path((run_id, sha256)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::body::Body;
+    use axum::http::{header, StatusCode};
+    use axum::response::Response;
+
+    if let Some(error) = validate_run_id_or_error(&state, &run_id, "invalid keyframe request") {
+        return error.into_response();
+    }
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return validation_error(
+            &state,
+            "invalid keyframe request",
+            vec![field_error(
+                "sha256",
+                "sha256 must be 64 hexadecimal characters".to_string(),
+            )],
+        )
+        .into_response();
+    }
+    if let Err(error) = load_run_snapshot(&state, &headers, &run_id) {
+        return error.into_response();
+    }
+
+    let events = match load_existing_events(&state, &run_id).await {
+        Ok(events) => events,
+        Err(error) => return error.into_response(),
+    };
+    if events.iter().any(|event| event.kind == "run_deleted") {
+        return not_found_error(
+            &state,
+            "run_id was not found",
+            vec![field_error("run_id", run_id)],
+        )
+        .into_response();
+    }
+    let referenced = events.iter().any(|event| {
+        event.kind == "keyframe_stored"
+            && parse_payload(&event.payload)
+                .get("image_sha256")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case(&sha256))
+    });
+    if !referenced {
+        return not_found_error(
+            &state,
+            "keyframe was not found",
+            vec![field_error("sha256", sha256)],
+        )
+        .into_response();
+    }
+
+    let sha256 = sha256.to_ascii_lowercase();
+    let path = state
+        .keyframe_blob_root()
+        .join(&sha256[..2])
+        .join(format!("{sha256}.jpg"));
+    let data = match tokio::fs::read(path).await {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return not_found_error(
+                &state,
+                "keyframe was not found",
+                vec![field_error("sha256", sha256)],
+            )
+            .into_response();
+        }
+        Err(err) => {
+            return internal_error(&state, format!("failed to read keyframe blob: {err}"))
+                .into_response();
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CONTENT_LENGTH, data.len())
+        .header(
+            header::CACHE_CONTROL,
+            "private, max-age=31536000, immutable",
+        )
+        .header(header::ETAG, format!("\"{sha256}\""))
+        .body(Body::from(data))
         .unwrap()
 }
 

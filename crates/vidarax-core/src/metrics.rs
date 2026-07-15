@@ -16,6 +16,7 @@ pub const DECODE_LATENCY_US_BUCKETS: [u64; 8] =
     [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 50_000];
 pub const GATE_LATENCY_US_BUCKETS: [u64; 8] = [1, 5, 10, 50, 100, 500, 1_000, 5_000];
 pub const VLM_LATENCY_MS_BUCKETS: [u64; 8] = [50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000];
+pub const EMBEDDING_LATENCY_MS_BUCKETS: [u64; 8] = [1, 2, 5, 10, 25, 50, 100, 500];
 pub const STDB_EMIT_LATENCY_MS_BUCKETS: [u64; 8] = [1, 5, 10, 25, 50, 100, 250, 1_000];
 
 /// Zero-alloc histogram with 8 fixed upper-bound buckets.
@@ -54,11 +55,23 @@ impl LatencyHistogram {
     /// Record a single observation.
     #[inline]
     pub fn record(&self, value: u64) {
-        self.sum.fetch_add(value, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
+        self.record_many(value, 1);
+    }
+
+    /// Record `count` observations with the same value using one atomic update
+    /// per field. Batch file decoders use this to preserve per-frame histogram
+    /// semantics without looping over hundreds of thousands of samples.
+    #[inline]
+    pub fn record_many(&self, value: u64, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.sum
+            .fetch_add(value.saturating_mul(count), Ordering::Relaxed);
+        self.count.fetch_add(count, Ordering::Relaxed);
         for (idx, &bound) in self.bounds.iter().enumerate() {
             if value <= bound {
-                self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+                self.buckets[idx].fetch_add(count, Ordering::Relaxed);
                 return;
             }
         }
@@ -90,6 +103,10 @@ pub struct PipelineMetrics {
     frames_decoded_total: AtomicU64,
     /// Decoded video frames shed by real-time decode freshness policy.
     frames_dropped_total: AtomicU64,
+    /// Frames evaluated by the gate across live and recorded-file pipelines.
+    gate_frames_analyzed_total: AtomicU64,
+    /// Frames selected as keyframes by the gate, before downstream queueing.
+    gate_keyframes_selected_total: AtomicU64,
     /// ffmpeg YUV pending FIFO exceeded the backpressure sanity bound.
     decode_pending_sanity_violations_total: AtomicU64,
     /// Keyframes forwarded from analysis workers to VLM workers.
@@ -98,8 +115,30 @@ pub struct PipelineMetrics {
     keyframes_dropped_total: AtomicU64,
     /// Keyframe storage payloads dropped because the sink JPEG backlog is full.
     sink_keyframes_dropped_total: AtomicU64,
+    /// New content-addressed keyframe blobs committed to local storage.
+    keyframe_blobs_written_total: AtomicU64,
+    /// Keyframes that reused an already-present content-addressed blob.
+    keyframe_blobs_reused_total: AtomicU64,
+    /// Local keyframe blob writes that failed before event metadata append.
+    keyframe_blob_failures_total: AtomicU64,
+    /// Raw JPEG bytes committed for newly-created local blobs.
+    keyframe_blob_bytes_total: AtomicU64,
     /// VLM inference calls dispatched.
     vlm_inferences_total: AtomicU64,
+    /// T2 candidates evaluated with a semantic embedding.
+    novelty_evaluated_total: AtomicU64,
+    /// T2 candidates reused without a VLM call.
+    novelty_reused_total: AtomicU64,
+    /// Reuse decisions overridden by the TTL or drift limit.
+    novelty_forced_refresh_total: AtomicU64,
+    /// Embedding requests that failed or timed out.
+    novelty_embedding_unavailable_total: AtomicU64,
+    /// Reuse decisions sampled through the VLM for calibration.
+    novelty_shadow_sampled_total: AtomicU64,
+    /// Shadow probes that returned a usable non-empty description.
+    novelty_shadow_completed_total: AtomicU64,
+    /// Shadow samples whose descriptions differed materially from the anchor.
+    novelty_shadow_changed_total: AtomicU64,
     /// Loop detection events emitted by analysis workers.
     loop_detected_total: AtomicU64,
     /// WHIP sessions created.
@@ -113,6 +152,10 @@ pub struct PipelineMetrics {
     pub gate_latency_us: LatencyHistogram,
     /// VLM inference round-trip latency in milliseconds.
     pub vlm_latency_ms: LatencyHistogram,
+    /// Raw-binary embedding sidecar round-trip latency in milliseconds.
+    pub novelty_embedding_latency_ms: LatencyHistogram,
+    /// Content-address/hash/write latency for local keyframe blobs.
+    pub keyframe_blob_latency_ms: LatencyHistogram,
     /// SpacetimeDB HTTP POST latency in milliseconds.
     pub stdb_emit_latency_ms: LatencyHistogram,
 }
@@ -124,11 +167,24 @@ impl PipelineMetrics {
             rtp_frames_received_total: AtomicU64::new(0),
             frames_decoded_total: AtomicU64::new(0),
             frames_dropped_total: AtomicU64::new(0),
+            gate_frames_analyzed_total: AtomicU64::new(0),
+            gate_keyframes_selected_total: AtomicU64::new(0),
             decode_pending_sanity_violations_total: AtomicU64::new(0),
             keyframes_total: AtomicU64::new(0),
             keyframes_dropped_total: AtomicU64::new(0),
             sink_keyframes_dropped_total: AtomicU64::new(0),
+            keyframe_blobs_written_total: AtomicU64::new(0),
+            keyframe_blobs_reused_total: AtomicU64::new(0),
+            keyframe_blob_failures_total: AtomicU64::new(0),
+            keyframe_blob_bytes_total: AtomicU64::new(0),
             vlm_inferences_total: AtomicU64::new(0),
+            novelty_evaluated_total: AtomicU64::new(0),
+            novelty_reused_total: AtomicU64::new(0),
+            novelty_forced_refresh_total: AtomicU64::new(0),
+            novelty_embedding_unavailable_total: AtomicU64::new(0),
+            novelty_shadow_sampled_total: AtomicU64::new(0),
+            novelty_shadow_completed_total: AtomicU64::new(0),
+            novelty_shadow_changed_total: AtomicU64::new(0),
             loop_detected_total: AtomicU64::new(0),
             sessions_created_total: AtomicU64::new(0),
             sessions_removed_total: AtomicU64::new(0),
@@ -136,6 +192,8 @@ impl PipelineMetrics {
             decode_latency_us: LatencyHistogram::new(DECODE_LATENCY_US_BUCKETS),
             gate_latency_us: LatencyHistogram::new(GATE_LATENCY_US_BUCKETS),
             vlm_latency_ms: LatencyHistogram::new(VLM_LATENCY_MS_BUCKETS),
+            novelty_embedding_latency_ms: LatencyHistogram::new(EMBEDDING_LATENCY_MS_BUCKETS),
+            keyframe_blob_latency_ms: LatencyHistogram::new(STDB_EMIT_LATENCY_MS_BUCKETS),
             stdb_emit_latency_ms: LatencyHistogram::new(STDB_EMIT_LATENCY_MS_BUCKETS),
         }
     }
@@ -149,6 +207,45 @@ impl PipelineMetrics {
     #[inline]
     pub fn inc_frames_decoded(&self) {
         self.frames_decoded_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a batch decoder result while retaining per-frame latency
+    /// semantics in the exported histogram.
+    #[inline]
+    pub fn record_decoded_batch(&self, frames: u64, elapsed_us: u64) {
+        if frames == 0 {
+            return;
+        }
+        self.frames_decoded_total
+            .fetch_add(frames, Ordering::Relaxed);
+        let per_frame_us = elapsed_us.div_ceil(frames).max(1);
+        self.decode_latency_us.record_many(per_frame_us, frames);
+    }
+
+    #[inline]
+    pub fn inc_gate_frame_analyzed(&self) {
+        self.gate_frames_analyzed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_gate_keyframe_selected(&self) {
+        self.gate_keyframes_selected_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one batch gate pass while retaining per-frame latency semantics.
+    #[inline]
+    pub fn record_gate_batch(&self, analyzed: u64, selected: u64, elapsed_us: u64) {
+        if analyzed == 0 {
+            return;
+        }
+        self.gate_frames_analyzed_total
+            .fetch_add(analyzed, Ordering::Relaxed);
+        self.gate_keyframes_selected_total
+            .fetch_add(selected.min(analyzed), Ordering::Relaxed);
+        let per_frame_us = elapsed_us.div_ceil(analyzed).max(1);
+        self.gate_latency_us.record_many(per_frame_us, analyzed);
     }
 
     #[inline]
@@ -201,8 +298,68 @@ impl PipelineMetrics {
     }
 
     #[inline]
+    pub fn record_keyframe_blob_written(&self, bytes: u64) {
+        self.keyframe_blobs_written_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.keyframe_blob_bytes_total
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_keyframe_blob_reused(&self) {
+        self.keyframe_blobs_reused_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_keyframe_blob_failure(&self) {
+        self.keyframe_blob_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
     pub fn inc_vlm_inferences(&self) {
         self.vlm_inferences_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_novelty_evaluated(&self) {
+        self.novelty_evaluated_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_novelty_reused(&self) {
+        self.novelty_reused_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_novelty_forced_refresh(&self) {
+        self.novelty_forced_refresh_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_novelty_embedding_unavailable(&self) {
+        self.novelty_embedding_unavailable_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_novelty_shadow_sampled(&self) {
+        self.novelty_shadow_sampled_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_novelty_shadow_completed(&self) {
+        self.novelty_shadow_completed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_novelty_shadow_changed(&self) {
+        self.novelty_shadow_changed_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -225,13 +382,38 @@ impl PipelineMetrics {
         let rtp = self.rtp_frames_received_total.load(Ordering::Relaxed);
         let decoded = self.frames_decoded_total.load(Ordering::Relaxed);
         let dropped = self.frames_dropped_total.load(Ordering::Relaxed);
+        let gate_analyzed = self.gate_frames_analyzed_total.load(Ordering::Relaxed);
+        let gate_selected = self.gate_keyframes_selected_total.load(Ordering::Relaxed);
         let pending_sanity = self
             .decode_pending_sanity_violations_total
             .load(Ordering::Relaxed);
         let kf = self.keyframes_total.load(Ordering::Relaxed);
         let kf_drop = self.keyframes_dropped_total.load(Ordering::Relaxed);
         let sink_kf_drop = self.sink_keyframes_dropped_total.load(Ordering::Relaxed);
+        let keyframe_blobs_written = self.keyframe_blobs_written_total.load(Ordering::Relaxed);
+        let keyframe_blobs_reused = self.keyframe_blobs_reused_total.load(Ordering::Relaxed);
+        let keyframe_blob_failures = self.keyframe_blob_failures_total.load(Ordering::Relaxed);
+        let keyframe_blob_bytes = self.keyframe_blob_bytes_total.load(Ordering::Relaxed);
         let vlm = self.vlm_inferences_total.load(Ordering::Relaxed);
+        let novelty_evaluated = self.novelty_evaluated_total.load(Ordering::Relaxed);
+        let novelty_reused = self.novelty_reused_total.load(Ordering::Relaxed);
+        let novelty_forced_refresh = self.novelty_forced_refresh_total.load(Ordering::Relaxed);
+        let novelty_embedding_unavailable = self
+            .novelty_embedding_unavailable_total
+            .load(Ordering::Relaxed);
+        let novelty_shadow_sampled = self.novelty_shadow_sampled_total.load(Ordering::Relaxed);
+        let novelty_shadow_completed = self.novelty_shadow_completed_total.load(Ordering::Relaxed);
+        let novelty_shadow_changed = self.novelty_shadow_changed_total.load(Ordering::Relaxed);
+        let novelty_reuse_ratio = if novelty_evaluated == 0 {
+            0.0
+        } else {
+            novelty_reused as f64 / novelty_evaluated as f64
+        };
+        let novelty_shadow_change_ratio = if novelty_shadow_completed == 0 {
+            0.0
+        } else {
+            novelty_shadow_changed as f64 / novelty_shadow_completed as f64
+        };
         let loops = self.loop_detected_total.load(Ordering::Relaxed);
         let sess_created = self.sessions_created_total.load(Ordering::Relaxed);
         let sess_removed = self.sessions_removed_total.load(Ordering::Relaxed);
@@ -240,11 +422,26 @@ impl PipelineMetrics {
             "vidarax_pipeline_rtp_frames_received_total {rtp}\n\
              vidarax_pipeline_frames_decoded_total {decoded}\n\
              vidarax_pipeline_frames_dropped_total {dropped}\n\
+             vidarax_pipeline_gate_frames_analyzed_total {gate_analyzed}\n\
+             vidarax_pipeline_gate_keyframes_selected_total {gate_selected}\n\
              vidarax_pipeline_decode_pending_sanity_violations_total {pending_sanity}\n\
              vidarax_pipeline_keyframes_total {kf}\n\
              vidarax_pipeline_keyframes_dropped_total {kf_drop}\n\
              vidarax_pipeline_sink_keyframes_dropped_total {sink_kf_drop}\n\
+             vidarax_pipeline_keyframe_blobs_written_total {keyframe_blobs_written}\n\
+             vidarax_pipeline_keyframe_blobs_reused_total {keyframe_blobs_reused}\n\
+             vidarax_pipeline_keyframe_blob_failures_total {keyframe_blob_failures}\n\
+             vidarax_pipeline_keyframe_blob_bytes_total {keyframe_blob_bytes}\n\
              vidarax_pipeline_vlm_inferences_total {vlm}\n\
+             vidarax_pipeline_novelty_evaluated_total {novelty_evaluated}\n\
+             vidarax_pipeline_novelty_reused_total {novelty_reused}\n\
+             vidarax_pipeline_novelty_forced_refresh_total {novelty_forced_refresh}\n\
+             vidarax_pipeline_novelty_embedding_unavailable_total {novelty_embedding_unavailable}\n\
+             vidarax_pipeline_novelty_shadow_sampled_total {novelty_shadow_sampled}\n\
+             vidarax_pipeline_novelty_shadow_completed_total {novelty_shadow_completed}\n\
+             vidarax_pipeline_novelty_shadow_changed_total {novelty_shadow_changed}\n\
+             vidarax_pipeline_novelty_reuse_ratio {novelty_reuse_ratio}\n\
+             vidarax_pipeline_novelty_shadow_change_ratio {novelty_shadow_change_ratio}\n\
              vidarax_pipeline_loop_detected_total {loops}\n\
              vidarax_pipeline_sessions_created_total {sess_created}\n\
              vidarax_pipeline_sessions_removed_total {sess_removed}\n"
@@ -264,6 +461,16 @@ impl PipelineMetrics {
             &self
                 .vlm_latency_ms
                 .render_prometheus("vidarax_pipeline_vlm_latency_ms", "ms"),
+        );
+        out.push_str(
+            &self
+                .novelty_embedding_latency_ms
+                .render_prometheus("vidarax_pipeline_novelty_embedding_latency_ms", "ms"),
+        );
+        out.push_str(
+            &self
+                .keyframe_blob_latency_ms
+                .render_prometheus("vidarax_pipeline_keyframe_blob_latency_ms", "ms"),
         );
         out.push_str(
             &self

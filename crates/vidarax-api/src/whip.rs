@@ -34,6 +34,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use vidarax_core::provider::{
     InferenceObserver, InferenceProvider, InferenceRequest, InferenceResult, ProviderError,
     ProviderKind, TokenUsage,
@@ -210,7 +211,7 @@ async fn start_whip_session(
     // attributed to this WebRTC session.
     let session_span = tracing::info_span!("whip_session", sess_id = %sess_id);
 
-    // Create a run ID so VLM events have a home in the WAL / SpacetimeDB.
+    // Create a run ID for VLM events.
     let run_id: Arc<str> = Arc::from(state.next_run_id().as_str());
     let session_id_arc: Arc<str> = Arc::from(sess_id.as_str());
 
@@ -391,12 +392,8 @@ async fn start_whip_session_transaction(
     tokio::spawn(run_future);
 
     // ── EventSink selection ────────────────────────────────────────────────
-    // Prefer SpacetimeDB when the client is configured; fall back to WAL.
-    let event_sink: Arc<dyn EventSink> = if let Some(stdb) = state.spacetime_client() {
-        Arc::new(stdb.clone())
-    } else {
-        WalEventSink::arc(state.clone(), run_id.to_string())
-    };
+    // WAL events and raw keyframe blobs stay local; descriptions may be mirrored.
+    let event_sink: Arc<dyn EventSink> = WalEventSink::arc(state.clone());
 
     // ── InferenceProvider selection ────────────────────────────────────────
     // Use the HTTP router when provider endpoints are configured.
@@ -440,6 +437,7 @@ async fn start_whip_session_transaction(
     let session_span_for_workers = session_span.clone();
     let metrics_for_workers = Arc::clone(&metrics_arc);
     let vlm_config_for_workers = vlm_config.clone();
+    let novelty_for_workers = state.novelty_config().clone();
     // Same InferenceMetrics instance /metrics reads from, handed to the
     // worker pipeline as an observer so each tiered VLM pass (keyframe or
     // clip mode) is recorded under the provider that actually served it.
@@ -488,8 +486,7 @@ async fn start_whip_session_transaction(
                 prompt: prompt_for_workers,
                 guided_json: guided_json_for_workers,
                 vlm_config: vlm_config_for_workers,
-                distillation: vidarax_core::tiered_vlm::DistillationConfig::default(),
-                training_store: None,
+                novelty: novelty_for_workers,
                 clip_config: clip_config_for_workers,
                 codec: session.codec,
                 metrics: metrics_for_workers,
@@ -936,21 +933,18 @@ fn spawn_created_whip_tombstone_retry(
 
 /// Request body for `PATCH /v1/stream/whip/{sess_id}/prompt`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdatePromptRequest {
     pub prompt: String,
-    /// Optional JSON schema for guided/structured VLM output.
-    ///
-    /// When present, the schema is passed as `guided_json` to VLM inference
-    /// requests and `max_tokens` is bumped to 1024 to accommodate structured
-    /// output.  Set to `null` or omit to revert to free-text inference.
-    pub output_schema: Option<String>,
+    /// Optional JSON Schema for structured VLM output.
+    pub output_schema: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
 struct UpdatePromptResponse {
     session_id: String,
     prompt: String,
-    output_schema: Option<String>,
+    output_schema: Option<Value>,
 }
 
 /// `PATCH /v1/stream/whip/{sess_id}/prompt`
@@ -959,7 +953,7 @@ struct UpdatePromptResponse {
 /// optionally sets a JSON schema for structured output.
 /// The new prompt and schema are used by VLM workers on the next keyframe.
 ///
-/// Body: `{ "prompt": "new prompt text", "output_schema": "{...}" }`
+/// Body: `{ "prompt": "new prompt text", "output_schema": {...} }`
 ///
 /// Response:
 /// - `200 OK` with `{ "session_id": "...", "prompt": "...", "output_schema": ... }`
@@ -984,7 +978,7 @@ pub async fn whip_update_prompt(
     }
 
     session.update_prompt(body.prompt.clone());
-    session.update_guided_json(body.output_schema.clone());
+    session.update_guided_json(body.output_schema.as_ref().map(Value::to_string));
     tracing::info!(
         sess_id = %sess_id,
         has_schema = body.output_schema.is_some(),

@@ -7,8 +7,8 @@ use tower_http::compression::CompressionLayer;
 use crate::handlers::{
     analyze_run, create_run, delete_run, get_events, get_interactions, get_markers, get_run,
     get_state, health, infer, infer_batch, ingest_run, keepalive_run, list_feedback, list_models,
-    list_runs, metrics, query, reason_realtime_run, search, serve_file, stop_run, submit_feedback,
-    upload_file,
+    list_runs, metrics, query, reason_realtime_run, search, serve_file, serve_keyframe, stop_run,
+    submit_feedback, upload_file,
 };
 use crate::security::enforce_security;
 use crate::state::AppState;
@@ -25,6 +25,7 @@ pub fn app_router(state: AppState) -> Router {
             post(upload_file).layer(DefaultBodyLimit::max(200 * 1024 * 1024)),
         )
         .route("/v1/files/{filename}", get(serve_file))
+        .route("/v1/runs/{run_id}/keyframes/{sha256}", get(serve_keyframe))
         .route("/v1/runs/{run_id}/ingest", post(ingest_run))
         .route("/v1/runs/{run_id}/analyze", post(analyze_run))
         .route("/v1/runs/{run_id}/reason", post(reason_realtime_run))

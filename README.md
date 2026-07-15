@@ -1,21 +1,25 @@
 # vidarax
 
-Real-time video intelligence engine. Any stream in, structured semantic events out.
+Self-hosted video intelligence for live streams and recorded files.
 
-Vidarax decodes live or file-based video, runs a deterministic gate engine (scene cuts, flicker, ghosting, exposure shifts, loop detection) to mark every frame, samples a subset of frames through tiered Vision Language Models for semantic analysis, and emits structured events in real time. Self-hosted, open-source VLMs, no external API dependencies.
+Vidarax decodes video, applies deterministic frame gates, and sends selected
+frames to a configured vision-language model. Live capture can also use an
+embedding sidecar to reuse recent descriptions while a scene remains
+semantically stable. Events commit to a local write-ahead log; selected JPEGs
+are stored as content-addressed blobs and referenced by event metadata.
 
 ## Architecture
 
 ```
- Sources                      vidarax                           Consumers
+  Sources                        vidarax                         Consumers
 ┌──────────┐   ┌──────────────────────────────────────────┐   ┌──────────────┐
-│ MP4/File  │──>│                                          │──>│ REST (poll)  │
-│ WebRTC    │──>│  Decode ──> Gate Engine ──> VLM Tiering  │──>│ TypeScript   │
-│ RTSP/HLS  │──>│               │                │         │──>│   SDK        │
-│ Upload    │──>│          Markers +         Semantic       │──>│ Vue 3 UI     │
-│           │   │          Keyframes        Events          │   │ Prometheus   │
-│           │   │               │                │         │   │ Optional     │
-│           │   │            WAL event log       │         │   │ SpacetimeDB  │
+│ MP4/File │──>│                                          │──>│ REST API     │
+│ WebRTC   │──>│  Decode ──> Gate Engine ──> VLM Tiering  │──>│ TypeScript   │
+│ RTSP/HLS │──>│               │                │         │──>│   SDK        │
+│ Upload   │──>│          Markers +         Semantic      │──>│ Vue 3 UI     │
+│          │   │          Keyframes         Events        │   │ Prometheus   │
+│          │   │               │                │         │   │ Optional     │
+│          │   │            WAL event log      │          │   │ SpacetimeDB  │
 └──────────┘   └──────────────────────────────────────────┘   └──────────────┘
 ```
 
@@ -25,9 +29,11 @@ Throughput depends on your hardware, the models you run, and the input video, so
 there is no single headline number worth quoting. Measure on your own setup: the
 Python harnesses in `benchmarks/`, the bench binaries under `crates/*/src/bin`,
 and the scripts in `scripts/` cover the gate engine, provider transport, and the
-end-to-end API path. The gate engine is the cheap stage that runs on every frame;
-tiered routing keeps the small model on the common case and escalates to a larger
-one only when it is uncertain.
+end-to-end API path. The deterministic gate is the cheap per-frame stage. The
+optional semantic novelty gate reduces repeat model calls, while bounded tiering
+can escalate an uncertain first pass to a second model. Calibration and
+provider/hardware measurements are deployment-specific; see
+[deployment and evidence](docs/deployment.md#live-semantic-novelty-and-evidence).
 
 ## Quick start
 
@@ -57,9 +63,9 @@ import { Vidarax } from 'vidarax'
 const v = new Vidarax('http://localhost:8080', { apiKey: 'your-key' })
 
 // analyze() runs the deterministic frame-signal pipeline; it takes no prompt.
-const run = await v.analyze('video.mp4', { mode: 'balanced' })
+const run = await v.analyze('/srv/vidarax-media/video.mp4', { mode: 'balanced' })
 
-for await (const event of run.events()) {
+for (const event of await v.getEvents(run.runId)) {
   console.log(event.kind, event.payload)
 }
 ```
@@ -76,7 +82,8 @@ const result = await v.reason(run_id, {
 })
 ```
 
-The SDK also supports WebRTC streaming, batch inference, structured JSON output via `output_schema`, and typed async iterators over events and markers.
+The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via
+`output_schema`, interactions, and snapshot reads of events and markers.
 
 ## API endpoints
 
@@ -86,7 +93,7 @@ The SDK also supports WebRTC streaming, batch inference, structured JSON output 
 | `GET` | `/v1/runs` | List runs |
 | `GET` | `/v1/runs/:id` | Get run details |
 | `DELETE` | `/v1/runs/:id` | Delete a run |
-| `POST` | `/v1/runs/:id/ingest` | Ingest video (URI, file path, raw frames) |
+| `POST` | `/v1/runs/:id/ingest` | Ingest and decode a video source |
 | `POST` | `/v1/runs/:id/analyze` | Deterministic frame analysis |
 | `POST` | `/v1/runs/:id/reason` | Realtime semantic reasoning (tiered VLM) |
 | `POST` | `/v1/runs/:id/stop` | Stop a run |
@@ -108,6 +115,7 @@ The SDK also supports WebRTC streaming, batch inference, structured JSON output 
 | `PATCH` | `/v1/stream/whip/:sess/prompt` | Update live-session prompt |
 | `POST` | `/v1/upload` | Upload a file for processing |
 | `GET` | `/v1/files/:filename` | Serve an uploaded or allowed-root file |
+| `GET` | `/v1/runs/:id/keyframes/:sha256` | Serve a run-owned keyframe as raw JPEG |
 | `GET` | `/v1/health` | Health check |
 | `GET` | `/v1/metrics` | Prometheus-compatible metrics |
 
@@ -174,7 +182,7 @@ that id.
 | Gate engine | Deterministic frame analysis on a single-threaded hot path |
 | Inference | vLLM and SGLang through OpenAI-compatible backends with fallback |
 | Decode | ffmpeg CPU, NVDEC, and Apple VideoToolbox (the MLX decode backend); VideoToolbox may fall back to software decode inside ffmpeg when the input or host cannot initialise hardware |
-| Persistence | WAL-backed event log; optional SpacetimeDB client and module are present but not wired into the production server path |
+| Persistence | Local WAL plus content-addressed JPEG blobs; optional SpacetimeDB mirror for blocking WHIP description events |
 | Frontend | Vue 3, dark command-center UI |
 | Streaming | WebRTC via WHIP (RFC 9725) |
 | SDK | TypeScript (`vidarax` on npm) |

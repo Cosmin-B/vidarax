@@ -14,7 +14,7 @@ import { useEventStream } from '@/composables/useEventStream'
 import { api, ApiError } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth'
 import { lsNum, STORAGE_KEYS, UI_DEFAULTS } from '@/lib/config'
-import type { FeedbackRequest, RawRunEvent } from '@/lib/api'
+import type { FeedbackRequest } from '@/lib/api'
 import type { RunStatus } from '@/stores/runs'
 import type { AgentEvent } from '@/stores/events'
 import { ChevronLeft, Image, Radio, Zap } from 'lucide-vue-next'
@@ -26,7 +26,7 @@ const router = useRouter()
 const runsStore = useRunsStore()
 const eventsStore = useEventsStore()
 const authStore = useAuthStore()
-const { connect: connectEvents, disconnect: disconnectEvents, isConnected: stdbConnected } = useEventStream()
+const { connect: connectEvents, disconnect: disconnectEvents, isConnected: timelineConnected } = useEventStream()
 
 const runId = computed(() => route.params.runId as string)
 const activeTab = ref<'player' | 'keyframes' | 'metadata'>('player')
@@ -336,7 +336,7 @@ onMounted(async () => {
     runsStore.setActiveRun({
       run_id: data.run_id,
       status: data.status as RunStatus,
-      mode: data.mode as 'batch' | 'stream' | 'webrtc',
+      mode: data.mode as 'balanced' | 'detailed' | 'efficiency' | 'custom',
       model: data.model,
       source_uri: data.source_uri,
       created_at: data.created_at,
@@ -350,13 +350,8 @@ onMounted(async () => {
     loading.value = false
   }
 
-  connectEvents(runId.value)
-
-  setTimeout(() => {
-    if (!stdbConnected.value) {
-      startEventsPolling(runId.value)
-    }
-  }, 200)
+  await connectEvents(runId.value)
+  startEventsPolling(runId.value)
 
   if (isProcessing.value) {
     keepaliveTimer = setInterval(async () => {
@@ -385,7 +380,7 @@ async function stopRun(): Promise<void> {
   actionLoading.value = 'stop'
   try {
     await api.runs.stop(runId.value)
-    runsStore.updateRunStatus(runId.value, 'stopped')
+    runsStore.updateRunStatus(runId.value, 'cancelled')
   } catch (err) {
     console.error('[RunDetail] stop failed:', err)
   } finally {
@@ -406,45 +401,11 @@ async function deleteRun(): Promise<void> {
   }
 }
 
-// ── HTTP events fallback ─────────────────────────────────────────────────────
-
-function mapRawEvent(raw: RawRunEvent, runIdVal: string): AgentEvent | null {
-  if (raw.kind !== 'marker_emitted') return null
-  const p = raw.payload
-  const eventType = (p.event_type as string | undefined)
-    ?? (p.kind as string | undefined)
-    ?? 'vlm_description'
-  return {
-    run_id: runIdVal,
-    session_id: (p.stream_id as string | undefined) ?? '',
-    frame_index: Number((p.start_frame as number | undefined) ?? 0),
-    pts_ms: Number(raw.pts_ms ?? 0),
-    event_type: eventType as AgentEvent['event_type'],
-    confidence: Number((p.confidence as number | undefined) ?? 0),
-    description: (p.description as string | undefined) ?? (p.summary as string | undefined) ?? '',
-    timestamp_ms: 0,
-  }
-}
-
 function startEventsPolling(id: string): void {
-  const TERMINAL = new Set<string>(['completed', 'failed', 'stopped'])
+  const TERMINAL = new Set<string>(['completed', 'failed', 'cancelled', 'expired'])
 
   async function poll(): Promise<void> {
     try {
-      const res = await api.runs.events(id)
-      const mapped = res.events
-        .map(e => mapRawEvent(e, id))
-        .filter((e): e is AgentEvent => e !== null)
-      const existing = new Set(
-        eventsStore.eventsForRun(id).map(e => `${e.frame_index}:${e.event_type}`)
-      )
-      for (const evt of mapped) {
-        const key = `${evt.frame_index}:${evt.event_type}`
-        if (!existing.has(key)) {
-          eventsStore.addEvent(evt)
-          existing.add(key)
-        }
-      }
       const runData = await api.runs.get(id)
       runsStore.updateRunStatus(id, runData.status as RunStatus)
       if (TERMINAL.has(runData.status) && eventsPollingTimer.value !== null) {
@@ -498,7 +459,8 @@ function statusConfig(status: RunStatus) {
     completed:  { label: 'Completed',  cls: 'badge-green' },
     failed:     { label: 'Failed',     cls: 'badge-red'   },
     pending:    { label: 'Pending',    cls: 'badge-muted' },
-    stopped:    { label: 'Stopped',   cls: 'badge-muted' },
+    cancelled:  { label: 'Cancelled', cls: 'badge-muted' },
+    expired:    { label: 'Expired',   cls: 'badge-muted' },
   }
   return map[status] ?? { label: status, cls: 'badge-muted' }
 }
@@ -806,9 +768,9 @@ function formatTime(ms: number): string {
               <h3 class="text-[#e2e8f0] font-medium text-sm">Events</h3>
               <div class="flex items-center gap-2">
                 <span
-                  v-if="!stdbConnected && eventsPollingTimer !== null"
+                  v-if="!timelineConnected && eventsPollingTimer !== null"
                   class="text-xs text-[#475569]"
-                  title="SpacetimeDB not connected — polling REST API every 3s"
+                  title="Reconnecting to the local timeline"
                 >
                   polling
                 </span>
@@ -820,7 +782,7 @@ function formatTime(ms: number): string {
                     animation="pulse"
                     class="icon-glow-amber"
                   />
-                  {{ stdbConnected ? 'Live' : 'Live (HTTP)' }}
+                  {{ timelineConnected ? 'Live' : 'Reconnecting' }}
                 </span>
               </div>
             </div>
@@ -970,7 +932,7 @@ function formatTime(ms: number): string {
           </button>
         </div>
 
-        <!-- SpacetimeDB keyframes (real jpeg_b64 data) -->
+        <!-- Durable keyframes loaded as authenticated JPEG blobs. -->
         <div v-if="keyframes.length > 0" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
           <div
             v-for="kf in keyframes"
@@ -980,8 +942,8 @@ function formatTime(ms: number): string {
             @click="seekTo(kf.pts_ms); activeTab = 'player'"
           >
             <img
-              v-if="kf.jpeg_b64"
-              :src="`data:image/jpeg;base64,${kf.jpeg_b64}`"
+              v-if="kf.image_url"
+              :src="kf.image_url"
               :alt="`Keyframe at frame ${kf.frame_index}`"
               class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
               loading="lazy"
@@ -1129,7 +1091,7 @@ function formatTime(ms: number): string {
             rows="3"
             placeholder="Additional feedback…"
             class="rounded-[8px] px-3 py-2 text-xs w-full resize-none"
-            style="background: #050507; border: 1px solid #1e2633; color: #e2e8f0; outline: none; font-family: 'JetBrains Mono', monospace;"
+            style="background: #050507; border: 1px solid #1e2633; color: #e2e8f0; outline: none; font-family: ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, monospace;"
           />
         </div>
 

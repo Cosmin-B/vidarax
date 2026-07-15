@@ -1,7 +1,7 @@
 /**
  * useMetrics.ts
  * Polls GET /v1/metrics every 2s, parses Prometheus text format.
- * Falls back to mock data when the endpoint is unavailable.
+ * Failed requests remain explicit; this composable never fabricates telemetry.
  *
  * Histogram parsing: extracts cumulative bucket counts from lines of the form
  *   vidarax_pipeline_decode_latency_us_bucket{le="500"} 42
@@ -24,9 +24,9 @@ export interface HistogramPercentiles {
 
 export interface PipelineStageMetrics {
   name: string
-  throughputFps: number
+  itemsTotal: number
+  itemLabel: string
   latencyMs: number
-  totalFrames: number
   status: 'healthy' | 'slow' | 'error' | 'idle'
   /** Present when real histogram data is available from the backend. */
   percentiles?: HistogramPercentiles
@@ -34,38 +34,29 @@ export interface PipelineStageMetrics {
 
 export interface MetricsData {
   stages: PipelineStageMetrics[]
-  decodeFps: number
   decodeLatencyMs: number
   decodeFramesTotal: number
+  droppedFramesTotal: number
   gateFramesTotal: number
   gateKeyframesTotal: number
+  keyframesDroppedTotal: number
   gatePassRate: number
-  sceneCuts: number
+  loopDetectedTotal: number
   vlmInferencesTotal: number
   vlmLatencyMs: number
-  vlmQueueDepth: number
-  spacetimeEventsTotal: number
-  spacetimeEmitRate: number
+  noveltyEvaluatedTotal: number
+  noveltyReusedTotal: number
+  noveltyForcedRefreshTotal: number
+  noveltyEmbeddingUnavailableTotal: number
+  noveltyReuseRatio: number
+  keyframeBlobsWrittenTotal: number
+  keyframeBlobsReusedTotal: number
+  keyframeBlobFailuresTotal: number
+  keyframeBlobBytesTotal: number
   activeSessions: number
   lastUpdated: number
   /** Real histogram percentiles from the backend, indexed by stage name. */
   histograms: Record<string, HistogramPercentiles>
-}
-
-export interface TraceSpan {
-  stage: 'decode' | 'gate' | 'vlm'
-  startMs: number
-  durationMs: number
-  status: 'ok' | 'slow'
-}
-
-export interface Trace {
-  id: string
-  frameIndex: number
-  timestamp: number
-  totalMs: number
-  spans: TraceSpan[]
-  confidence: number
 }
 
 // ─── Histogram parser ─────────────────────────────────────────────────────────
@@ -223,38 +214,6 @@ function parsePrometheus(text: string): Map<string, number> {
   return result
 }
 
-// ─── Mock data generator ──────────────────────────────────────────────────────
-
-function generateMockText(tick: number): string {
-  const t = tick * 0.15
-  const fps = (28 + Math.sin(t * 0.5) * 3).toFixed(1)
-  const decodeLatency = (0.5 + Math.sin(t) * 0.2).toFixed(2)
-  const gateLatency = (1.0 + Math.cos(t * 0.7) * 0.3).toFixed(2)
-  const vlmLatency = (350 + Math.sin(t * 0.3) * 60).toFixed(0)
-  const framesTotal = 1200 + tick * 28
-  const keyframesTotal = Math.floor(framesTotal * 0.15)
-  const vlmTotal = Math.floor(keyframesTotal * 0.85)
-  const stdbTotal = Math.floor(vlmTotal * 1.2)
-  const stdbRate = (parseFloat(fps) * 0.15).toFixed(1)
-  const queueDepth = Math.max(0, Math.floor(2 + Math.sin(t * 2) * 2))
-
-  return [
-    `vidarax_pipeline_throughput_fps ${fps}`,
-    `vidarax_decode_latency_ms ${decodeLatency}`,
-    `vidarax_decode_frames_total ${framesTotal}`,
-    `vidarax_gate_latency_ms ${gateLatency}`,
-    `vidarax_gate_frames_total ${framesTotal}`,
-    `vidarax_gate_keyframes_total ${keyframesTotal}`,
-    `vidarax_gate_scene_cuts_total ${Math.floor(keyframesTotal * 0.3)}`,
-    `vidarax_vlm_latency_ms ${vlmLatency}`,
-    `vidarax_vlm_inferences_total ${vlmTotal}`,
-    `vidarax_vlm_queue_depth ${queueDepth}`,
-    `vidarax_spacetimedb_events_total ${stdbTotal}`,
-    `vidarax_spacetimedb_emit_rate_per_s ${stdbRate}`,
-    `vidarax_active_sessions 1`,
-  ].join('\n')
-}
-
 // ─── Histogram → ms conversion helpers ───────────────────────────────────────
 
 /**
@@ -288,7 +247,23 @@ function vlmPercentilesMs(
   return toPercentiles(h)
 }
 
-function stdbPercentilesMs(
+function noveltyPercentilesMs(
+  histograms: Map<string, RawHistogram>,
+): HistogramPercentiles | null {
+  const h = histograms.get('vidarax_pipeline_novelty_embedding_latency_ms')
+  if (!h || h.totalCount === 0) return null
+  return toPercentiles(h)
+}
+
+function keyframeBlobPercentilesMs(
+  histograms: Map<string, RawHistogram>,
+): HistogramPercentiles | null {
+  const h = histograms.get('vidarax_pipeline_keyframe_blob_latency_ms')
+  if (!h || h.totalCount === 0) return null
+  return toPercentiles(h)
+}
+
+function eventMirrorPercentilesMs(
   histograms: Map<string, RawHistogram>,
 ): HistogramPercentiles | null {
   const h = histograms.get('vidarax_pipeline_stdb_emit_latency_ms')
@@ -296,29 +271,48 @@ function stdbPercentilesMs(
   return toPercentiles(h)
 }
 
-// ─── MetricsData builder ──────────────────────────────────────────────────────
-
 function buildMetrics(
   map: Map<string, number>,
   histograms: Map<string, RawHistogram>,
-  tick: number,
 ): MetricsData {
   const get = (k: string) => map.get(k) ?? 0
-  const t = tick * 0.15
-  const fps = get('vidarax_pipeline_throughput_fps')
 
-  // Prefer real histogram mean for latency display; fall back to plain counter.
+  // Latency is emitted as histograms by the backend. Missing histograms are
+  // represented as idle, never estimated.
   const decodePct = decodePercentilesMs(histograms)
   const gatePct = gatePercentilesMs(histograms)
   const vlmPct = vlmPercentilesMs(histograms)
-  const stdbPct = stdbPercentilesMs(histograms)
+  const noveltyPct = noveltyPercentilesMs(histograms)
+  const keyframeBlobPct = keyframeBlobPercentilesMs(histograms)
+  const eventMirrorPct = eventMirrorPercentilesMs(histograms)
 
-  const decodeLatency = decodePct?.mean ?? get('vidarax_decode_latency_ms')
-  const gateLatency = gatePct?.mean ?? get('vidarax_gate_latency_ms')
-  const vlmLatency = vlmPct?.mean ?? get('vidarax_vlm_latency_ms')
-  const sessions = get('vidarax_active_sessions')
-  const stdbRate = get('vidarax_spacetimedb_emit_rate_per_s')
-  const stdbLatency = stdbPct?.mean ?? parseFloat((5 + Math.sin(t * 0.2) * 2).toFixed(1))
+  const decodeLatency = decodePct?.mean ?? 0
+  const gateLatency = gatePct?.mean ?? 0
+  const vlmLatency = vlmPct?.mean ?? 0
+  const sessions = Math.max(
+    0,
+    get('vidarax_pipeline_sessions_created_total')
+      - get('vidarax_pipeline_sessions_removed_total'),
+  )
+  const rtpFrames = get('vidarax_pipeline_rtp_frames_received_total')
+  const decodedFrames = get('vidarax_pipeline_frames_decoded_total')
+  const droppedFrames = get('vidarax_pipeline_frames_dropped_total')
+  const keyframes = get('vidarax_pipeline_keyframes_total')
+  // New backends expose gate decisions independently from downstream VLM
+  // queueing. Fall back to the legacy counters during rolling upgrades.
+  const gateFrames = map.has('vidarax_pipeline_gate_frames_analyzed_total')
+    ? get('vidarax_pipeline_gate_frames_analyzed_total')
+    : decodedFrames
+  const gateSelected = map.has('vidarax_pipeline_gate_keyframes_selected_total')
+    ? get('vidarax_pipeline_gate_keyframes_selected_total')
+    : keyframes
+  const keyframesDropped = get('vidarax_pipeline_keyframes_dropped_total')
+    + get('vidarax_pipeline_sink_keyframes_dropped_total')
+  const vlmInferences = get('vidarax_pipeline_vlm_inferences_total')
+  const noveltyEvaluated = get('vidarax_pipeline_novelty_evaluated_total')
+  const noveltyReused = get('vidarax_pipeline_novelty_reused_total')
+  const keyframeBlobsWritten = get('vidarax_pipeline_keyframe_blobs_written_total')
+  const keyframeBlobFailures = get('vidarax_pipeline_keyframe_blob_failures_total')
 
   function stageStatus(
     latencyMs: number,
@@ -334,134 +328,79 @@ function buildMetrics(
   const stages: PipelineStageMetrics[] = [
     {
       name: 'WebRTC',
-      throughputFps: fps,
-      latencyMs: parseFloat((0.2 + Math.sin(t) * 0.05).toFixed(2)),
-      totalFrames: get('vidarax_decode_frames_total'),
+      itemsTotal: rtpFrames,
+      itemLabel: 'frames',
+      latencyMs: 0,
       status: sessions > 0 ? 'healthy' : 'idle',
     },
     {
       name: 'Decode',
-      throughputFps: fps,
+      itemsTotal: decodedFrames,
+      itemLabel: 'frames',
       latencyMs: decodeLatency,
-      totalFrames: get('vidarax_decode_frames_total'),
       status: stageStatus(decodeLatency, 2, 5),
       percentiles: decodePct ?? undefined,
     },
     {
       name: 'Gate',
-      throughputFps: fps,
+      itemsTotal: gateSelected,
+      itemLabel: 'selected',
       latencyMs: gateLatency,
-      totalFrames: get('vidarax_gate_frames_total'),
       status: stageStatus(gateLatency, 3, 8),
       percentiles: gatePct ?? undefined,
     },
     {
       name: 'VLM',
-      throughputFps: fps * 0.15,
+      itemsTotal: vlmInferences,
+      itemLabel: 'calls',
       latencyMs: vlmLatency,
-      totalFrames: get('vidarax_vlm_inferences_total'),
       status: stageStatus(vlmLatency, 500, 800),
       percentiles: vlmPct ?? undefined,
     },
     {
-      name: 'SpacetimeDB',
-      throughputFps: stdbRate,
-      latencyMs: stdbLatency,
-      totalFrames: get('vidarax_spacetimedb_events_total'),
-      status: 'healthy',
-      percentiles: stdbPct ?? undefined,
+      name: 'Keyframe store',
+      itemsTotal: keyframeBlobsWritten,
+      itemLabel: 'blobs',
+      latencyMs: keyframeBlobPct?.mean ?? 0,
+      status: keyframeBlobFailures > 0
+        ? 'error'
+        : stageStatus(keyframeBlobPct?.mean ?? 0, 20, 100),
+      percentiles: keyframeBlobPct ?? undefined,
     },
   ]
 
-  const gateFrames = get('vidarax_gate_frames_total')
-  const gateKeyframes = get('vidarax_gate_keyframes_total')
-
-  // Collect all available histogram percentiles for consumers (MetricsGrid, etc.)
   const histogramsOut: Record<string, HistogramPercentiles> = {}
   if (decodePct) histogramsOut['Decode'] = decodePct
   if (gatePct) histogramsOut['Gate'] = gatePct
   if (vlmPct) histogramsOut['VLM'] = vlmPct
-  if (stdbPct) histogramsOut['SpacetimeDB'] = stdbPct
+  if (noveltyPct) histogramsOut['Novelty'] = noveltyPct
+  if (keyframeBlobPct) histogramsOut['Keyframe store'] = keyframeBlobPct
+  if (eventMirrorPct) histogramsOut['Event mirror'] = eventMirrorPct
 
   return {
     stages,
-    decodeFps: fps,
     decodeLatencyMs: decodeLatency,
-    decodeFramesTotal: get('vidarax_decode_frames_total'),
+    decodeFramesTotal: decodedFrames,
+    droppedFramesTotal: droppedFrames,
     gateFramesTotal: gateFrames,
-    gateKeyframesTotal: gateKeyframes,
-    gatePassRate: gateFrames > 0 ? gateKeyframes / gateFrames : 0,
-    sceneCuts: get('vidarax_gate_scene_cuts_total'),
-    vlmInferencesTotal: get('vidarax_vlm_inferences_total'),
+    gateKeyframesTotal: gateSelected,
+    keyframesDroppedTotal: keyframesDropped,
+    gatePassRate: gateFrames > 0 ? gateSelected / gateFrames : 0,
+    loopDetectedTotal: get('vidarax_pipeline_loop_detected_total'),
+    vlmInferencesTotal: vlmInferences,
     vlmLatencyMs: vlmLatency,
-    vlmQueueDepth: get('vidarax_vlm_queue_depth'),
-    spacetimeEventsTotal: get('vidarax_spacetimedb_events_total'),
-    spacetimeEmitRate: stdbRate,
+    noveltyEvaluatedTotal: noveltyEvaluated,
+    noveltyReusedTotal: noveltyReused,
+    noveltyForcedRefreshTotal: get('vidarax_pipeline_novelty_forced_refresh_total'),
+    noveltyEmbeddingUnavailableTotal: get('vidarax_pipeline_novelty_embedding_unavailable_total'),
+    noveltyReuseRatio: noveltyEvaluated > 0 ? noveltyReused / noveltyEvaluated : 0,
+    keyframeBlobsWrittenTotal: keyframeBlobsWritten,
+    keyframeBlobsReusedTotal: get('vidarax_pipeline_keyframe_blobs_reused_total'),
+    keyframeBlobFailuresTotal: keyframeBlobFailures,
+    keyframeBlobBytesTotal: get('vidarax_pipeline_keyframe_blob_bytes_total'),
     activeSessions: sessions,
     lastUpdated: Date.now(),
     histograms: histogramsOut,
-  }
-}
-
-// ─── Mock trace generator (exported for TracingPage) ─────────────────────────
-
-let _traceFrameIdx = 5000
-let _nextTraceId = 1
-
-export function generateMockTrace(metrics: MetricsData): Trace {
-  const id = `tr-${String(_nextTraceId++).padStart(4, '0')}`
-  const frameIndex = _traceFrameIdx
-  _traceFrameIdx += Math.floor(6 + Math.random() * 5)
-
-  // Use real p50 from histogram when available; fall back to current mean.
-  const decodePct = metrics.histograms['Decode']
-  const vlmPct = metrics.histograms['VLM']
-  const gatePct = metrics.histograms['Gate']
-
-  const baseDecodeMs = (decodePct?.p50 ?? metrics.decodeLatencyMs) || 0.5
-  const baseGateMs = gatePct?.p50 ?? 1.0
-  const baseVlmMs = (vlmPct?.p50 ?? metrics.vlmLatencyMs) || 350
-
-  const decodeMs = baseDecodeMs * (0.85 + Math.random() * 0.3)
-  const gateMs = baseGateMs * (0.8 + Math.random() * 0.4)
-  const vlmMs = baseVlmMs * (0.8 + Math.random() * 0.4)
-
-  // Determine "slow" thresholds from p95 when available.
-  const decodeSlowThresh = decodePct?.p95 ?? 2
-  const gateSlowThresh = gatePct?.p95 ?? 3
-  const vlmSlowThresh = vlmPct?.p95 ?? 500
-
-  const spans: TraceSpan[] = [
-    {
-      stage: 'decode',
-      startMs: 0,
-      durationMs: parseFloat(decodeMs.toFixed(2)),
-      status: decodeMs > decodeSlowThresh ? 'slow' : 'ok',
-    },
-    {
-      stage: 'gate',
-      startMs: parseFloat(decodeMs.toFixed(2)),
-      durationMs: parseFloat(gateMs.toFixed(2)),
-      status: gateMs > gateSlowThresh ? 'slow' : 'ok',
-    },
-    {
-      stage: 'vlm',
-      startMs: parseFloat((decodeMs + gateMs).toFixed(2)),
-      durationMs: parseFloat(vlmMs.toFixed(2)),
-      status: vlmMs > vlmSlowThresh ? 'slow' : 'ok',
-    },
-  ]
-
-  const totalMs = decodeMs + gateMs + vlmMs
-  const confidence = 0.68 + Math.random() * 0.28
-
-  return {
-    id,
-    frameIndex,
-    timestamp: Date.now() - Math.floor(Math.random() * 30000),
-    totalMs: parseFloat(totalMs.toFixed(1)),
-    spans,
-    confidence: parseFloat(confidence.toFixed(2)),
   }
 }
 
@@ -471,9 +410,7 @@ export function useMetrics(intervalMs = 2000) {
   const metrics = ref<MetricsData | null>(null)
   const error = ref<string | null>(null)
   const loading = ref(false)
-  const usingMock = ref(false)
 
-  let tick = 0
   let timer: ReturnType<typeof setInterval> | null = null
 
   async function fetchMetrics() {
@@ -481,26 +418,18 @@ export function useMetrics(intervalMs = 2000) {
     error.value = null
     try {
       const auth = useAuthStore()
-      let text: string
-      let usedMock = false
-      try {
-        const res = await fetch(`${auth.apiEndpoint}/v1/metrics`, {
-          headers: { ...auth.defaultHeaders(), Accept: 'text/plain' },
-          signal: AbortSignal.timeout(4000),
-        })
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        text = await res.text()
-      } catch {
-        text = generateMockText(tick)
-        usedMock = true
-      }
-      usingMock.value = usedMock
+      const res = await fetch(`${auth.apiEndpoint}/v1/metrics`, {
+        headers: { ...auth.defaultHeaders(), Accept: 'text/plain' },
+        signal: AbortSignal.timeout(4000),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const text = await res.text()
       const map = parsePrometheus(text)
       const histograms = parseHistograms(text)
-      metrics.value = buildMetrics(map, histograms, tick)
-      tick++
+      metrics.value = buildMetrics(map, histograms)
     } catch (e) {
-      error.value = e instanceof Error ? e.message : 'Metrics fetch failed'
+      const detail = e instanceof Error ? e.message : 'unknown error'
+      error.value = `Metrics unavailable: ${detail}`
     } finally {
       loading.value = false
     }
@@ -520,5 +449,5 @@ export function useMetrics(intervalMs = 2000) {
 
   onUnmounted(stop)
 
-  return { metrics, error, loading, usingMock, start, stop, refetch: fetchMetrics }
+  return { metrics, error, loading, start, stop, refetch: fetchMetrics }
 }

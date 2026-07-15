@@ -1,4 +1,4 @@
-# Demo Script (3 minutes)
+# Demo runbook (3 minutes)
 
 Audience: engineers, investors. Tone: direct, technical, no fluff.
 
@@ -13,7 +13,7 @@ Screen: Dashboard page at `/`.
 Point out the Command Center:
 - Recent runs list with status indicators
 - Stats row: total runs, processing, events, completed
-- Live events feed streaming from SpacetimeDB
+- Recent events read from the run timeline
 
 ## 0:40 -- 1:30 | Upload and Analyze
 
@@ -32,11 +32,11 @@ Click View Results to open Run Detail (`/runs/:runId`). Show:
 
 Navigate to Tracing (`/tracing`).
 
-> "Every frame is observable. Ingest, decode, gate engine, VLM, SpacetimeDB."
+> "The pipeline exposes decode, gate, model, WAL, and optional mirror latency."
 
-Point out: pipeline flow diagram, live metrics grid (2s refresh), trace timeline waterfall.
+Point out: pipeline counters, measured p50/p95/p99 latency, semantic reuse and forced-refresh counts, and binary keyframe-sidecar health. If `/v1/metrics` is unavailable, the page says so instead of showing sample data.
 
-> "Gate engine is deterministic Rust. Two-pass sliding window -- deterministic metadata first, refined markers second."
+> "The deterministic gate is allocation-free in the measured hot path. The semantic gate fails open, bounds reuse by time and cumulative drift, and exposes shadow-calibration counters."
 
 ## 2:10 -- 2:45 | Settings and Model Routing
 
@@ -50,12 +50,14 @@ Navigate to Settings (`/settings`). Show:
 
 ## 2:45 -- 3:00 | Close
 
-> "Open VLMs. Deterministic gate engine. Tiered inference. Vidarax -- the intelligent routing layer between your video and your models."
+> "Vidarax filters repeat work, keeps the event record local, and lets each deployment prove its own latency and quality targets."
 
 ## Pre-demo Checklist
 
 - [ ] API server running (`cargo run --release -p vidarax-api`)
 - [ ] vLLM running with target models loaded
+- [ ] Embedding sidecar running if semantic novelty is part of the demo
+- [ ] Novelty threshold calibrated for the selected video and provider
 - [ ] Frontend running (`cd ui && npm run dev`)
 - [ ] 10-second test video ready
 - [ ] Browser tabs pre-loaded: Dashboard, Upload, Tracing, Settings

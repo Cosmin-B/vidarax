@@ -5,7 +5,6 @@ use std::env;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -49,7 +48,7 @@ async fn main() {
         Err(e) => exit_with_error(e),
     };
 
-    if let Err(e) = dispatch(cli.command, &global, config, output).await {
+    if let Err(e) = dispatch(cli.command, config, output).await {
         exit_with_error(e);
     }
 }
@@ -125,9 +124,6 @@ enum Commands {
     Config(ConfigCommands),
     /// List stream states and terminal status.
     States,
-    /// Run local distillation helpers.
-    #[command(subcommand)]
-    Distill(DistillCommands),
     /// Create a run.
     #[command(name = "run-create", hide = true)]
     RunCreate(RunCreateArgs),
@@ -395,46 +391,6 @@ enum ConfigCommands {
     Show,
 }
 
-#[derive(Subcommand, Debug)]
-enum DistillCommands {
-    /// Show stored training data status.
-    Status(DistillCliArgs),
-    /// Train a local specialist model.
-    Train(DistillCliArgs),
-    /// Export a local specialist model.
-    Export(DistillCliArgs),
-    /// Ask the API to reload specialist weights.
-    Deploy(DistillCliArgs),
-}
-
-#[derive(Args, Debug, Clone)]
-struct DistillCliArgs {
-    /// Training data directory.
-    #[arg(long, value_name = "DIR", default_value = ".vidarax-data")]
-    data_dir: PathBuf,
-    /// Use the MLX training script.
-    #[arg(long)]
-    mlx: bool,
-    /// Resume training.
-    #[arg(long)]
-    resume: bool,
-    /// Export format.
-    #[arg(long, value_name = "gguf|onnx|mlx", default_value = "gguf")]
-    format: String,
-}
-
-impl DistillCliArgs {
-    fn to_opts(&self, tenant_id: Option<String>) -> DistillOpts {
-        DistillOpts {
-            tenant_id,
-            data_dir: self.data_dir.clone(),
-            mlx: self.mlx,
-            resume: self.resume,
-            format: self.format.clone(),
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 struct OutputMode {
     json: bool,
@@ -443,7 +399,6 @@ struct OutputMode {
 
 async fn dispatch(
     command: Commands,
-    global: &GlobalArgs,
     config: RuntimeConfig,
     output: OutputMode,
 ) -> Result<(), String> {
@@ -467,16 +422,6 @@ async fn dispatch(
         Commands::Doctor => cmd_doctor(config, output).await,
         Commands::Config(ConfigCommands::Show) => cmd_config_show(config, output),
         Commands::States => cmd_states(output),
-        Commands::Distill(command) => {
-            let tenant_id = global.tenant_id.clone();
-            match command {
-                DistillCommands::Status(args) => cmd_distill_status(args.to_opts(tenant_id)).await,
-                DistillCommands::Train(args) => cmd_distill_train(args.to_opts(tenant_id)).await,
-                DistillCommands::Export(args) => cmd_distill_export(args.to_opts(tenant_id)).await,
-                DistillCommands::Deploy(args) => cmd_distill_deploy(args.to_opts(tenant_id)).await,
-            }
-            Ok(())
-        }
         Commands::RunCreate(args) => cmd_run_create(config, output, &args).await,
     }
 }
@@ -1991,187 +1936,6 @@ fn extract_error_message(body: &Value) -> Option<String> {
 fn exit_with_error(message: String) -> ! {
     eprintln!("error: {message}");
     std::process::exit(1);
-}
-
-struct DistillOpts {
-    tenant_id: Option<String>,
-    data_dir: PathBuf,
-    mlx: bool,
-    resume: bool,
-    format: String,
-}
-
-impl DistillOpts {
-    fn require_tenant_id(&self) -> &str {
-        self.tenant_id.as_deref().unwrap_or_else(|| {
-            eprintln!("error: --tenant-id is required");
-            std::process::exit(1);
-        })
-    }
-}
-
-/// Show the number of stored training pairs and database location.
-#[cfg(feature = "training")]
-async fn cmd_distill_status(opts: DistillOpts) {
-    let tenant_id = opts.require_tenant_id();
-
-    match vidarax_core::training_data::TrainingStore::new(&opts.data_dir) {
-        Ok(store) => {
-            let count = store.pair_count(tenant_id).unwrap_or(0);
-            println!("tenant_id : {tenant_id}");
-            println!("pairs     : {count}");
-            println!("data_dir  : {}", opts.data_dir.display());
-        }
-        Err(e) => {
-            eprintln!("error opening training store: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-#[cfg(not(feature = "training"))]
-async fn cmd_distill_status(_opts: DistillOpts) {
-    eprintln!("error: training support is not compiled in (rebuild with --features training)");
-    std::process::exit(1);
-}
-
-/// Spawn the Python training script and stream its output.
-#[cfg(feature = "training")]
-async fn cmd_distill_train(opts: DistillOpts) {
-    let tenant_id = opts.require_tenant_id();
-
-    let jsonl_path = opts.data_dir.join(format!("{tenant_id}-training.jsonl"));
-    match vidarax_core::training_data::TrainingStore::new(&opts.data_dir) {
-        Ok(store) => match store.export_training_jsonl(tenant_id, &jsonl_path) {
-            Ok(n) => {
-                tracing::info!(count = n, path = %jsonl_path.display(), "exported training pairs")
-            }
-            Err(e) => {
-                eprintln!("error exporting training data: {e}");
-                std::process::exit(1);
-            }
-        },
-        Err(e) => {
-            eprintln!("error opening training store: {e}");
-            std::process::exit(1);
-        }
-    }
-
-    let script = if opts.mlx {
-        "scripts/train_specialist_mlx.py"
-    } else {
-        "scripts/train_specialist.py"
-    };
-
-    let mut cmd = tokio::process::Command::new("python3");
-    cmd.arg(script)
-        .arg("--data-dir")
-        .arg(&opts.data_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    if opts.resume {
-        cmd.arg("--resume");
-    }
-
-    tracing::info!(script, tenant_id, "starting training subprocess");
-    run_subprocess(cmd).await;
-}
-
-#[cfg(not(feature = "training"))]
-async fn cmd_distill_train(opts: DistillOpts) {
-    let _ = (opts.mlx, opts.resume);
-    eprintln!("error: training support is not compiled in (rebuild with --features training)");
-    std::process::exit(1);
-}
-
-/// Spawn the Python export script to convert the fine-tuned model.
-async fn cmd_distill_export(opts: DistillOpts) {
-    let tenant_id = opts.require_tenant_id();
-
-    let format = opts.format.as_str();
-    if !matches!(format, "gguf" | "onnx" | "mlx") {
-        eprintln!("error: --format must be one of: gguf, onnx, mlx");
-        std::process::exit(1);
-    }
-
-    let mut cmd = tokio::process::Command::new("python3");
-    cmd.arg("scripts/export_specialist.py")
-        .arg("--tenant-id")
-        .arg(tenant_id)
-        .arg("--format")
-        .arg(format)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    tracing::info!(tenant_id, format, "starting export subprocess");
-    run_subprocess(cmd).await;
-}
-
-/// Write a `.reload-specialist` sentinel file for the running API.
-async fn cmd_distill_deploy(opts: DistillOpts) {
-    let tenant_id = opts.require_tenant_id();
-
-    let sentinel = opts.data_dir.join(".reload-specialist");
-    match std::fs::write(&sentinel, tenant_id) {
-        Ok(()) => {
-            tracing::info!(
-                path = %sentinel.display(),
-                tenant_id,
-                "reload sentinel written — running API will pick this up"
-            );
-            println!("sentinel written: {}", sentinel.display());
-        }
-        Err(e) => {
-            eprintln!("error writing sentinel: {e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-/// Spawn the command, stream stdout and stderr, then wait for exit.
-async fn run_subprocess(mut cmd: tokio::process::Command) {
-    use tokio::io::AsyncBufReadExt as _;
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("failed to spawn subprocess: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    if let Some(stdout) = child.stdout.take() {
-        tokio::spawn(async move {
-            let mut lines = tokio::io::BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::info!("[subprocess] {}", line);
-            }
-        });
-    }
-
-    if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(async move {
-            let mut lines = tokio::io::BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::warn!("[subprocess] {}", line);
-            }
-        });
-    }
-
-    match child.wait().await {
-        Ok(status) if status.success() => {
-            tracing::info!("subprocess exited successfully");
-        }
-        Ok(status) => {
-            eprintln!("subprocess exited with: {status}");
-            std::process::exit(status.code().unwrap_or(1));
-        }
-        Err(e) => {
-            eprintln!("subprocess wait error: {e}");
-            std::process::exit(1);
-        }
-    }
 }
 
 #[cfg(test)]

@@ -5,11 +5,6 @@ version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-[features]
-# Enable training-data commands (distill status, distill train).
-# Pulls in rusqlite + zvec-bindings via vidarax-core/training.
-training = ["vidarax-core/training"]
-
 [dependencies]
 vidarax-contracts = { path = "../vidarax-contracts" }
 vidarax-core = { path = "../vidarax-core" }
@@ -19,7 +14,7 @@ indicatif = "0.17"
 owo-colors = "4"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "multipart", "query"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
