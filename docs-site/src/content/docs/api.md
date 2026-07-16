@@ -164,7 +164,7 @@ Not everything uses the envelope. WHIP routes return raw SDP on success and bare
 | `VIDARAX_ACTIVE_STREAM_LIMIT` | `5` | Max active runs per resolved principal |
 | `VIDARAX_STREAM_TTL_SECS` | `3600` | Run idle TTL |
 | `VIDARAX_NOVELTY_EMBEDDING_ADDR` | unset | Binary TCP embedding sidecar; setting it enables live semantic novelty |
-| `VIDARAX_NOVELTY_REUSE_THRESHOLD` | `0.12` | Embedding-distance ceiling for description reuse |
+| `VIDARAX_NOVELTY_REUSE_THRESHOLD` | `0.01` | Conservative embedding-distance ceiling for description reuse; calibrate it on labelled deployment traffic |
 
 When neither backend URL is set, the server reads a TOML config file (`VIDARAX_CONFIG`, default `vidarax.toml`) that declares backends in priority order; the parser supports `openai_compat` and `gemini` backend types, and string fields interpolate `${ENV_VAR}` references. When either explicit URL is set, the TOML file is not read.
 

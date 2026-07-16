@@ -49,7 +49,7 @@ paths. Values below come from the current Rust source, mainly
 | `VIDARAX_NOVELTY_MAX_CUMULATIVE_DRIFT` | `0.50` | Refresh after reuse scores accumulate to this value. |
 | `VIDARAX_NOVELTY_SHADOW_SAMPLE_RATE` | `0.01` | Fraction of reuse decisions sampled through the VLM. |
 | `VIDARAX_NOVELTY_EMBEDDING_TIMEOUT_MS` | `2000` | Sidecar deadline. Failure runs the VLM. |
-| `VIDARAX_NOVELTY_REUSE_THRESHOLD` | `0.12` | Reuse at or below this embedding-distance score. Must be in `[0,1)`. |
+| `VIDARAX_NOVELTY_REUSE_THRESHOLD` | `0.01` | Reuse at or below this embedding-distance score. Must be in `[0,1)`; treat the default as a conservative starting point and calibrate it on labelled deployment traffic. |
 | `VIDARAX_ALLOW_REMOTE_HLS` | `false` | Allow remote HLS manifests. Keep disabled unless manifests are trusted. |
 | `VIDARAX_ALLOW_INSECURE_HTTP` | `false` | Allow `http://` media sources and redirects. |
 | `VIDARAX_ALLOW_UNENCRYPTED_RTSP` | `false` | Allow `rtsp://` camera sources. |

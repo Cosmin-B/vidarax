@@ -110,6 +110,7 @@ fn main() {
     embedding_latencies_ms.sort_by(f64::total_cmp);
     let embedding_mean_ms =
         embedding_latencies_ms.iter().sum::<f64>() / embedding_latencies_ms.len() as f64;
+    let embedding_p50_ms = percentile(&embedding_latencies_ms, 0.50);
     let embedding_p95_ms = percentile(&embedding_latencies_ms, 0.95);
     let mut best: Option<OperatingPoint> = None;
 
@@ -117,7 +118,10 @@ fn main() {
     println!("  manifest: {}", manifest_path.display());
     println!("  samples: {}", candidates.len());
     println!("  sidecar: {sidecar_addr}");
-    println!("  embedding latency: mean={embedding_mean_ms:.2}ms p95={embedding_p95_ms:.2}ms");
+    println!(
+        "  embedding latency: p50={embedding_p50_ms:.2}ms p95={embedding_p95_ms:.2}ms \
+         mean={embedding_mean_ms:.2}ms"
+    );
     println!(
         "  baseline VLM p50: {vlm_p50_ms:.2}ms; max reuse: {max_reuse_ms}ms; \
          max drift: {max_cumulative_drift:.2}"

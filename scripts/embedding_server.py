@@ -63,7 +63,10 @@ def _detect_device(requested: str) -> torch.device:
 def _extract_embeddings(images: list[Image.Image]) -> np.ndarray:
     inputs = _processor(images=images, return_tensors="pt").to(_device)
     outputs = _model.get_image_features(**inputs)
-    embeddings = outputs / outputs.norm(dim=-1, keepdim=True)
+    features = getattr(outputs, "pooler_output", outputs)
+    if not isinstance(features, torch.Tensor):
+        raise TypeError(f"unexpected image feature output {type(outputs).__name__}")
+    embeddings = features / features.norm(dim=-1, keepdim=True)
     return embeddings.cpu().float().numpy()
 
 

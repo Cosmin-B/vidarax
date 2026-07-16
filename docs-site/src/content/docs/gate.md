@@ -51,6 +51,8 @@ That general gate maps the fused score to three outcomes:
 
 Live capture deliberately uses a narrower binary policy: a SigLIP2 embedding either reuses the last successful description or runs the VLM. It does not call a second model to settle ambiguity. Reuse is bounded by a capture-time TTL and cumulative embedding drift; shadow sampling sends a configurable fraction of reuse decisions through the VLM to measure disagreement. Sidecar timeouts and malformed embeddings fail open by running the VLM.
 
+The shipped reuse threshold is deliberately conservative. It is a safe starting point, not a universal calibration: operators should select a threshold against labelled, representative streams and the latency of the provider they actually run.
+
 The gate anchor advances only after a successful, non-empty VLM description. Reused frames and failed inference do not change it. The embedding sidecar receives raw JPEG bytes over a length-prefixed TCP protocol and returns 768 little-endian `f32` values; no image is transformed into JSON or base64. See [Deployment](/operations/) for operations and the repository's `docs/deployment.md` for calibration and provider/hardware evidence commands.
 
 ## Tiered escalation to a second-pass model

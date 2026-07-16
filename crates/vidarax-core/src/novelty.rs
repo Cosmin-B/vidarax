@@ -35,6 +35,13 @@ pub const LIVE_EMBEDDING_TIMEOUT_MS: u64 = 2_000;
 pub const LIVE_MAX_CUMULATIVE_DRIFT: f32 = 0.50;
 /// Default invisible sampling rate for online false-drop evidence.
 pub const LIVE_SHADOW_SAMPLE_RATE: f32 = 0.01;
+/// Conservative live reuse threshold selected from preliminary labelled calibration.
+///
+/// This is intentionally separate from [`DEFAULT_TAU_LO`]: the generic gate
+/// fuses OCR, embedding, and perceptual-hash signals, while live capture makes
+/// its decision from embedding distance alone. Deployments should still
+/// calibrate this value on representative labelled streams.
+pub const LIVE_REUSE_THRESHOLD: f32 = 0.01;
 
 /// splitmix64 — a fast, well-distributed integer mixer. Used both to derive the
 /// per-slot MinHash seeds and to spread a token's base hash across the slots.
@@ -222,7 +229,7 @@ impl Default for LiveNoveltyConfig {
             max_cumulative_drift: LIVE_MAX_CUMULATIVE_DRIFT,
             shadow_sample_rate: LIVE_SHADOW_SAMPLE_RATE,
             embedding_timeout_ms: LIVE_EMBEDDING_TIMEOUT_MS,
-            reuse_threshold: DEFAULT_TAU_LO,
+            reuse_threshold: LIVE_REUSE_THRESHOLD,
         }
     }
 }
@@ -707,6 +714,11 @@ mod tests {
     use super::*;
 
     const DIM: usize = 16;
+
+    #[test]
+    fn live_default_uses_calibrated_conservative_threshold() {
+        assert_eq!(LiveNoveltyConfig::default().reuse_threshold, 0.01);
+    }
 
     /// A unit-ish embedding pointing mostly along axis `axis`, with a little
     /// energy spread so quantisation has something to represent.
