@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use base64::Engine as _;
 use serde_json::Value;
 use vidarax_contracts::models::normalize_model_id;
 
@@ -89,6 +90,10 @@ pub struct InferenceImage {
 #[derive(Debug, Clone)]
 pub struct InferenceVideo {
     pub media_type: &'static str, // e.g. "video/mp4"
+    /// Raw media used by binary-capable providers. Keeping this alongside the
+    /// legacy representation lets video pipelines avoid a base64/JSON copy.
+    pub raw_bytes: Option<Arc<[u8]>>,
+    /// Legacy representation for providers that only accept data URLs.
     pub data_base64: String,
 }
 
@@ -490,10 +495,20 @@ fn build_payload(model: &str, request: &InferenceRequest) -> String {
             }));
         }
         for video in &request.input_videos {
+            let data_base64 = video.data_base64.clone();
+            let data_base64 = if data_base64.is_empty() {
+                video
+                    .raw_bytes
+                    .as_ref()
+                    .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+                    .unwrap_or_default()
+            } else {
+                data_base64
+            };
             content.push(serde_json::json!({
                 "type": "video_url",
                 "video_url": {
-                    "url": format!("data:{};base64,{}", video.media_type, video.data_base64)
+                    "url": format!("data:{};base64,{}", video.media_type, data_base64)
                 }
             }));
         }
@@ -904,6 +919,7 @@ mod tests {
         }];
         req.input_videos = vec![InferenceVideo {
             media_type: "video/mp4",
+            raw_bytes: None,
             data_base64: "dmlk".to_string(),
         }];
         let body = build_payload("openbmb/MiniCPM-V-4_5", &req);
@@ -927,6 +943,7 @@ mod tests {
         let mut req = request();
         req.input_videos = vec![InferenceVideo {
             media_type: "video/mp4",
+            raw_bytes: None,
             data_base64: "dmlk".to_string(),
         }];
         let body = build_payload("openbmb/MiniCPM-V-4_5", &req);

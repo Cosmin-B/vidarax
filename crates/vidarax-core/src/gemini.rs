@@ -1,6 +1,6 @@
 //! Gemini VLM provider using the native `generateContent` API.
 //!
-//! Supports both inline media (< 20 MB) and the File API for larger payloads.
+//! Supports inline legacy media and raw binary video through the File API.
 //!
 //! # Examples
 //!
@@ -124,8 +124,15 @@ impl GeminiProvider {
 
         // Videos — inline if small, File API if large
         for video in &request.input_videos {
-            let approx_bytes = video.data_base64.len() * 3 / 4;
-            if approx_bytes < INLINE_SIZE_LIMIT {
+            if video.raw_bytes.is_some() {
+                let uri = self.upload_file(video)?;
+                parts.push(serde_json::json!({
+                    "fileData": {
+                        "mimeType": video.media_type,
+                        "fileUri": uri
+                    }
+                }));
+            } else if video.data_base64.len() * 3 / 4 < INLINE_SIZE_LIMIT {
                 parts.push(serde_json::json!({
                     "inlineData": {
                         "mimeType": video.media_type,
@@ -170,9 +177,12 @@ impl GeminiProvider {
     /// Upload `video` via the Gemini File API (resumable upload) and return
     /// the file URI. Polls until the file reaches `ACTIVE` state.
     fn upload_file(&self, video: &InferenceVideo) -> Result<String, ProviderError> {
-        let raw_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&video.data_base64)
-            .map_err(|e| ProviderError::Transport(format!("base64 decode failed: {e}")))?;
+        let raw_bytes = match &video.raw_bytes {
+            Some(bytes) => bytes.to_vec(),
+            None => base64::engine::general_purpose::STANDARD
+                .decode(&video.data_base64)
+                .map_err(|e| ProviderError::Transport(format!("base64 decode failed: {e}")))?,
+        };
 
         let byte_count = raw_bytes.len();
 
@@ -556,6 +566,7 @@ mod tests {
         // A tiny base64 string decodes well under 20 MB
         req.input_videos = vec![InferenceVideo {
             media_type: "video/mp4",
+            raw_bytes: None,
             data_base64: "dmlkZW8=".to_string(),
         }];
         let body = p.build_payload(&req).unwrap();
@@ -891,6 +902,7 @@ mod tests {
             input_images: vec![],
             input_videos: vec![crate::provider::InferenceVideo {
                 media_type: "video/mp4",
+                raw_bytes: None,
                 data_base64: b64,
             }],
             max_tokens: 100,

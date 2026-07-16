@@ -579,7 +579,8 @@ pub async fn infer_chunk_semantics(
     let (images, videos) = if let Some(clip_bytes) = video_clip {
         let vids = vec![InferenceVideo {
             media_type: "video/mp4",
-            data_base64: BASE64_STANDARD.encode(clip_bytes.as_ref()),
+            raw_bytes: Some(Arc::clone(&clip_bytes)),
+            data_base64: String::new(),
         }];
         (Vec::new(), vids)
     } else {
