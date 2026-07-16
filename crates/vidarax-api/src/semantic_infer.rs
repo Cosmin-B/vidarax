@@ -42,7 +42,7 @@ pub struct SemanticOverlay {
     pub confidence: f32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ChunkSemanticResult {
     pub overlay: Option<SemanticOverlay>,
     pub raw_output: Option<Value>,
@@ -289,6 +289,7 @@ pub async fn run_semantic_dispatch(
     temporal_chain: bool,
     vlm_concurrency: usize,
     observer: Option<Arc<dyn InferenceObserver>>,
+    completion_tx: Option<tokio::sync::mpsc::UnboundedSender<(usize, ChunkSemanticResult)>>,
 ) -> (Vec<Option<ChunkSemanticResult>>, Vec<Instant>) {
     let num_chunks = chunk_preps.len();
     let mut semantic_results: Vec<Option<ChunkSemanticResult>> =
@@ -356,6 +357,9 @@ pub async fn run_semantic_dispatch(
                 last_pts_ms = prep.pts_end_ms;
             }
 
+            if let Some(tx) = &completion_tx {
+                let _ = tx.send((chunk_idx, result.clone()));
+            }
             semantic_results[chunk_idx] = Some(result);
             task_end_times[chunk_idx] = Instant::now();
         }
@@ -385,6 +389,9 @@ pub async fn run_semantic_dispatch(
             match joined {
                 Ok((task_id, (idx, result, finished))) => {
                     task_chunks.remove(&task_id);
+                    if let Some(tx) = &completion_tx {
+                        let _ = tx.send((idx, result.clone()));
+                    }
                     semantic_results[idx] = Some(result);
                     task_end_times[idx] = finished;
                 }
@@ -392,7 +399,11 @@ pub async fn run_semantic_dispatch(
                     let finished = Instant::now();
                     let task_id = err.id();
                     if let Some(idx) = task_chunks.remove(&task_id) {
-                        semantic_results[idx] = Some(semantic_join_failure_result(err));
+                        let result = semantic_join_failure_result(err);
+                        if let Some(tx) = &completion_tx {
+                            let _ = tx.send((idx, result.clone()));
+                        }
+                        semantic_results[idx] = Some(result);
                         task_end_times[idx] = finished;
                     } else {
                         tracing::warn!(
@@ -879,6 +890,7 @@ mod tests {
             false,
             false,
             2,
+            None,
             None,
         )
         .await;

@@ -1259,6 +1259,29 @@ fn marker_to_emit_event_request(
     }
 }
 
+async fn append_semantic_chunk_event(
+    state: &AppState,
+    run_id: &str,
+    request_id: &str,
+    stream_id: &str,
+    index_name: &Option<String>,
+    chunk_idx: usize,
+    result: &ChunkSemanticResult,
+) -> Result<(), String> {
+    let Some(mut details) = result.event_payload(chunk_idx, request_id, stream_id) else {
+        return Ok(());
+    };
+    if let Some(index) = index_name {
+        if let Some(object) = details.as_object_mut() {
+            object.insert("index_name".to_string(), serde_json::json!(index));
+        }
+    }
+    state
+        .append_run_event_async(run_id, "semantic_chunk_inferred", details)
+        .await
+        .map(|_| ())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn assemble_realtime_reason_response(
     state: &AppState,
@@ -1288,24 +1311,6 @@ async fn assemble_realtime_reason_response(
     for (chunk_idx, prep) in chunk_preps.into_iter().enumerate() {
         let semantic_overlay = semantic_results[chunk_idx].take().unwrap_or_default();
         let finished = task_end_times[chunk_idx];
-
-        if let Some(mut details) = semantic_overlay.event_payload(chunk_idx, request_id, stream_id)
-        {
-            if let Some(ref idx) = index_name {
-                if let Some(obj) = details.as_object_mut() {
-                    obj.insert("index_name".to_string(), serde_json::json!(idx));
-                }
-            }
-            if let Err(err) = state
-                .append_run_event_async(run_id, "semantic_chunk_inferred", details)
-                .await
-            {
-                return Err(internal_error(
-                    state,
-                    format!("failed to append semantic_chunk_inferred event: {err}"),
-                ));
-            }
-        }
 
         for frame in prep.analyzed {
             let (row, marker_input) = compose_frame_metadata(
@@ -1731,7 +1736,8 @@ pub async fn reason_realtime_run(
             Arc::clone(state.inference_metrics_arc()),
             Arc::clone(state.pipeline_metrics_arc()),
         )));
-    let (semantic_results, task_end_times) = run_semantic_dispatch(
+    let (semantic_event_tx, mut semantic_event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let semantic_dispatch = run_semantic_dispatch(
         &chunk_preps,
         providers,
         semantic_available,
@@ -1744,8 +1750,31 @@ pub async fn reason_realtime_run(
         temporal_chain,
         vlm_concurrency,
         analyze_observer,
-    )
-    .await;
+        Some(semantic_event_tx),
+    );
+    let semantic_journal = async {
+        while let Some((chunk_idx, result)) = semantic_event_rx.recv().await {
+            append_semantic_chunk_event(
+                &state,
+                &run_id,
+                &request_id,
+                &stream_id,
+                &index_name,
+                chunk_idx,
+                &result,
+            )
+            .await?;
+        }
+        Ok::<(), String>(())
+    };
+    let ((semantic_results, task_end_times), semantic_journal_result) =
+        tokio::join!(semantic_dispatch, semantic_journal);
+    if let Err(err) = semantic_journal_result {
+        return internal_error(
+            &state,
+            format!("failed to append semantic_chunk_inferred event: {err}"),
+        );
+    }
 
     let assembled = match assemble_realtime_reason_response(
         &state,
