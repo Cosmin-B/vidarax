@@ -4,7 +4,9 @@ use std::sync::Arc;
 use vidarax_core::metrics::PipelineMetrics;
 use vidarax_core::provider::{InferenceObserver, ProviderKind, TokenUsage};
 
-const LATENCY_BUCKETS_MS: [u64; 10] = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
+const LATENCY_BUCKETS_MS: [u64; 14] = [
+    10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 15000, 20000, 30000, 60000,
+];
 
 pub struct InferenceMetrics {
     vllm: ProviderMetrics,
@@ -255,7 +257,7 @@ impl ProviderMetrics {
         if total < 10 {
             return false; // too few samples
         }
-        // LATENCY_BUCKETS_MS = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]
+        // LATENCY_BUCKETS_MS includes 10 ms through 60 s.
         // Index 8 (inclusive) gives cumulative count ≤ 5 000 ms.
         let within_5s: u64 = self
             .latency_buckets

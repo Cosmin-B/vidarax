@@ -135,6 +135,7 @@ fn backend_entries_from_explicit_urls(
             base_url: Some(base_url.clone()),
             api_key: None,
             model: None,
+            upstream_model: None,
             openai_kind: Some("vllm".to_string()),
             priority: 1,
         });
@@ -146,6 +147,7 @@ fn backend_entries_from_explicit_urls(
             base_url: Some(base_url.clone()),
             api_key: None,
             model: None,
+            upstream_model: None,
             openai_kind: Some("sglang".to_string()),
             priority: 2,
         });
@@ -280,6 +282,7 @@ mod tests {
             base_url: Some(base_url.to_string()),
             api_key: None,
             model: None,
+            upstream_model: None,
             openai_kind: None,
             priority: 1,
         };

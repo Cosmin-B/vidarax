@@ -339,15 +339,12 @@ async fn start_whip_session_transaction(
     // The guard can overlap briefly with the committed run; that only rejects
     // a racing creator early, never admits one beyond the cap.
     // Store the session bound to the requesting principal.
-    if !state
-        .insert_session(
-            sess_id.clone(),
-            principal.clone(),
-            Arc::clone(&run_id),
-            Arc::clone(&session),
-        )
-        .await
-    {
+    if !state.insert_session(
+        sess_id.clone(),
+        principal.clone(),
+        Arc::clone(&run_id),
+        Arc::clone(&session),
+    ) {
         // Collision or global session limit reached.
         tracing::error!("WHIP session insert failed for {sess_id} (collision or limit)");
         tombstone_created_whip_run_with_request_bound(
@@ -581,7 +578,7 @@ pub async fn whip_ice(
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
-    let Some((owner_principal, _run_id, session)) = state.get_session(&sess_id).await else {
+    let Some((owner_principal, _run_id, session)) = state.get_session(&sess_id) else {
         tracing::debug!("WHIP ICE unknown session {sess_id}");
         return StatusCode::NOT_FOUND;
     };
@@ -633,12 +630,10 @@ pub async fn whip_terminate(
     // reclaimed the live session, so consult the reclaimed-session record too.
     let live_session = state
         .get_session(&sess_id)
-        .await
         .map(|(principal, run_id, _)| (principal, run_id));
     let reclaimed_session = if live_session.is_none() {
         state
             .get_reclaimed_session(&sess_id)
-            .await
             .and_then(|(principal, run_id)| {
                 state.run_is_deleted(&run_id).then_some((principal, run_id))
             })
@@ -734,7 +729,7 @@ async fn reclaim_whip_session_transaction(
     append_whip_run_deleted_once(&state, &run_id, &sess_id, &reason).await?;
 
     if let Some((_principal, _existing_run_id, session)) =
-        state.remove_session_for_run(&sess_id, &run_id).await
+        state.remove_session_for_run(&sess_id, &run_id)
     {
         state.pipeline_metrics().inc_sessions_removed();
         session.close();
@@ -795,7 +790,7 @@ async fn reclaim_whip_session_from_watcher_with_backoff(
 }
 
 async fn watcher_reclaim_terminal(state: &AppState, sess_id: &str, run_id: &str) -> bool {
-    if let Some((_principal, existing_run_id, _session)) = state.get_session(sess_id).await {
+    if let Some((_principal, existing_run_id, _session)) = state.get_session(sess_id) {
         return &*existing_run_id != run_id;
     }
 
@@ -805,7 +800,6 @@ async fn watcher_reclaim_terminal(state: &AppState, sess_id: &str, run_id: &str)
 
     state
         .get_reclaimed_session(sess_id)
-        .await
         .is_some_and(|(_principal, reclaimed_run_id)| &*reclaimed_run_id == run_id)
 }
 
@@ -966,7 +960,7 @@ pub async fn whip_update_prompt(
     headers: HeaderMap,
     Json(body): Json<UpdatePromptRequest>,
 ) -> Response {
-    let Some((owner_principal, _run_id, session)) = state.get_session(&sess_id).await else {
+    let Some((owner_principal, _run_id, session)) = state.get_session(&sess_id) else {
         tracing::debug!("WHIP update_prompt: unknown session {sess_id}");
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -1003,10 +997,9 @@ mod tests {
         apply_attach_config, hex_char, new_session_id, parse_attach_config_header,
         reclaim_whip_session, reclaim_whip_session_from_watcher,
         reclaim_whip_session_from_watcher_with_backoff, should_reclaim_peer_state,
-        spawn_session_reclaimer, start_whip_session,
-        tombstone_created_whip_run_with_request_bound_and_backoff, whip_setup_error_response,
-        whip_terminate, PeerConnectionState, WebRtcSession, WebRtcSetupError, ATTACH_CONFIG_HEADER,
-        RUN_ID_HEADER,
+        start_whip_session, tombstone_created_whip_run_with_request_bound_and_backoff,
+        whip_setup_error_response, whip_terminate, PeerConnectionState, WebRtcSession,
+        WebRtcSetupError, ATTACH_CONFIG_HEADER, RUN_ID_HEADER,
     };
     use axum::body::Body;
     use axum::extract::{Path, State};
@@ -1123,7 +1116,7 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(state.session_count().await, 0);
+        assert_eq!(state.session_count(), 0);
         assert_eq!(state.count_active_runs_for_principal("public", now_ms()), 0);
         assert_eq!(session.close_call_count_for_tests(), 1);
     }
@@ -1204,7 +1197,7 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(state.session_count().await, 2);
+        assert_eq!(state.session_count(), 2);
         assert_eq!(state.count_active_runs_for_principal("public", now_ms()), 2);
         assert_eq!(rejected_session.close_call_count_for_tests(), 1);
         assert_eq!(
@@ -1283,111 +1276,6 @@ mod tests {
             "active stream limit exceeded"
         );
         assert_eq!(rejected_session.close_call_count_for_tests(), 1);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_creation_after_insert_does_not_orphan_active_run() {
-        let state = AppState::with_wal_for_tests(std::env::temp_dir().join(format!(
-            "vidarax-whip-create-cancel-{}.wal",
-            std::process::id()
-        )));
-        let session = Arc::new(WebRtcSession::new_for_tests());
-        let reclaimed_guard = state.hold_reclaimed_sessions_write_for_tests().await;
-
-        let create_state = state.clone();
-        let create_session = Arc::clone(&session);
-        let create_task = tokio::spawn(async move {
-            start_whip_session(
-                create_state,
-                HeaderMap::new(),
-                create_session,
-                "v=0\r\n".to_string(),
-                None,
-            )
-            .await
-        });
-
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while state.session_count().await == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("creation should insert before the held reclaimed-session lock");
-
-        create_task.abort();
-        let _ = create_task.await;
-        let created = state
-            .read_all_events()
-            .unwrap()
-            .into_iter()
-            .find(|event| event.kind == "run_created")
-            .expect("creation should have appended run_created before insert");
-        let payload: serde_json::Value = serde_json::from_str(&created.payload).unwrap();
-        let sess_id = payload
-            .get("session_id")
-            .and_then(|value| value.as_str())
-            .unwrap()
-            .to_string();
-        let run_id: Arc<str> = Arc::from(created.run_id);
-        drop(reclaimed_guard);
-
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if state
-                    .pipeline_metrics()
-                    .render_prometheus()
-                    .contains("vidarax_pipeline_sessions_created_total 1\n")
-                {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("detached creation transaction should complete after request cancellation");
-
-        // This stands in for the abandoned client's peer connection reaching
-        // Disconnected: the production watcher receives the same state and uses
-        // the same reclaim path.
-        let (peer_state_tx, peer_state_rx) =
-            tokio::sync::watch::channel(PeerConnectionState::Connected);
-        spawn_session_reclaimer(
-            state.clone(),
-            sess_id.clone(),
-            Arc::clone(&run_id),
-            peer_state_rx,
-        );
-        peer_state_tx
-            .send(PeerConnectionState::Disconnected)
-            .unwrap();
-
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if state.session_count().await == 0
-                    && state.count_active_runs_for_principal("public", now_ms()) == 0
-                {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("peer-state reclaimer should release an abandoned visible session");
-
-        let events = state.read_all_events().unwrap();
-        let run_created = events
-            .iter()
-            .filter(|event| event.kind == "run_created")
-            .count();
-        let run_deleted = events
-            .iter()
-            .filter(|event| event.kind == "run_deleted")
-            .count();
-        assert_eq!(run_created, 1);
-        assert_eq!(run_deleted, 1);
-        assert_eq!(state.session_count().await, 0);
-        assert_eq!(state.count_active_runs_for_principal("public", now_ms()), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1486,16 +1374,12 @@ mod tests {
             state.count_active_runs_for_principal(principal, now_ms()),
             1
         );
-        assert!(
-            state
-                .insert_session(
-                    sess_id.to_string(),
-                    principal.to_string(),
-                    Arc::clone(&run_id),
-                    Arc::new(WebRtcSession::new_for_tests()),
-                )
-                .await
-        );
+        assert!(state.insert_session(
+            sess_id.to_string(),
+            principal.to_string(),
+            Arc::clone(&run_id),
+            Arc::new(WebRtcSession::new_for_tests()),
+        ));
 
         reclaim_whip_session(&state, sess_id, &run_id, "peer_disconnected")
             .await
@@ -1515,7 +1399,7 @@ mod tests {
             0
         );
         assert!(state.run_runtime_snapshot(&run_id, now_ms()).is_none());
-        assert!(state.get_session(sess_id).await.is_none());
+        assert!(state.get_session(sess_id).is_none());
     }
 
     #[cfg(unix)]
@@ -1545,16 +1429,12 @@ mod tests {
                 }),
             )
             .unwrap();
-        assert!(
-            state
-                .insert_session(
-                    sess_id.to_string(),
-                    principal.to_string(),
-                    Arc::clone(&run_id),
-                    Arc::clone(&session),
-                )
-                .await
-        );
+        assert!(state.insert_session(
+            sess_id.to_string(),
+            principal.to_string(),
+            Arc::clone(&run_id),
+            Arc::clone(&session),
+        ));
 
         state.pause_timeline_appends_for_tests();
 
@@ -1572,7 +1452,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 if state.run_is_deleted(&run_id)
-                    && state.session_count().await == 0
+                    && state.session_count() == 0
                     && session.close_call_count_for_tests() == 1
                 {
                     return;
@@ -1583,8 +1463,8 @@ mod tests {
         .await
         .expect("blocked reclaim should commit, remove, and close the live session");
 
-        assert_eq!(state.session_count().await, 0);
-        assert!(state.get_session(sess_id).await.is_none());
+        assert_eq!(state.session_count(), 0);
+        assert!(state.get_session(sess_id).is_none());
         assert_eq!(session.close_call_count_for_tests(), 1);
     }
 
@@ -1615,16 +1495,12 @@ mod tests {
             state.count_active_runs_for_principal(principal, now_ms()),
             0
         );
-        assert!(
-            state
-                .insert_session(
-                    sess_id.to_string(),
-                    principal.to_string(),
-                    Arc::clone(&run_id),
-                    Arc::new(WebRtcSession::new_for_tests()),
-                )
-                .await
-        );
+        assert!(state.insert_session(
+            sess_id.to_string(),
+            principal.to_string(),
+            Arc::clone(&run_id),
+            Arc::new(WebRtcSession::new_for_tests()),
+        ));
 
         reclaim_whip_session(&state, sess_id, &run_id, "delete")
             .await
@@ -1641,7 +1517,7 @@ mod tests {
             0
         );
         assert!(state.run_runtime_snapshot(&run_id, now_ms()).is_none());
-        assert!(state.get_session(sess_id).await.is_none());
+        assert!(state.get_session(sess_id).is_none());
     }
 
     #[tokio::test]
@@ -1665,16 +1541,12 @@ mod tests {
                 }),
             )
             .unwrap();
-        assert!(
-            state
-                .insert_session(
-                    sess_id.to_string(),
-                    principal.to_string(),
-                    Arc::clone(&run_id),
-                    Arc::new(WebRtcSession::new_for_tests()),
-                )
-                .await
-        );
+        assert!(state.insert_session(
+            sess_id.to_string(),
+            principal.to_string(),
+            Arc::clone(&run_id),
+            Arc::new(WebRtcSession::new_for_tests()),
+        ));
 
         reclaim_whip_session_from_watcher(&state, sess_id, &run_id, "peer_disconnected").await;
 
@@ -1693,7 +1565,7 @@ mod tests {
             state.count_active_runs_for_principal(principal, now_ms()),
             0
         );
-        assert!(state.get_session(sess_id).await.is_none());
+        assert!(state.get_session(sess_id).is_none());
     }
 
     #[tokio::test]
@@ -1717,16 +1589,12 @@ mod tests {
                 }),
             )
             .unwrap();
-        assert!(
-            state
-                .insert_session(
-                    sess_id.to_string(),
-                    principal.to_string(),
-                    Arc::clone(&run_id),
-                    Arc::new(WebRtcSession::new_for_tests()),
-                )
-                .await
-        );
+        assert!(state.insert_session(
+            sess_id.to_string(),
+            principal.to_string(),
+            Arc::clone(&run_id),
+            Arc::new(WebRtcSession::new_for_tests()),
+        ));
 
         reclaim_whip_session_from_watcher(&state, sess_id, &run_id, "peer_disconnected").await;
 
@@ -1742,7 +1610,7 @@ mod tests {
             state.count_active_runs_for_principal(principal, now_ms()),
             0
         );
-        assert!(state.get_session(sess_id).await.is_none());
+        assert!(state.get_session(sess_id).is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1767,16 +1635,12 @@ mod tests {
                 }),
             )
             .unwrap();
-        assert!(
-            state
-                .insert_session(
-                    sess_id.to_string(),
-                    principal.to_string(),
-                    Arc::clone(&run_id),
-                    Arc::clone(&session),
-                )
-                .await
-        );
+        assert!(state.insert_session(
+            sess_id.to_string(),
+            principal.to_string(),
+            Arc::clone(&run_id),
+            Arc::clone(&session),
+        ));
 
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let delete_state = state.clone();
@@ -1817,7 +1681,7 @@ mod tests {
             0
         );
         assert!(state.run_runtime_snapshot(&run_id, now_ms()).is_none());
-        assert!(state.get_session(sess_id).await.is_none());
+        assert!(state.get_session(sess_id).is_none());
         assert!(state
             .pipeline_metrics()
             .render_prometheus()
@@ -1846,16 +1710,12 @@ mod tests {
                 }),
             )
             .unwrap();
-        assert!(
-            state
-                .insert_session(
-                    sess_id.to_string(),
-                    principal.to_string(),
-                    Arc::clone(&run_id),
-                    Arc::new(WebRtcSession::new_for_tests()),
-                )
-                .await
-        );
+        assert!(state.insert_session(
+            sess_id.to_string(),
+            principal.to_string(),
+            Arc::clone(&run_id),
+            Arc::new(WebRtcSession::new_for_tests()),
+        ));
         state.set_timeline_append_failure_for_tests(true);
 
         let result = reclaim_whip_session(&state, sess_id, &run_id, "delete").await;
@@ -1866,7 +1726,7 @@ mod tests {
             1
         );
         assert!(
-            state.get_session(sess_id).await.is_some(),
+            state.get_session(sess_id).is_some(),
             "failed tombstone append must leave the session reachable for retry"
         );
     }
@@ -1892,16 +1752,12 @@ mod tests {
                 }),
             )
             .unwrap();
-        assert!(
-            state
-                .insert_session(
-                    sess_id.to_string(),
-                    principal.to_string(),
-                    Arc::clone(&run_id),
-                    Arc::new(WebRtcSession::new_for_tests()),
-                )
-                .await
-        );
+        assert!(state.insert_session(
+            sess_id.to_string(),
+            principal.to_string(),
+            Arc::clone(&run_id),
+            Arc::new(WebRtcSession::new_for_tests()),
+        ));
         state.set_timeline_append_failure_for_tests(true);
 
         let restore_state = state.clone();
@@ -1938,7 +1794,7 @@ mod tests {
             0
         );
         assert!(state.run_runtime_snapshot(&run_id, now_ms()).is_none());
-        assert!(state.get_session(sess_id).await.is_none());
+        assert!(state.get_session(sess_id).is_none());
     }
 
     fn now_ms() -> u64 {

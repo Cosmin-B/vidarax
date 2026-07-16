@@ -54,8 +54,14 @@ cd ui && npm install && npm run dev
 ### SDK
 
 ```bash
-npm install vidarax
+cd packages/vidarax-sdk
+npm install
+npm run build
+npm link
 ```
+
+Until the first npm release, install the SDK from this workspace and link it
+into your application with `npm link vidarax`.
 
 ```typescript
 import { Vidarax } from 'vidarax'
@@ -159,6 +165,8 @@ name = "mlx"
 type = "openai_compat"
 openai_kind = "mlx"
 base_url = "http://127.0.0.1:8080"
+model = "Qwen/Qwen3-VL-4B-Instruct"
+upstream_model = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
 priority = 1
 ```
 
@@ -171,8 +179,9 @@ vidarax checks every request's `model` id against its supported-model contract
 and rejects unknown ids before it opens a connection, so the first-pass and
 second-pass models you configure must be supported ids, for example
 `Qwen/Qwen3-VL-4B-Instruct`, not a raw `mlx-community/...-4bit` conversion name.
-Load the matching conversion under mlx-vlm and make sure its server answers to
-that id.
+`model` declares the curated Vidarax id this backend serves, while
+`upstream_model` maps it to the conversion id mlx-vlm actually loads. The model
+catalog reports only that curated id as available on this backend.
 
 ## Tech stack
 
@@ -181,7 +190,7 @@ that id.
 | Backend | Rust, Axum, Hyper (HTTP/1.1 + H2, optional H3) |
 | Gate engine | Deterministic frame analysis on a single-threaded hot path |
 | Inference | vLLM and SGLang through OpenAI-compatible backends with fallback |
-| Decode | ffmpeg CPU, NVDEC, and Apple VideoToolbox (the MLX decode backend); VideoToolbox may fall back to software decode inside ffmpeg when the input or host cannot initialise hardware |
+| Decode | ffmpeg CPU, NVDEC, and Apple VideoToolbox; VideoToolbox may fall back to software decode inside ffmpeg when the input or host cannot initialise hardware |
 | Persistence | Local WAL plus content-addressed JPEG blobs; optional SpacetimeDB mirror for blocking WHIP description events |
 | Frontend | Vue 3, dark command-center UI |
 | Streaming | WebRTC via WHIP (RFC 9725) |

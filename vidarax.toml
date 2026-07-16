@@ -38,6 +38,8 @@ priority = 2
 # type = "openai_compat"
 # openai_kind = "mlx"
 # base_url = "http://127.0.0.1:8080"
+# model = "Qwen/Qwen3-VL-4B-Instruct"
+# upstream_model = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
 # priority = 1
 
 # Gemini is opt-in, not the default. Uncomment to add it as a hosted fallback

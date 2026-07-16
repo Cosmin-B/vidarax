@@ -179,9 +179,9 @@ pub struct StreamFrame {
 /// Work item forwarded to VLM workers when a keyframe is decided upon.
 #[derive(Debug, Clone)]
 pub struct KeyframeWork {
-    /// Session run identifier — shared via `Arc<str>` so cloning is pointer-width.
+    /// Session run identifier — shared via `Arc<str>` so cloning only updates a refcount.
     pub run_id: Arc<str>,
-    /// Session identifier — shared via `Arc<str>` so cloning is pointer-width.
+    /// Session identifier — shared via `Arc<str>` so cloning only updates a refcount.
     pub session_id: Arc<str>,
     pub frame_index: u64,
     pub pts_ms: u64,
@@ -1337,7 +1337,7 @@ where
             .name(format!("vx-vlm-{i}"))
             .spawn(move || {
                 // Per-session token budget: (window_start, tokens_emitted_in_window).
-                // Key is Arc<str>: clone is pointer-width; Hash/Eq compare string content.
+                // Cloning Arc<str> only updates a refcount; Hash/Eq compare string content.
                 let mut token_budget: std::collections::HashMap<
                     Arc<str>,
                     (std::time::Instant, u32),

@@ -48,8 +48,12 @@ pub struct BackendEntry {
     pub base_url: Option<String>,
     /// API key for `gemini` backends.
     pub api_key: Option<String>,
-    /// Default model ID for `gemini` backends.
+    /// Default model ID for `gemini` backends. For `openai_compat`, the public
+    /// curated model id served by this backend.
     pub model: Option<String>,
+    /// Model id sent to an `openai_compat` backend when it differs from the
+    /// public curated id (for example an MLX quantized conversion).
+    pub upstream_model: Option<String>,
     /// Provider flavor for `openai_compat` backends, used for telemetry
     /// labelling. Accepts "vllm", "sglang", or "mlx" (mlx-vlm's OpenAI-compatible
     /// server, typically run on-device on Apple Silicon). When unset the flavor
@@ -88,6 +92,9 @@ pub fn parse_config(toml_str: &str) -> Result<VidaraxConfig, String> {
         }
         if let Some(s) = &entry.model {
             entry.model = Some(interpolate_env_vars(s));
+        }
+        if let Some(s) = &entry.upstream_model {
+            entry.upstream_model = Some(interpolate_env_vars(s));
         }
         if let Some(s) = &entry.openai_kind {
             entry.openai_kind = Some(interpolate_env_vars(s));
@@ -231,7 +238,25 @@ fn build_single_provider(
             let transport = HttpTransport::new(base_url)
                 .map_err(|e| format!("backend '{}': transport error: {e:?}", entry.name))?;
 
-            Ok(Box::new(OpenAiCompatProvider::new(transport, kind)))
+            if entry.upstream_model.is_some() && entry.model.is_none() {
+                return Err(format!(
+                    "backend '{}': upstream_model requires a public model id",
+                    entry.name
+                ));
+            }
+            if let Some(model) = entry.model.as_deref() {
+                if vidarax_contracts::models::normalize_model_id(model).is_none() {
+                    return Err(format!(
+                        "backend '{}': unsupported public model id '{model}'",
+                        entry.name
+                    ));
+                }
+            }
+
+            Ok(Box::new(
+                OpenAiCompatProvider::new(transport, kind)
+                    .with_model_mapping(entry.model.clone(), entry.upstream_model.clone()),
+            ))
         }
         "gemini" => Ok(Box::new(build_gemini_provider(entry)?)),
         other => Err(format!("backend '{}': unknown type '{other}'", entry.name)),
@@ -554,6 +579,7 @@ base_url = "${_VDX_TEST_URL}"
             base_url: None,
             api_key: None,
             model: None,
+            upstream_model: None,
             openai_kind: None,
             priority: 1,
         };
@@ -568,6 +594,7 @@ base_url = "${_VDX_TEST_URL}"
             base_url: None,
             api_key: Some("test-api-key".into()),
             model: Some("gemini-3.1-flash-lite".into()),
+            upstream_model: None,
             openai_kind: None,
             priority: 1,
         };
@@ -588,6 +615,7 @@ base_url = "${_VDX_TEST_URL}"
             base_url: None,
             api_key: None,
             model: Some("gemini-3.1-flash-lite".into()),
+            upstream_model: None,
             openai_kind: None,
             priority: 1,
         };
@@ -610,6 +638,7 @@ base_url = "${_VDX_TEST_URL}"
             base_url: None,
             api_key: Some("${_VDX_NONEXISTENT_GEMINI_KEY}".into()),
             model: None,
+            upstream_model: None,
             openai_kind: None,
             priority: 1,
         };
@@ -625,6 +654,7 @@ base_url = "${_VDX_TEST_URL}"
             base_url: None,
             api_key: None,
             model: None,
+            upstream_model: None,
             openai_kind: None,
             priority: 1,
         };
@@ -641,6 +671,7 @@ base_url = "${_VDX_TEST_URL}"
             base_url: Some("${_VDX_NONEXISTENT_VLLM_URL}".into()),
             api_key: None,
             model: None,
+            upstream_model: None,
             openai_kind: None,
             priority: 1,
         };
@@ -661,6 +692,7 @@ base_url = "${_VDX_TEST_URL}"
             base_url: Some("http://localhost:8000".into()),
             api_key: None,
             model: None,
+            upstream_model: None,
             openai_kind: None,
             priority: 1,
         };
@@ -677,6 +709,7 @@ base_url = "${_VDX_TEST_URL}"
             base_url: Some("http://localhost:8000".into()),
             api_key: None,
             model: None,
+            upstream_model: None,
             openai_kind: Some("sglang".into()),
             priority: 1,
         };
@@ -694,6 +727,7 @@ base_url = "${_VDX_TEST_URL}"
             base_url: Some("http://127.0.0.1:8080".into()),
             api_key: None,
             model: None,
+            upstream_model: None,
             openai_kind: Some("mlx".into()),
             priority: 1,
         };
@@ -710,6 +744,7 @@ base_url = "${_VDX_TEST_URL}"
             base_url: Some("http://localhost:8001".into()),
             api_key: None,
             model: None,
+            upstream_model: None,
             openai_kind: None,
             priority: 1,
         };
@@ -726,6 +761,7 @@ base_url = "${_VDX_TEST_URL}"
                 base_url: Some("http://localhost:8001".into()),
                 api_key: None,
                 model: None,
+                upstream_model: None,
                 openai_kind: None,
                 priority: 2,
             },
@@ -735,6 +771,7 @@ base_url = "${_VDX_TEST_URL}"
                 base_url: Some("http://localhost:8000".into()),
                 api_key: None,
                 model: None,
+                upstream_model: None,
                 openai_kind: None,
                 priority: 1,
             },
@@ -754,6 +791,7 @@ base_url = "${_VDX_TEST_URL}"
             base_url: Some("http://localhost:8000".into()),
             api_key: None,
             model: None,
+            upstream_model: None,
             openai_kind: None,
             priority: 1,
         }];
@@ -780,6 +818,7 @@ base_url = "${_VDX_TEST_URL}"
                 base_url: Some("http://localhost:8000".into()),
                 api_key: None,
                 model: None,
+                upstream_model: None,
                 openai_kind: None,
                 priority: 1,
             },
@@ -789,6 +828,7 @@ base_url = "${_VDX_TEST_URL}"
                 base_url: None,
                 api_key: Some("test-api-key".into()),
                 model: Some("gemini-3.1-flash-lite".into()),
+                upstream_model: None,
                 openai_kind: None,
                 priority: 10,
             },
@@ -815,6 +855,7 @@ base_url = "${_VDX_TEST_URL}"
             base_url: None,
             api_key: Some("test-api-key".into()),
             model: None,
+            upstream_model: None,
             openai_kind: None,
             priority: 1,
         }];
@@ -836,6 +877,7 @@ base_url = "${_VDX_TEST_URL}"
                 base_url: None,
                 api_key: Some("key-primary".into()),
                 model: Some("gemini-3.1-flash-lite".into()),
+                upstream_model: None,
                 openai_kind: None,
                 priority: 1,
             },
@@ -845,6 +887,7 @@ base_url = "${_VDX_TEST_URL}"
                 base_url: None,
                 api_key: Some("key-secondary".into()),
                 model: Some("gemini-3.1-flash-lite".into()),
+                upstream_model: None,
                 openai_kind: None,
                 priority: 2,
             },
@@ -875,6 +918,7 @@ base_url = "${_VDX_TEST_URL}"
                 base_url: None,
                 api_key: Some("key-secondary".into()),
                 model: Some("gemini-3.1-flash-lite".into()),
+                upstream_model: None,
                 openai_kind: None,
                 priority: 2,
             },
@@ -884,6 +928,7 @@ base_url = "${_VDX_TEST_URL}"
                 base_url: None,
                 api_key: Some("key-primary".into()),
                 model: Some("gemini-3.1-flash-lite".into()),
+                upstream_model: None,
                 openai_kind: None,
                 priority: 1,
             },
@@ -909,6 +954,7 @@ base_url = "${_VDX_TEST_URL}"
             base_url: None,
             api_key: Some("key-alpha".into()),
             model: Some("gemini-3.1-flash-lite".into()),
+            upstream_model: None,
             openai_kind: None,
             priority: 5,
         };
@@ -918,6 +964,7 @@ base_url = "${_VDX_TEST_URL}"
             base_url: None,
             api_key: Some("key-omega".into()),
             model: Some("gemini-3.1-flash-lite".into()),
+            upstream_model: None,
             openai_kind: None,
             priority: 5,
         };
@@ -941,6 +988,7 @@ base_url = "${_VDX_TEST_URL}"
                 base_url: Some("http://localhost:8000".into()),
                 api_key: None,
                 model: None,
+                upstream_model: None,
                 openai_kind: None,
                 priority: 1,
             },
@@ -950,6 +998,7 @@ base_url = "${_VDX_TEST_URL}"
                 base_url: None,
                 api_key: None,
                 model: Some("gemini-3.1-flash-lite".into()),
+                upstream_model: None,
                 openai_kind: None,
                 priority: 10,
             },

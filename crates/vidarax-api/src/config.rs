@@ -33,6 +33,7 @@ pub fn load_backend_config(
                     base_url: Some(url),
                     api_key: None,
                     model: None,
+                    upstream_model: None,
                     openai_kind: Some("vllm".to_string()),
                     priority: 1,
                 });
@@ -44,6 +45,7 @@ pub fn load_backend_config(
                     base_url: Some(url),
                     api_key: None,
                     model: None,
+                    upstream_model: None,
                     openai_kind: Some("sglang".to_string()),
                     priority: 2,
                 });

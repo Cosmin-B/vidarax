@@ -4,8 +4,16 @@ TypeScript SDK for the Vidarax video analysis API.
 
 ## Installation
 
+The package has not had its first npm release. Build and link it from this
+workspace:
+
 ```bash
-npm install vidarax
+cd packages/vidarax-sdk
+npm install
+npm run build
+npm link
+# In your application:
+npm link vidarax
 ```
 
 Requires Node.js 18+ or any modern browser.

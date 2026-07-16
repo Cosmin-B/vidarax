@@ -3,7 +3,7 @@ title: Media plane
 description: The per-session worker threads, the bounded channels between them, and how every buffer pool is sized as a sum over in-flight positions.
 ---
 
-The media plane is the execution graph that turns RTP frames into VLM events for one live session. It lives in `crates/vidarax-core/src/webrtc/workers.rs` and guarantees three things: decode, gating, and inference run on blocking OS threads rather than on the tokio async runtime (WebRTC ingress itself is async, itemized below), every handoff between stages is a bounded queue with a defined full-queue behavior, and every byte buffer that crosses a stage boundary comes from a pool whose slot count is computed, not guessed. This page covers the task and thread topology, the channel contracts, and the pool-sizing method. The decoder that feeds this pipeline is covered in [Decode sidecar](/internals/decode-sidecar/); the keyframe decision itself in [Gate internals](/internals/gate-internals/).
+The media plane is the execution graph that turns RTP frames into VLM events for one live session. It lives in `crates/vidarax-core/src/webrtc/workers.rs` and guarantees three things: decode, gating, and inference run on blocking OS threads rather than on the tokio async runtime (WebRTC ingress itself is async, itemized below), every handoff between stages is a bounded queue with a defined full-queue behavior, and every byte buffer that crosses a stage boundary comes from a pool whose slot count is computed, not guessed. This page covers the task and thread topology, the channel contracts, and the pool-sizing method. The decoder that feeds this pipeline is covered in [Decode sidecar](/docs/internals/decode-sidecar/); the keyframe decision itself in [Gate internals](/docs/internals/gate-internals/).
 
 ## The task and thread topology
 
@@ -23,7 +23,7 @@ The complete per-session inventory, grouped by runtime and mode:
 | `vx-clip-acc` | OS thread | clip only | `spawn_clip_accumulator` | Batches sampled frames into `ClipWork` windows | Clip frame channel closes |
 | `vx-clip-vlm-{i}` | OS thread | clip only | `spawn_clip_vlm_workers` | Multi-image VLM inference over a clip window, calls the sink directly | Clip work channel closes |
 
-One process-wide thread sits behind all sessions: `vidarax-timeline-writer`, which owns the WAL writer and is described in [WAL and events](/internals/wal-and-events/#who-appends-and-every-kind).
+One process-wide thread sits behind all sessions: `vidarax-timeline-writer`, which owns the WAL writer and is described in [WAL and events](/docs/internals/wal-and-events/#who-appends-and-every-kind).
 
 The `{i}` suffixes are cosmetic. `per_stream_decode_workers`, `per_stream_analysis_workers`, and `per_stream_vlm_workers` all clamp the configured count to 1:
 
@@ -52,7 +52,7 @@ All inter-stage channels are bounded `kanal` MPMC channels. Capacities are named
 
 Two behaviors are deliberate and worth internalizing before changing anything:
 
-- The RTP handoff is lossless. `enqueue_rtp_frame_lossless` awaits channel capacity instead of dropping, so sustained overload backpressures into WebRTC jitter buffering, NACKs, and keyframe requests rather than corrupting the stateful decoder with a gap in the ordered stream.
+- While a session is active, the RTP handoff is lossless. `enqueue_rtp_frame_lossless` awaits channel capacity instead of dropping, so sustained overload backpressures into WebRTC jitter buffering, NACKs, and keyframe requests rather than corrupting the stateful decoder with a gap in the ordered stream. Session teardown is the explicit exception: a monotonic stop signal cancels an in-flight receive or enqueue, the track task drops that final frame, and the owner joins every track task before closing the downstream channel.
 - The decode-to-VLM handoff is lossy on purpose. In the decode worker, `vlm_tx.try_send(work)` treats a full queue the same as a closed channel: the keyframe is dropped and `inc_keyframes_dropped` is recorded. A stalled VLM must cost keyframes, not stall decoding for the whole stream. Note the kanal detail encoded in the match: `try_send` returns `Ok(false)` on a full queue, so only `Ok(true)` counts as a kept keyframe.
 
 ## The two wiring modes
@@ -102,7 +102,7 @@ decode_to_analysis + normal_path + clip_path
 
 With the per-stream clamps applied, the doc comment at `workers.rs:40` itemizes the result: 484 slots total, as 66 on the decode-to-analysis leg (a full stream-frame queue, one frame in the analysis worker, one in the sender), 162 on the normal VLM path (a full VLM queue, one in the worker, the 128-slot sink backlog allowance, one in the sender), 64 in the clip-frame queue, 64 held by the accumulator's current window, and 128 for clip work in flight (one active worker plus one blocked sender, each holding a full 64-frame clip; the queued term is zero because the queue has no capacity). A unit test, `jpeg_pool_covers_full_clip_path_and_bounded_sink_backlog_without_heap_growth`, re-derives the sum and pins it to 484 and to `JPEG_POOL_SLOT_CEILING` (512), so a change to any capacity constant fails the test until the derivation is updated deliberately.
 
-Undersizing a pool is not a correctness bug, only an allocation one: `VecPool::acquire` returns a fresh `Vec` when the free-list is empty, and `RecycledBytes::drop` frees instead of recycling when the free-list is full. The sizing exists so buffers in pool-covered positions are never allocated in the steady state. That property covers the buffer positions itemized above; it is not a blanket statement for clip inference, which still allocates off-pool per clip: the clip VLM worker clones the window's last frame for its metadata event, and `RecycledBytes::clone` deep-copies into an unpooled `Vec`, and building the multi-image request encodes each JPEG into a fresh string. See [Allocation discipline](/internals/allocation-discipline/) for how the pooled-path property is enforced.
+Undersizing a pool is not a correctness bug, only an allocation one: `VecPool::acquire` returns a fresh `Vec` when the free-list is empty, and `RecycledBytes::drop` frees instead of recycling when the free-list is full. The sizing exists so buffers in pool-covered positions are never allocated in the steady state. That property covers the buffer positions itemized above; it is not a blanket statement for clip inference, which still allocates off-pool per clip: the clip VLM worker clones the window's last frame for its metadata event, and `RecycledBytes::clone` deep-copies into an unpooled `Vec`, and building the multi-image request encodes each JPEG into a fresh string. See [Allocation discipline](/docs/internals/allocation-discipline/) for how the pooled-path property is enforced.
 
 ### The sink backlog permit counter
 
@@ -110,7 +110,7 @@ The `vx-event-writer` channel holds 512 events, but only `JPEG_SINK_EVENT_POOL_A
 
 ## The event sink boundary
 
-Workers report results only through the `EventSink` trait (`emit_event_sync`, `emit_event_nonblocking`, `store_keyframe_sync`), never by touching storage directly. The trait is `Send + Sync` because worker threads share one `Arc<dyn EventSink>`. Keyframe-mode VLM workers enqueue `SinkEvent`s and let the dedicated writer thread absorb storage latency. Clip VLM workers call the blocking sink methods directly, which is acceptable because clip cadence is bounded by the accumulator's window and delay settings. The WAL-backed sink and its optional SpacetimeDB mirror are described in [WAL and events](/internals/wal-and-events/).
+Workers report results only through the `EventSink` trait (`emit_event_sync`, `emit_event_nonblocking`, `store_keyframe_sync`), never by touching storage directly. The trait is `Send + Sync` because worker threads share one `Arc<dyn EventSink>`. Keyframe-mode VLM workers enqueue `SinkEvent`s and let the dedicated writer thread absorb storage latency. Clip VLM workers call the blocking sink methods directly, which is acceptable because clip cadence is bounded by the accumulator's window and delay settings. The WAL-backed sink and its optional SpacetimeDB mirror are described in [WAL and events](/docs/internals/wal-and-events/).
 
 ## Edge cases and limits
 

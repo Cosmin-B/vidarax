@@ -41,7 +41,7 @@ The exact rules a maintainer or operator can rely on, as implemented today:
 
 ## Who appends, and every kind
 
-All appends funnel through one thread, `vidarax-timeline-writer`, which owns the `WalWriter`, assigns `seq`, stamps `pts_ms` with wall-clock milliseconds, applies the event to the run registry, updates the in-memory tails, and publishes a fresh snapshot. Async handlers reach it through `AppState::append_run_event_async`; the append is acknowledged over a oneshot channel only after the WAL write succeeded, and a failed write rolls the writer's sequence counter back so the numbering stays dense.
+All appends funnel through one thread, `vidarax-timeline-writer`, which owns the `WalWriter`, assigns `seq`, stamps `pts_ms` with wall-clock milliseconds, applies the event to the run registry, updates the in-memory tails, and publishes a fresh snapshot. Async handlers reach it through `AppState::append_run_event_async`; the append is acknowledged over a oneshot channel only after the WAL write succeeded, and a failed write rolls the writer's sequence counter back so the numbering stays dense. Cancellation has one linearization point: before the bounded-channel send completes, the caller still owns the command and no append occurs; after it completes, the writer owns the command and finishes it even if the request disappears while waiting for the acknowledgement. Retried state transitions therefore need an idempotency rule; `run_deleted` has one, while ordinary telemetry events are append-only observations.
 
 Handler-appended kinds, by string literal in `handlers.rs` (all through `append_run_event_async`):
 
@@ -97,7 +97,7 @@ Three append flavors, one contract table:
 | `append_run_event` | worker threads | blocks on ack | yield-and-retry | yes, via the idempotent claim |
 | `append_run_event_nonblocking` | hot paths | no | drops event | refused with an error |
 
-`run_deleted` is special-cased on every path: it routes through the single-winner claim described in [State and cancellation](/internals/state-and-cancellation/#single-winner-deletion), so the deletion event is appended exactly once per run while the deletion claim is retained, and only through a confirmed append. The retention is bounded: deleted-run records live in a FIFO capped at 4,096 entries, and once a record is evicted, a later DELETE of the same run takes the unknown-run path and appends another `run_deleted`.
+`run_deleted` is special-cased on every path: it routes through the single-winner claim described in [State and cancellation](/docs/internals/state-and-cancellation/#single-winner-deletion), so the deletion event is appended exactly once per run while the deletion claim is retained, and only through a confirmed append. The retention is bounded: deleted-run records live in a FIFO capped at 4,096 entries, and once a record is evicted, a later DELETE of the same run takes the unknown-run path and appends another `run_deleted`.
 
 ## Replay and reads
 
@@ -119,7 +119,7 @@ The `replay_schema` integration test (`crates/vidarax-core/tests/replay_schema.r
 - Schema acceptance. `schemas/processing-config.schema.json` and `schemas/frame-metadata.schema.json` must accept their reference fixtures.
 - Schema rejection. A frame-metadata instance missing required fields must fail validation, proving the schema actually constrains.
 
-The same script is the first step of `scripts/release_gates.sh`, so no release ships with drifted gate behavior or schemas; see [Allocation discipline](/internals/allocation-discipline/#the-release-gate-scripts) for the rest of that pipeline.
+The same script is the first step of `scripts/release_gates.sh`, so no release ships with drifted gate behavior or schemas; see [Allocation discipline](/docs/internals/allocation-discipline/#the-release-gate-scripts) for the rest of that pipeline.
 
 ## Edge cases and limits
 

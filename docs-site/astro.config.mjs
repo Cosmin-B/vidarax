@@ -4,6 +4,7 @@ import starlight from '@astrojs/starlight';
 import markdoc from '@astrojs/markdoc';
 
 export default defineConfig({
+  base: '/docs',
   integrations: [
     markdoc(),
     starlight({

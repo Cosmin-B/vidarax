@@ -150,6 +150,11 @@ impl ProviderError {
 
 pub trait Transport: Send + Sync {
     fn call(&self, endpoint: &str, body: String, timeout_ms: u64) -> Result<String, ProviderError>;
+
+    /// Check whether the transport's backend is reachable without running inference.
+    fn probe(&self, _timeout_ms: u64) -> Result<(), ProviderError> {
+        Ok(())
+    }
 }
 
 pub trait InferenceProvider: Send + Sync {
@@ -165,6 +170,19 @@ pub trait InferenceProvider: Send + Sync {
     /// when they know which model failed.
     fn kind_for_model(&self, _model: &str) -> ProviderKind {
         self.kind()
+    }
+
+    /// Provider kinds that can currently accept work.
+    ///
+    /// Test and in-process providers are available by construction. Networked
+    /// providers override this with a bounded transport probe.
+    fn available_kinds(&self) -> Vec<ProviderKind> {
+        vec![self.kind()]
+    }
+
+    /// Provider kinds configured to serve a public Vidarax model id.
+    fn configured_kinds_for_model(&self, _model: &str) -> Vec<ProviderKind> {
+        vec![self.kind()]
     }
 }
 
@@ -232,6 +250,20 @@ impl Transport for HttpTransport {
             .text()
             .map_err(|err| ProviderError::Transport(err.to_string()))
     }
+
+    fn probe(&self, timeout_ms: u64) -> Result<(), ProviderError> {
+        let response = self
+            .client
+            .get(self.endpoint_url("/v1/models"))
+            .timeout(Duration::from_millis(timeout_ms.max(1)))
+            .send()
+            .map_err(|err| ProviderError::Transport(err.to_string()))?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(ProviderError::HttpStatus(response.status().as_u16()))
+        }
+    }
 }
 
 /// Unified OpenAI-compatible provider for vLLM, SGLang, and any other
@@ -248,6 +280,8 @@ impl Transport for HttpTransport {
 pub struct OpenAiCompatProvider<T: Transport> {
     transport: T,
     kind: ProviderKind,
+    served_model: Option<Arc<str>>,
+    upstream_model: Option<Arc<str>>,
     model_cache: ArcSwap<Arc<str>>,
 }
 
@@ -256,8 +290,28 @@ impl<T: Transport> OpenAiCompatProvider<T> {
         Self {
             transport,
             kind,
+            served_model: None,
+            upstream_model: None,
             model_cache: ArcSwap::from(Arc::new(Arc::from(""))),
         }
+    }
+
+    /// Override the model id sent to the OpenAI-compatible backend while
+    /// retaining Vidarax's curated model id at its public API boundary.
+    pub fn with_model_mapping(
+        mut self,
+        served_model: Option<String>,
+        upstream_model: Option<String>,
+    ) -> Self {
+        self.served_model = served_model
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(Arc::from);
+        self.upstream_model = upstream_model
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(Arc::from);
+        self
     }
 }
 
@@ -268,7 +322,15 @@ impl<T: Transport> InferenceProvider for OpenAiCompatProvider<T> {
 
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
         let model = canonical_model(&request.model)?;
-        let body = build_payload(model, request);
+        if self
+            .served_model
+            .as_deref()
+            .is_some_and(|served| served != model)
+        {
+            return Err(ProviderError::UnsupportedModel(request.model.to_string()));
+        }
+        let upstream_model = self.upstream_model.as_deref().unwrap_or(model);
+        let body = build_payload(upstream_model, request);
         let t0 = Instant::now();
         let response = self
             .transport
@@ -285,6 +347,26 @@ impl<T: Transport> InferenceProvider for OpenAiCompatProvider<T> {
             inference_latency_ms,
             usage,
         })
+    }
+
+    fn available_kinds(&self) -> Vec<ProviderKind> {
+        if self.transport.probe(1_000).is_ok() {
+            vec![self.kind]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn configured_kinds_for_model(&self, model: &str) -> Vec<ProviderKind> {
+        if self
+            .served_model
+            .as_deref()
+            .is_none_or(|served| served == model)
+        {
+            vec![self.kind]
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -330,6 +412,26 @@ impl<P: InferenceProvider, F: InferenceProvider> InferenceProvider for ProviderR
             Err(err) => Err(err),
         }
     }
+
+    fn available_kinds(&self) -> Vec<ProviderKind> {
+        let mut kinds = self.primary.available_kinds();
+        for kind in self.fallback.available_kinds() {
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
+        }
+        kinds
+    }
+
+    fn configured_kinds_for_model(&self, model: &str) -> Vec<ProviderKind> {
+        let mut kinds = self.primary.configured_kinds_for_model(model);
+        for kind in self.fallback.configured_kinds_for_model(model) {
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
+        }
+        kinds
+    }
 }
 
 /// Forward trait calls through an `Arc<dyn InferenceProvider + Send + Sync>`.
@@ -353,6 +455,14 @@ impl InferenceProvider for Arc<dyn InferenceProvider + Send + Sync> {
     // object so a router's override actually runs.
     fn kind_for_model(&self, model: &str) -> ProviderKind {
         (**self).kind_for_model(model)
+    }
+
+    fn available_kinds(&self) -> Vec<ProviderKind> {
+        (**self).available_kinds()
+    }
+
+    fn configured_kinds_for_model(&self, model: &str) -> Vec<ProviderKind> {
+        (**self).configured_kinds_for_model(model)
     }
 }
 
@@ -448,6 +558,25 @@ impl InferenceProvider for ModelRoutingProvider {
             .get(request.model.as_ref())
             .unwrap_or(&self.default)
             .infer(request)
+    }
+
+    fn available_kinds(&self) -> Vec<ProviderKind> {
+        let mut kinds = self.default.available_kinds();
+        for provider in self.routes.values() {
+            for kind in provider.available_kinds() {
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
+            }
+        }
+        kinds
+    }
+
+    fn configured_kinds_for_model(&self, model: &str) -> Vec<ProviderKind> {
+        self.routes
+            .get(model)
+            .unwrap_or(&self.default)
+            .configured_kinds_for_model(model)
     }
 }
 

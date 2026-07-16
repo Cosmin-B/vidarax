@@ -3,7 +3,7 @@ title: WebRTC ingest
 description: The WHIP signalling path, how RTP becomes Annex B decoder input, and the session lifecycle from offer to teardown.
 ---
 
-The WHIP path in `crates/vidarax-api/src/whip.rs` and `vidarax-core/src/webrtc/session.rs` accepts a browser's SDP offer, negotiates one inbound video stream, and feeds its RTP into the per-session worker pipeline. It guarantees that the answered codec, the depacketizer, and the decoder always agree; that RTP ingress into the decoder is lossless and ordered; and that every visible session has both a durable `run_created` event and a watcher that reclaims it. This page walks offer handling, the RTP-to-decoder conversion, and the lifecycle. The workers downstream are in [Media plane](/internals/media-plane/); the ownership and cancellation invariants in [State and cancellation](/internals/state-and-cancellation/).
+The WHIP path in `crates/vidarax-api/src/whip.rs` and `vidarax-core/src/webrtc/session.rs` accepts a browser's SDP offer, negotiates one inbound video stream, and feeds its RTP into the per-session worker pipeline. It guarantees that the answered codec, the depacketizer, and the decoder always agree; that RTP ingress into the decoder is lossless and ordered; and that every visible session has both a durable `run_created` event and a watcher that reclaims it. This page walks offer handling, the RTP-to-decoder conversion, and the lifecycle. The workers downstream are in [Media plane](/docs/internals/media-plane/); the ownership and cancellation invariants in [State and cancellation](/docs/internals/state-and-cancellation/).
 
 ## Endpoint contract
 
@@ -33,7 +33,7 @@ The session then installs the selected codec as the sole video capability, insta
 
 ## Session start
 
-`start_whip_session` generates the session id, resolves the caller's principal, allocates a run id, and runs `start_whip_session_transaction` in a detached task so client disconnects cannot cancel it mid-flight. The transaction's ordering (slot reservation, durable `run_created`, session insert, reclaimer spawn) and the detached-task reasoning behind it are covered in [State and cancellation](/internals/state-and-cancellation/#the-insert-to-spawn-window-in-whiprs). After that, the media wiring happens:
+`start_whip_session` generates the session id, resolves the caller's principal, allocates a run id, and runs `start_whip_session_transaction` in a detached task so client disconnects cannot cancel it mid-flight. The transaction's ordering (slot reservation, durable `run_created`, session insert, reclaimer spawn) and the detached-task reasoning behind it are covered in [State and cancellation](/docs/internals/state-and-cancellation/#the-insert-to-spawn-window-in-whiprs). After that, the media wiring happens:
 
 ```rust
 let (frame_tx, frame_rx) = kanal::bounded::<RtpFrame>(RTP_FRAME_QUEUE_CAPACITY);
@@ -44,7 +44,7 @@ let run_future = session.run(frame_tx, Arc::clone(&metrics_arc));
 tokio::spawn(run_future);
 ```
 
-Every session uses `WalEventSink`, so worker events are visible through the local timeline. If SpacetimeDB is attached, the sink mirrors successful blocking description events after their WAL commit (see [WAL and events](/internals/wal-and-events/#the-wal-event-sink)). The inference provider falls back to a `NullInferenceProvider` when none is configured, so the pipeline still decodes and gates. That fallback emits the explicit description "(no inference provider configured)". Worker threads are spawned inside one `tokio::task::spawn_blocking` call; their wiring receives the live novelty settings, while the token-rate cap comes from the session so an attach-config value set before worker start is honored. The session's prompt and guided-JSON handles (`ArcSwap`s) are shared with the workers, which lets `PATCH /prompt` affect the next keyframe without restarting threads.
+Every session uses `WalEventSink`, so worker events are visible through the local timeline. If SpacetimeDB is attached, the sink mirrors successful blocking description events after their WAL commit (see [WAL and events](/docs/internals/wal-and-events/#the-wal-event-sink)). The inference provider falls back to a `NullInferenceProvider` when none is configured, so the pipeline still decodes and gates. That fallback emits the explicit description "(no inference provider configured)". Worker threads are spawned inside one `tokio::task::spawn_blocking` call; their wiring receives the live novelty settings, while the token-rate cap comes from the session so an attach-config value set before worker start is honored. The session's prompt and guided-JSON handles (`ArcSwap`s) are shared with the workers, which lets `PATCH /prompt` affect the next keyframe without restarting threads.
 
 ## How RTP becomes decoder input
 
@@ -56,7 +56,7 @@ Every session uses `WalEventSink`, so worker events are visible through the loca
 - `seq` comes from one `Arc<AtomicU64>` shared by all track tasks of the session; it is a per-session monotone counter, not the RTP sequence number.
 - Payload bytes are copied into buffers from a per-task `VecPool` sized by `rtp_nal_pool_slots`: `RTP_FRAME_QUEUE_CAPACITY` (128) queued frames plus one held by the decode worker plus one being constructed.
 
-The enqueue is lossless: `enqueue_rtp_frame_lossless` awaits capacity on the bounded channel instead of dropping. A gap in an ordered stream would corrupt the stateful decoder, so when decode falls behind, the tokio task yields and sustained overload backpressures the WebRTC media layer, where jitter buffers, NACKs, and keyframe requests are the right tools for real-time loss. The decode worker on the other side of this channel, and the decoder warm-up that consumes the first SPS/PPS/IDR units, are covered in [Decode sidecar](/internals/decode-sidecar/#decoder-warm-up).
+The enqueue is lossless while the session is active: `enqueue_rtp_frame_lossless` awaits capacity on the bounded channel instead of dropping. A gap in an ordered stream would corrupt the stateful decoder, so when decode falls behind, the tokio task yields and sustained overload backpressures the WebRTC media layer, where jitter buffers, NACKs, and keyframe requests are the right tools for real-time loss. On teardown, the session sends a monotonic stop signal to every track task and joins them; an in-flight frame may be discarded at that explicit boundary so a blocked sender cannot hold the decoder open forever. The decode worker on the other side of this channel, and the decoder warm-up that consumes the first SPS/PPS/IDR units, are covered in [Decode sidecar](/docs/internals/decode-sidecar/#decoder-warm-up).
 
 Audio samples on a video track are ignored; a receive error ends the track task.
 

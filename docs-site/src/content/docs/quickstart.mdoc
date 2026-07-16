@@ -68,7 +68,7 @@ for (const event of await v.getEvents(run.runId)) {
 }
 ```
 
-The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via `output_schema`, interactions, and snapshot reads of events and markers. See [Events and SDK](/events/#the-typescript-sdk) for the method list.
+The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via `output_schema`, interactions, and snapshot reads of events and markers. See [Events and SDK](/docs/events/#the-typescript-sdk) for the method list.
 
 The same flow over plain HTTP: create a run and capture its ID, then run semantic reasoning against a source the server can read.
 
@@ -112,4 +112,4 @@ Markers (frame-range annotations derived from the analysis pass) have their own 
 curl -s "http://127.0.0.1:8080/v1/runs/$RUN_ID/markers?event_type=scene_cut" -H 'x-api-key: dev-key'
 ```
 
-See [Events and SDK](/events/) for the event shapes and kinds, and [API reference](/api/) for the route contracts and selected configuration variables.
+See [Events and SDK](/docs/events/) for the event shapes and kinds, and [API reference](/docs/api/) for the route contracts and selected configuration variables.

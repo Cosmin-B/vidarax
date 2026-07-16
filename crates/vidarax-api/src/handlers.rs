@@ -1851,9 +1851,10 @@ pub async fn get_markers(
 pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
     let request_id = state.next_request_id();
     let provider = state.provider().cloned();
+    let provider_for_probe = provider.clone();
     let is_saturated = state.inference_metrics().is_high_latency();
     let availability = match tokio::task::spawn_blocking(move || {
-        runtime_model_availability(provider, is_saturated)
+        runtime_model_availability(provider_for_probe, is_saturated)
     })
     .await
     {
@@ -1862,16 +1863,15 @@ pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
             return internal_error(&state, format!("model catalog worker join failure: {err}"));
         }
     };
-    let providers_available = availability.providers;
-    let status = availability.status;
-
     let mut models = Vec::with_capacity(REQUIRED_MEDIUM_MODELS.len() + REQUIRED_SMALL_MODELS.len());
     for model in REQUIRED_MEDIUM_MODELS {
+        let (status, providers_available) =
+            model_availability(provider.as_ref(), &availability, model);
         models.push(ModelCatalogItem {
             id: (*model).to_string(),
             tier: "medium".to_string(),
             availability: status.to_string(),
-            providers_available: providers_available.clone(),
+            providers_available,
             fallback_candidates: fallback_candidates(model)
                 .iter()
                 .map(ToString::to_string)
@@ -1879,11 +1879,13 @@ pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
         });
     }
     for model in REQUIRED_SMALL_MODELS {
+        let (status, providers_available) =
+            model_availability(provider.as_ref(), &availability, model);
         models.push(ModelCatalogItem {
             id: (*model).to_string(),
             tier: "small".to_string(),
             availability: status.to_string(),
-            providers_available: providers_available.clone(),
+            providers_available,
             fallback_candidates: fallback_candidates(model)
                 .iter()
                 .map(ToString::to_string)
@@ -3583,8 +3585,8 @@ fn parse_payload(raw: &str) -> Value {
 }
 
 struct RuntimeAvailability {
-    status: &'static str,
-    providers: Vec<String>,
+    saturated: bool,
+    providers: Vec<ProviderKind>,
 }
 
 fn runtime_model_availability(
@@ -3593,19 +3595,38 @@ fn runtime_model_availability(
 ) -> RuntimeAvailability {
     let Some(provider) = provider else {
         return RuntimeAvailability {
-            status: "unavailable",
+            saturated: false,
             providers: Vec::new(),
         };
     };
-    // With the abstract provider layer, we report the top-level kind as
-    // available.  Health-checking individual backends is deferred to a future
-    // backends health endpoint.
-    let kind_name = provider.kind().name().to_string();
-    let status = if is_saturated { "saturated" } else { "ready" };
     RuntimeAvailability {
-        status,
-        providers: vec![kind_name],
+        saturated: is_saturated,
+        providers: provider.available_kinds(),
     }
+}
+
+fn model_availability(
+    provider: Option<&Arc<dyn InferenceProvider + Send + Sync>>,
+    runtime: &RuntimeAvailability,
+    model: &str,
+) -> (&'static str, Vec<String>) {
+    let Some(provider) = provider else {
+        return ("unavailable", Vec::new());
+    };
+    let providers = provider
+        .configured_kinds_for_model(model)
+        .into_iter()
+        .filter(|kind| runtime.providers.contains(kind))
+        .map(|kind| kind.name().to_string())
+        .collect::<Vec<_>>();
+    let status = if providers.is_empty() {
+        "unavailable"
+    } else if runtime.saturated {
+        "saturated"
+    } else {
+        "ready"
+    };
+    (status, providers)
 }
 
 fn now_epoch_ms() -> u64 {

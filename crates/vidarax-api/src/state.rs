@@ -4,10 +4,10 @@ use dashmap::DashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, oneshot, Notify, RwLock};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use serde_json::Value;
 
@@ -47,7 +47,7 @@ const DEFAULT_STREAM_ID: &str = "stream-0";
 type SessionEntry = (String, Arc<str>, Arc<WebRtcSession>);
 type SessionMap = DashMap<String, SessionEntry>;
 type ReclaimedSessionEntry = (String, Arc<str>);
-type ReclaimedSessionMap = Arc<RwLock<ReclaimedSessions>>;
+type ReclaimedSessionMap = Arc<Mutex<ReclaimedSessions>>;
 type StreamReservations = Arc<DashMap<String, usize>>;
 
 /// WHIP DELETE remains idempotent for watcher-reclaimed sessions within this
@@ -183,6 +183,10 @@ pub struct AppStateInner {
     spacetime_client: Option<SpacetimeClient>,
     /// Active WebRTC peer connections indexed by session ID.
     sessions: SessionMap,
+    /// Exact global admission count for `sessions`. The DashMap length is an
+    /// observation, not an atomic reservation, so it cannot enforce the cap
+    /// under concurrent inserts by itself.
+    session_slots: AtomicUsize,
     /// Recently reclaimed WHIP sessions, retained so DELETE remains idempotent
     /// after a peer-state watcher has already removed the live session entry.
     reclaimed_sessions: ReclaimedSessionMap,
@@ -279,7 +283,8 @@ impl AppStateConfig {
                 active_stream_limit: self.active_stream_limit.max(1),
                 spacetime_client: None,
                 sessions: DashMap::new(),
-                reclaimed_sessions: Arc::new(RwLock::new(ReclaimedSessions::default())),
+                session_slots: AtomicUsize::new(0),
+                reclaimed_sessions: Arc::new(Mutex::new(ReclaimedSessions::default())),
                 webrtc_config: WebRtcConfig::default(),
             }),
         }
@@ -362,7 +367,8 @@ impl AppState {
                 active_stream_limit: active_stream_limit.max(1),
                 spacetime_client: None,
                 sessions: DashMap::new(),
-                reclaimed_sessions: Arc::new(RwLock::new(ReclaimedSessions::default())),
+                session_slots: AtomicUsize::new(0),
+                reclaimed_sessions: Arc::new(Mutex::new(ReclaimedSessions::default())),
                 webrtc_config,
             }),
         })
@@ -477,34 +483,42 @@ impl AppState {
     ///
     /// Returns `false` if the session ID already exists (collision) or the
     /// global session limit has been reached.
-    pub async fn insert_session(
+    pub fn insert_session(
         &self,
         sess_id: String,
         principal: String,
         run_id: Arc<str>,
         session: Arc<WebRtcSession>,
     ) -> bool {
-        // The cap is a coarse resource guard, so a plain length check is enough
-        // even though a burst of concurrent inserts near the ceiling can admit a
-        // few extra. Check it before claiming the entry: reading the map length
-        // while holding an entry guard would deadlock against the same map.
-        if self.sessions.len() >= MAX_WEBRTC_SESSIONS {
+        if self
+            .session_slots
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_WEBRTC_SESSIONS).then_some(active + 1)
+            })
+            .is_err()
+        {
             return false;
         }
         // Claim the id under one shard lock so two inserts for the same id cannot
         // both win.
         match self.sessions.entry(sess_id.clone()) {
-            Entry::Occupied(_) => return false,
+            Entry::Occupied(_) => {
+                self.session_slots.fetch_sub(1, Ordering::AcqRel);
+                return false;
+            }
             Entry::Vacant(slot) => {
                 slot.insert((principal, run_id, session));
             }
         }
-        self.reclaimed_sessions.write().await.remove(&sess_id);
+        self.reclaimed_sessions
+            .lock()
+            .expect("reclaimed-session registry lock poisoned")
+            .remove(&sess_id);
         true
     }
 
     /// Look up a WebRTC session by ID.  Returns `None` if not found.
-    pub async fn get_session(&self, sess_id: &str) -> Option<SessionEntry> {
+    pub fn get_session(&self, sess_id: &str) -> Option<SessionEntry> {
         self.sessions
             .get(sess_id)
             .map(|entry| entry.value().clone())
@@ -516,7 +530,7 @@ impl AppState {
     /// removal is the atomic ownership transfer for reclaim paths: exactly one
     /// caller can win cleanup for a given session. The reclaim record is written
     /// right after the winning removal.
-    pub(crate) async fn remove_session_for_run(
+    pub(crate) fn remove_session_for_run(
         &self,
         sess_id: &str,
         run_id: &str,
@@ -526,33 +540,29 @@ impl AppState {
             .remove_if(sess_id, |_, (_, existing_run_id, _)| {
                 &**existing_run_id == run_id
             })?;
+        self.session_slots.fetch_sub(1, Ordering::AcqRel);
         let (principal, existing_run_id, _session) = &entry;
-        self.reclaimed_sessions.write().await.insert(
-            sess_id.to_string(),
-            principal.clone(),
-            Arc::clone(existing_run_id),
-            now_epoch_ms(),
-        );
+        self.reclaimed_sessions
+            .lock()
+            .expect("reclaimed-session registry lock poisoned")
+            .insert(
+                sess_id.to_string(),
+                principal.clone(),
+                Arc::clone(existing_run_id),
+                now_epoch_ms(),
+            );
         Some(entry)
     }
 
-    pub(crate) async fn get_reclaimed_session(
-        &self,
-        sess_id: &str,
-    ) -> Option<ReclaimedSessionEntry> {
+    pub(crate) fn get_reclaimed_session(&self, sess_id: &str) -> Option<ReclaimedSessionEntry> {
         self.reclaimed_sessions
-            .write()
-            .await
+            .lock()
+            .expect("reclaimed-session registry lock poisoned")
             .get(sess_id, now_epoch_ms())
     }
 
-    #[cfg(test)]
-    pub(crate) async fn hold_reclaimed_sessions_write_for_tests(&self) -> impl Drop {
-        Arc::clone(&self.reclaimed_sessions).write_owned().await
-    }
-
     /// Number of active WebRTC sessions.
-    pub async fn session_count(&self) -> usize {
+    pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
 
@@ -821,6 +831,12 @@ impl AppState {
         &self,
         request: TimelineAppendRequest,
     ) -> Result<TimelineEvent, String> {
+        // Cancellation boundary: before `send` completes, the command remains
+        // owned by this future and is not appended. After `send` completes, the
+        // single-owner writer owns the command and will finish it even if the
+        // caller disappears while waiting for the reply. Callers that may retry
+        // a state transition need their own idempotency rule; run deletion uses
+        // `append_run_deleted_for_stream_idempotent_async` for exactly that.
         let (reply_tx, reply_rx) = oneshot::channel();
         self.timeline_tx
             .send(TimelineCommand::Append {
@@ -2669,30 +2685,64 @@ mod tests {
         for i in 0..(RECLAIMED_SESSION_MAX_ENTRIES + 16) {
             let sess_id = format!("sess-reclaimed-{i:04}");
             let run_id: Arc<str> = Arc::from(format!("run-reclaimed-{i:04}"));
-            assert!(
-                state
-                    .insert_session(
-                        sess_id.clone(),
-                        "tenant-a".to_string(),
-                        Arc::clone(&run_id),
-                        Arc::new(WebRtcSession::new_for_tests()),
-                    )
-                    .await
-            );
+            assert!(state.insert_session(
+                sess_id.clone(),
+                "tenant-a".to_string(),
+                Arc::clone(&run_id),
+                Arc::new(WebRtcSession::new_for_tests()),
+            ));
             state
                 .remove_session_for_run(&sess_id, &run_id)
-                .await
                 .expect("session should be reclaimed");
         }
 
         assert_eq!(
-            state.reclaimed_sessions.read().await.len(),
+            state
+                .reclaimed_sessions
+                .lock()
+                .expect("reclaimed-session registry lock poisoned")
+                .len(),
             RECLAIMED_SESSION_MAX_ENTRIES
         );
-        assert!(state
-            .get_reclaimed_session("sess-reclaimed-0000")
-            .await
-            .is_none());
+        assert!(state.get_reclaimed_session("sess-reclaimed-0000").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_session_admission_never_exceeds_global_cap() {
+        let state = AppState::with_wal_for_tests(std::env::temp_dir().join(format!(
+            "vidarax-state-session-cap-{}.wal",
+            std::process::id()
+        )));
+        let barrier = Arc::new(tokio::sync::Barrier::new(MAX_WEBRTC_SESSIONS * 2));
+        let mut tasks = Vec::with_capacity(MAX_WEBRTC_SESSIONS * 2);
+
+        for i in 0..(MAX_WEBRTC_SESSIONS * 2) {
+            let state = state.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                let session = Arc::new(WebRtcSession::new_for_tests());
+                barrier.wait().await;
+                state.insert_session(
+                    format!("sess-cap-{i:04}"),
+                    "tenant-a".to_string(),
+                    Arc::from(format!("run-cap-{i:04}")),
+                    session,
+                )
+            }));
+        }
+
+        let mut admitted = 0;
+        for task in tasks {
+            if task.await.expect("admission task should not panic") {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, MAX_WEBRTC_SESSIONS);
+        assert_eq!(state.session_count(), MAX_WEBRTC_SESSIONS);
+        assert_eq!(
+            state.session_slots.load(Ordering::Acquire),
+            MAX_WEBRTC_SESSIONS
+        );
     }
 
     #[test]

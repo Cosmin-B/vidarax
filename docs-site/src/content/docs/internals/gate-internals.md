@@ -3,7 +3,7 @@ title: Gate internals
 description: What the gate computes per frame, the branchless decision dispatch, the deferred commit protocol, and tiered escalation in run_tiered.
 ---
 
-The gate is the deterministic filter that decides, per decoded frame, whether to spend a VLM call. It lives in `crates/vidarax-core/src/gate.rs`, with its input signals computed in `webrtc/signals.rs`, its windowed second pass in `pipeline.rs`, and the model escalation decision in `tiered_vlm.rs`. It guarantees determinism (same frames in, same decisions out, which is what the replay gate in [Allocation discipline](/internals/allocation-discipline/) pins), zero heap allocation on the per-frame path, and exactly one decision per frame. This page is the code-level companion to [The gate](/gate/).
+The gate is the deterministic filter that decides, per decoded frame, whether to spend a VLM call. It lives in `crates/vidarax-core/src/gate.rs`, with its input signals computed in `webrtc/signals.rs`, its windowed second pass in `pipeline.rs`, and the model escalation decision in `tiered_vlm.rs`. It guarantees determinism (same frames in, same decisions out, which is what the replay gate in [Allocation discipline](/docs/internals/allocation-discipline/) pins), zero heap allocation on the per-frame path, and exactly one decision per frame. This page is the code-level companion to [The gate](/docs/gate/).
 
 ## What is computed per frame
 

@@ -59,7 +59,7 @@ npm test
 
 Live tests need the matching local services: a VLM backend such as vLLM or SGLang for inference, `ffmpeg` and `ffprobe` on `PATH` for decode, and SpacetimeDB when running the module or the parity tests that depend on it.
 
-Before shipping, run the release gates described in [Operations](/operations/#release-gates).
+Before shipping, run the release gates described in [Operations](/docs/operations/#release-gates).
 
 ## Contributing basics
 

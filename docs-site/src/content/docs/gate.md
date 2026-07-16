@@ -53,7 +53,7 @@ Live capture deliberately uses a narrower binary policy: a SigLIP2 embedding eit
 
 The shipped reuse threshold is deliberately conservative. It is a safe starting point, not a universal calibration: operators should select a threshold against labelled, representative streams and the latency of the provider they actually run.
 
-The gate anchor advances only after a successful, non-empty VLM description. Reused frames and failed inference do not change it. The embedding sidecar receives raw JPEG bytes over a length-prefixed TCP protocol and returns 768 little-endian `f32` values; no image is transformed into JSON or base64. See [Deployment](/operations/) for operations and the repository's `docs/deployment.md` for calibration and provider/hardware evidence commands.
+The gate anchor advances only after a successful, non-empty VLM description. Reused frames and failed inference do not change it. The embedding sidecar receives raw JPEG bytes over a length-prefixed TCP protocol and returns 768 little-endian `f32` values; no image is transformed into JSON or base64. See [Deployment](/docs/operations/) for operations and the repository's `docs/deployment.md` for calibration and provider/hardware evidence commands.
 
 ## Tiered escalation to a second-pass model
 
@@ -66,3 +66,9 @@ The mechanism is three rules:
 - The second pass has its own output token budget.
 
 The first-pass model handles every frame; the second-pass model runs only on the frames the first pass was uncertain about. The `/v1/models` catalog reports each model's tier and runtime availability.
+
+Calibrate semantic reuse on more than one natural sequence. Include frozen
+content, slow drift, hard scene cuts, overlays, low-light frames, and repeated
+motion, then validate the selected threshold with live shadow samples. Batch
+file analysis does not traverse the live semantic-novelty gate, so its novelty
+counters are not applicable.

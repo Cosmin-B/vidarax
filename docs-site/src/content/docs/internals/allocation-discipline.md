@@ -3,7 +3,7 @@ title: Allocation discipline
 description: The counting allocator in the perf probe, the pointer-identity tests that pin pool reuse, and the release-gate scripts as mechanism.
 ---
 
-The hot paths in vidarax are written to a stated policy: no per-frame heap allocation in the core ingest and gate loops, pre-allocated pools everywhere buffers cross threads (see [Development](/development/#contributing-basics) for the policy text). The repository enforces the policy three ways: a global counting allocator in a probe binary that measures allocation events per frame, unit tests that assert pool reuse by pointer identity rather than by effect, and release-gate scripts that turn the allocation probe into a pass-or-fail check. The pointer-identity tests run in the ordinary workspace test suite; the release-gate scripts do not run them. This page describes each mechanism.
+The hot paths in vidarax are written to a stated policy: no per-frame heap allocation in the core ingest and gate loops, pre-allocated pools everywhere buffers cross threads (see [Development](/docs/development/#contributing-basics) for the policy text). The repository enforces the policy three ways: a global counting allocator in a probe binary that measures allocation events per frame, unit tests that assert pool reuse by pointer identity rather than by effect, and release-gate scripts that turn the allocation probe into a pass-or-fail check. The pointer-identity tests run in the ordinary workspace test suite; the release-gate scripts do not run them. This page describes each mechanism.
 
 ## The counting allocator
 
@@ -56,7 +56,7 @@ The same technique pins reuse at other layers:
 - `yuv_plane_pools_ensure_dims_rebuilds_on_resolution_change` in `webrtc/decode.rs` drains a plane pool's free-list and proves that a later acquire can only be pool-served after a deliberate rebuild, pinning the first-frame-then-grow policy.
 - In `crates/vidarax-api/src/state.rs`, `registry_keeps_same_map_snapshot_for_existing_run_event` asserts with `Arc::ptr_eq` that a non-structural run event updates per-run atomics in place without replacing the registry entry, and `publishing_append_reuses_unchanged_run_tail_arc` asserts that publishing a timeline snapshot shares untouched runs' tails by `Arc` instead of cloning them.
 
-The complementary sizing tests, such as the one deriving the 484-slot JPEG pool bound, are described in [Media plane](/internals/media-plane/#pool-sizing-as-a-sum-over-in-flight-positions).
+The complementary sizing tests, such as the one deriving the 484-slot JPEG pool bound, are described in [Media plane](/docs/internals/media-plane/#pool-sizing-as-a-sum-over-in-flight-positions).
 
 ## The release-gate scripts
 
@@ -64,11 +64,11 @@ Three scripts under `scripts/` turn the probe and the replay tests into gates. E
 
 | Script | What it checks |
 |---|---|
-| `validate_replay_and_schema.sh` | Runs the `replay_schema` integration test: gate decisions replay deterministically to a pinned fingerprint, and the published JSON Schemas accept their reference fixtures and reject invalid ones. See [WAL and events](/internals/wal-and-events/#validation-replay-and-schema-gates). |
+| `validate_replay_and_schema.sh` | Runs the `replay_schema` integration test: gate decisions replay deterministically to a pinned fingerprint, and the published JSON Schemas accept their reference fixtures and reject invalid ones. See [WAL and events](/docs/internals/wal-and-events/#validation-replay-and-schema-gates). |
 | `bench_regression.sh` | Builds and runs `perf_probe` in release mode and compares `allocations.per_frame` against `VIDARAX_MAX_ALLOC_PER_FRAME`. This is the executable form of the no-per-frame-allocation policy: a change that adds a heap allocation inside `gate.process` fails this script. |
 | `release_gates.sh` | Runs both of the above, then builds release binaries for `vidarax-cli` and `vidarax-api` and compares their file sizes against `VIDARAX_MAX_CLI_SIZE_BYTES` and `VIDARAX_MAX_API_SIZE_BYTES`, then runs the probe's timing regression gate against its configured ceiling. |
 
-Conceptually the ceilings guard four different regressions: semantic drift in the gate (replay fingerprint), allocation creep on the per-frame path (allocations per frame), dependency and code-size creep in the shipped artifacts (binary sizes), and timing regressions in the gate decision itself. The operational procedure around running them is in [Operations](/operations/#release-gates).
+Conceptually the ceilings guard four different regressions: semantic drift in the gate (replay fingerprint), allocation creep on the per-frame path (allocations per frame), dependency and code-size creep in the shipped artifacts (binary sizes), and timing regressions in the gate decision itself. The operational procedure around running them is in [Operations](/docs/operations/#release-gates).
 
 ## Edge cases and limits
 

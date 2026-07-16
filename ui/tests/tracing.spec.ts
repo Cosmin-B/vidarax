@@ -2,9 +2,41 @@ import { test, expect } from '@playwright/test'
 
 /**
  * Tracing page E2E tests.
- * Verifies the /tracing route renders Pipeline Observability, 5 pipeline stages,
- * 4 metric cards, and the trace timeline section.
+ * Verifies the /tracing route renders real Prometheus-backed pipeline metrics.
  */
+
+const METRICS = `
+vidarax_pipeline_rtp_frames_received_total 12
+vidarax_pipeline_frames_decoded_total 10
+vidarax_pipeline_frames_dropped_total 2
+vidarax_pipeline_gate_frames_analyzed_total 10
+vidarax_pipeline_gate_keyframes_selected_total 3
+vidarax_pipeline_keyframes_dropped_total 0
+vidarax_pipeline_sink_keyframes_dropped_total 0
+vidarax_pipeline_vlm_inferences_total 2
+vidarax_pipeline_novelty_evaluated_total 2
+vidarax_pipeline_novelty_reused_total 1
+vidarax_pipeline_novelty_forced_refresh_total 0
+vidarax_pipeline_novelty_embedding_unavailable_total 0
+vidarax_pipeline_keyframe_blobs_written_total 2
+vidarax_pipeline_keyframe_blobs_reused_total 1
+vidarax_pipeline_keyframe_blob_failures_total 0
+vidarax_pipeline_keyframe_blob_bytes_total 4096
+vidarax_pipeline_sessions_created_total 1
+vidarax_pipeline_sessions_removed_total 0
+vidarax_pipeline_decode_latency_us_bucket{le="10000"} 10
+vidarax_pipeline_decode_latency_us_bucket{le="+Inf"} 10
+vidarax_pipeline_decode_latency_us_sum 50000
+vidarax_pipeline_decode_latency_us_count 10
+vidarax_pipeline_gate_latency_us_bucket{le="10"} 10
+vidarax_pipeline_gate_latency_us_bucket{le="+Inf"} 10
+vidarax_pipeline_gate_latency_us_sum 20
+vidarax_pipeline_gate_latency_us_count 10
+vidarax_pipeline_vlm_latency_ms_bucket{le="1000"} 2
+vidarax_pipeline_vlm_latency_ms_bucket{le="+Inf"} 2
+vidarax_pipeline_vlm_latency_ms_sum 1200
+vidarax_pipeline_vlm_latency_ms_count 2
+`
 
 test.describe('Tracing page', () => {
   test.beforeEach(async ({ page }) => {
@@ -15,9 +47,9 @@ test.describe('Tracing page', () => {
       localStorage.setItem('vidarax_spacetime_endpoint', 'http://localhost:3000')
     })
 
-    // Return 503 immediately so the composable falls back to mock data without delay
+    // Keep this deterministic: the dashboard must display only backend metrics.
     await page.route('http://localhost:8080/v1/metrics', async route => {
-      await route.fulfill({ status: 503, body: '' })
+      await route.fulfill({ status: 200, contentType: 'text/plain', body: METRICS })
     })
   })
 
@@ -38,10 +70,9 @@ test.describe('Tracing page', () => {
     await expect(page.getByRole('button', { name: /refresh metrics/i })).toBeVisible()
   })
 
-  test('"MOCK DATA" badge is shown when API is unavailable', async ({ page }) => {
+  test('LIVE badge is shown when metrics are available', async ({ page }) => {
     await page.goto('/tracing')
-    // The composable falls back to generated data when the real endpoint is down
-    await expect(page.getByText('MOCK DATA')).toBeVisible({ timeout: 10_000 })
+    await expect(page.getByText('LIVE', { exact: true })).toBeVisible({ timeout: 10_000 })
   })
 
   // ── Pipeline stages ──────────────────────────────────────────────────────────
@@ -53,7 +84,7 @@ test.describe('Tracing page', () => {
     await expect(pipelineSection).toBeVisible({ timeout: 10_000 })
 
     // Each of the 5 stages should appear in the pipeline diagram
-    for (const stageName of ['WebRTC', 'Decode', 'Gate', 'VLM', 'SpacetimeDB']) {
+    for (const stageName of ['WebRTC', 'Decode', 'Gate', 'VLM', 'Keyframe store']) {
       await expect(pipelineSection.getByText(stageName, { exact: true })).toBeVisible()
     }
   })
@@ -75,7 +106,7 @@ test.describe('Tracing page', () => {
     await expect(metricsSection).toBeVisible({ timeout: 10_000 })
 
     // All 4 card headings should be present
-    for (const cardName of ['Decode', 'Gate Engine', 'VLM Inference', 'SpacetimeDB']) {
+    for (const cardName of ['Decode', 'Gate Engine', 'VLM Inference', 'Keyframe sidecar']) {
       await expect(metricsSection.getByRole('heading', { name: cardName })).toBeVisible()
     }
   })
@@ -85,47 +116,7 @@ test.describe('Tracing page', () => {
 
     const metricsSection = page.getByRole('region', { name: 'Live pipeline metrics' })
     await expect(metricsSection).toBeVisible({ timeout: 10_000 })
-    await expect(metricsSection.getByText(/live metrics/i)).toBeVisible()
-  })
-
-  // ── Trace Timeline ───────────────────────────────────────────────────────────
-
-  test('Trace Timeline section renders', async ({ page }) => {
-    await page.goto('/tracing')
-
-    const timelineSection = page.getByRole('region', { name: 'Trace waterfall timeline' })
-    await expect(timelineSection).toBeVisible({ timeout: 10_000 })
-  })
-
-  test('Trace Timeline section header is visible', async ({ page }) => {
-    await page.goto('/tracing')
-
-    const timelineSection = page.getByRole('region', { name: 'Trace waterfall timeline' })
-    await expect(timelineSection).toBeVisible({ timeout: 10_000 })
-    await expect(timelineSection.getByText(/trace timeline/i).first()).toBeVisible()
-  })
-
-  test('Trace Timeline section is labelled as synthetic sample data', async ({ page }) => {
-    await page.goto('/tracing')
-
-    const timelineSection = page.getByRole('region', { name: 'Trace waterfall timeline' })
-    await expect(timelineSection).toBeVisible({ timeout: 10_000 })
-    await expect(timelineSection.getByText('SYNTHETIC')).toBeVisible()
-    await expect(timelineSection.getByText(/illustrative sample data/i)).toBeVisible()
-    await expect(timelineSection.getByText(/per-span tracing is not exposed by the API yet/i)).toBeVisible()
-  })
-
-  test('Trace Timeline legend shows Decode, Gate, VLM labels', async ({ page }) => {
-    await page.goto('/tracing')
-
-    const timelineSection = page.getByRole('region', { name: 'Trace waterfall timeline' })
-    await expect(timelineSection).toBeVisible({ timeout: 10_000 })
-
-    // TraceTimeline renders a legend with STAGE_LABEL values
-    const traceCard = timelineSection.locator('.card-skeuo')
-    await expect(traceCard.getByText('DECODE')).toBeVisible()
-    await expect(traceCard.getByText('GATE')).toBeVisible()
-    await expect(traceCard.getByText('VLM')).toBeVisible()
+    await expect(metricsSection.getByText(/pipeline metrics/i)).toBeVisible()
   })
 
   // ── Refresh ──────────────────────────────────────────────────────────────────

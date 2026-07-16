@@ -17,7 +17,6 @@ pub mod metrics;
 pub mod novelty;
 pub mod pipeline;
 pub mod provider;
-pub mod semantic_merge;
 pub mod tiered_vlm;
 pub mod timeline;
 pub mod webrtc;

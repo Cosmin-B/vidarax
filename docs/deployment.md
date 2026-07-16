@@ -60,6 +60,12 @@ paths. Values below come from the current Rust source, mainly
 | `RUST_LOG` | `info` | Tracing filter used by `tracing_subscriber`. |
 | `VIDARAX_TRACES_ENDPOINT` | unset | Optional OTLP gRPC endpoint for trace export. |
 
+For an OpenAI-compatible backend that serves a converted model id, set both
+`model` and `upstream_model` in its TOML entry. `model` is the curated Vidarax
+id exposed to clients; `upstream_model` is the backend-specific id sent on the
+wire. This is required for mlx-vlm quantized conversions. `GET /v1/models`
+probes configured backends and reports readiness per curated model.
+
 The `VIDARAX_STAGING_*` names are live-test fixtures, not server settings.
 WHIP events always commit locally. SpacetimeDB receives descriptions only.
 
@@ -124,7 +130,9 @@ signal, not ground truth: description overlap can treat paraphrases as changes.
 Compare sampled and completed totals to spot provider failures.
 
 Activation is not calibration. Label at least 30 ordered JPEGs as `novel` or
-`redundant`, measure the deployment's VLM p50, and run:
+`redundant`. Include frozen content, slow drift, hard cuts, overlays, low-light
+frames, and repeated motion; a single natural sequence is not enough to expose
+false reuse. Measure the deployment's VLM p50, and run:
 
 ```bash
 CARGO_TARGET_DIR=/tmp/vidarax-calibration-target \
@@ -137,7 +145,10 @@ cargo run -p vidarax-core --release --example novelty_live_calibration -- \
 
 The final values are VLM p50 ms, maximum reuse ms, drift budget, minimum recall,
 and minimum speedup. The command fails if no threshold meets both floors. Set
-`VIDARAX_NOVELTY_REUSE_THRESHOLD` to the selected value.
+`VIDARAX_NOVELTY_REUSE_THRESHOLD` to the selected value, then confirm it with
+live shadow samples. A file-based `/reason` benchmark does not exercise the
+live semantic gate and must report novelty as not applicable rather than zero
+reuse.
 
 Provider and hardware results must remain separate. Create a TSV outside the
 repository with one configured deployment per row:
@@ -162,8 +173,11 @@ python3 benchmarks/provider_hardware_matrix.py \
 
 Omit `VIDARAX_API_KEY` only for an explicitly open local server. The output
 keeps every measured run plus aggregate quality, tokens, wall-clock p50/p95,
-provider-latency histogram bounds, request counts, and errors for each row. The
-command fails on missing provider calls, excess errors, or low mean F1.
+provider-latency histogram bounds, request counts, decoded-frame and gate
+selection counts, decode and gate mean latency, semantic-novelty counters when
+applicable, and errors for each row. The command fails on missing provider
+calls, excess errors, or low mean F1. Keep unavailable providers and
+accelerators as explicit gaps; do not infer their results from another row.
 
 `GET /v1/health` returns readiness for the running HTTP server. It does not
 check model backend availability.

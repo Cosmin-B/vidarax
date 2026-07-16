@@ -35,6 +35,13 @@ Check readiness with:
 curl -fsS http://127.0.0.1:8080/v1/health
 ```
 
+That endpoint covers the HTTP server. Query `GET /v1/models` to check live
+provider reachability and per-model readiness. For mlx-vlm, an
+`openai_compat` backend should set `model` to the curated Vidarax id and
+`upstream_model` to the quantized `mlx-community/...` conversion id.
+The backend rejects other curated model ids instead of silently sending them
+to the mapped conversion.
+
 ## Observability
 
 Three signals come out of the server:

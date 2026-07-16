@@ -3,6 +3,8 @@ title: What is vidarax
 description: A self-hosted video intelligence engine that turns video streams into structured semantic events.
 ---
 
+[← Vidarax](/)
+
 Vidarax is a self-hosted video intelligence engine. Video streams go in, structured semantic events come out.
 
 It decodes live or file-based video, runs a deterministic gate engine over every frame (scene cuts, flicker, ghosting, exposure shifts, loop detection), samples a subset of frames through tiered vision language models for semantic analysis, and emits structured events in real time. The server, storage, and event pipeline run on infrastructure you operate. Inference goes to a VLM backend you configure: a self-hosted OpenAI-compatible endpoint (vLLM or SGLang), or optionally Google's Gemini API. No SaaS dependency is required, but the Gemini integration exists for deployments that want it.
@@ -27,6 +29,6 @@ Vidarax is for teams that run their own inference and need machine-readable answ
 
 ## Where to go next
 
-- [Quickstart](/quickstart/): run the server and get events from a video.
-- [Architecture](/architecture/): the control plane, the media plane, and how state persists.
-- [API reference](/api/): endpoints and configuration.
+- [Quickstart](/docs/quickstart/): run the server and get events from a video.
+- [Architecture](/docs/architecture/): the control plane, the media plane, and how state persists.
+- [API reference](/docs/api/): endpoints and configuration.

@@ -34,7 +34,7 @@ The media plane splits by workload. WebRTC ingress is async: the session event l
 
 One ordered stream uses one stateful decoder, and the analysis and VLM stages own stream-order state, so the per-stream worker count for each stage is clamped to one. Parallelism comes from running many sessions, not from splitting one ordered stream.
 
-Decoding for file and URL sources goes through a pluggable backend registry with two phases: a frame-signal pass that computes per-frame statistics for the gate engine, then selective JPEG extraction for only the frames the gate keeps. See [Ingest](/ingest/) for the decode paths and [The gate](/gate/) for what happens to each frame.
+Decoding for file and URL sources goes through a pluggable backend registry with two phases: a frame-signal pass that computes per-frame statistics for the gate engine, then selective JPEG extraction for only the frames the gate keeps. See [Ingest](/docs/ingest/) for the decode paths and [The gate](/docs/gate/) for what happens to each frame.
 
 ## Event sinks
 

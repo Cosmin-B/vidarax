@@ -539,14 +539,13 @@ impl WebRtcSession {
         let mut shutdown = self.shutdown.subscribe();
 
         async move {
-            // run() owns the per-track ingestion tasks so it can abort them when
-            // the connection goes away. A local close() publishes Closed but
-            // does not wake an in-flight pc.recv() or track.recv(), so without
-            // watching for shutdown and aborting the tasks, run() and each track
-            // task would block forever holding a frame_tx clone, and the decode
-            // worker reading that channel would never see it close.
+            // run() owns the per-track ingestion tasks and gives them a separate
+            // monotonic stop signal. A local close() does not wake an in-flight
+            // pc.recv() or track.recv(), so every blocking receive/send is raced
+            // against this signal and each task is joined during teardown.
             let mut peer_state = pc.subscribe_peer_state();
             let mut track_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+            let (track_stop, _) = tokio::sync::watch::channel(false);
 
             loop {
                 // Decide before waiting. peer_state is subscribed inside this
@@ -597,11 +596,23 @@ impl WebRtcSession {
                                 let tx = frame_tx.clone();
                                 let seq = Arc::clone(&seq_counter);
                                 let metrics = Arc::clone(&metrics);
+                                let mut stop = track_stop.subscribe();
 
                                 track_tasks.push(tokio::spawn(async move {
                                     let nals_pool = VecPool::with_slots(rtp_nal_pool_slots);
                                     loop {
-                                        match track.recv().await {
+                                        let sample = tokio::select! {
+                                            biased;
+                                            changed = stop.changed() => {
+                                                if changed.is_err() || *stop.borrow() {
+                                                    break;
+                                                }
+                                                continue;
+                                            }
+                                            sample = track.recv() => sample,
+                                        };
+
+                                        match sample {
                                             Ok(MediaSample::Video(frame)) => {
                                                 let nal_seq =
                                                     seq.fetch_add(1, Ordering::Relaxed);
@@ -622,11 +633,21 @@ impl WebRtcSession {
                                                     codec,
                                                 };
 
-                                                if !enqueue_rtp_frame_lossless(
-                                                    &tx, rtp_frame, &metrics,
-                                                )
-                                                .await
-                                                {
+                                                let queued = tokio::select! {
+                                                    biased;
+                                                    changed = stop.changed() => {
+                                                        if changed.is_err() || *stop.borrow() {
+                                                            break;
+                                                        }
+                                                        continue;
+                                                    }
+                                                    queued = enqueue_rtp_frame_lossless(
+                                                        &tx,
+                                                        rtp_frame,
+                                                        &metrics,
+                                                    ) => queued,
+                                                };
+                                                if !queued {
                                                     break;
                                                 }
                                             }
@@ -646,12 +667,15 @@ impl WebRtcSession {
                 }
             }
 
-            // The connection is going away. Abort the track tasks so each
-            // frame_tx clone drops; together with frame_tx dropping here, the
-            // decode worker downstream sees its channel close and exits instead
-            // of blocking forever on a peer that no longer sends frames.
+            // The connection is going away. Stop and join the track tasks so
+            // each frame_tx clone drops in a known place. Together with
+            // frame_tx dropping here, the decode worker downstream sees its
+            // channel close and exits. An in-flight frame may be discarded at
+            // this explicit teardown boundary; active-session sends remain
+            // lossless and backpressured.
+            track_stop.send_replace(true);
             for handle in track_tasks {
-                handle.abort();
+                let _ = handle.await;
             }
         }
     }
@@ -666,7 +690,8 @@ impl WebRtcSession {
 
     /// Read the current VLM prompt (empty string means use the default).
     ///
-    /// Clones only the `Arc<str>` pointer (pointer-width), not the string data.
+    /// Clones only the `Arc<str>` handle and increments its reference count;
+    /// the string data is not copied or reallocated.
     pub fn read_prompt(&self) -> Arc<str> {
         Arc::clone(&*self.prompt.load_full())
     }
