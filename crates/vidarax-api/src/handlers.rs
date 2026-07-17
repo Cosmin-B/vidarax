@@ -14,6 +14,7 @@ use tokio::task::JoinSet;
 use vidarax_contracts::models::{
     fallback_candidates, REQUIRED_MEDIUM_MODELS, REQUIRED_SMALL_MODELS,
 };
+use vidarax_core::coordinates::{FrameCoordinates, IMAGE_COORDINATE_SCHEMA};
 use vidarax_core::gate::{FrameSignal, GateEventType};
 use vidarax_core::ingest::{
     compute_semantic_frame_indices, prepare_source_for_reuse, probe_source_fps, DecodedJpegFrame,
@@ -355,6 +356,8 @@ pub async fn ingest_run(
                 "width": decoded.width,
                 "height": decoded.height,
                 "pixel_format": decoded.pixel_format,
+                "coordinate_schema": IMAGE_COORDINATE_SCHEMA,
+                "coordinates": decoded.coordinates,
                 "signals": signals
             }),
         )
@@ -803,13 +806,18 @@ pub async fn analyze_run(
         );
     }
 
-    let (signals, sampling_policy, sample_fps) = if payload.frames.is_empty() {
+    let (signals, sampling_policy, sample_fps, coordinates) = if payload.frames.is_empty() {
         let events = match load_existing_events(&state, &run_id).await {
             Ok(events) => events,
             Err(error) => return error,
         };
         match load_decoded_signals_from_events(&events) {
-            Ok(decoded) => (decoded.signals, decoded.sampling_policy, decoded.sample_fps),
+            Ok(decoded) => (
+                decoded.signals,
+                decoded.sampling_policy,
+                decoded.sample_fps,
+                decoded.coordinates,
+            ),
             Err(message) => {
                 return validation_error(
                     &state,
@@ -892,7 +900,7 @@ pub async fn analyze_run(
         } else {
             estimate_sample_fps(&signals).unwrap_or(1.0)
         };
-        (signals, sampling_policy, sample_fps)
+        (signals, sampling_policy, sample_fps, None)
     };
 
     let principal = state.security_policy().principal_key_from_headers(&headers);
@@ -939,6 +947,7 @@ pub async fn analyze_run(
                 &request_id,
                 &trace_id,
                 m,
+                coordinates,
                 None,
                 false,
                 None,
@@ -970,23 +979,24 @@ pub async fn analyze_run(
         }
     }
 
+    let mut analysis_event = json!({
+        "request_id": request_id,
+        "stream_id": stream_id,
+        "frames": metadata.len(),
+        "window_size": window_size,
+        "segment_ms": segment_ms,
+        "sampling_policy": sampling_policy.as_str(),
+        "sample_fps": sample_fps,
+        "mode": mode,
+        "model": model,
+        "markers": markers.len()
+    });
+    if let Some(coordinates) = coordinates {
+        analysis_event["coordinate_schema"] = json!(IMAGE_COORDINATE_SCHEMA);
+        analysis_event["coordinates"] = json!(coordinates);
+    }
     if let Err(err) = state
-        .append_run_event_async(
-            &run_id,
-            "analysis_generated",
-            json!({
-                "request_id": request_id,
-                "stream_id": stream_id,
-                "frames": metadata.len(),
-                "window_size": window_size,
-                "segment_ms": segment_ms,
-                "sampling_policy": sampling_policy.as_str(),
-                "sample_fps": sample_fps,
-                "mode": mode,
-                "model": model,
-                "markers": markers.len()
-            }),
-        )
+        .append_run_event_async(&run_id, "analysis_generated", analysis_event)
         .await
     {
         return internal_error(
@@ -1270,6 +1280,7 @@ async fn assemble_realtime_reason_response(
     sampling_policy: SamplingPolicy,
     sample_fps: f32,
     source_fps: Option<f32>,
+    coordinates: FrameCoordinates,
     semantic_segment_ms: u64,
     request_id: &str,
     trace_id: &str,
@@ -1322,6 +1333,7 @@ async fn assemble_realtime_reason_response(
                 request_id,
                 trace_id,
                 frame,
+                Some(coordinates),
                 semantic_overlay.overlay.as_ref(),
                 semantic_overlay.used_fallback,
                 semantic_overlay.finish_reason.clone(),
@@ -1429,6 +1441,8 @@ async fn assemble_realtime_reason_response(
                 "sampling_policy": sampling_policy.as_str(),
                 "source_fps": source_fps,
                 "sample_fps": sample_fps,
+                "coordinate_schema": IMAGE_COORDINATE_SCHEMA,
+                "coordinates": coordinates,
                 "lag_p95_ms": lag_p95_ms,
                 "lag_p99_ms": lag_p99_ms,
                 "mode": mode,
@@ -1639,6 +1653,8 @@ pub async fn reason_realtime_run(
                 "request_id": request_id,
                 "source_uri": payload.source_uri.as_str(),
                 "index_name": index_name,
+                "coordinate_schema": IMAGE_COORDINATE_SCHEMA,
+                "coordinates": decoded.coordinates,
             }),
         )
         .await
@@ -1757,6 +1773,7 @@ pub async fn reason_realtime_run(
         sampling_policy,
         sample_fps,
         source_fps,
+        decoded.coordinates,
         semantic_segment_ms,
         &request_id,
         &trace_id,

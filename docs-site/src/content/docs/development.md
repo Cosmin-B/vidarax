@@ -9,7 +9,7 @@ Vidarax is a Rust workspace with a TypeScript SDK, a Vue 3 UI, and a SpacetimeDB
 
 ```
 crates/
-  vidarax-core/         Lock-free primitives, gate engine, ingest pipeline
+  vidarax-core/         Frame filter, media primitives, ingest pipeline
   vidarax-contracts/    Shared model contracts and error mapping
   vidarax-api/          Axum HTTP server, handlers, WHIP, security
   vidarax-cli/          CLI tooling
@@ -59,7 +59,7 @@ npm test
 
 Live tests need the matching local services: a VLM backend such as vLLM or SGLang for inference, `ffmpeg` and `ffprobe` on `PATH` for decode, and SpacetimeDB when running the module or the parity tests that depend on it.
 
-Before shipping, run the release gates described in [Operations](/docs/operations/#release-gates).
+Before shipping, run the [release checks](/docs/operations/#release-checks).
 
 ## Contributing basics
 
@@ -71,6 +71,6 @@ The project has an explicit concurrency and memory policy for hot paths:
 
 - Favor lock-free and wait-free structures on hot paths; if a lock is unavoidable, document why lock-free was rejected and what the contention model is.
 - Prefer bounded FIFO, SPSC, and MPSC queues with explicit backpressure.
-- Avoid per-frame heap allocation in the core ingest and gate loops; pre-allocate for throughput pipelines. Any new hot-path allocation needs explicit justification and measurement.
+- Avoid selected-global-allocator calls per frame after warmup in the core ingest and filter loops; reuse bounded buffers in throughput pipelines. Any new hot-path allocation needs explicit justification and measurement.
 
 When weighing a change, the project's ordered checklist applies: avoid the work entirely, do it once, do it fewer times, approximate safely, use a lookup table or bounded queue, constrain the problem, delete dead code, and only then reach for vectorization. Back decisions with data.

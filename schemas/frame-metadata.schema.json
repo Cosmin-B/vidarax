@@ -34,6 +34,25 @@
       "type": "integer",
       "minimum": 0
     },
+    "coordinate_schema": {
+      "const": "vidarax.image.v1"
+    },
+    "coordinates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_extent",
+        "requested_region",
+        "resolved_region",
+        "analysis_extent"
+      ],
+      "properties": {
+        "source_extent": { "$ref": "#/$defs/pixelExtent" },
+        "requested_region": { "$ref": "#/$defs/normalizedRect" },
+        "resolved_region": { "$ref": "#/$defs/pixelRect" },
+        "analysis_extent": { "$ref": "#/$defs/pixelExtent" }
+      }
+    },
     "mode": {
       "type": "string",
       "enum": [
@@ -195,6 +214,38 @@
       "type": "string",
       "description": "Deterministic key format: run_id:pts_ms:seq"
     }
+  },
+  "$defs": {
+    "pixelExtent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "pixelRect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "width", "height"],
+      "properties": {
+        "x": { "type": "integer", "minimum": 0 },
+        "y": { "type": "integer", "minimum": 0 },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "normalizedRect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "width", "height"],
+      "properties": {
+        "x": { "type": "number", "minimum": 0, "maximum": 1 },
+        "y": { "type": "number", "minimum": 0, "maximum": 1 },
+        "width": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "height": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }
+      }
+    }
   }
 }
-

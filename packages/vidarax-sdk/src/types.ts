@@ -25,6 +25,26 @@ export interface CropRegion {
   height: number;
 }
 
+/** Pixel dimensions in the `vidarax.image.v1` coordinate contract. */
+export interface PixelExtent {
+  width: number;
+  height: number;
+}
+
+/** Exact rectangle in source-frame pixels, with a top-left origin. */
+export interface PixelRect extends PixelExtent {
+  x: number;
+  y: number;
+}
+
+/** Spatial provenance for the filter input, before optional model transport resizing. */
+export interface FrameCoordinates {
+  source_extent: PixelExtent;
+  requested_region: CropRegion;
+  resolved_region: PixelRect;
+  analysis_extent: PixelExtent;
+}
+
 /** Run lifecycle state (lowercased Debug repr from Rust). */
 export type RunStatus = "pending" | "processing" | "completed" | "cancelled" | "failed";
 
@@ -211,6 +231,8 @@ export interface AnalyzeFrameMetadata {
   stream_id: string;
   frame_index: number;
   pts_ms: EpochMs;
+  coordinate_schema?: "vidarax.image.v1";
+  coordinates?: FrameCoordinates;
   mode: string;
   model: string;
   sampling_policy: string;

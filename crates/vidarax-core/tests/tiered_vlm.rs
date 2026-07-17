@@ -53,6 +53,7 @@ fn keyframe_work_has_prompt_field() {
         session_id: "s".into(),
         frame_index: 0,
         pts_ms: 0,
+        coordinates: vidarax_core::coordinates::FrameCoordinates::full_frame(640, 480),
         event_type: "scene_cut",
         confidence: 0.9,
         novelty_score: 0.0,

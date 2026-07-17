@@ -1,6 +1,6 @@
 ---
 title: Operations
-description: Deployment, observability, hardening, and the release gates.
+description: Deployment, observability, hardening, and release checks.
 ---
 
 This page covers what a deployment consists of, what the server exposes for observability, and the release-gate practice the project uses before shipping.
@@ -62,16 +62,16 @@ Read `docs/security.md` in the repository before exposing a deployment to untrus
 - Keep the insecure media toggles (`VIDARAX_ALLOW_INSECURE_HTTP`, `VIDARAX_ALLOW_UNENCRYPTED_RTSP`, `VIDARAX_ALLOW_REMOTE_HLS`, `VIDARAX_ALLOW_INSECURE_TLS`) disabled unless the source network is trusted.
 - Remote ingest applies application-level SSRF mitigations, but redirects or nested playlist resources that resolve to private addresses over an allowed scheme cannot be fully blocked in the application. Deployments that ingest untrusted sources need network-level egress controls: an egress proxy or resolver that enforces a public-IP policy on every connection.
 
-## Release gates
+## Release checks
 
-Before a release, `scripts/release_gates.sh` runs a fixed sequence of checks. Each check compares an observed value against a configured ceiling and fails the gate on regression; the ceilings live in environment variables (`VIDARAX_MAX_CLI_SIZE_BYTES`, `VIDARAX_MAX_API_SIZE_BYTES`, `VIDARAX_MAX_ALLOC_PER_FRAME`, and a timing ceiling) so they can be tightened or relaxed without editing the script.
+Before a release, `scripts/release_gates.sh` runs a fixed sequence of checks. Each one compares an observed value against a configured ceiling and exits non-zero on regression. The ceilings live in environment variables (`VIDARAX_MAX_CLI_SIZE_BYTES`, `VIDARAX_MAX_API_SIZE_BYTES`, `VIDARAX_MAX_ALLOC_TOTAL`, and a timing ceiling) so they can be tightened or relaxed without editing the script.
 
-Conceptually, the gates check four things:
+The checks cover four things:
 
 1. Correctness is reproducible. `scripts/validate_replay_and_schema.sh` runs the deterministic replay and schema tests: the same input must produce the same events, and the published JSON Schemas must accept their reference fixtures and reject invalid ones.
-2. The hot path does not silently start allocating. `scripts/bench_regression.sh` runs an allocation probe and fails if per-frame allocations exceed the configured budget.
+2. The measured hot path does not silently start allocating. `scripts/bench_regression.sh` fails on the first counted allocation after warmup by default (`VIDARAX_MAX_ALLOC_TOTAL=0`).
 3. The shipped binaries do not silently grow. The script builds release binaries for the CLI and the API server and compares their sizes against configured ceilings.
-4. The gate engine's hot path is covered by an automated timing regression gate.
+4. The per-frame filter's hot path is covered by an automated timing regression check.
 
 Run the full sequence from the repository root:
 
@@ -79,4 +79,4 @@ Run the full sequence from the repository root:
 scripts/release_gates.sh
 ```
 
-The individual scripts can also be run alone. Beyond the gates, `scripts/` contains smoke and integration harnesses: `smoke_v1.sh` and `smoke_mp4_pipeline.sh` boot the server and exercise the API path, `e2e_integration_test.sh` runs an end-to-end pass over a generated test video (`generate_test_video.sh`), and `staging_provider_e2e.sh` runs the live provider integration test when the staging backend URLs are set. Throughput depends on hardware, models, and input, so the repository publishes no headline numbers; measure on your own setup with the harnesses in `benchmarks/`, the bench binaries under `crates/*/src/bin`, and the scripts in `scripts/`.
+The individual scripts can also be run alone. Beyond these checks, `scripts/` contains smoke and integration harnesses: `smoke_v1.sh` and `smoke_mp4_pipeline.sh` boot the server and exercise the API path, `e2e_integration_test.sh` runs an end-to-end pass over a generated test video (`generate_test_video.sh`), and `staging_provider_e2e.sh` runs the live provider integration test when the staging backend URLs are set. Throughput depends on hardware, models, and input, so the repository publishes no universal headline number; measure the provider and hardware combination you deploy.

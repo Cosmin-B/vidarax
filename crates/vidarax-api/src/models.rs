@@ -285,6 +285,10 @@ pub struct AnalyzeFrameMetadata {
     pub stream_id: String,
     pub frame_index: u64,
     pub pts_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coordinate_schema: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coordinates: Option<vidarax_core::coordinates::FrameCoordinates>,
     pub mode: String,
     pub model: String,
     pub sampling_policy: String,

@@ -3,7 +3,7 @@ title: State and cancellation
 description: AppState layout, RAII slot reservation, the single-winner delete protocol, and how request cancellation is kept away from session ownership.
 ---
 
-`AppState` in `crates/vidarax-api/src/state.rs` is the shared state behind every handler: the run registry, the timeline writer, session maps, and the concurrency guards around them. Its design goal is that every invariant survives concurrent requests racing each other and futures being cancelled mid-flight. The mechanisms are RAII guards whose `Drop` runs on every exit path including panics, compare-and-swap claims that admit exactly one winner, and lock-free snapshots readers can load without blocking writers. This page covers the layout, the `StreamSlotGuard` reservation, the insert-to-spawn window in `whip.rs`, single-winner deletion, and the snapshot registry. Event persistence itself is in [WAL and events](/docs/internals/wal-and-events/).
+`AppState` in `crates/vidarax-api/src/state.rs` is the shared state behind every handler: the run registry, the timeline writer, session maps, and the concurrency guards around them. Its design goal is that every invariant survives concurrent requests racing each other and futures being cancelled mid-flight. The mechanisms are RAII guards whose `Drop` runs on normal returns, cancellation, and unwinding panics; compare-and-swap claims that admit exactly one winner; and lock-free snapshots readers can load without blocking writers. Release builds use `panic = "abort"`, so an abort does not run destructors. This page covers the layout, the `StreamSlotGuard` reservation, the insert-to-spawn window in `whip.rs`, single-winner deletion, and the snapshot registry. Event persistence itself is in [WAL and events](/docs/internals/wal-and-events/).
 
 ## AppState layout
 
@@ -53,7 +53,7 @@ impl Drop for StreamSlotGuard {
 }
 ```
 
-The entry is held across the check and the remove, so a concurrent reservation for the same principal cannot race the decrement, and a count that reaches zero deletes its key, keeping the map bounded to principals that actually hold reservations. Because release is `Drop`, it runs on every exit path: early returns, `?` propagation, future cancellation, and panics. The guard may briefly overlap with its own committed run (the reservation is released after `run_created` is durable and visible); that overlap can only reject a racing creator early, never admit one past the limit.
+The entry is held across the check and the remove, so a concurrent reservation for the same principal cannot race the decrement, and a count that reaches zero deletes its key, keeping the map bounded to principals that actually hold reservations. Because release is `Drop`, it runs on early returns, `?` propagation, future cancellation, and unwinding panics. It does not run after a process abort, including a panic in the release profile. The guard may briefly overlap with its own committed run (the reservation is released after `run_created` is durable and visible); that overlap can only reject a racing creator early, never admit one past the limit.
 
 ## The insert-to-spawn window in whip.rs
 

@@ -79,6 +79,9 @@ export type {
   AnalyzeAnnotations,
   AnalyzeTrace,
   AnalyzeFrameMetadata,
+  FrameCoordinates,
+  PixelExtent,
+  PixelRect,
   AnalyzeFramesRequest,
   AnalyzeFramesResponse,
 

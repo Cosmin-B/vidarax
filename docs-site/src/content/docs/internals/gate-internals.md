@@ -96,7 +96,7 @@ pub fn needs_second_pass(&self, first_pass_confidence: f32) -> bool {
 2. Parse confidence from the first pass's output text: `parse_confidence_from_output` looks for a `confidence` field in a JSON body and returns 0.5 when the output is not JSON or has no such field, so free-text output lands exactly at the "uncertain" midpoint and escalates only if the threshold is above 0.5.
 3. If `needs_second_pass` says so, rewrite the request to `second_pass_model` with `second_pass_max_tokens`, a second-pass timeout, and a forced `guided_json` of `teacher_label_schema()`, so the second-pass model always returns structured labels regardless of what schema the caller set. On success, the second result wins, with the first pass's token usage and latency folded in so accounting spans the whole analysis. On failure, the first-pass result is returned and `used_second_pass` stays false: a broken teacher degrades quality, never availability.
 
-The caller in `workers.rs` records which tier answered in the event kind: `vlm` for a first-pass answer, `vlm_tiered` when the second pass ran (`clip_vlm` / `clip_vlm_tiered` on the clip path). Before tiering, live keyframe mode can ask the semantic-novelty gate to reuse the last successful description.
+The caller in `workers.rs` records which tier answered in the event kind: `vlm` for a first-pass answer, `vlm_tiered` when the second pass ran (`clip_vlm` / `clip_vlm_tiered` on the clip path). Before tiering, live keyframe mode can ask the semantic novelty filter to reuse the last successful description.
 
 ## Edge cases and limits
 

@@ -7,6 +7,7 @@
 
 pub mod admission;
 pub mod backends;
+pub mod coordinates;
 pub mod crop;
 pub mod dedup;
 pub mod embedding_sidecar;

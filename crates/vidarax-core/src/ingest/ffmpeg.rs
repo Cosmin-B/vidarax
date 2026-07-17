@@ -1,6 +1,7 @@
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 
+use crate::coordinates::FrameCoordinates;
 use crate::crop::CropRegion;
 use crate::gate::FrameSignal;
 
@@ -245,6 +246,7 @@ pub struct DecodedMp4Batch {
     pub width: u32,
     pub height: u32,
     pub pixel_format: String,
+    pub coordinates: FrameCoordinates,
     pub frame_signals: Vec<FrameSignal>,
 }
 
@@ -331,6 +333,14 @@ fn decode_mp4_to_frame_signals_inner(
     }
 
     let source_uri = source.as_ffmpeg_input();
+    let source_dimensions = match config.crop {
+        Some(crop) if !crop.is_full_frame() => {
+            Some(probe_source_dimensions_inner(source).ok_or_else(|| {
+                "video source dimensions are unavailable for crop provenance".to_string()
+            })?)
+        }
+        _ => None,
+    };
     let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
     let fps_expr = format!("{}fps={:.3}", crop_prefix(config.crop), config.sample_fps);
     let output = Command::new(ffmpeg_path())
@@ -364,7 +374,51 @@ fn decode_mp4_to_frame_signals_inner(
                 tracing::warn!(%err, "perceptual-hash pass failed; falling back to checksum hash");
                 Vec::new()
             });
-    parse_framemd5_to_signals(&text, source_uri, config.max_frames, &ahashes)
+    let mut decoded = parse_framemd5_to_signals(&text, source_uri, config.max_frames, &ahashes)?;
+    if let Some((source_width, source_height)) = source_dimensions {
+        let coordinates = FrameCoordinates::resolve(source_width, source_height, config.crop)
+            .ok_or_else(|| "crop is too small to represent at the source dimensions".to_string())?;
+        decoded.coordinates = coordinates;
+        if decoded.coordinates.analysis_extent.width != decoded.width
+            || decoded.coordinates.analysis_extent.height != decoded.height
+        {
+            return Err(format!(
+                "decoded crop dimensions {}x{} do not match coordinate provenance {}x{}",
+                decoded.width,
+                decoded.height,
+                decoded.coordinates.analysis_extent.width,
+                decoded.coordinates.analysis_extent.height,
+            ));
+        }
+    }
+    Ok(decoded)
+}
+
+fn probe_source_dimensions_inner(source: &InputSource) -> Option<(u32, u32)> {
+    let source_uri = source.as_ffmpeg_input();
+    let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
+    let output = Command::new(ffprobe_path())
+        .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
+        .args(ffmpeg_input_options_for_source(source))
+        .args([
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0:s=x",
+            source_uri,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(output.stdout).ok()?;
+    let (width, height) = raw.trim().split_once('x')?;
+    let width = width.parse().ok()?;
+    let height = height.parse().ok()?;
+    (width > 0 && height > 0).then_some((width, height))
 }
 
 /// Compute a real 64-bit average-hash per sampled frame by decoding the source a
@@ -634,12 +688,16 @@ fn parse_framemd5_to_signals(
     if frame_signals.is_empty() {
         return Err("no video frames decoded from source".to_string());
     }
+    if width == 0 || height == 0 {
+        return Err("video decoder did not report valid frame dimensions".to_string());
+    }
 
     Ok(DecodedMp4Batch {
         source_uri: source_uri.to_string(),
         width,
         height,
         pixel_format: "framemd5".to_string(),
+        coordinates: FrameCoordinates::full_frame(width, height),
         frame_signals,
     })
 }

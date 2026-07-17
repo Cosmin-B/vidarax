@@ -6,15 +6,17 @@ description: The control plane on tokio, the media plane on OS threads, event si
 Vidarax separates request handling from media processing. HTTP and control logic run on the tokio async runtime. Decode, analysis, and VLM work runs on dedicated OS threads connected by bounded queues. Worker output commits to the local write-ahead log. When SpacetimeDB is configured, blocking WHIP description events are mirrored only after that local commit.
 
 ```
-  Sources                        vidarax                         Consumers
+ Sources                         vidarax                          Consumers
 ┌──────────┐   ┌──────────────────────────────────────────┐   ┌──────────────┐
 │ MP4/File │──>│                                          │──>│ REST API     │
-│ WebRTC   │──>│  Decode ──> Gate Engine ──> VLM Tiering  │──>│ TypeScript   │
-│ RTSP/HLS │──>│               │                │         │──>│   SDK        │
-│ Upload   │──>│          Markers +         Semantic      │──>│ Vue 3 UI     │
-│          │   │          Keyframes         Events        │   │ Prometheus   │
-│          │   │               │                │         │   │ Optional     │
-│          │   │            WAL event log      │          │   │ SpacetimeDB  │
+│ WebRTC   │──>│ Decode ──> Frame Filter ──> VLM Tiering   │──>│ TypeScript   │
+│ RTSP/HLS │──>│              │                │          │──>│ SDK          │
+│ Upload   │──>│              v                v          │──>│ Vue 3 UI     │
+│          │   │        Markers +         Semantic       │   │ Prometheus   │
+│          │   │        Keyframes          Events        │   │ Optional     │
+│          │   │              └───────┬────────┘          │   │ SpacetimeDB  │
+│          │   │                      v                   │   │              │
+│          │   │                WAL event log             │   │              │
 └──────────┘   └──────────────────────────────────────────┘   └──────────────┘
 ```
 
@@ -34,7 +36,7 @@ The media plane splits by workload. WebRTC ingress is async: the session event l
 
 One ordered stream uses one stateful decoder, and the analysis and VLM stages own stream-order state, so the per-stream worker count for each stage is clamped to one. Parallelism comes from running many sessions, not from splitting one ordered stream.
 
-Decoding for file and URL sources goes through a pluggable backend registry with two phases: a frame-signal pass that computes per-frame statistics for the gate engine, then selective JPEG extraction for only the frames the gate keeps. See [Ingest](/docs/ingest/) for the decode paths and [The gate](/docs/gate/) for what happens to each frame.
+Decoding for file and URL sources goes through a pluggable backend registry with two phases: a frame-signal pass that computes statistics for the per-frame filter, then selective JPEG extraction for only the frames the filter keeps. See [Ingest](/docs/ingest/) for the decode paths and [The per-frame filter](/docs/gate/) for what happens to each frame.
 
 ## Event sinks
 
@@ -42,6 +44,7 @@ Worker threads report results through an `EventSink` trait rather than writing s
 
 - It bridges worker events into the API timeline, so live VLM results appear in `GET /v1/runs/{id}/events` without an external database. Appends funnel through a bounded channel into the single timeline-writer thread, which assigns sequence numbers and swaps the registry snapshot.
 - `store_keyframe_sync` writes raw JPEG bytes to the content-addressed blob sidecar before appending a `keyframe_stored` metadata event. The WAL never carries JSON-encoded or base64 image bytes.
+- Frame and keyframe events carry `coordinate_schema: "vidarax.image.v1"` plus source dimensions, the requested normalized crop, the exact resolved pixel region, and the analyzed extent. The contract describes image coordinates, not camera extrinsics or a robot/world transform.
 - When `VIDARAX_SPACETIMEDB_URL` is set, successful blocking description events are mirrored after the WAL commit and feedback endpoints are enabled. Mirror failure is logged and does not roll back local durability. Nonblocking events and raw keyframes remain local.
 
 ## How state is persisted
@@ -51,5 +54,7 @@ The durable store is a write-ahead log at `${VIDARAX_DATA_DIR}/timeline.wal` (da
 - Append-only plain text, one event per line, tab-separated with escaped fields. JPEG bytes live under `${VIDARAX_DATA_DIR}/keyframes/blobs/`; the WAL stores their relative reference, media type, size, and SHA-256.
 - Each event carries a monotonic sequence number, a run ID, a stream ID, a presentation timestamp, a kind, and a JSON payload.
 - The file is created with owner-only read and write permissions on Unix.
+
+Blob creation happens before the referencing WAL append. A crash between those steps can leave an unreferenced blob. Reads remain consistent because no event points at missing bytes, but automatic orphan reconciliation is not implemented yet.
 
 Run state is not stored as a mutable row anywhere. `GET /v1/runs/{id}/state` derives the current state by replaying the run's persisted events, and deletion is soft: `DELETE /v1/runs/{id}` appends a `run_deleted` event. Recently appended runs keep an in-memory tail of their events, so those reads are served from memory; when a run falls out of that set, reads fall back to WAL replay with the same cursor order.

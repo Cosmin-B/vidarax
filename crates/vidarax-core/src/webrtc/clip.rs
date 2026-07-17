@@ -32,6 +32,7 @@ use std::time::Instant;
 use arc_swap::ArcSwapOption;
 use base64::Engine as _;
 
+use crate::coordinates::FrameCoordinates;
 use crate::gate::FrameSignal;
 use crate::metrics::PipelineMetrics;
 use crate::provider::{InferenceImage, InferenceObserver, InferenceProvider, InferenceRequest};
@@ -39,7 +40,7 @@ use crate::tiered_vlm::{run_tiered, TieredVlmConfig};
 use crate::webrtc::recycle::RecycledBytes;
 use crate::webrtc::workers::{
     per_stream_vlm_workers, prune_stale_token_budget_entries, token_budget_entry, EventSink,
-    StreamFrame,
+    KeyframeEvent, StreamFrame,
 };
 
 // ─── ClipConfig ───────────────────────────────────────────────────────────────
@@ -139,7 +140,7 @@ pub struct ClipWork {
     ///
     /// JPEG buffers are recycled byte handles moved into clip work without
     /// copying the payload on the runtime path.
-    pub frames: VecDeque<(FrameSignal, RecycledBytes)>,
+    pub frames: VecDeque<(FrameSignal, RecycledBytes, FrameCoordinates)>,
     /// PTS of the first frame in the batch (milliseconds).
     pub pts_start: u64,
     /// PTS of the last frame in the batch (milliseconds).
@@ -191,7 +192,7 @@ pub struct ClipAccumulator {
     session_id: Arc<str>,
     prompt: Arc<str>,
     /// Buffered frames for the current window.
-    buffer: VecDeque<(FrameSignal, RecycledBytes)>,
+    buffer: VecDeque<(FrameSignal, RecycledBytes, FrameCoordinates)>,
     /// PTS-based sampling state shared with the decode-side pre-encode gate.
     rate_gate: ClipRateGate,
     /// PTS of the first accepted frame in the current logical clip window.
@@ -250,7 +251,8 @@ impl ClipAccumulator {
         if self.window_start_pts.is_none() {
             self.window_start_pts = Some(sf.pts_ms);
         }
-        self.buffer.push_back((sf.signal, jpeg_bytes));
+        self.buffer
+            .push_back((sf.signal, jpeg_bytes, sf.coordinates));
 
         // ── Check window duration ──────────────────────────────────────────
         let window_start_pts = self.window_start_pts.unwrap_or(sf.pts_ms);
@@ -271,15 +273,15 @@ impl ClipAccumulator {
             if delay_ms > 0 && last.elapsed().as_millis() < delay_ms as u128 {
                 // Slide the window forward by dropping the oldest frame — O(1) with VecDeque.
                 self.buffer.pop_front();
-                self.window_start_pts = self.buffer.front().map(|(sig, _)| sig.pts_ms);
+                self.window_start_pts = self.buffer.front().map(|(sig, _, _)| sig.pts_ms);
                 return None;
             }
         }
 
         // ── Emit ───────────────────────────────────────────────────────────
         let deque = std::mem::take(&mut self.buffer);
-        let pts_start = deque.front().map(|(s, _)| s.pts_ms).unwrap_or(0);
-        let pts_end = deque.back().map(|(s, _)| s.pts_ms).unwrap_or(pts_start);
+        let pts_start = deque.front().map(|(s, _, _)| s.pts_ms).unwrap_or(0);
+        let pts_end = deque.back().map(|(s, _, _)| s.pts_ms).unwrap_or(pts_start);
         self.last_emit = Some(now);
         self.window_start_pts = None;
         Some(ClipWork {
@@ -400,7 +402,7 @@ where
                     let input_images: Vec<InferenceImage> = work
                         .frames
                         .iter()
-                        .map(|(_, jpeg_bytes)| InferenceImage {
+                        .map(|(_, jpeg_bytes, _)| InferenceImage {
                             media_type: "image/jpeg",
                             data_base64: base64::engine::general_purpose::STANDARD
                                 .encode(jpeg_bytes),
@@ -463,39 +465,32 @@ where
                     };
 
                     // Use the last frame's signal for metadata.
-                    let (last_signal, last_jpeg) =
-                        work.frames.back().cloned().unwrap_or_else(|| {
-                            (
-                                FrameSignal {
-                                    frame_index: 0,
-                                    pts_ms: work.pts_end,
-                                    perceptual_hash: 0,
-                                    luma_mean: 0.0,
-                                    flicker_score: 0.0,
-                                    ghosting_score: 0.0,
-                                    noise_variance_score: 0.0,
-                                },
-                                RecycledBytes::default(),
-                            )
-                        });
+                    let Some((last_signal, last_jpeg, last_coordinates)) =
+                        work.frames.back().cloned()
+                    else {
+                        metrics.inc_keyframes_dropped();
+                        continue;
+                    };
 
                     let _ = stdb.emit_event_sync(
                         &work.run_id,
                         &work.session_id,
                         last_signal.frame_index,
                         work.pts_end,
+                        last_coordinates,
                         event_type,
                         0.9,
                         &description,
                     );
-                    let _ = stdb.store_keyframe_sync(
-                        &work.run_id,
-                        last_signal.frame_index,
-                        work.pts_end,
+                    let _ = stdb.store_keyframe_sync(KeyframeEvent {
+                        run_id: &work.run_id,
+                        frame_index: last_signal.frame_index,
+                        pts_ms: work.pts_end,
+                        coordinates: last_coordinates,
                         event_type,
-                        &description,
-                        &last_jpeg,
-                    );
+                        description: &description,
+                        jpeg_data: &last_jpeg,
+                    });
                 }
             })?;
     }
@@ -508,7 +503,7 @@ fn clip_vlm_worker_count(configured: usize) -> usize {
 }
 
 fn downsample_clip_buffer(
-    buffer: &mut VecDeque<(FrameSignal, RecycledBytes)>,
+    buffer: &mut VecDeque<(FrameSignal, RecycledBytes, FrameCoordinates)>,
     window_start_pts: u64,
     window_ms: u64,
 ) {
@@ -517,8 +512,8 @@ fn downsample_clip_buffer(
     }
 
     let last_slot = (MAX_CLIP_FRAMES_PER_REQUEST - 1) as u64;
-    let mut slots: [Option<(FrameSignal, RecycledBytes)>; MAX_CLIP_FRAMES_PER_REQUEST] =
-        std::array::from_fn(|_| None);
+    let mut slots: [Option<(FrameSignal, RecycledBytes, FrameCoordinates)>;
+        MAX_CLIP_FRAMES_PER_REQUEST] = std::array::from_fn(|_| None);
 
     let original_len = buffer.len();
     for (idx, frame) in buffer.drain(..).enumerate() {
@@ -550,7 +545,7 @@ fn downsample_clip_buffer(
         let new_distance = frame.0.pts_ms.abs_diff(target_pts);
 
         match &slots[slot] {
-            Some((existing, _)) if existing.pts_ms.abs_diff(target_pts) <= new_distance => {}
+            Some((existing, _, _)) if existing.pts_ms.abs_diff(target_pts) <= new_distance => {}
             _ => slots[slot] = Some(frame),
         }
     }
@@ -580,6 +575,7 @@ mod tests {
             jpeg: Some([0xff_u8, 0xd8, 0xaa, 0xbb, 0xff, 0xd9].into()),
             pts_ms,
             seq,
+            coordinates: FrameCoordinates::full_frame(640, 480),
         }
     }
 
@@ -615,17 +611,25 @@ mod tests {
         let mut buffer = VecDeque::new();
         for i in 0..63_u64 {
             let mut frame = make_frame(i, i * 900);
-            buffer.push_back((frame.signal, frame.jpeg.take().unwrap()));
+            buffer.push_back((frame.signal, frame.jpeg.take().unwrap(), frame.coordinates));
         }
         let mut near_window_end = make_frame(63, 60_000);
-        buffer.push_back((near_window_end.signal, near_window_end.jpeg.take().unwrap()));
+        buffer.push_back((
+            near_window_end.signal,
+            near_window_end.jpeg.take().unwrap(),
+            near_window_end.coordinates,
+        ));
         let mut triggering = make_frame(64, 60_900);
-        buffer.push_back((triggering.signal, triggering.jpeg.take().unwrap()));
+        buffer.push_back((
+            triggering.signal,
+            triggering.jpeg.take().unwrap(),
+            triggering.coordinates,
+        ));
 
         downsample_clip_buffer(&mut buffer, 0, 60_000);
 
-        let pts_start = buffer.front().map(|(s, _)| s.pts_ms).unwrap();
-        let pts_end = buffer.back().map(|(s, _)| s.pts_ms).unwrap();
+        let pts_start = buffer.front().map(|(s, _, _)| s.pts_ms).unwrap();
+        let pts_end = buffer.back().map(|(s, _, _)| s.pts_ms).unwrap();
 
         assert_eq!(pts_start, 0);
         assert_eq!(pts_end, 60_900);

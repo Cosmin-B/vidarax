@@ -2153,6 +2153,28 @@ mod tests {
                 .unwrap_or(0)
                 >= 1
         );
+        let first_metadata = analyze_json
+            .get("metadata")
+            .and_then(|value| value.as_array())
+            .and_then(|rows| rows.first())
+            .expect("decoded analysis should return frame metadata");
+        assert_eq!(
+            first_metadata
+                .get("coordinate_schema")
+                .and_then(|value| value.as_str()),
+            Some("vidarax.image.v1")
+        );
+        let coordinates = first_metadata
+            .get("coordinates")
+            .expect("decoded analysis should preserve image provenance");
+        assert_eq!(
+            coordinates.pointer("/requested_region/width"),
+            Some(&json!(1.0))
+        );
+        assert_eq!(
+            coordinates.pointer("/analysis_extent"),
+            coordinates.pointer("/source_extent")
+        );
 
         let query_req = Request::builder()
             .uri("/v1/query")

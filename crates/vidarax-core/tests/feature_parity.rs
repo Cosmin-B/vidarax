@@ -119,6 +119,7 @@ fn make_stream_frame(seq: u64, pts_ms: u64) -> StreamFrame {
         jpeg: Some([0xff_u8, 0xd8, 0xaa, 0xbb, 0xff, 0xd9].into()),
         pts_ms,
         seq,
+        coordinates: vidarax_core::coordinates::FrameCoordinates::full_frame(640, 480),
     }
 }
 

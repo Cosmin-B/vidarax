@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::{Id as TaskId, JoinError, JoinSet};
+use vidarax_core::coordinates::{FrameCoordinates, IMAGE_COORDINATE_SCHEMA};
 use vidarax_core::gate::{FrameSignal, GateEventType};
 use vidarax_core::ingest::pipeline::DecodePipeline;
 use vidarax_core::ingest::{DecodedJpegFrame, PreparedSource};
@@ -31,6 +32,7 @@ pub struct DecodedSignals {
     pub signals: Vec<FrameSignal>,
     pub sampling_policy: SamplingPolicy,
     pub sample_fps: f32,
+    pub coordinates: Option<FrameCoordinates>,
 }
 
 #[derive(Debug, Clone)]
@@ -189,11 +191,28 @@ pub fn load_decoded_signals_from_events(
         .map(|value| value as f32)
         .or_else(|| estimate_sample_fps(&out))
         .unwrap_or(1.0);
+    let coordinates = match payload
+        .get("coordinate_schema")
+        .and_then(|value| value.as_str())
+    {
+        Some(IMAGE_COORDINATE_SCHEMA) => {
+            let value = payload
+                .get("coordinates")
+                .cloned()
+                .ok_or_else(|| "decoded ingest payload is missing coordinates".to_string())?;
+            Some(
+                serde_json::from_value(value)
+                    .map_err(|_| "decoded ingest coordinates are invalid".to_string())?,
+            )
+        }
+        _ => None,
+    };
 
     Ok(DecodedSignals {
         signals: out,
         sampling_policy,
         sample_fps,
+        coordinates,
     })
 }
 
@@ -999,6 +1018,7 @@ pub fn compose_frame_metadata(
     request_id: &str,
     trace_id: &str,
     m: FrameMetadata,
+    coordinates: Option<FrameCoordinates>,
     semantic: Option<&SemanticOverlay>,
     semantic_fallback: bool,
     finish_reason: Option<String>,
@@ -1046,6 +1066,8 @@ pub fn compose_frame_metadata(
             stream_id: stream_id.to_string(),
             frame_index: m.frame_index,
             pts_ms: m.pts_ms,
+            coordinate_schema: coordinates.map(|_| IMAGE_COORDINATE_SCHEMA),
+            coordinates,
             mode: mode.to_string(),
             model: model.to_string(),
             sampling_policy: sampling_policy.as_str().to_string(),

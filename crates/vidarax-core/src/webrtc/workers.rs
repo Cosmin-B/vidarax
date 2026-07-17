@@ -9,7 +9,8 @@ use std::sync::Arc;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use base64::Engine as _;
 
-use crate::crop::{CropRegion, ResolvedCrop};
+use crate::coordinates::FrameCoordinates;
+use crate::crop::{CropRegion, PixelCrop};
 use crate::dedup::DedupFilter;
 use crate::embedding_sidecar::EmbeddingSidecarClient;
 use crate::gate::{FrameSignal, GateConfig, GateEventType};
@@ -118,6 +119,7 @@ pub trait EventSink: Send + Sync {
         session_id: &str,
         frame_index: u64,
         pts_ms: u64,
+        coordinates: FrameCoordinates,
         event_type: &str,
         confidence: f32,
         description: &str,
@@ -131,6 +133,7 @@ pub trait EventSink: Send + Sync {
         session_id: &str,
         frame_index: u64,
         pts_ms: u64,
+        coordinates: FrameCoordinates,
         event_type: &str,
         confidence: f32,
         description: &str,
@@ -140,6 +143,7 @@ pub trait EventSink: Send + Sync {
             session_id,
             frame_index,
             pts_ms,
+            coordinates,
             event_type,
             confidence,
             description,
@@ -147,15 +151,19 @@ pub trait EventSink: Send + Sync {
     }
 
     /// Persist a keyframe with its JPEG thumbnail (blocking).
-    fn store_keyframe_sync(
-        &self,
-        run_id: &str,
-        frame_index: u64,
-        pts_ms: u64,
-        event_type: &str,
-        description: &str,
-        jpeg_data: &[u8],
-    ) -> Result<(), String>;
+    fn store_keyframe_sync(&self, event: KeyframeEvent<'_>) -> Result<(), String>;
+}
+
+/// One keyframe and the provenance required to persist it correctly.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyframeEvent<'a> {
+    pub run_id: &'a str,
+    pub frame_index: u64,
+    pub pts_ms: u64,
+    pub coordinates: FrameCoordinates,
+    pub event_type: &'a str,
+    pub description: &'a str,
+    pub jpeg_data: &'a [u8],
 }
 
 // ─── Pipeline types ───────────────────────────────────────────────────────────
@@ -174,6 +182,8 @@ pub struct StreamFrame {
     pub pts_ms: u64,
     /// Per-session monotonically increasing frame index (== `signal.frame_index`).
     pub seq: u64,
+    /// Transform from source pixels to this frame's analyzed pixels.
+    pub coordinates: FrameCoordinates,
 }
 
 /// Work item forwarded to VLM workers when a keyframe is decided upon.
@@ -185,6 +195,7 @@ pub struct KeyframeWork {
     pub session_id: Arc<str>,
     pub frame_index: u64,
     pub pts_ms: u64,
+    pub coordinates: FrameCoordinates,
     /// Gate reason code: `"scene_cut"` | `"periodic_keepalive"` | `"initial_frame"`.
     pub event_type: &'static str,
     /// Gate confidence score in \[0.0, 1.0\].
@@ -241,6 +252,7 @@ fn build_stream_frame_from_yuv(
         jpeg,
         pts_ms,
         seq,
+        coordinates: FrameCoordinates::full_frame(yuv.width, yuv.height),
     })
 }
 
@@ -248,6 +260,7 @@ fn build_clip_stream_frame_from_yuv(
     yuv: &YuvFrame,
     seq: u64,
     pts_ms: u64,
+    coordinates: FrameCoordinates,
     prev_signal: &mut Option<crate::gate::FrameSignal>,
     clip_rate_gate: &mut ClipRateGate,
     encode: impl FnOnce() -> Option<RecycledBytes>,
@@ -276,6 +289,7 @@ fn build_clip_stream_frame_from_yuv(
         jpeg,
         pts_ms,
         seq,
+        coordinates,
     })
 }
 
@@ -365,6 +379,7 @@ impl GateStreamState {
         &mut self,
         signal: FrameSignal,
         pts_ms: u64,
+        coordinates: FrameCoordinates,
         ctx: &KeyframeContext<'_>,
         encode: impl FnOnce() -> Option<RecycledBytes>,
     ) -> Option<KeyframeWork> {
@@ -374,6 +389,7 @@ impl GateStreamState {
                 ctx.session_id,
                 event.frame_index,
                 event.pts_ms,
+                coordinates,
                 "loop_detected",
                 event.confidence,
                 event.description,
@@ -407,6 +423,7 @@ impl GateStreamState {
             session_id: Arc::clone(ctx.session_id),
             frame_index: signal.frame_index,
             pts_ms,
+            coordinates,
             event_type,
             confidence: meta.confidence,
             novelty_score: meta.novelty_score,
@@ -676,21 +693,13 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
                     .record(decode_start.elapsed().as_micros() as u64);
                 metrics.inc_frames_decoded();
 
-                // Restrict analysis to the configured region of interest. Cropping
-                // here, before either sink branch, means the gate signals and the
-                // VLM JPEG both see only the ROI.
-                let yuv = match crop.map(|c| c.resolve(yuv.width, yuv.height)) {
-                    // No crop, or one that covers the whole frame: use it as-is.
-                    None | Some(ResolvedCrop::Full) => yuv,
-                    Some(ResolvedCrop::Rect(rect)) => {
-                        // A malformed source re-pack falls back to the original,
-                        // which the per-branch check_frame then drops.
-                        match &crop_pool {
-                            Some(pool) => crop_yuv(&yuv, rect, pool).unwrap_or(yuv),
-                            None => yuv,
-                        }
-                    }
-                    Some(ResolvedCrop::TooSmall) => {
+                // Resolve the crop once, then carry both the requested and exact
+                // pixel region with the frame. Durable events can map a model's
+                // coordinates back to the source without guessing which resize
+                // or crop was active.
+                let coordinates = match FrameCoordinates::resolve(yuv.width, yuv.height, crop) {
+                    Some(coordinates) => coordinates,
+                    None => {
                         // The requested region is too small to represent at this
                         // resolution. Dropping is deliberate: widening it back to
                         // the whole frame would analyze more of the screen than
@@ -705,6 +714,30 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
                             );
                         }
                         continue 'rtp_frames;
+                    }
+                };
+                // Restrict analysis to the configured region of interest. Cropping
+                // here, before either sink branch, means the frame filter and VLM
+                // JPEG both see the same pixels.
+                let selected = coordinates.resolved_region;
+                let yuv = if selected.x == 0
+                    && selected.y == 0
+                    && selected.width == coordinates.source_extent.width
+                    && selected.height == coordinates.source_extent.height
+                {
+                    yuv
+                } else {
+                    let rect = PixelCrop {
+                        x: selected.x,
+                        y: selected.y,
+                        width: selected.width,
+                        height: selected.height,
+                    };
+                    // A malformed source re-pack falls back to the original,
+                    // which the per-branch check_frame then drops.
+                    match &crop_pool {
+                        Some(pool) => crop_yuv(&yuv, rect, pool).unwrap_or(yuv),
+                        None => yuv,
                     }
                 };
 
@@ -742,7 +775,7 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
                         };
                         // The encoder only runs if the gate keeps the frame. A
                         // rejected thumbnail costs this one frame, not the stream.
-                        let work = gate.on_frame(signal, pts_ms, &ctx, || {
+                        let work = gate.on_frame(signal, pts_ms, coordinates, &ctx, || {
                             match yuv_to_jpeg_unchecked(&yuv, 75, &mut ycbcr_scratch, &jpeg_pool) {
                                 Ok(bytes) => Some(bytes),
                                 Err(err) => {
@@ -780,6 +813,7 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
                             &yuv,
                             seq,
                             pts_ms,
+                            coordinates,
                             &mut prev_signal,
                             clip_rate_gate,
                             || match yuv_to_jpeg_unchecked(&yuv, 75, &mut ycbcr_scratch, &jpeg_pool) {
@@ -887,6 +921,7 @@ pub fn spawn_analysis_workers(params: AnalysisWorkerParams) -> std::io::Result<(
                             ctx.session_id,
                             event.frame_index,
                             event.pts_ms,
+                            sf.coordinates,
                             "loop_detected",
                             event.confidence,
                             event.description,
@@ -966,6 +1001,7 @@ fn store_keyframe_event_with_backlog(
     run_id: Arc<str>,
     frame_index: u64,
     pts_ms: u64,
+    coordinates: FrameCoordinates,
     event_type: &'static str,
     description: Arc<str>,
     jpeg_bytes: RecycledBytes,
@@ -982,6 +1018,7 @@ fn store_keyframe_event_with_backlog(
         run_id,
         frame_index,
         pts_ms,
+        coordinates,
         event_type,
         description,
         jpeg_bytes,
@@ -996,6 +1033,7 @@ enum SinkEvent {
         session_id: Arc<str>,
         frame_index: u64,
         pts_ms: u64,
+        coordinates: FrameCoordinates,
         event_type: &'static str,
         confidence: f32,
         description: Arc<str>,
@@ -1004,6 +1042,7 @@ enum SinkEvent {
         run_id: Arc<str>,
         frame_index: u64,
         pts_ms: u64,
+        coordinates: FrameCoordinates,
         event_type: &'static str,
         description: Arc<str>,
         jpeg_bytes: RecycledBytes,
@@ -1281,6 +1320,7 @@ where
                         session_id,
                         frame_index,
                         pts_ms,
+                        coordinates,
                         event_type,
                         confidence,
                         description,
@@ -1290,6 +1330,7 @@ where
                             &session_id,
                             frame_index,
                             pts_ms,
+                            coordinates,
                             event_type,
                             confidence,
                             &description,
@@ -1299,19 +1340,21 @@ where
                         run_id,
                         frame_index,
                         pts_ms,
+                        coordinates,
                         event_type,
                         description,
                         jpeg_bytes,
                         ..
                     } => {
-                        let _ = stdb.store_keyframe_sync(
-                            &run_id,
+                        let _ = stdb.store_keyframe_sync(KeyframeEvent {
+                            run_id: &run_id,
                             frame_index,
                             pts_ms,
+                            coordinates,
                             event_type,
-                            &description,
-                            &jpeg_bytes,
-                        );
+                            description: &description,
+                            jpeg_data: &jpeg_bytes,
+                        });
                     }
                 }
                 let emit_ms = emit_start.elapsed().as_millis() as u64;
@@ -1626,6 +1669,7 @@ where
                             session_id: Arc::clone(&work.session_id),
                             frame_index: work.frame_index,
                             pts_ms: work.pts_ms,
+                            coordinates: work.coordinates,
                             event_type,
                             confidence: work.confidence,
                             description: Arc::clone(&description),
@@ -1646,6 +1690,7 @@ where
                             session_id: Arc::clone(&work.session_id),
                             frame_index: work.frame_index,
                             pts_ms: work.pts_ms,
+                            coordinates: work.coordinates,
                             event_type: "state_transition",
                             confidence: work.confidence,
                             description: Arc::from(transition_desc),
@@ -1657,6 +1702,7 @@ where
                         Arc::clone(&work.run_id),
                         work.frame_index,
                         work.pts_ms,
+                        work.coordinates,
                         work.event_type,
                         description,
                         work.jpeg_bytes,
@@ -1798,11 +1844,12 @@ mod tests {
         advance_temporal_context, build_clip_stream_frame_from_yuv, build_stream_frame_from_yuv,
         decode_output_pool_slots, hash_word, jaccard_word_overlap, jpeg_pool_slots,
         prune_stale_token_budget_entries, token_budget_entry, DecoderBackend, EventSink,
-        GateStreamState, KeyframeContext, KeyframeWork, StreamFrame, CLIP_FRAME_QUEUE_CAPACITY,
-        CLIP_WORK_QUEUE_CAPACITY, FFMPEG_YUV_READER_QUEUE_CAPACITY, JPEG_POOL_SLOT_CEILING,
-        JPEG_SINK_EVENT_POOL_ALLOWANCE, SINK_EVENT_QUEUE_CAPACITY, STREAM_FRAME_QUEUE_CAPACITY,
-        VLM_WORK_QUEUE_CAPACITY,
+        GateStreamState, KeyframeContext, KeyframeEvent, KeyframeWork, StreamFrame,
+        CLIP_FRAME_QUEUE_CAPACITY, CLIP_WORK_QUEUE_CAPACITY, FFMPEG_YUV_READER_QUEUE_CAPACITY,
+        JPEG_POOL_SLOT_CEILING, JPEG_SINK_EVENT_POOL_ALLOWANCE, SINK_EVENT_QUEUE_CAPACITY,
+        STREAM_FRAME_QUEUE_CAPACITY, VLM_WORK_QUEUE_CAPACITY,
     };
+    use crate::coordinates::FrameCoordinates;
     use crate::gate::FrameSignal;
     use crate::webrtc::clip::ClipRateGate;
     use crate::webrtc::clip::MAX_CLIP_FRAMES_PER_REQUEST;
@@ -1836,6 +1883,7 @@ mod tests {
             _session_id: &str,
             _frame_index: u64,
             _pts_ms: u64,
+            _coordinates: FrameCoordinates,
             event_type: &str,
             _confidence: f32,
             _description: &str,
@@ -1844,16 +1892,11 @@ mod tests {
             Ok(())
         }
 
-        fn store_keyframe_sync(
-            &self,
-            _run_id: &str,
-            _frame_index: u64,
-            _pts_ms: u64,
-            event_type: &str,
-            _description: &str,
-            _jpeg_data: &[u8],
-        ) -> Result<(), String> {
-            self.keyframes.lock().unwrap().push(event_type.to_string());
+        fn store_keyframe_sync(&self, event: KeyframeEvent<'_>) -> Result<(), String> {
+            self.keyframes
+                .lock()
+                .unwrap()
+                .push(event.event_type.to_string());
             Ok(())
         }
     }
@@ -1872,6 +1915,7 @@ mod tests {
             jpeg: Some([0xff_u8, 0xd8, 0xff, 0xd9].into()), // minimal JPEG markers
             pts_ms: seq * 33,
             seq,
+            coordinates: FrameCoordinates::full_frame(640, 480),
         }
     }
 
@@ -1896,6 +1940,7 @@ mod tests {
             session_id: "s1".into(),
             frame_index: 0,
             pts_ms: 0,
+            coordinates: FrameCoordinates::full_frame(640, 480),
             event_type: "scene_cut",
             confidence: 0.9,
             novelty_score: 0.8,
@@ -1911,10 +1956,19 @@ mod tests {
     #[test]
     fn mock_sink_records_calls() {
         let sink = MockSink::new();
-        sink.emit_event_sync("r", "s", 0, 0, "vlm", 0.9, "hello")
+        let coordinates = FrameCoordinates::full_frame(640, 480);
+        sink.emit_event_sync("r", "s", 0, 0, coordinates, "vlm", 0.9, "hello")
             .unwrap();
-        sink.store_keyframe_sync("r", 0, 0, "scene_cut", "hello", b"")
-            .unwrap();
+        sink.store_keyframe_sync(KeyframeEvent {
+            run_id: "r",
+            frame_index: 0,
+            pts_ms: 0,
+            coordinates,
+            event_type: "scene_cut",
+            description: "hello",
+            jpeg_data: b"",
+        })
+        .unwrap();
         assert_eq!(sink.events.lock().unwrap().as_slice(), ["vlm"]);
         assert_eq!(sink.keyframes.lock().unwrap().as_slice(), ["scene_cut"]);
     }
@@ -2096,6 +2150,7 @@ mod tests {
                 Arc::from("run"),
                 frame_index as u64,
                 0,
+                FrameCoordinates::full_frame(640, 480),
                 "scene_cut",
                 Arc::from("description"),
                 [0xff_u8, 0xd8, 0xff, 0xd9].into(),
@@ -2110,6 +2165,7 @@ mod tests {
             Arc::from("run"),
             JPEG_SINK_EVENT_POOL_ALLOWANCE as u64,
             0,
+            FrameCoordinates::full_frame(640, 480),
             "scene_cut",
             Arc::from("description"),
             [0xff_u8, 0xd8, 0xff, 0xd9].into(),
@@ -2124,6 +2180,7 @@ mod tests {
             Arc::from("run"),
             999,
             0,
+            FrameCoordinates::full_frame(640, 480),
             "scene_cut",
             Arc::from("description"),
             [0xff_u8, 0xd8, 0xff, 0xd9].into(),
@@ -2233,9 +2290,13 @@ mod tests {
         };
 
         let first = gate
-            .on_frame(make_stream_frame(0).signal, 0, &ctx, || {
-                Some([0xff_u8, 0xd8, 0xff, 0xd9].into())
-            })
+            .on_frame(
+                make_stream_frame(0).signal,
+                0,
+                FrameCoordinates::full_frame(640, 480),
+                &ctx,
+                || Some([0xff_u8, 0xd8, 0xff, 0xd9].into()),
+            )
             .expect("initial keyframe work");
         assert_eq!(&*first.prompt, "");
 
@@ -2244,9 +2305,13 @@ mod tests {
         let mut scene_cut = make_stream_frame(1);
         scene_cut.signal.perceptual_hash = !scene_cut.signal.perceptual_hash;
         let second = gate
-            .on_frame(scene_cut.signal, scene_cut.pts_ms, &ctx, || {
-                Some([0xff_u8, 0xd8, 0xff, 0xd9].into())
-            })
+            .on_frame(
+                scene_cut.signal,
+                scene_cut.pts_ms,
+                scene_cut.coordinates,
+                &ctx,
+                || Some([0xff_u8, 0xd8, 0xff, 0xd9].into()),
+            )
             .expect("scene-cut keyframe work");
         assert_eq!(&*second.prompt, "describe updated prompt");
     }
@@ -2269,13 +2334,23 @@ mod tests {
         };
 
         assert!(gate
-            .on_frame(make_stream_frame(0).signal, 0, &ctx, || None)
+            .on_frame(
+                make_stream_frame(0).signal,
+                0,
+                FrameCoordinates::full_frame(640, 480),
+                &ctx,
+                || None,
+            )
             .is_none());
 
         let second = gate
-            .on_frame(make_stream_frame(1).signal, 33, &ctx, || {
-                Some([0xff_u8, 0xd8, 0xff, 0xd9].into())
-            })
+            .on_frame(
+                make_stream_frame(1).signal,
+                33,
+                FrameCoordinates::full_frame(640, 480),
+                &ctx,
+                || Some([0xff_u8, 0xd8, 0xff, 0xd9].into()),
+            )
             .expect("uncommitted failed keep should not suppress the next keep");
         assert_eq!(second.frame_index, 1);
     }
@@ -2287,18 +2362,32 @@ mod tests {
         let mut gate = ClipRateGate::new(1);
         let mut encode_calls = 0usize;
 
-        let first =
-            build_clip_stream_frame_from_yuv(&yuv, 0, 0, &mut prev_signal, &mut gate, || {
+        let first = build_clip_stream_frame_from_yuv(
+            &yuv,
+            0,
+            0,
+            FrameCoordinates::full_frame(64, 64),
+            &mut prev_signal,
+            &mut gate,
+            || {
                 encode_calls += 1;
                 Some([0xff_u8, 0xd8, 0xff, 0xd9].into())
-            });
+            },
+        );
         assert!(first.is_some());
 
-        let second =
-            build_clip_stream_frame_from_yuv(&yuv, 1, 500, &mut prev_signal, &mut gate, || {
+        let second = build_clip_stream_frame_from_yuv(
+            &yuv,
+            1,
+            500,
+            FrameCoordinates::full_frame(64, 64),
+            &mut prev_signal,
+            &mut gate,
+            || {
                 encode_calls += 1;
                 Some([0xff_u8, 0xd8, 0xff, 0xd9].into())
-            });
+            },
+        );
 
         let second = second.expect("over-rate frame should still forward its signal");
         assert!(second.jpeg.is_none());

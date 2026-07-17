@@ -2,7 +2,7 @@
 
 Self-hosted video intelligence for live streams and recorded files.
 
-Vidarax decodes video, applies deterministic frame gates, and sends selected
+Vidarax decodes video, applies a deterministic per-frame filter, and sends selected
 frames to a configured vision-language model. Live capture can also use an
 embedding sidecar to reuse recent descriptions while a scene remains
 semantically stable. Events commit to a local write-ahead log; selected JPEGs
@@ -11,15 +11,17 @@ are stored as content-addressed blobs and referenced by event metadata.
 ## Architecture
 
 ```
-  Sources                        vidarax                         Consumers
+ Sources                         vidarax                          Consumers
 ┌──────────┐   ┌──────────────────────────────────────────┐   ┌──────────────┐
 │ MP4/File │──>│                                          │──>│ REST API     │
-│ WebRTC   │──>│  Decode ──> Gate Engine ──> VLM Tiering  │──>│ TypeScript   │
-│ RTSP/HLS │──>│               │                │         │──>│   SDK        │
-│ Upload   │──>│          Markers +         Semantic      │──>│ Vue 3 UI     │
-│          │   │          Keyframes         Events        │   │ Prometheus   │
-│          │   │               │                │         │   │ Optional     │
-│          │   │            WAL event log      │          │   │ SpacetimeDB  │
+│ WebRTC   │──>│ Decode ──> Frame Filter ──> VLM Tiering   │──>│ TypeScript   │
+│ RTSP/HLS │──>│              │                │          │──>│ SDK          │
+│ Upload   │──>│              v                v          │──>│ Vue 3 UI     │
+│          │   │        Markers +         Semantic       │   │ Prometheus   │
+│          │   │        Keyframes          Events        │   │ Optional     │
+│          │   │              └───────┬────────┘          │   │ SpacetimeDB  │
+│          │   │                      v                   │   │              │
+│          │   │                WAL event log             │   │              │
 └──────────┘   └──────────────────────────────────────────┘   └──────────────┘
 ```
 
@@ -28,9 +30,9 @@ are stored as content-addressed blobs and referenced by event metadata.
 Throughput depends on your hardware, the models you run, and the input video, so
 there is no single headline number worth quoting. Measure on your own setup: the
 Python harnesses in `benchmarks/`, the bench binaries under `crates/*/src/bin`,
-and the scripts in `scripts/` cover the gate engine, provider transport, and the
-end-to-end API path. The deterministic gate is the cheap per-frame stage. The
-optional semantic novelty gate reduces repeat model calls, while bounded tiering
+and the scripts in `scripts/` cover the per-frame filter, provider transport, and the
+end-to-end API path. The deterministic filter is the cheap per-frame stage. The
+optional semantic novelty filter reduces repeat model calls, while bounded tiering
 can escalate an uncertain first pass to a second model. Calibration and
 provider/hardware measurements are deployment-specific; see
 [deployment and evidence](docs/deployment.md#live-semantic-novelty-and-evidence).
@@ -201,7 +203,7 @@ catalog reports only that curated id as available on this backend.
 
 ```
 crates/
-  vidarax-core/         Lock-free primitives, gate engine, ingest pipeline
+  vidarax-core/         Frame filter, media primitives, ingest pipeline
   vidarax-contracts/    Shared model contracts and error mapping
   vidarax-api/          Axum HTTP server, handlers, WHIP, security
   vidarax-cli/          CLI tooling

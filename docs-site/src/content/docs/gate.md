@@ -1,13 +1,13 @@
 ---
-title: The gate
-description: The per-frame gate engine and tiered escalation to a second-pass model.
+title: The per-frame filter
+description: The deterministic per-frame filter, semantic novelty reuse, and tiered model escalation.
 ---
 
-Running a vision language model on every frame of a video is the wrong shape for the problem: most frames say nothing new. Vidarax filters before it infers. Every frame passes the deterministic gate, which works from per-frame statistics without any model call; only frames the gate keeps become candidates for inference; and inference itself is tiered, with a second-pass model consulted only when the first pass reports low confidence.
+Running a vision language model on every frame of a video is wasteful because most adjacent frames say nothing new. Vidarax filters before it infers. Every frame passes a deterministic filter built from image statistics; only selected frames become candidates for inference. A second model can handle cases where the first model returns a low schema confidence score.
 
-## The per-frame gate
+## The deterministic filter
 
-Every decoded frame is first reduced to a small fixed-size signal: a perceptual hash, a mean luma value, and scores for flicker, ghosting, and noise variance. The gate engine compares each signal against the last kept frame and emits exactly one decision per frame:
+Every decoded frame is first reduced to a small fixed-size signal: a perceptual hash, a mean luma value, and scores for flicker, ghosting, and noise variance. The filter compares each signal against the last kept frame and emits exactly one decision per frame:
 
 - Keep keyframe: the frame goes downstream for JPEG encoding and possible inference.
 - Suspect artifact: the frame is marked as a visual anomaly.
@@ -26,16 +26,16 @@ Each decision carries a reason code:
 | `noise_variance_spike` | The noise variance score crossed its threshold. |
 | `no_trigger` | Nothing fired; the frame is skipped. |
 
-All thresholds live in a single gate configuration with defaults defined in code. The gate is deterministic: the same frames in the same order produce the same decisions, which is what makes replay testing of the pipeline possible. It runs on a single-threaded hot path and avoids per-frame heap allocation by design; in the live pipeline, JPEG encoding happens only for frames the gate keeps, not for every decoded frame.
+All thresholds live in one filter configuration with defaults defined in code. The result is deterministic: the same frames in the same order produce the same decisions, which makes replay testing possible. The filter runs on a single-threaded hot path and avoids selected-global-allocator calls after warmup in the measured probe. In the live pipeline, JPEG encoding happens only for selected frames.
 
-Two small companions run beside the gate:
+Two small companions run beside the filter:
 
 - Loop detection. A fixed-size ring of recent perceptual hashes detects when the stream is showing the same screen repeatedly; a loop fires when enough recent hashes sit within a hash-distance threshold of the current frame.
-- Description dedup. When a loop causes the gate to fire on perceptually identical frames, a dedup filter compares each outgoing VLM description against the last emitted one and suppresses exact repeats, so the event stream does not fill with identical descriptions.
+- Description dedup. When a loop causes the filter to select perceptually identical frames, a dedup filter compares each outgoing VLM description against the last emitted one and suppresses exact repeats.
 
-## The semantic novelty gate
+## The semantic novelty filter
 
-The frame gate asks whether pixels changed enough to inspect. The semantic novelty gate asks whether a kept frame changed enough to justify another VLM call. Set `VIDARAX_NOVELTY_EMBEDDING_ADDR` to enable it on live WHIP capture; without that address the pipeline behaves as before.
+The per-frame filter asks whether pixels changed enough to inspect. The semantic novelty filter asks whether a selected frame changed enough to justify another VLM call. Set `VIDARAX_NOVELTY_EMBEDDING_ADDR` to enable it on live WHIP capture; without that address the pipeline runs the VLM for each selected frame.
 
 The reusable library gate can fuse three distances between a candidate and a rolling window:
 
@@ -43,7 +43,7 @@ The reusable library gate can fuse three distances between a candidate and a rol
 - Embedding change, compared with cosine similarity.
 - Perceptual-hash change, compared with bit distance.
 
-That general gate maps the fused score to three outcomes:
+The reusable library maps the fused score to three outcomes:
 
 - Admit: clearly new; run the full model.
 - Drop: clearly redundant; spend nothing.
@@ -53,11 +53,11 @@ Live capture deliberately uses a narrower binary policy: a SigLIP2 embedding eit
 
 The shipped reuse threshold is deliberately conservative. It is a safe starting point, not a universal calibration: operators should select a threshold against labelled, representative streams and the latency of the provider they actually run.
 
-The gate anchor advances only after a successful, non-empty VLM description. Reused frames and failed inference do not change it. The embedding sidecar receives raw JPEG bytes over a length-prefixed TCP protocol and returns 768 little-endian `f32` values; no image is transformed into JSON or base64. See [Deployment](/docs/operations/) for operations and the repository's `docs/deployment.md` for calibration and provider/hardware evidence commands.
+The novelty anchor advances only after a successful, non-empty VLM description. Reused frames and failed inference do not change it. The embedding sidecar receives raw JPEG bytes over a length-prefixed TCP protocol and returns 768 little-endian `f32` values; no image is transformed into JSON or base64. See [Deployment](/docs/operations/) for operations and the repository's `docs/deployment.md` for calibration and provider/hardware evidence commands.
 
 ## Tiered escalation to a second-pass model
 
-Frames the gate keeps reach inference, and inference itself is two-tiered. A first-pass model handles the common case. When the first pass returns a confidence below the configured threshold, the same frame is re-run against a second-pass model, and the second answer is used.
+Frames the filter keeps reach inference, and inference itself can be two-tiered. A first-pass model handles the common case. When its output contains a confidence score below the configured threshold, the same frame is sent to a second-pass model. This is an uncalibrated model-reported schema value, not a validated probability of correctness.
 
 The mechanism is three rules:
 
@@ -70,5 +70,5 @@ The first-pass model handles every frame; the second-pass model runs only on the
 Calibrate semantic reuse on more than one natural sequence. Include frozen
 content, slow drift, hard scene cuts, overlays, low-light frames, and repeated
 motion, then validate the selected threshold with live shadow samples. Batch
-file analysis does not traverse the live semantic-novelty gate, so its novelty
+file analysis does not traverse the live semantic novelty filter, so its novelty
 counters are not applicable.

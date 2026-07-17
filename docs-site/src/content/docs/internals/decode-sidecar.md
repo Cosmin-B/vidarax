@@ -1,9 +1,9 @@
 ---
 title: Decode sidecar
-description: The long-lived ffmpeg subprocess, its reader thread and bounded handoff, and the drain-before-write rule that removes the two-pipe interleaving deadlock.
+description: The long-lived ffmpeg subprocess, its reader thread and bounded handoff, and the limits of the drain-before-write rule.
 ---
 
-The decode sidecar is the long-lived ffmpeg subprocess that turns encoded live video into raw YUV frames, implemented in `crates/vidarax-core/src/webrtc/decode.rs`. Its design removes the classic two-pipe interleaving deadlock between parent and child, keeps the handoff of decoded frames lossless, and makes the steady-state decode loop allocate from bounded pools rather than the heap. This page walks the process spawn, decoder warm-up, the reader thread and its bounded channel, the drain-before-write rule, pool interaction, and teardown. Where these frames go next is covered in [Media plane](/docs/internals/media-plane/); the higher-level view of ingest paths is in [Ingest](/docs/ingest/).
+The decode sidecar is the long-lived ffmpeg subprocess that turns encoded live video into raw YUV frames, implemented in `crates/vidarax-core/src/webrtc/decode.rs`. A dedicated reader and a drain-before-write rule reduce the classic two-pipe deadlock window between parent and child. The handoff of decoded frames is lossless, and the steady-state decode loop draws from bounded pools rather than allocating a fresh buffer per frame. This page walks the process spawn, decoder warm-up, the reader thread and its bounded channel, the drain-before-write rule, pool interaction, and teardown. Where these frames go next is covered in [Media plane](/docs/internals/media-plane/); the higher-level view of ingest paths is in [Ingest](/docs/ingest/).
 
 ## Backend selection
 
@@ -62,7 +62,7 @@ if stdout.read_exact(&mut y).is_err() { break; }
 if !send_yuv_frame_lossless(&tx, frame) { break; }
 ```
 
-The channel holds `FFMPEG_YUV_READER_QUEUE_CAPACITY` (16) frames. The send is blocking and the handoff is lossless: the reader never drops or evicts a decoded frame. When the channel is full the reader parks, which in turn stops it reading stdout, which lets the pipe fill, which is fine, because the decode side is guaranteed to come back and drain (next section). Reading directly into pooled buffers means the frame handed downstream is the one ffmpeg wrote, with no intermediate copy, and recycled buffers keep their capacity so the `resize` stops allocating after warm-up.
+The channel holds `FFMPEG_YUV_READER_QUEUE_CAPACITY` (16) frames. The send is blocking and the handoff is lossless: the reader never drops or evicts a decoded frame. When the channel is full the reader parks, stops reading stdout, and can let the pipe fill. The decode side drains before its next write, but the code does not yet prove a bound on how much output one input can produce before that drain. Reading directly into pooled buffers means the frame handed downstream is the one ffmpeg wrote, with no intermediate copy, and recycled buffers keep their capacity so the `resize` stops allocating after warm-up.
 
 The reader exits when `read_exact` fails (ffmpeg closed stdout) or when the receiver side is gone (send fails). There is no separate shutdown signal.
 
@@ -89,7 +89,7 @@ if let Some(frame) = pending.pop_back() {
 
 `drain_ready_yuv_frames` is a non-blocking `try_recv` loop that moves every ready frame from the channel into the decoder-local `pending: VecDeque<YuvFrame>` and reports whether the reader has exited.
 
-The deadlock argument is short, and it targets one specific hazard: the interleaving deadlock where the parent blocks writing stdin while ffmpeg blocks writing stdout. The parent can only block writing stdin when ffmpeg's stdin pipe is full; ffmpeg only stops consuming stdin when its stdout pipe is full; stdout only stays full when the reader thread is parked on a full channel; and the parent emptied that channel immediately before writing. So a full handoff channel can never be the standing reason both sides are stuck: the reader always has room for at least one blocking send after each drain, which unblocks ffmpeg's stdout, which unblocks its stdin consumption. No decoded output is ever dropped by the handoff itself. The argument assumes healthy pipes and that one written input produces a bounded amount of output before the next drain; it removes the known interleaving deadlock rather than proving every hang impossible.
+The rule targets one specific hazard: the parent entering a blocking stdin write while decoded output is already waiting. Draining first gives the reader up to 16 frames of handoff capacity before the write. It does not make the two-pipe topology deadlock-proof. If one input can cause more output than the available channel and pipe capacity before ffmpeg resumes consuming stdin, the reader can still park and the pipes can still form a cycle. No decoded output is dropped by the handoff itself, but a complete proof needs a measured or enforced per-input output-burst bound.
 
 Dropping does happen, but as policy rather than pipe pressure: after the write, `pop_back` returns the freshest pending frame and everything older is shed and counted through `inc_frames_dropped_by`. Under real-time backlog this keeps downstream labels close to the current RTP timestamp instead of replaying a growing latency queue. The label itself is best-effort: the raw pipe has no metadata channel, so a returned frame is attributed to the current access unit.
 

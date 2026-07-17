@@ -85,9 +85,9 @@ pub struct WalEventSink {
 }
 ```
 
-`emit_event_sync` wraps the worker fields (`session_id`, `frame_index`, `pts_ms`, `confidence`, `description`) in JSON and calls the confirmed local append. After that succeeds, it attempts the SpacetimeDB mirror; mirror failure is logged and does not undo local durability. `emit_event_nonblocking` uses the detached local append and never mirrors because a network call would violate its nonblocking contract. When the writer queue (capacity `TIMELINE_WRITER_QUEUE_CAP`, 1024) is full, that detached event is dropped with a warning.
+`emit_event_sync` wraps the worker fields (`session_id`, `frame_index`, `pts_ms`, `coordinate_schema`, `coordinates`, `confidence`, `description`) in JSON and calls the confirmed local append. After that succeeds, it attempts the SpacetimeDB mirror; mirror failure is logged and does not undo local durability. `emit_event_nonblocking` uses the detached local append and never mirrors because a network call would violate its nonblocking contract. When the writer queue (capacity `TIMELINE_WRITER_QUEUE_CAP`, 1024) is full, that detached event is dropped with a warning.
 
-`store_keyframe_sync` hashes the raw JPEG, atomically writes a `0o600` content-addressed blob if the hash is new, and then appends `keyframe_stored` with `image_ref`, media type, byte count, and SHA-256. The blob write is flushed but not fsynced. If the blob write fails, no metadata event is appended; duplicate content reuses the existing file.
+`store_keyframe_sync` hashes the raw JPEG, atomically writes a `0o600` content-addressed blob if the hash is new, and then appends `keyframe_stored` with `image_ref`, media type, byte count, SHA-256, and `vidarax.image.v1` coordinate provenance. The blob write is flushed but not fsynced. If the blob write fails, no metadata event is appended; duplicate content reuses the existing file. A crash after the blob rename but before the WAL append can leave an unreferenced blob. Automatic startup reconciliation or retention-based garbage collection is not implemented yet.
 
 Three append flavors, one contract table:
 

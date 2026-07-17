@@ -3,7 +3,7 @@ title: Ingest
 description: Supported sources, the ffmpeg decode sidecar, the drain-before-write rule, and decoder warm-up.
 ---
 
-Ingest turns a source into decoded frames the gate engine can score. There are two decode paths: an ffmpeg subprocess path for files and URLs, and a long-lived decoder pipeline for live WebRTC streams.
+Ingest turns a source into decoded frames the per-frame filter can score. There are two decode paths: an ffmpeg subprocess path for files and URLs, and a long-lived decoder pipeline for live WebRTC streams.
 
 ## Supported sources
 
@@ -36,7 +36,7 @@ Ingest requests control sampling: a `sampling_policy` (for example `fixed` with 
 
 Live WebRTC video needs a stateful decoder that survives across frames. GPU H.264 and H.265 use a long-lived ffmpeg sidecar process; software H.264 uses openh264 in-process; software H.265 uses the ffmpeg sidecar; VP8 uses libvpx in-process when the `vp8` build feature is enabled.
 
-The sidecar paths are built around one hazard: a subprocess connected by two pipes can deadlock. If the parent blocks writing encoded input while ffmpeg blocks writing decoded output, neither side ever makes progress. Vidarax removes that interleaving hazard with a dedicated reader thread and a strict ordering rule.
+The sidecar paths are built around one hazard: a subprocess connected by two pipes can deadlock. If the parent blocks writing encoded input while ffmpeg blocks writing decoded output, neither side makes progress. Vidarax narrows that interleaving window with a dedicated reader thread and a strict ordering rule.
 
 ### The reader thread and the bounded channel
 
@@ -48,7 +48,7 @@ Each frame is read directly into buffers acquired from a bounded pool. Recycled 
 
 The decode side owns ffmpeg's stdin, and it follows one ownership rule: drain before write. Every `decode()` call first drains all currently ready YUV frames out of the bounded channel into a decoder-local FIFO, and only then writes the next encoded input to ffmpeg.
 
-This ordering removes the known two-pipe interleaving deadlock. The parent can block on the reader channel being full, but it has just emptied that channel before writing; the reader can block on the same channel, and the decode side comes back and drains it before it writes again. A full handoff channel is therefore never the standing reason both sides are stuck, and no decoded output is dropped by the handoff itself. The argument assumes healthy pipes and a bounded amount of output per written input; it does not make every failure mode impossible.
+The channel holds 16 frames and the reader uses blocking sends. Draining it before each write makes room for output already produced, but the reader can still block when a new output burst fills the handoff. The current implementation does not establish a maximum decoded-output burst per input write, so this ordering reduces the deadlock window rather than proving it absent. No decoded output is dropped by the handoff itself.
 
 Under real-time backlog the decoder-local FIFO sheds older decoded frames and returns the freshest ready frame, so downstream labels stay close to the current stream position. Shedding happens after the lossless handoff, as an explicit freshness policy, not as a side effect of a full pipe.
 
