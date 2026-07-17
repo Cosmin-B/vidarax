@@ -28,7 +28,7 @@ use vidarax_core::timeline::TimelineEvent;
 use crate::auth::{header_value, strong_hash_hex, HEADER_TENANT_ID};
 use crate::config::UPLOAD_DIR_NAME;
 use crate::ids::validate_run_id;
-use crate::inference_metrics::PipelineInferenceObserver;
+use crate::inference_metrics::{InferenceMetrics, PipelineInferenceObserver};
 use crate::models::{
     AnalyzeFrameMetadata, AnalyzeFramesRequest, AnalyzeFramesResponse, AnalyzeMarker,
     CreateRunRequest, CreateRunResponse, FieldError, InferBatchItemError, InferBatchItemResult,
@@ -2191,6 +2191,9 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     let mut metrics =
         format!("vidarax_runs_created_total {runs}\nvidarax_timeline_events_total {events}\n");
     metrics.push_str(&state.inference_metrics().render_prometheus());
+    metrics.push_str(&InferenceMetrics::render_admission_prometheus(
+        state.inference_admission(),
+    ));
     metrics.push_str(&state.pipeline_metrics().render_prometheus());
     (axum::http::StatusCode::OK, metrics)
 }

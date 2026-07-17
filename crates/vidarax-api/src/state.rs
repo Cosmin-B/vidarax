@@ -20,6 +20,7 @@ use serde_json::Value;
 static DROPPED_DETACHED_TIMELINE_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 use vidarax_contracts::lifecycle::StreamState;
+use vidarax_core::admission::{AdmissionLimits, InferenceAdmission};
 use vidarax_core::ingest::pipeline::{create_pipeline, DecodePipeline, PipelineBackend};
 use vidarax_core::novelty::LiveNoveltyConfig;
 use vidarax_core::provider::InferenceProvider;
@@ -169,6 +170,7 @@ pub struct AppStateInner {
     // (as an `InferenceObserver`) and record tiered inference outcomes
     // without borrowing from AppState.
     inference_metrics: Arc<InferenceMetrics>,
+    inference_admission: Arc<InferenceAdmission>,
     pipeline_metrics: Arc<PipelineMetrics>,
     novelty_config: LiveNoveltyConfig,
     run_registry: Arc<RunRegistry>,
@@ -231,6 +233,7 @@ struct AppStateConfig {
     security_policy: SecurityPolicy,
     stream_ttl_secs: u64,
     active_stream_limit: usize,
+    inference_admission_limits: AdmissionLimits,
 }
 
 impl AppStateConfig {
@@ -241,6 +244,12 @@ impl AppStateConfig {
             security_policy: SecurityPolicy::from_config_for_tests(),
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            inference_admission_limits: AdmissionLimits {
+                global_in_flight: 8,
+                per_principal_in_flight: 4,
+                global_waiters: 128,
+                wait_timeout: std::time::Duration::from_secs(5),
+            },
         }
     }
 
@@ -270,6 +279,10 @@ impl AppStateConfig {
                 decode_pipeline: default_test_decode_pipeline(),
                 security_policy: self.security_policy,
                 inference_metrics: Arc::new(InferenceMetrics::new()),
+                inference_admission: Arc::new(
+                    InferenceAdmission::new(self.inference_admission_limits)
+                        .expect("test admission limits are valid"),
+                ),
                 pipeline_metrics: Arc::new(PipelineMetrics::new()),
                 novelty_config: LiveNoveltyConfig::default(),
                 run_registry,
@@ -304,6 +317,7 @@ impl AppState {
         active_stream_limit: usize,
         webrtc_config: WebRtcConfig,
         novelty: LiveNoveltyConfig,
+        inference_admission_limits: AdmissionLimits,
     ) -> Result<Self, String> {
         let existing_events = read_all_events(&wal_path).map_err(|err| err.to_string())?;
         let run_registry = build_run_registry(&existing_events);
@@ -354,6 +368,10 @@ impl AppState {
                 decode_pipeline,
                 security_policy,
                 inference_metrics: Arc::new(InferenceMetrics::new()),
+                inference_admission: Arc::new(
+                    InferenceAdmission::new(inference_admission_limits)
+                        .map_err(ToString::to_string)?,
+                ),
                 pipeline_metrics: Arc::new(PipelineMetrics::new()),
                 novelty_config: novelty,
                 run_registry,
@@ -946,6 +964,10 @@ impl AppState {
 
     pub fn inference_metrics(&self) -> &InferenceMetrics {
         &self.inference_metrics
+    }
+
+    pub fn inference_admission(&self) -> &InferenceAdmission {
+        &self.inference_admission
     }
 
     /// Return the raw `Arc` for cases that need to move the metrics into
