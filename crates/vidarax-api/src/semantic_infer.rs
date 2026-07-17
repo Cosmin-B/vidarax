@@ -27,6 +27,18 @@ use crate::state::AppState;
 static SEMANTIC_TASK_PANIC_CHUNK_FOR_TESTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(usize::MAX);
 
+const SEMANTIC_OVERLAY_SCHEMA: &str = r#"{
+  "type": "object",
+  "properties": {
+    "event_type": { "type": "string" },
+    "object_label": { "type": "string" },
+    "summary": { "type": "string" },
+    "description": { "type": "string" },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+  },
+  "required": ["event_type", "object_label", "summary", "description", "confidence"]
+}"#;
+
 pub struct DecodedSignals {
     pub signals: Vec<FrameSignal>,
     pub sampling_policy: SamplingPolicy,
@@ -52,6 +64,7 @@ pub struct ChunkSemanticResult {
     pub error: Option<String>,
     pub attempted: bool,
     pub finish_reason: Option<String>,
+    pub response_chars: Option<usize>,
     /// Token spend for this chunk's analysis (summed across tiered passes).
     pub usage: TokenUsage,
     /// Wall-clock inference latency for this chunk (summed across passes).
@@ -74,6 +87,8 @@ impl ChunkSemanticResult {
                 "provider_fallback_used": self.provider_fallback_used,
                 "semantic_fallback_used": self.used_fallback,
                 "semantic_error": self.error,
+                "finish_reason": self.finish_reason,
+                "response_chars": self.response_chars,
                 "event_type": self.overlay.as_ref().map(|o| o.event_type.clone()),
                 "object_label": self.overlay.as_ref().map(|o| o.object_label.clone()),
                 "summary": self.overlay.as_ref().map(|o| o.summary.clone()),
@@ -597,16 +612,21 @@ pub async fn infer_chunk_semantics(
         (imgs, Vec::new())
     };
 
+    let has_custom_output_schema = guided_json.is_some();
+    let request_guided_json = guided_json
+        .as_ref()
+        .map(Arc::clone)
+        .or_else(|| Some(Arc::from(SEMANTIC_OVERLAY_SCHEMA)));
     let request = InferenceRequest {
         model: tiered_config.first_pass_model.clone(),
         prompt: Arc::from(prompt),
         input_images: images,
         input_videos: videos,
-        max_tokens: 160,
+        max_tokens: 320,
         temperature: 0.0,
         timeout_ms,
         allow_fallback: true,
-        guided_json: guided_json.as_ref().map(Arc::clone),
+        guided_json: request_guided_json,
     };
 
     // Capture the failing model's backend kind before the closure moves
@@ -661,10 +681,11 @@ pub async fn infer_chunk_semantics(
     result.provider = Some(provider_result.provider.name().to_string());
     result.provider_fallback_used = provider_result.fallback_used;
     result.finish_reason = provider_result.finish_reason.clone();
+    result.response_chars = Some(provider_result.output_text.chars().count());
     result.usage = provider_result.usage;
     result.inference_latency_ms = provider_result.inference_latency_ms;
 
-    if guided_json.is_some() {
+    if has_custom_output_schema {
         let parsed = serde_json::from_str::<Value>(&provider_result.output_text)
             .unwrap_or_else(|_| json!({"raw": provider_result.output_text}));
         result.raw_output = Some(parsed);
@@ -672,14 +693,20 @@ pub async fn infer_chunk_semantics(
         result
     } else {
         match parse_semantic_overlay(&provider_result.output_text) {
-            Some(overlay) => {
+            Ok(overlay) => {
                 result.overlay = Some(overlay);
                 result.used_fallback = provider_result.fallback_used;
                 result
             }
-            None => {
+            Err(parse_error) => {
+                tracing::warn!(
+                    error = parse_error.as_str(),
+                    finish_reason = result.finish_reason.as_deref().unwrap_or("unknown"),
+                    response_chars = result.response_chars.unwrap_or(0),
+                    "semantic output did not match the overlay contract"
+                );
                 result.used_fallback = true;
-                result.error = Some("semantic_parse_failed".to_string());
+                result.error = Some(format!("semantic_parse_failed:{}", parse_error.as_str()));
                 result
             }
         }
@@ -714,22 +741,32 @@ pub fn select_semantic_images(
     out
 }
 
-fn parse_semantic_overlay(raw: &str) -> Option<SemanticOverlay> {
+#[derive(Debug, PartialEq, Eq)]
+enum SemanticParseError {
+    EmptyResponse,
+    JsonObjectNotFound,
+    InvalidJson,
+}
+
+impl SemanticParseError {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::EmptyResponse => "empty_response",
+            Self::JsonObjectNotFound => "json_object_not_found",
+            Self::InvalidJson => "invalid_json",
+        }
+    }
+}
+
+fn parse_semantic_overlay(raw: &str) -> Result<SemanticOverlay, SemanticParseError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return None;
+        return Err(SemanticParseError::EmptyResponse);
     }
-    let json_text = if trimmed.starts_with('{') && trimmed.ends_with('}') {
-        trimmed
-    } else {
-        let start = trimmed.find('{')?;
-        let end = trimmed.rfind('}')?;
-        if start >= end {
-            return None;
-        }
-        &trimmed[start..=end]
-    };
-    let value: Value = serde_json::from_str(json_text).ok()?;
+    let json_text =
+        extract_first_json_object(trimmed).ok_or(SemanticParseError::JsonObjectNotFound)?;
+    let value: Value =
+        serde_json::from_str(json_text).map_err(|_| SemanticParseError::InvalidJson)?;
 
     let event_type = normalize_semantic_event(
         value
@@ -763,13 +800,46 @@ fn parse_semantic_overlay(raw: &str) -> Option<SemanticOverlay> {
         .map(|v| (v as f32).clamp(0.0, 1.0))
         .unwrap_or(0.5);
 
-    Some(SemanticOverlay {
+    Ok(SemanticOverlay {
         event_type,
         object_label,
         summary,
         description,
         confidence,
     })
+}
+
+fn extract_first_json_object(raw: &str) -> Option<&str> {
+    let start = raw.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, ch) in raw[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&raw[start..=start + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn truncate_context(text: &str, max_chars: usize) -> &str {
@@ -797,6 +867,10 @@ mod tests {
         }
 
         fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+            assert_eq!(
+                request.guided_json.as_deref(),
+                Some(SEMANTIC_OVERLAY_SCHEMA)
+            );
             Ok(InferenceResult {
                 provider: ProviderKind::Vllm,
                 model: Arc::clone(&request.model),
@@ -851,6 +925,40 @@ mod tests {
         assert_eq!(
             payload.get("description").and_then(Value::as_str),
             Some("A person walks past the front desk carrying a bag.")
+        );
+    }
+
+    #[test]
+    fn semantic_overlay_parser_accepts_fenced_json_with_braces_in_strings() {
+        let raw = r#"Result:
+```json
+{"event_type":"context_observation","object_label":"subject","summary":"turn {left}","description":"The subject oscillates before contact.","confidence":0.8}
+```
+Ignore this trailing {not json}."#;
+
+        let overlay = parse_semantic_overlay(raw).expect("fenced overlay should parse");
+        assert_eq!(overlay.object_label, "subject");
+        assert_eq!(overlay.summary, "turn {left}");
+        assert_eq!(overlay.confidence, 0.8);
+    }
+
+    #[test]
+    fn semantic_overlay_parser_reports_actionable_failure_categories() {
+        assert_eq!(
+            parse_semantic_overlay("   ").unwrap_err(),
+            SemanticParseError::EmptyResponse
+        );
+        assert_eq!(
+            parse_semantic_overlay("plain prose only").unwrap_err(),
+            SemanticParseError::JsonObjectNotFound
+        );
+        assert_eq!(
+            parse_semantic_overlay("prefix {not-json} suffix").unwrap_err(),
+            SemanticParseError::InvalidJson
+        );
+        assert_eq!(
+            parse_semantic_overlay("{\"summary\": \"truncated\"").unwrap_err(),
+            SemanticParseError::JsonObjectNotFound
         );
     }
 
