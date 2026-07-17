@@ -66,6 +66,16 @@ pub fn internal_error(state: &AppState, message: impl Into<String>) -> ApiRespon
     )
 }
 
+pub fn service_unavailable(state: &AppState, message: impl Into<String>) -> ApiResponse {
+    structured_error(
+        state.next_request_id(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "provider_saturated",
+        message,
+        Vec::new(),
+    )
+}
+
 fn structured_error(
     request_id: String,
     status: StatusCode,

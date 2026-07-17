@@ -23,7 +23,7 @@ use vidarax_contracts::lifecycle::StreamState;
 use vidarax_core::admission::{AdmissionLimits, InferenceAdmission};
 use vidarax_core::ingest::pipeline::{create_pipeline, DecodePipeline, PipelineBackend};
 use vidarax_core::novelty::LiveNoveltyConfig;
-use vidarax_core::provider::InferenceProvider;
+use vidarax_core::provider::{AdmittedProvider, InferenceProvider};
 #[cfg(test)]
 use vidarax_core::timeline::append_event;
 use vidarax_core::timeline::{read_all_events, TimelineEvent, WalWriter};
@@ -948,6 +948,19 @@ impl AppState {
 
     pub fn provider(&self) -> Option<&Arc<dyn InferenceProvider + Send + Sync>> {
         self.provider.as_ref()
+    }
+
+    pub fn admitted_provider(
+        &self,
+        principal: &str,
+    ) -> Option<Arc<dyn InferenceProvider + Send + Sync>> {
+        self.provider.as_ref().map(|provider| {
+            Arc::new(AdmittedProvider::new(
+                Arc::clone(provider),
+                Arc::clone(&self.inference_admission),
+                principal.into(),
+            )) as Arc<dyn InferenceProvider + Send + Sync>
+        })
     }
 
     pub fn decode_pipeline(&self) -> Arc<dyn DecodePipeline> {

@@ -645,6 +645,7 @@ pub async fn infer_chunk_semantics(
                 ProviderError::HttpStatus(code) => format!("http_status_{code}"),
                 ProviderError::Transport(_) => "transport_error".to_string(),
                 ProviderError::InvalidResponse(_) => "invalid_response".to_string(),
+                ProviderError::Saturated { .. } => "provider_saturated".to_string(),
             });
             return result;
         }

@@ -440,7 +440,7 @@ async fn start_whip_session_transaction(
     // clip mode) is recorded under the provider that actually served it.
     let observer_for_workers: Option<Arc<dyn InferenceObserver>> =
         Some(Arc::clone(state.inference_metrics_arc()) as Arc<dyn InferenceObserver>);
-    let provider = state.provider().cloned();
+    let provider = state.admitted_provider(&principal);
     let clip_config_for_workers = clip_config;
     // Share the session's guided_json handle with VLM workers so that
     // PATCH /prompt with output_schema takes effect on the next keyframe

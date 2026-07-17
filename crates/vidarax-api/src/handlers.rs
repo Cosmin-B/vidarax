@@ -37,7 +37,8 @@ use crate::models::{
     RealtimeReasonResponse, SamplingPolicy, SearchHit, SearchRequest, SearchResponse, TokenMetrics,
 };
 use crate::response::{
-    conflict_error, internal_error, not_found_error, ok, validation_error, ApiResponse,
+    conflict_error, internal_error, not_found_error, ok, service_unavailable, validation_error,
+    ApiResponse,
 };
 use crate::semantic::{build_marker_lifecycle, MarkerConfig};
 use crate::semantic_infer::{
@@ -1661,7 +1662,7 @@ pub async fn reason_realtime_run(
         state.webrtc_config().gate_config.clone(),
     );
 
-    let providers = state.provider().cloned();
+    let providers = state.admitted_provider(&principal);
     let semantic_available = semantic_inference && providers.is_some();
     let semantic_segment_ms = segment_ms;
     if semantic_inference && !semantic_available {
@@ -2203,6 +2204,7 @@ struct PreparedInferRequest {
     run_id: Option<String>,
     request: InferenceRequest,
     primary_provider: ProviderKind,
+    principal: String,
 }
 
 struct InferExecutionError {
@@ -2330,6 +2332,7 @@ async fn validate_infer_request(
                 .map(|schema| Arc::from(schema.to_string())),
         },
         primary_provider,
+        principal: state.security_policy().principal_key_from_headers(headers),
     })
 }
 
@@ -2337,10 +2340,12 @@ async fn execute_infer_request(
     state: AppState,
     prepared: PreparedInferRequest,
 ) -> Result<InferResponse, InferExecutionError> {
-    let provider = state.provider().cloned().ok_or(InferExecutionError {
-        code: "internal_error",
-        message: "inference providers are not configured".to_string(),
-    })?;
+    let provider = state
+        .admitted_provider(&prepared.principal)
+        .ok_or(InferExecutionError {
+            code: "internal_error",
+            message: "inference providers are not configured".to_string(),
+        })?;
 
     let request_id = state.next_request_id();
     let started = Instant::now();
@@ -2440,6 +2445,10 @@ fn map_provider_execution_error(err: ProviderError) -> InferExecutionError {
             code: "provider_invalid_response",
             message: format!("inference provider invalid response: {message}"),
         },
+        ProviderError::Saturated { .. } => InferExecutionError {
+            code: "provider_saturated",
+            message: "inference capacity is temporarily unavailable".to_string(),
+        },
     }
 }
 
@@ -2450,6 +2459,9 @@ fn infer_execution_error_to_response(state: &AppState, err: InferExecutionError)
             "invalid infer payload",
             vec![field_error("model", err.message)],
         );
+    }
+    if err.code == "provider_saturated" {
+        return service_unavailable(state, err.message);
     }
     internal_error(state, err.message)
 }

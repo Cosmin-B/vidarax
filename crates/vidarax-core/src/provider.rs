@@ -5,6 +5,8 @@ use arc_swap::ArcSwap;
 use serde_json::Value;
 use vidarax_contracts::models::normalize_model_id;
 
+use crate::admission::{InferenceAdmission, LimitClass};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Vllm,
@@ -136,6 +138,10 @@ pub enum ProviderError {
     HttpStatus(u16),
     Transport(String),
     InvalidResponse(std::borrow::Cow<'static, str>),
+    Saturated {
+        retry_after_ms: u64,
+        blocked_by: LimitClass,
+    },
 }
 
 impl ProviderError {
@@ -143,8 +149,66 @@ impl ProviderError {
         match self {
             ProviderError::HttpStatus(code) => matches!(*code, 408 | 429 | 500..=599),
             ProviderError::Transport(_) => true,
+            ProviderError::Saturated { .. } => true,
             ProviderError::UnsupportedModel(_) | ProviderError::InvalidResponse(_) => false,
         }
+    }
+}
+
+pub struct AdmittedProvider {
+    inner: Arc<dyn InferenceProvider + Send + Sync>,
+    admission: Arc<InferenceAdmission>,
+    principal: Box<str>,
+}
+
+impl AdmittedProvider {
+    pub fn new(
+        inner: Arc<dyn InferenceProvider + Send + Sync>,
+        admission: Arc<InferenceAdmission>,
+        principal: Box<str>,
+    ) -> Self {
+        Self {
+            inner,
+            admission,
+            principal,
+        }
+    }
+}
+
+impl InferenceProvider for AdmittedProvider {
+    fn kind(&self) -> ProviderKind {
+        self.inner.kind()
+    }
+
+    fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+        let _permit =
+            self.admission
+                .acquire(&self.principal)
+                .map_err(|error| ProviderError::Saturated {
+                    retry_after_ms: self
+                        .admission
+                        .limits()
+                        .wait_timeout
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64,
+                    blocked_by: match error {
+                        crate::admission::AdmissionError::Timeout { blocked_by } => blocked_by,
+                        crate::admission::AdmissionError::WaiterLimit => LimitClass::Global,
+                    },
+                })?;
+        self.inner.infer(request)
+    }
+
+    fn kind_for_model(&self, model: &str) -> ProviderKind {
+        self.inner.kind_for_model(model)
+    }
+
+    fn available_kinds(&self) -> Vec<ProviderKind> {
+        self.inner.available_kinds()
+    }
+
+    fn configured_kinds_for_model(&self, model: &str) -> Vec<ProviderKind> {
+        self.inner.configured_kinds_for_model(model)
     }
 }
 
@@ -764,10 +828,11 @@ fn parse_content_value(value: Value) -> Result<String, ProviderError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_payload, infer_with_endpoints, HttpTransport, InferenceImage, InferenceProvider,
-        InferenceRequest, InferenceResult, InferenceVideo, ModelRoutingProvider,
+        build_payload, infer_with_endpoints, AdmittedProvider, HttpTransport, InferenceImage,
+        InferenceProvider, InferenceRequest, InferenceResult, InferenceVideo, ModelRoutingProvider,
         OpenAiCompatProvider, ProviderError, ProviderKind, ProviderRouter, TokenUsage, Transport,
     };
+    use crate::admission::{AdmissionLimits, InferenceAdmission, LimitClass};
     use serde_json::Value;
     use std::collections::HashMap;
     use std::io::{Read, Write};
@@ -777,6 +842,7 @@ mod tests {
         Arc, Mutex,
     };
     use std::thread;
+    use std::time::Duration;
 
     struct MockTransport {
         calls: AtomicUsize,
@@ -1321,5 +1387,33 @@ mod tests {
             leaf.kind_for_model("gemini-3.1-flash-lite"),
             ProviderKind::Sglang
         );
+    }
+
+    #[test]
+    fn admitted_provider_bounds_calls_and_releases_capacity() {
+        let admission = Arc::new(
+            InferenceAdmission::new(AdmissionLimits {
+                global_in_flight: 1,
+                per_principal_in_flight: 1,
+                global_waiters: 1,
+                wait_timeout: Duration::from_millis(5),
+            })
+            .unwrap(),
+        );
+        let inner: Arc<dyn InferenceProvider + Send + Sync> =
+            Arc::new(RecordingModelProvider::new(ProviderKind::Vllm));
+        let provider = AdmittedProvider::new(inner, Arc::clone(&admission), "tenant-secret".into());
+        let held = admission.acquire("tenant-secret").unwrap();
+
+        assert_eq!(
+            provider.infer(&request()).unwrap_err(),
+            ProviderError::Saturated {
+                retry_after_ms: 5,
+                blocked_by: LimitClass::Principal,
+            }
+        );
+        drop(held);
+        provider.infer(&request()).expect("capacity was released");
+        assert_eq!(admission.snapshot().active, 0);
     }
 }
