@@ -272,6 +272,9 @@ struct AnalyzeArgs {
     /// Reason chunk size.
     #[arg(long, value_name = "N", default_value_t = 25)]
     chunk_size: usize,
+    /// Per-chunk semantic provider timeout in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 30_000)]
+    semantic_timeout_ms: u64,
     /// Cap frames for ingest and reason.
     #[arg(long, value_name = "N")]
     max_frames: Option<u64>,
@@ -336,6 +339,10 @@ impl AnalyzeArgs {
         body.insert("fixed_fps".to_string(), json!(self.fixed_fps));
         body.insert("chunk_size".to_string(), json!(self.chunk_size));
         body.insert("semantic_inference".to_string(), Value::Bool(true));
+        body.insert(
+            "semantic_timeout_ms".to_string(),
+            json!(self.semantic_timeout_ms),
+        );
         if let Some(max_frames) = self.max_frames {
             body.insert("max_frames".to_string(), json!(max_frames));
         }
@@ -1144,6 +1151,9 @@ fn validate_analyze_args(args: &AnalyzeArgs) -> Result<(), String> {
     }
     if args.chunk_size == 0 {
         return Err("--chunk-size must be greater than 0".to_string());
+    }
+    if !(100..=120_000).contains(&args.semantic_timeout_ms) {
+        return Err("--semantic-timeout-ms must be in [100, 120000]".to_string());
     }
     if non_empty_opt(&args.model).is_none() {
         return Err("--model must not be empty".to_string());
@@ -2142,6 +2152,7 @@ mod tests {
             mode: None,
             fixed_fps: 1.0,
             chunk_size: 25,
+            semantic_timeout_ms: 30_000,
             max_frames: None,
             index_name: None,
             sampling_policy: None,
@@ -2227,6 +2238,12 @@ mod tests {
                 .get("semantic_inference")
                 .and_then(Value::as_bool),
             Some(true)
+        );
+        assert_eq!(
+            without_prompt
+                .get("semantic_timeout_ms")
+                .and_then(Value::as_u64),
+            Some(30_000)
         );
 
         args.prompt = Some("custom semantic prompt".to_string());
