@@ -9,15 +9,9 @@
 # The video is a 10-second clip with 3 solid-colour scenes (red/blue/green)
 # that produce 2 abrupt scene cuts to exercise vidarax marker detection.
 #
-# If an SSH key is configured for the Hetzner host and the VIDARAX_API env var
-# points to that host, the video is also copied to the remote /tmp directory.
-
 set -euo pipefail
 
 OUTPUT="${1:-/tmp/vidarax-e2e-test.mp4}"
-HETZNER_HOST="user@localhost"
-SSH_KEY="${HETZNER_SSH_KEY:-$HOME/.ssh/hetzner_linux_new}"
-VIDARAX_API="${VIDARAX_API:-http://localhost:8080}"
 
 # Check for ffmpeg
 if ! command -v ffmpeg >/dev/null 2>&1; then
@@ -42,10 +36,3 @@ ffmpeg -y \
 
 SIZE=$(wc -c < "$OUTPUT")
 echo "[generate-test-video] OK: $OUTPUT (${SIZE} bytes, 10s, 3 scenes: red/blue/green)"
-
-# Copy to remote Hetzner host if the API is hosted there and SSH key exists
-if [[ "$VIDARAX_API" == *"100.125"* ]] && [[ -f "$SSH_KEY" ]]; then
-    echo "[generate-test-video] Copying to $HETZNER_HOST:/tmp/ ..."
-    scp -i "$SSH_KEY" -q "$OUTPUT" "$HETZNER_HOST:/tmp/vidarax-e2e-test.mp4"
-    echo "[generate-test-video] Remote copy complete."
-fi
