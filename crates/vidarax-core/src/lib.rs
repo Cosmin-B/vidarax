@@ -5,6 +5,7 @@
 // new unsafe block anywhere else fails the build instead of slipping in.
 #![deny(unsafe_code)]
 
+pub mod admission;
 pub mod backends;
 pub mod crop;
 pub mod dedup;
