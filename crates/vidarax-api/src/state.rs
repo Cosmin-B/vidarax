@@ -27,6 +27,7 @@ use vidarax_core::provider::{AdmittedProvider, InferenceProvider};
 #[cfg(test)]
 use vidarax_core::timeline::append_event;
 use vidarax_core::timeline::{read_all_events, TimelineEvent, WalWriter};
+use vidarax_core::webrtc::resources::MediaSessionResources;
 use vidarax_core::webrtc::session::WebRtcSession;
 
 use crate::ids::{parse_run_sequence, random_run_id};
@@ -47,6 +48,7 @@ const DEFAULT_STREAM_ID: &str = "stream-0";
 /// Each entry stores the owning principal, run ID, and live session.
 type SessionEntry = (String, Arc<str>, Arc<WebRtcSession>);
 type SessionMap = DashMap<String, SessionEntry>;
+type MediaReservationMap = DashMap<String, MediaResourcePermit>;
 type ReclaimedSessionEntry = (String, Arc<str>);
 type ReclaimedSessionMap = Arc<Mutex<ReclaimedSessions>>;
 type StreamReservations = Arc<DashMap<String, usize>>;
@@ -154,6 +156,118 @@ impl ReclaimedSessions {
 }
 
 #[derive(Clone)]
+struct MediaResourceBudget {
+    inner: Arc<MediaResourceBudgetInner>,
+}
+
+struct MediaResourceBudgetInner {
+    memory_limit_bytes: u64,
+    worker_thread_limit: usize,
+    reserved_bytes: AtomicU64,
+    reserved_worker_threads: AtomicUsize,
+    rejected_total: AtomicU64,
+    last_rejection_timestamp_seconds: AtomicU64,
+}
+
+impl MediaResourceBudget {
+    fn new(memory_limit_bytes: u64, worker_thread_limit: usize) -> Self {
+        Self {
+            inner: Arc::new(MediaResourceBudgetInner {
+                memory_limit_bytes,
+                worker_thread_limit,
+                reserved_bytes: AtomicU64::new(0),
+                reserved_worker_threads: AtomicUsize::new(0),
+                rejected_total: AtomicU64::new(0),
+                last_rejection_timestamp_seconds: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    fn try_reserve(&self, resources: MediaSessionResources) -> Option<MediaResourcePermit> {
+        if self
+            .inner
+            .reserved_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                reserved
+                    .checked_add(resources.reserved_bytes)
+                    .filter(|next| *next <= self.inner.memory_limit_bytes)
+            })
+            .is_err()
+        {
+            self.record_rejection();
+            return None;
+        }
+
+        if self
+            .inner
+            .reserved_worker_threads
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                reserved
+                    .checked_add(resources.worker_threads)
+                    .filter(|next| *next <= self.inner.worker_thread_limit)
+            })
+            .is_err()
+        {
+            self.inner
+                .reserved_bytes
+                .fetch_sub(resources.reserved_bytes, Ordering::AcqRel);
+            self.record_rejection();
+            return None;
+        }
+
+        Some(MediaResourcePermit {
+            budget: Arc::clone(&self.inner),
+            resources,
+        })
+    }
+
+    fn record_rejection(&self) {
+        self.inner.rejected_total.fetch_add(1, Ordering::Relaxed);
+        self.inner.last_rejection_timestamp_seconds.store(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs()),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn render_prometheus(&self) -> String {
+        format!(
+            "vidarax_media_capacity_memory_limit_bytes {}\n\
+             vidarax_media_capacity_memory_reserved_bytes {}\n\
+             vidarax_media_capacity_worker_thread_limit {}\n\
+             vidarax_media_capacity_worker_threads_reserved {}\n\
+             vidarax_media_capacity_rejections_total {}\n\
+             vidarax_media_capacity_last_rejection_timestamp_seconds {}\n",
+            self.inner.memory_limit_bytes,
+            self.inner.reserved_bytes.load(Ordering::Relaxed),
+            self.inner.worker_thread_limit,
+            self.inner.reserved_worker_threads.load(Ordering::Relaxed),
+            self.inner.rejected_total.load(Ordering::Relaxed),
+            self.inner
+                .last_rejection_timestamp_seconds
+                .load(Ordering::Relaxed),
+        )
+    }
+}
+
+pub(crate) struct MediaResourcePermit {
+    budget: Arc<MediaResourceBudgetInner>,
+    resources: MediaSessionResources,
+}
+
+impl Drop for MediaResourcePermit {
+    fn drop(&mut self) {
+        self.budget
+            .reserved_bytes
+            .fetch_sub(self.resources.reserved_bytes, Ordering::AcqRel);
+        self.budget
+            .reserved_worker_threads
+            .fetch_sub(self.resources.worker_threads, Ordering::AcqRel);
+    }
+}
+
+#[derive(Clone)]
 pub struct AppState {
     inner: Arc<AppStateInner>,
 }
@@ -161,6 +275,7 @@ pub struct AppState {
 pub struct AppStateInner {
     run_seq: AtomicU64,
     request_seq: AtomicU64,
+    pipeline_generation_seq: AtomicU64,
     wal_path: Arc<PathBuf>,
     ingest_file_roots: Vec<PathBuf>,
     provider: Option<Arc<dyn InferenceProvider + Send + Sync>>,
@@ -189,6 +304,8 @@ pub struct AppStateInner {
     /// observation, not an atomic reservation, so it cannot enforce the cap
     /// under concurrent inserts by itself.
     session_slots: AtomicUsize,
+    media_budget: MediaResourceBudget,
+    media_reservations: MediaReservationMap,
     /// Recently reclaimed WHIP sessions, retained so DELETE remains idempotent
     /// after a peer-state watcher has already removed the live session entry.
     reclaimed_sessions: ReclaimedSessionMap,
@@ -234,6 +351,8 @@ struct AppStateConfig {
     stream_ttl_secs: u64,
     active_stream_limit: usize,
     inference_admission_limits: AdmissionLimits,
+    media_memory_budget_bytes: u64,
+    media_worker_thread_budget: usize,
 }
 
 impl AppStateConfig {
@@ -250,6 +369,8 @@ impl AppStateConfig {
                 global_waiters: 128,
                 wait_timeout: std::time::Duration::from_secs(5),
             },
+            media_memory_budget_bytes: u64::MAX,
+            media_worker_thread_budget: usize::MAX,
         }
     }
 
@@ -273,6 +394,7 @@ impl AppStateConfig {
             inner: Arc::new(AppStateInner {
                 run_seq: AtomicU64::new(0),
                 request_seq: AtomicU64::new(0),
+                pipeline_generation_seq: AtomicU64::new(0),
                 wal_path,
                 ingest_file_roots: default_test_ingest_roots(),
                 provider: self.provider,
@@ -297,6 +419,11 @@ impl AppStateConfig {
                 spacetime_client: None,
                 sessions: DashMap::new(),
                 session_slots: AtomicUsize::new(0),
+                media_budget: MediaResourceBudget::new(
+                    self.media_memory_budget_bytes,
+                    self.media_worker_thread_budget,
+                ),
+                media_reservations: DashMap::new(),
                 reclaimed_sessions: Arc::new(Mutex::new(ReclaimedSessions::default())),
                 webrtc_config: WebRtcConfig::default(),
             }),
@@ -318,6 +445,8 @@ impl AppState {
         webrtc_config: WebRtcConfig,
         novelty: LiveNoveltyConfig,
         inference_admission_limits: AdmissionLimits,
+        media_memory_budget_bytes: u64,
+        media_worker_thread_budget: usize,
     ) -> Result<Self, String> {
         let existing_events = read_all_events(&wal_path).map_err(|err| err.to_string())?;
         let run_registry = build_run_registry(&existing_events);
@@ -362,6 +491,7 @@ impl AppState {
             inner: Arc::new(AppStateInner {
                 run_seq: AtomicU64::new(run_count.max(max_run_seq)),
                 request_seq: AtomicU64::new(0),
+                pipeline_generation_seq: AtomicU64::new(0),
                 wal_path,
                 ingest_file_roots,
                 provider,
@@ -386,6 +516,11 @@ impl AppState {
                 spacetime_client: None,
                 sessions: DashMap::new(),
                 session_slots: AtomicUsize::new(0),
+                media_budget: MediaResourceBudget::new(
+                    media_memory_budget_bytes,
+                    media_worker_thread_budget,
+                ),
+                media_reservations: DashMap::new(),
                 reclaimed_sessions: Arc::new(Mutex::new(ReclaimedSessions::default())),
                 webrtc_config,
             }),
@@ -501,12 +636,35 @@ impl AppState {
     ///
     /// Returns `false` if the session ID already exists (collision) or the
     /// global session limit has been reached.
+    #[cfg(test)]
     pub fn insert_session(
         &self,
         sess_id: String,
         principal: String,
         run_id: Arc<str>,
         session: Arc<WebRtcSession>,
+    ) -> bool {
+        self.insert_session_reserved(sess_id, principal, run_id, session, None)
+    }
+
+    pub(crate) fn insert_session_with_media_reservation(
+        &self,
+        sess_id: String,
+        principal: String,
+        run_id: Arc<str>,
+        session: Arc<WebRtcSession>,
+        reservation: MediaResourcePermit,
+    ) -> bool {
+        self.insert_session_reserved(sess_id, principal, run_id, session, Some(reservation))
+    }
+
+    fn insert_session_reserved(
+        &self,
+        sess_id: String,
+        principal: String,
+        run_id: Arc<str>,
+        session: Arc<WebRtcSession>,
+        reservation: Option<MediaResourcePermit>,
     ) -> bool {
         if self
             .session_slots
@@ -527,6 +685,9 @@ impl AppState {
             Entry::Vacant(slot) => {
                 slot.insert((principal, run_id, session));
             }
+        }
+        if let Some(reservation) = reservation {
+            self.media_reservations.insert(sess_id.clone(), reservation);
         }
         self.reclaimed_sessions
             .lock()
@@ -559,6 +720,7 @@ impl AppState {
                 &**existing_run_id == run_id
             })?;
         self.session_slots.fetch_sub(1, Ordering::AcqRel);
+        self.media_reservations.remove(sess_id);
         let (principal, existing_run_id, _session) = &entry;
         self.reclaimed_sessions
             .lock()
@@ -570,6 +732,17 @@ impl AppState {
                 now_epoch_ms(),
             );
         Some(entry)
+    }
+
+    pub(crate) fn try_reserve_media_resources(
+        &self,
+        resources: MediaSessionResources,
+    ) -> Option<MediaResourcePermit> {
+        self.media_budget.try_reserve(resources)
+    }
+
+    pub fn render_media_capacity_prometheus(&self) -> String {
+        self.media_budget.render_prometheus()
     }
 
     pub(crate) fn get_reclaimed_session(&self, sess_id: &str) -> Option<ReclaimedSessionEntry> {
@@ -593,6 +766,14 @@ impl AppState {
     pub fn next_request_id(&self) -> String {
         let seq = self.request_seq.fetch_add(1, Ordering::AcqRel) + 1;
         format!("req-{seq:016x}")
+    }
+
+    pub fn next_pipeline_generation(&self) -> vidarax_core::webrtc::runtime::PipelineGeneration {
+        let value = self
+            .pipeline_generation_seq
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        vidarax_core::webrtc::runtime::PipelineGeneration::new(value)
     }
 
     pub fn append_run_event(
@@ -1841,6 +2022,80 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::thread;
+
+    fn media_resources(bytes: u64, threads: usize) -> MediaSessionResources {
+        MediaSessionResources {
+            worker_threads: threads,
+            reserved_bytes: bytes,
+            rtp_queue_bytes: bytes,
+            decoded_frame_bytes: 0,
+            jpeg_payload_bytes: 0,
+            scratch_bytes: 0,
+            sidecar_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn media_budget_reserves_both_dimensions_and_releases_on_drop() {
+        let budget = MediaResourceBudget::new(100, 4);
+        let first = budget.try_reserve(media_resources(60, 2)).unwrap();
+        assert!(budget.try_reserve(media_resources(50, 1)).is_none());
+        assert!(budget.try_reserve(media_resources(10, 3)).is_none());
+        drop(first);
+        assert!(budget.try_reserve(media_resources(100, 4)).is_some());
+
+        let metrics = budget.render_prometheus();
+        assert!(metrics.contains("vidarax_media_capacity_rejections_total 2"));
+    }
+
+    #[test]
+    fn concurrent_media_budget_admission_never_exceeds_limit() {
+        const CONTENDERS: usize = 16;
+        let budget = MediaResourceBudget::new(1_000, 4);
+        let start = Arc::new(std::sync::Barrier::new(CONTENDERS + 1));
+        let release = Arc::new(AtomicBool::new(false));
+        let (results_tx, results_rx) = std::sync::mpsc::channel();
+        let mut threads = Vec::with_capacity(CONTENDERS);
+
+        for _ in 0..CONTENDERS {
+            let budget = budget.clone();
+            let start = Arc::clone(&start);
+            let release = Arc::clone(&release);
+            let results_tx = results_tx.clone();
+            threads.push(thread::spawn(move || {
+                start.wait();
+                let permit = budget.try_reserve(media_resources(100, 1));
+                results_tx.send(permit.is_some()).unwrap();
+                while !release.load(AtomicOrdering::Acquire) {
+                    thread::yield_now();
+                }
+                drop(permit);
+            }));
+        }
+        drop(results_tx);
+        start.wait();
+
+        let admitted = (0..CONTENDERS)
+            .map(|_| results_rx.recv().unwrap())
+            .filter(|admitted| *admitted)
+            .count();
+        assert_eq!(admitted, 4);
+        assert_eq!(
+            budget.inner.reserved_worker_threads.load(Ordering::Acquire),
+            4
+        );
+        assert_eq!(budget.inner.reserved_bytes.load(Ordering::Acquire), 400);
+
+        release.store(true, AtomicOrdering::Release);
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            budget.inner.reserved_worker_threads.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(budget.inner.reserved_bytes.load(Ordering::Acquire), 0);
+    }
 
     fn event(seq: u64, kind: &str, pts_ms: u64, payload: Value) -> TimelineEvent {
         event_for_run(seq, "run-1", kind, pts_ms, payload)

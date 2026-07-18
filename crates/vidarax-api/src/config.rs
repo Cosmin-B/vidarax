@@ -104,6 +104,10 @@ pub struct ServerConfig {
     pub cors_allowed_origins: Vec<String>,
     pub stream_ttl_secs: u64,
     pub active_stream_limit: usize,
+    /// Process-wide live media payload reservation budget.
+    pub media_memory_budget_bytes: u64,
+    /// Process-wide OS worker-thread reservation budget for live pipelines.
+    pub media_worker_thread_budget: usize,
     pub transport: TransportMode,
     pub decode_backend: String,
     /// STUN server URIs (comma-separated). Defaults to Google's public STUN server.
@@ -199,6 +203,14 @@ impl ServerConfig {
             return Err("VIDARAX_STREAM_TTL_SECS must be in [60, 86400]".to_string());
         }
         let active_stream_limit = parse_usize_env("VIDARAX_ACTIVE_STREAM_LIMIT", 5)?.clamp(1, 1024);
+        let media_memory_budget_bytes = parse_bounded_u64_env(
+            "VIDARAX_MEDIA_MEMORY_BUDGET_BYTES",
+            8 * 1024 * 1024 * 1024,
+            256 * 1024 * 1024,
+            1024 * 1024 * 1024 * 1024,
+        )?;
+        let media_worker_thread_budget =
+            parse_usize_env("VIDARAX_MEDIA_WORKER_THREAD_BUDGET", 64)?.clamp(1, 4096);
         let webrtc_stun_servers = {
             let v = parse_csv_env("VIDARAX_WEBRTC_STUN_SERVERS");
             if v.is_empty() {
@@ -261,6 +273,8 @@ impl ServerConfig {
             cors_allowed_origins,
             stream_ttl_secs,
             active_stream_limit,
+            media_memory_budget_bytes,
+            media_worker_thread_budget,
             transport,
             decode_backend,
             webrtc_stun_servers,
@@ -955,6 +969,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:custom.example.com:3478".into()],
@@ -1017,6 +1033,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".into()],
@@ -1289,6 +1307,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".into()],

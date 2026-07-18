@@ -26,10 +26,10 @@
 //! `delay_seconds` (wall-clock) prevents bursting.
 
 use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use arc_swap::ArcSwapOption;
 use base64::Engine as _;
 
 use crate::coordinates::FrameCoordinates;
@@ -38,6 +38,9 @@ use crate::metrics::PipelineMetrics;
 use crate::provider::{InferenceImage, InferenceObserver, InferenceProvider, InferenceRequest};
 use crate::tiered_vlm::{run_tiered, TieredVlmConfig};
 use crate::webrtc::recycle::RecycledBytes;
+use crate::webrtc::runtime::{
+    apply_pending_session_commands, PipelineGeneration, PipelineStage, SessionCommand, StageHandle,
+};
 use crate::webrtc::workers::{
     per_stream_vlm_workers, prune_stale_token_budget_entries, token_budget_entry, EventSink,
     KeyframeEvent, StreamFrame,
@@ -145,8 +148,6 @@ pub struct ClipWork {
     pub pts_start: u64,
     /// PTS of the last frame in the batch (milliseconds).
     pub pts_end: u64,
-    /// Semantic prompt forwarded to the VLM.
-    pub prompt: Arc<str>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,7 +191,6 @@ pub struct ClipAccumulator {
     config: ClipConfig,
     run_id: Arc<str>,
     session_id: Arc<str>,
-    prompt: Arc<str>,
     /// Buffered frames for the current window.
     buffer: VecDeque<(FrameSignal, RecycledBytes, FrameCoordinates)>,
     /// PTS-based sampling state shared with the decode-side pre-encode gate.
@@ -202,25 +202,16 @@ pub struct ClipAccumulator {
 }
 
 impl ClipAccumulator {
-    /// Create a new accumulator.  `prompt` is forwarded verbatim to each
-    /// emitted [`ClipWork`]; pass an empty string to use the worker default.
-    ///
     /// # Panics
     ///
     /// Does **not** panic; validation must be done by the caller via
     /// [`ClipConfig::validate`] before constructing.
-    pub fn new(
-        config: ClipConfig,
-        run_id: Arc<str>,
-        session_id: Arc<str>,
-        prompt: Arc<str>,
-    ) -> Self {
+    pub fn new(config: ClipConfig, run_id: Arc<str>, session_id: Arc<str>) -> Self {
         let rate_gate = ClipRateGate::new(config.target_fps);
         Self {
             config,
             run_id,
             session_id,
-            prompt,
             buffer: VecDeque::new(),
             rate_gate,
             window_start_pts: None,
@@ -290,7 +281,6 @@ impl ClipAccumulator {
             frames: deque,
             pts_start,
             pts_end,
-            prompt: Arc::clone(&self.prompt),
         })
     }
 }
@@ -311,14 +301,24 @@ pub fn spawn_clip_accumulator(
     config: ClipConfig,
     run_id: Arc<str>,
     session_id: Arc<str>,
-    prompt: Arc<str>,
     session_span: tracing::Span,
-) -> std::io::Result<()> {
-    std::thread::Builder::new()
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<StageHandle> {
+    let handle = std::thread::Builder::new()
         .name("vx-clip-acc".to_string())
         .spawn(move || {
-            let mut acc = ClipAccumulator::new(config, run_id, session_id, prompt);
-            while let Ok(sf) = frame_rx.recv() {
+            let mut acc = ClipAccumulator::new(config, run_id, session_id);
+            loop {
+                if stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                let sf = match frame_rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                    Ok(frame) => frame,
+                    Err(kanal::ReceiveErrorTimeout::Timeout) => continue,
+                    Err(
+                        kanal::ReceiveErrorTimeout::Closed | kanal::ReceiveErrorTimeout::SendClosed,
+                    ) => break,
+                };
                 let _guard = session_span.enter();
                 if let Some(clip) = acc.push(sf) {
                     if clip_tx.send(clip).is_err() {
@@ -328,7 +328,7 @@ pub fn spawn_clip_accumulator(
             }
         })?;
 
-    Ok(())
+    Ok(StageHandle::new(PipelineStage::ClipAccumulator, handle))
 }
 
 // ─── spawn_clip_vlm_workers ───────────────────────────────────────────────────
@@ -351,17 +351,21 @@ pub fn spawn_clip_vlm_workers<I>(
     metrics: Arc<PipelineMetrics>,
     session_span: tracing::Span,
     max_output_tokens_per_second: u32,
-    // Shared guided-JSON schema handle.  When the inner `Option` is `Some`,
-    // the schema is passed to the first-pass VLM request and `max_tokens`
-    // is raised to 1024 to accommodate structured output.
-    guided_json: Arc<ArcSwapOption<Arc<str>>>,
+    initial_prompt: Arc<str>,
+    initial_guided_json: Option<Arc<str>>,
+    generation: PipelineGeneration,
+    commands: tokio::sync::mpsc::Receiver<SessionCommand>,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
     // Where tiered VLM inference outcomes are recorded for `/metrics`. `None`
     // when the caller has no metrics sink wired up (e.g. tests).
     observer: Option<Arc<dyn InferenceObserver>>,
-) -> std::io::Result<()>
+) -> std::io::Result<Vec<StageHandle>>
 where
     I: InferenceProvider + 'static,
 {
+    debug_assert_eq!(clip_vlm_worker_count(n), 1);
+    let mut commands = Some(commands);
+    let mut handles = Vec::with_capacity(clip_vlm_worker_count(n));
     for i in 0..clip_vlm_worker_count(n) {
         let clip_rx = clip_rx.clone();
         let provider = Arc::clone(&provider);
@@ -369,14 +373,36 @@ where
         let config = config.clone();
         let metrics = Arc::clone(&metrics);
         let session_span = session_span.clone();
-        let guided_json = Arc::clone(&guided_json);
+        let mut prompt = Arc::clone(&initial_prompt);
+        let mut guided_json = initial_guided_json.clone();
+        let mut commands = commands
+            .take()
+            .expect("one command receiver belongs to one clip VLM worker");
         let observer = observer.clone();
         let mut token_budget = std::collections::HashMap::new();
+        let stopping = Arc::clone(&stopping);
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(format!("vx-clip-vlm-{i}"))
             .spawn(move || {
-                while let Ok(work) = clip_rx.recv() {
+                loop {
+                    if stopping.load(Ordering::Acquire) {
+                        break;
+                    }
+                    apply_pending_session_commands(
+                        &mut commands,
+                        generation,
+                        &mut prompt,
+                        &mut guided_json,
+                    );
+                    let work = match clip_rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                        Ok(work) => work,
+                        Err(kanal::ReceiveErrorTimeout::Timeout) => continue,
+                        Err(
+                            kanal::ReceiveErrorTimeout::Closed
+                            | kanal::ReceiveErrorTimeout::SendClosed,
+                        ) => break,
+                    };
                     let _guard = session_span.enter();
                     if max_output_tokens_per_second > 0 {
                         let now = std::time::Instant::now();
@@ -392,10 +418,10 @@ where
                     }
                     metrics.inc_vlm_inferences();
 
-                    let prompt: Arc<str> = if work.prompt.is_empty() {
+                    let effective_prompt: Arc<str> = if prompt.is_empty() {
                         Arc::from("Briefly describe what is happening across these video frames.")
                     } else {
-                        Arc::clone(&work.prompt)
+                        Arc::clone(&prompt)
                     };
 
                     // Build multi-image request — all frames sent together.
@@ -409,13 +435,9 @@ where
                         })
                         .collect();
 
-                    // Snapshot the current guided_json schema once per inference.
-                    let current_guided_json: Option<Arc<str>> =
-                        guided_json.load_full().map(|schema| Arc::clone(&*schema));
-
                     let request = InferenceRequest {
                         model: Arc::clone(&config.first_pass_model),
-                        prompt: Arc::clone(&prompt),
+                        prompt: effective_prompt,
                         input_images,
                         input_videos: vec![],
                         // Allow more tokens and time for multi-frame analysis.
@@ -423,7 +445,7 @@ where
                         temperature: 0.0,
                         timeout_ms: 15_000,
                         allow_fallback: true,
-                        guided_json: current_guided_json,
+                        guided_json: guided_json.clone(),
                     };
 
                     let clip_call_start = std::time::Instant::now();
@@ -493,9 +515,10 @@ where
                     });
                 }
             })?;
+        handles.push(StageHandle::new(PipelineStage::Vlm, handle));
     }
 
-    Ok(())
+    Ok(handles)
 }
 
 fn clip_vlm_worker_count(configured: usize) -> usize {
@@ -586,7 +609,7 @@ mod tests {
             clip_length_seconds: MAX_CLIP_LENGTH_SECONDS as f32,
             delay_seconds: 0.0,
         };
-        let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into(), "".into());
+        let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into());
         let mut clip = None;
 
         for i in 0..=1800_u64 {
@@ -707,7 +730,7 @@ mod tests {
             clip_length_seconds: 0.5,
             delay_seconds: 0.0, // no delay so first window triggers immediately
         };
-        let mut acc = ClipAccumulator::new(cfg, "run1".into(), "sess1".into(), "describe".into());
+        let mut acc = ClipAccumulator::new(cfg, "run1".into(), "sess1".into());
 
         // Send frames at 10 fps (100ms apart), for 600ms → 7 frames.
         // Window requires 500ms elapsed since first frame.
@@ -734,7 +757,7 @@ mod tests {
             clip_length_seconds: 5.0, // 1 fps * 5s = 5 frames
             delay_seconds: 0.0,
         };
-        let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into(), "".into());
+        let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into());
 
         // Send 10 frames at 500ms apart — only every other one should be accepted.
         for i in 0..10u64 {
@@ -765,7 +788,7 @@ mod tests {
             clip_length_seconds: 0.1,
             delay_seconds: 0.0,
         };
-        let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into(), "".into());
+        let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into());
 
         let mut no_jpeg = make_frame(0, 0);
         no_jpeg.jpeg = None;
@@ -780,7 +803,7 @@ mod tests {
             clip_length_seconds: 2.0, // 2 seconds window
             delay_seconds: 0.0,
         };
-        let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into(), "".into());
+        let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into());
 
         // Send 10 frames at 100ms each → 1 second elapsed, below 2s window
         for i in 0..10u64 {
@@ -796,12 +819,7 @@ mod tests {
             clip_length_seconds: 0.5,
             delay_seconds: 0.0,
         };
-        let mut acc = ClipAccumulator::new(
-            cfg,
-            "my-run".into(),
-            "my-session".into(),
-            "test prompt".into(),
-        );
+        let mut acc = ClipAccumulator::new(cfg, "my-run".into(), "my-session".into());
 
         let mut clip = None;
         for i in 0..10u64 {
@@ -814,6 +832,5 @@ mod tests {
         let c = clip.expect("clip should be emitted");
         assert_eq!(&*c.run_id, "my-run");
         assert_eq!(&*c.session_id, "my-session");
-        assert_eq!(&*c.prompt, "test prompt");
     }
 }

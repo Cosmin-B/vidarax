@@ -7,7 +7,7 @@ The media plane is the execution graph that turns RTP frames into VLM events for
 
 ## The task and thread topology
 
-The control plane (Axum handlers, session signalling) runs on tokio, and so does WebRTC ingress: the session event loop and its per-track receive tasks are tokio tasks. The processing stages are detached `std::thread` workers spawned by `spawn_pipeline` in `workers.rs`, bridged from async context through one `tokio::task::spawn_blocking` call in `whip.rs`. Each worker thread shuts down when its upstream channel closes, so dropping the RTP sender tears the pipeline down stage by stage.
+The control plane (Axum handlers, session signalling) runs on tokio, and so does WebRTC ingress: the session event loop and its per-track receive tasks are tokio tasks. The processing stages are owned `std::thread` workers spawned by `spawn_pipeline` in `workers.rs`, bridged from async context through one `tokio::task::spawn_blocking` call in `whip.rs`. `PipelineRuntime` retains a stage tag and join handle for every worker. One supervisor owns the session generation: an unexpected exit closes the peer, raises the shared stop signal, and bounded-joins every sibling instead of restarting one stateful stage.
 
 The complete per-session inventory, grouped by runtime and mode:
 
@@ -16,7 +16,7 @@ The complete per-session inventory, grouped by runtime and mode:
 | Session event loop | tokio task | both | `tokio::spawn(session.run(...))` in `whip.rs` | Drives the rustrtc peer connection | Peer close ends the future |
 | Track receive task (per video track) | tokio task | both | `session.run` on each `Track` event | Receives depacketized samples, frames them as `RtpFrame`, lossless enqueue | Track receive error or channel close |
 | `vx-decode-0` | OS thread | both | `spawn_decode_workers` | Decodes RTP access units to YUV, computes frame signals, runs the gate inline (keyframe mode) or PTS sampling (clip mode) | RTP channel closes |
-| ffmpeg stdout reader (unnamed) | OS thread | both, sidecar backends only | `spawn_frame_reader` per sidecar decoder | Reads YUV planes from ffmpeg stdout into pooled buffers, blocking sends into the reader channel | `read_exact` fails or receiver gone; no separate signal |
+| ffmpeg stdout reader (unnamed) | OS thread | both | `spawn_frame_reader` per sidecar decoder | Reads YUV planes from ffmpeg stdout into pooled buffers, blocking sends into the reader channel | Sidecar exit or receiver close; `Decoder::drop` kills the child and joins the reader |
 | `vx-vlm-{i}` | OS thread | keyframe only | `spawn_vlm_workers` | Semantic-novelty check, tiered VLM inference, dedup, temporal context | VLM work channel closes |
 | `vx-event-writer` | OS thread | keyframe only | `spawn_vlm_workers` | Drains `SinkEvent`s and calls the blocking `EventSink` methods so inference threads do not own storage writes | Sink event channel closes |
 | `vx-analysis-{i}` | OS thread | clip only | `spawn_analysis_workers` | Loop detection, forwards accepted frames to the clip accumulator | Stream frame channel closes |
@@ -24,6 +24,12 @@ The complete per-session inventory, grouped by runtime and mode:
 | `vx-clip-vlm-{i}` | OS thread | clip only | `spawn_clip_vlm_workers` | Multi-image VLM inference over a clip window, calls the sink directly | Clip work channel closes |
 
 One process-wide thread sits behind all sessions: `vidarax-timeline-writer`, which owns the WAL writer and is described in [WAL and events](/docs/internals/wal-and-events/#who-appends-and-every-kind).
+
+`PipelineGeneration`, `PipelineStage`, and `PipelineHealth` make lifecycle state
+typed rather than implicit. Live prompt/schema changes travel over an eight-slot
+`SessionCommand` channel with the generation attached. The PATCH request returns
+success only after the VLM worker acknowledges ownership of the new values; a
+closed, stale, or timed-out command cannot mutate a replacement generation.
 
 The `{i}` suffixes are cosmetic. `per_stream_decode_workers`, `per_stream_analysis_workers`, and `per_stream_vlm_workers` all clamp the configured count to 1:
 
@@ -84,7 +90,7 @@ const DECODE_OUTPUT_POOL_SLOTS_PER_WORKER: usize = FFMPEG_READER_CONSTRUCTING_YU
     + DECODE_CONSUMER_YUV_FRAMES;
 ```
 
-Reading the sum as positions: one frame the reader thread is currently assembling from ffmpeg stdout, plus a full reader handoff channel (`FFMPEG_YUV_READER_QUEUE_CAPACITY`, 16), plus the decoder-local pending FIFO's steady-state allowance (`FFMPEG_YUV_PENDING_POOL_ALLOWANCE`, 4), plus one frame held by the decode consumer. Total: 22 slots. The same figure appears in `decode.rs` as `FFMPEG_YUV_READER_POOL_MIN_SLOTS`, and `spawn_frame_reader` clamps up to it, so a caller cannot under-provision the reader path. The in-process openh264 backend has no reader thread or pending FIFO, so it needs only `SOFTWARE_YUV_POOL_MIN_SLOTS` (2): one caller-held output plus the next decoded output.
+Reading the sum as positions: one frame the reader thread is currently assembling from ffmpeg stdout, plus a full reader handoff channel (`FFMPEG_YUV_READER_QUEUE_CAPACITY`, 16), plus the decoder-local pending FIFO's steady-state allowance (`FFMPEG_YUV_PENDING_POOL_ALLOWANCE`, 4), plus one frame held by the decode consumer. Total: 22 slots. The same figure appears in `decode.rs` as `FFMPEG_YUV_READER_POOL_MIN_SLOTS`, and `spawn_frame_reader` clamps up to it, so a caller cannot under-provision the reader path. Live H.264 and H.265 both use the ffmpeg process boundary. The retained direct openh264 decoder path has no reader thread or pending FIFO and needs only `SOFTWARE_YUV_POOL_MIN_SLOTS` (2), but live backend selection does not choose it.
 
 ### The JPEG pool
 
@@ -115,6 +121,8 @@ Workers report results only through the `EventSink` trait (`emit_event_sync`, `e
 ## Edge cases and limits
 
 - A malformed frame (planes shorter than the declared dimensions) is dropped by `check_frame` before it can update `prev_signal`, so one corrupt decode cannot poison the temporal deltas of every following frame.
+- Compressed RTP access units larger than 2 MiB are dropped before the pipeline-owned queue copy, and JPEGs larger than 2 MiB are recycled before they can enter downstream work. Those payload limits make the process reservation a byte bound rather than a queue-item estimate.
+- The process reserves the full per-generation byte envelope and fixed worker count before workers start. `VIDARAX_MEDIA_MEMORY_BUDGET_BYTES` and `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` bound total admitted generations even across principals.
 - A frame the gate keeps but whose JPEG encode fails or comes back empty is dropped entirely; an empty payload would waste a VLM call.
 - While the loop detector reports the stream stuck (`loop_active`), the VLM worker skips inference for kept keyframes and counts them as dropped; the `loop_detected` event was already emitted by the gate side.
 - The per-session output token budget (`max_output_tokens_per_second`, zero disables) is enforced in the VLM worker with a one-second window per session; over-budget keyframes are dropped, and token counts are approximated from output byte length.

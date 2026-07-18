@@ -34,7 +34,7 @@ Ingest requests control sampling: a `sampling_policy` (for example `fixed` with 
 
 ## The ffmpeg decode sidecar for live streams
 
-Live WebRTC video needs a stateful decoder that survives across frames. GPU H.264 and H.265 use a long-lived ffmpeg sidecar process; software H.264 uses openh264 in-process; software H.265 uses the ffmpeg sidecar; VP8 uses libvpx in-process when the `vp8` build feature is enabled.
+Live WebRTC video needs a stateful decoder that survives across frames. H.264 and H.265 use a long-lived ffmpeg sidecar process on both CPU and GPU paths so a native decoder crash cannot abort the API process. VP8 uses libvpx in-process when the `vp8` build feature is enabled; that optional path does not have process isolation.
 
 The sidecar paths are built around one hazard: a subprocess connected by two pipes can deadlock. If the parent blocks writing encoded input while ffmpeg blocks writing decoded output, neither side makes progress. Vidarax narrows that interleaving window with a dedicated reader thread and a strict ordering rule.
 
@@ -59,3 +59,8 @@ A live H.264 decoder commonly cannot emit a frame from its first input: it needs
 Warm-up also applies to memory: pooled frame buffers are grown to their working size during the first frames, and because recycled buffers keep their capacity, later resizes do not reallocate.
 
 Codec detection is lazy. The decoder is created on the first frame, when the codec is known, and rebuilt if a later session negotiates a different codec on the same worker. The codec and the decoder travel together in a single slot so they cannot drift apart.
+
+A broken ffmpeg pipe or exited reader ends the decode stage. The per-session
+supervisor faults that generation, closes the peer, stops and joins its sibling
+stages, and lets the single-winner reclaimer tombstone the run. It never restarts
+one decoder while temporal workers still belong to the old generation.

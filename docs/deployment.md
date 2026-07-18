@@ -32,6 +32,8 @@ paths. Values below come from the current Rust source, mainly
 | `VIDARAX_CORS_ALLOWED_ORIGINS` | empty | Comma-separated browser origins. Empty means no origin is allowed. `*` is rejected when API keys are required. |
 | `VIDARAX_STREAM_TTL_SECS` | `3600` | Idle TTL for active runs. Must be in `[60, 86400]`. |
 | `VIDARAX_ACTIVE_STREAM_LIMIT` | `5` | Max active runs per resolved principal. Clamped to `[1, 1024]`. |
+| `VIDARAX_MEDIA_MEMORY_BUDGET_BYTES` | `8589934592` | Process-wide live media reservation budget. Must be between 256 MiB and 1 TiB. Session admission reserves a conservative payload envelope before workers start. |
+| `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` | `64` | Process-wide live media OS-thread budget. Clamped to `[1, 4096]`. H.264/H.265 keyframe generations reserve 4 threads; clip generations reserve 5, including the ffmpeg stdout reader. |
 | `VIDARAX_WEBRTC_STUN_SERVERS` | `stun:stun.l.google.com:19302` | Comma-separated STUN server URIs. |
 | `VIDARAX_WEBRTC_TURN_URL` | unset | Optional TURN relay URL. |
 | `VIDARAX_WEBRTC_TURN_USERNAME` | unset | Optional TURN username. |
@@ -181,6 +183,14 @@ accelerators as explicit gaps; do not infer their results from another row.
 
 `GET /v1/health` returns readiness for the running HTTP server. It does not
 check model backend availability.
+
+Live-session admission also enforces a process capacity plan. Each negotiated
+generation reserves bounded RTP queue bytes, decoded-frame pool bytes, JPEG
+payload bytes, provider scratch space, a 64 MiB ffmpeg-process allowance, and
+its fixed worker count before `run_created` is appended. The reservation is
+released with the session. Watch the `vidarax_media_capacity_*` metrics when
+sizing the two media budget settings; a rejected reservation returns `503
+media process capacity exhausted` without creating a durable run.
 
 ## Backend configuration
 

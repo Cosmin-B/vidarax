@@ -24,6 +24,14 @@ vidarax_pipeline_keyframe_blob_failures_total 0
 vidarax_pipeline_keyframe_blob_bytes_total 4096
 vidarax_pipeline_sessions_created_total 1
 vidarax_pipeline_sessions_removed_total 0
+vidarax_pipeline_generations_active 1
+vidarax_pipeline_generations_started_total 1
+vidarax_pipeline_generation_shutdown_clean_total 0
+vidarax_pipeline_generation_shutdown_faulted_total 0
+vidarax_pipeline_generation_shutdown_forced_total 0
+vidarax_pipeline_worker_faults_total_all 0
+vidarax_pipeline_last_fault_timestamp_seconds 0
+vidarax_infer_admission_waiting 0
 vidarax_pipeline_decode_latency_us_bucket{le="10000"} 10
 vidarax_pipeline_decode_latency_us_bucket{le="+Inf"} 10
 vidarax_pipeline_decode_latency_us_sum 50000
@@ -76,6 +84,17 @@ test.describe('Tracing page', () => {
   })
 
   // ── Pipeline stages ──────────────────────────────────────────────────────────
+
+  test('generation supervisor health is visible', async ({ page }) => {
+    await page.goto('/tracing')
+
+    const health = page.getByRole('region', { name: 'Pipeline generation health' })
+    await expect(health).toBeVisible({ timeout: 10_000 })
+    await expect(health.getByText('Healthy', { exact: true })).toBeVisible()
+    await expect(health.getByText('Active', { exact: true })).toBeVisible()
+    await expect(health.getByText('Worker faults', { exact: true })).toBeVisible()
+    await expect(health.getByText('Forced stops', { exact: true })).toBeVisible()
+  })
 
   test('Pipeline Flow section renders with 5 stage cards', async ({ page }) => {
     await page.goto('/tracing')

@@ -6,14 +6,10 @@ The WebRTC input path receives `RtpFrame` values with access unit bytes,
 `pts_ms`, `seq`, and `codec`. The decode worker calls `Decoder::decode` and
 then builds a `StreamFrame` with the returned pixels and a timestamp label.
 
-The in-process openh264 H.264 path is already frame-exact in this model.
-`Decoder::decode` passes one access unit to openh264 synchronously. If openh264
-returns a frame, the worker attaches the `seq` and `pts_ms` from that same
-access unit. Parameter-set-only input returns `Buffered` and emits no frame.
-
-The ffmpeg sidecar path is different. It writes raw encoded bytes to stdin and
+Live H.264 and H.265 now use the ffmpeg process boundary on both CPU and GPU
+paths. The sidecar writes raw encoded bytes to stdin and
 reads raw YUV420 frames from stdout. Rawvideo stdout has no PTS, frame index, or
-packet metadata. For GPU H.264, the worker labels any returned frame with the
+packet metadata. The worker labels any returned frame with the
 current RTP access unit as a best-effort approximation.
 
 ## Rejected ffmpeg container approach
@@ -34,19 +30,16 @@ problem from input to the subprocess boundary.
 
 ## Decision
 
-VP8 is unsupported for live decode in the current zero-dependency design.
-Constructing a VP8 decoder creates an unsupported decoder state, and the first
-decode call returns an unsupported codec error. The decode worker logs that
-clear error once and stops instead of silently dropping every frame.
+Native crash containment wins over frame-exact labels for the default H.264
+path. Both CPU and GPU H.264 use the supervised ffmpeg child, and their labels
+remain best-effort. A broken sidecar faults the whole session generation; it is
+not restarted underneath temporal workers.
 
-The honest path to VP8 support, and to frame-exact PTS for non-openh264 codecs,
-is an in-process decoder. That decoder must accept packets with timestamps and
-return decoded frames with their own timestamps, without relying on subprocess
-demuxer buffering or a separate metadata side channel. This is a future
-dependency-bearing change and is outside the current scope.
+The optional `vp8` feature provides an in-process libvpx decoder and can retain
+the synchronous packet-to-frame association, but it is an explicit native
+in-process exception without sidecar crash containment. Builds without that
+feature reject VP8 during codec selection.
 
-Until then:
-
-- H.264 software decode via openh264 is frame-exact.
-- H.264 GPU decode via the ffmpeg sidecar uses best-effort current-RTP labels.
-- VP8 fails fast as an unsupported configuration.
+True frame-exact labels across a process boundary require an output protocol
+that carries decoded-frame PTS alongside pixels without the long-lived
+container buffering observed here. Rawvideo stdout does not provide it.

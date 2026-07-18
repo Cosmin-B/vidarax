@@ -139,6 +139,8 @@ The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via
 | `VIDARAX_TRANSPORT` | `h1h2` | Transport mode (`h1h2` or `h3`) |
 | `VIDARAX_DATA_DIR` | `.vidarax-data` | WAL and runtime data directory |
 | `VIDARAX_ACTIVE_STREAM_LIMIT` | `5` | Max active runs per resolved principal |
+| `VIDARAX_MEDIA_MEMORY_BUDGET_BYTES` | `8589934592` | Process-wide reservation budget for live media payloads |
+| `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` | `64` | Process-wide reservation budget for live pipeline OS threads |
 | `VIDARAX_STREAM_TTL_SECS` | `3600` | Run idle TTL |
 
 Full configuration reference in [docs/deployment.md](docs/deployment.md).

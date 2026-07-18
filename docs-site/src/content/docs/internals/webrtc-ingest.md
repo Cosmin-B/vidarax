@@ -11,10 +11,10 @@ RFC 9725 signalling maps to three handlers:
 
 | Endpoint | Handler | Success | Errors |
 |---|---|---|---|
-| `POST /v1/stream/whip` | `whip_offer` | 201, `application/sdp` answer, `Location: /v1/stream/whip/{sess_id}`, `x-vidarax-run-id` header | 400 empty or non-UTF-8 offer or bad attach header, 409 stream limit, 415 unserveable video, 500 negotiation or persistence failure, 503 session limit or id collision |
+| `POST /v1/stream/whip` | `whip_offer` | 201, `application/sdp` answer, `Location: /v1/stream/whip/{sess_id}`, `x-vidarax-run-id` header | 400 empty or non-UTF-8 offer or bad attach header, 409 stream limit, 415 unserveable video, 500 negotiation or persistence failure, 503 session, media-capacity, or id-collision refusal |
 | `PATCH /v1/stream/whip/{sess_id}` | `whip_ice` | 204 | 400 non-UTF-8 body, 403 principal mismatch, 404 unknown session |
 | `DELETE /v1/stream/whip/{sess_id}` | `whip_terminate` | 200 | 403, 404, 500 cleanup incomplete (retryable) |
-| `PATCH /v1/stream/whip/{sess_id}/prompt` | `whip_update_prompt` | 200 JSON echo | 403, 404 |
+| `PATCH /v1/stream/whip/{sess_id}/prompt` | `whip_update_prompt` | 200 after worker acknowledgement | 403, 404, 409 closed generation, 503 acknowledgement timeout |
 
 Session IDs are `sess-` plus 16 hex characters from the OS RNG (`new_session_id`), with a timestamp fallback if the RNG is unavailable. Per-session configuration can ride the offer in the `x-attach-config` header: base64url-encoded JSON (`AttachStreamRequest`) carrying an initial prompt, a token-rate cap, and an optional clip-mode config, capped at 8 KiB encoded (`ATTACH_CONFIG_HEADER_MAX_ENCODED_LEN`).
 
@@ -33,7 +33,7 @@ The session then installs the selected codec as the sole video capability, insta
 
 ## Session start
 
-`start_whip_session` generates the session id, resolves the caller's principal, allocates a run id, and runs `start_whip_session_transaction` in a detached task so client disconnects cannot cancel it mid-flight. The transaction's ordering (slot reservation, durable `run_created`, session insert, reclaimer spawn) and the detached-task reasoning behind it are covered in [State and cancellation](/docs/internals/state-and-cancellation/#the-insert-to-spawn-window-in-whiprs). After that, the media wiring happens:
+`start_whip_session` generates the session id, resolves the caller's principal, allocates a run id, and runs `start_whip_session_transaction` in a detached task so client disconnects cannot cancel it mid-flight. The transaction's ordering (stream slot, byte/thread capacity reservation, durable `run_created`, session insert, reclaimer spawn) and the detached-task reasoning behind it are covered in [State and cancellation](/docs/internals/state-and-cancellation/#the-insert-to-spawn-window-in-whiprs). After that, the media wiring happens:
 
 ```rust
 let (frame_tx, frame_rx) = kanal::bounded::<RtpFrame>(RTP_FRAME_QUEUE_CAPACITY);
@@ -44,17 +44,18 @@ let run_future = session.run(frame_tx, Arc::clone(&metrics_arc));
 tokio::spawn(run_future);
 ```
 
-Every session uses `WalEventSink`, so worker events are visible through the local timeline. If SpacetimeDB is attached, the sink mirrors successful blocking description events after their WAL commit (see [WAL and events](/docs/internals/wal-and-events/#the-wal-event-sink)). The inference provider falls back to a `NullInferenceProvider` when none is configured, so the pipeline still decodes and gates. That fallback emits the explicit description "(no inference provider configured)". Worker threads are spawned inside one `tokio::task::spawn_blocking` call; their wiring receives the live novelty settings, while the token-rate cap comes from the session so an attach-config value set before worker start is honored. The session's prompt and guided-JSON handles (`ArcSwap`s) are shared with the workers, which lets `PATCH /prompt` affect the next keyframe without restarting threads.
+Every session uses `WalEventSink`, so worker events are visible through the local timeline. If SpacetimeDB is attached, the sink mirrors successful blocking description events after their WAL commit (see [WAL and events](/docs/internals/wal-and-events/#the-wal-event-sink)). The inference provider falls back to a `NullInferenceProvider` when none is configured, so the pipeline still decodes and gates. That fallback emits the explicit description "(no inference provider configured)". Worker threads are spawned inside one `tokio::task::spawn_blocking` call. `PipelineRuntime` owns their stage-tagged join handles and supervises the generation as one unit. The VLM worker owns prompt and schema values after startup; `PATCH /prompt` sends a bounded generation-tagged command and returns success only after that worker acknowledges the update.
 
 ## How RTP becomes decoder input
 
 `session.run` returns an owned future driving the rustrtc event loop. For each `PeerConnectionEvent::Track` whose kind is video, it spawns a tokio task that receives media samples and converts each into an `RtpFrame`:
 
 - Depacketization has already happened inside rustrtc via the configured factory, so a video sample is a complete access unit for H.264 and H.265, or a raw VP8 payload.
-- For H.264 and H.265, the 4-byte Annex B start code `00 00 00 01` is prepended (`ANNEX_B_START`), because rustrtc delivers NAL payloads without start codes while openh264 and the ffmpeg sidecar require them. VP8 passes through unframed.
+- For H.264 and H.265, the 4-byte Annex B start code `00 00 00 01` is prepended (`ANNEX_B_START`), because rustrtc delivers NAL payloads without the framing the ffmpeg sidecar expects. VP8 passes through unframed.
 - `pts_ms` is derived from the RTP timestamp on its 90 kHz clock (`rtp_timestamp / 90`).
 - `seq` comes from one `Arc<AtomicU64>` shared by all track tasks of the session; it is a per-session monotone counter, not the RTP sequence number.
 - Payload bytes are copied into buffers from a per-task `VecPool` sized by `rtp_nal_pool_slots`: `RTP_FRAME_QUEUE_CAPACITY` (128) queued frames plus one held by the decode worker plus one being constructed.
+- An access unit above `MAX_RTP_ACCESS_UNIT_BYTES` (2 MiB) is dropped before that pipeline-owned copy, so the item-bounded queue also has a finite payload-byte envelope.
 
 The enqueue is lossless while the session is active: `enqueue_rtp_frame_lossless` awaits capacity on the bounded channel instead of dropping. A gap in an ordered stream would corrupt the stateful decoder, so when decode falls behind, the tokio task yields and sustained overload backpressures the WebRTC media layer, where jitter buffers, NACKs, and keyframe requests are the right tools for real-time loss. On teardown, the session sends a monotonic stop signal to every track task and joins them; an in-flight frame may be discarded at that explicit boundary so a blocked sender cannot hold the decoder open forever. The decode worker on the other side of this channel, and the decoder warm-up that consumes the first SPS/PPS/IDR units, are covered in [Decode sidecar](/docs/internals/decode-sidecar/#decoder-warm-up).
 
@@ -69,7 +70,7 @@ A session ends through one of two doors, both funneling into the same reclaim tr
 
 `reclaim_whip_session_transaction` appends the run's `run_deleted` exactly once through the idempotent claim, then removes the session under `remove_session_for_run` (ownership-checked, single winner), closes the peer connection, and bumps the removal metric. The watcher path wraps this in retries with exponential backoff between `WHIP_RECLAIM_INITIAL_BACKOFF` and `WHIP_RECLAIM_MAX_BACKOFF`, stopping early when it observes the work already done (session re-owned by a different run, or run already deleted). Failure to insert a session at creation time tombstones the freshly created run with `WHIP_CREATE_TOMBSTONE_INLINE_ATTEMPTS` inline attempts and a detached retry task as backstop, so a failed creation cannot leave an active run behind.
 
-Closing the peer connection ends `session.run` on its next poll, which drops `frame_tx`; the decode worker's `recv` loop then ends, its channels close downstream, and the worker threads exit stage by stage, with the decoder's `Drop` killing any ffmpeg sidecar.
+Closing the peer connection marks the generation stopping before `session.run` drops `frame_tx`. Workers then treat channel closure as a clean stop. The supervisor joins every stage; the decoder's `Drop` kills and waits for its ffmpeg child and joins the stdout reader. An unexpected stage exit instead faults the generation, closes the same peer, stops siblings, and records the fixed stage/reason telemetry.
 
 ## Edge cases and limits
 
@@ -78,4 +79,4 @@ Closing the peer connection ends `session.run` on its next poll, which drops `fr
 - DELETE idempotency has a horizon: reclaimed-session records expire after `RECLAIMED_SESSION_TTL_MS` (ten minutes) or past `RECLAIMED_SESSION_MAX_ENTRIES` (1024) entries, after which a repeat DELETE returns 404.
 - The response headers degrade safely: an unrepresentable `Location` falls back to `/`, and an unrepresentable run id header to an empty value, rather than failing the created session.
 - `x-attach-config` larger than the encoded cap is rejected with a pointer to `PATCH /prompt` for large prompts.
-- Prompt and schema updates are read per keyframe by the workers; there is no synchronization point, so an update applies to the next keyframe after the swap, not retroactively.
+- Prompt and schema updates have a synchronization point: the bounded command carries the active generation and a one-shot acknowledgement. A request that times out drops its acknowledgement, and the worker discards that cancelled command instead of applying it later.

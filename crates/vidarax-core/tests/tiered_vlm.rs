@@ -45,7 +45,7 @@ fn is_tiered_returns_true_only_when_models_differ() {
 }
 
 #[test]
-fn keyframe_work_has_prompt_field() {
+fn keyframe_work_carries_media_not_mutable_configuration() {
     use vidarax_core::webrtc::workers::KeyframeWork;
 
     let kw = KeyframeWork {
@@ -59,8 +59,7 @@ fn keyframe_work_has_prompt_field() {
         novelty_score: 0.0,
         motion_score: 0.0,
         jpeg_bytes: Vec::new().into(),
-        prompt: "Describe this frame.".into(),
         loop_active: false,
     };
-    assert_eq!(&*kw.prompt, "Describe this frame.");
+    assert!(!kw.loop_active);
 }

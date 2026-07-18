@@ -2213,6 +2213,7 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         state.inference_admission(),
     ));
     metrics.push_str(&state.pipeline_metrics().render_prometheus());
+    metrics.push_str(&state.render_media_capacity_prometheus());
     (axum::http::StatusCode::OK, metrics)
 }
 

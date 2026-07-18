@@ -16,7 +16,7 @@ description: AppState layout, RAII slot reservation, the single-winner delete pr
 | Read acceleration | `timeline_snapshot: Arc<ArcSwap<RingSnapshot>>` | Copy-on-write snapshot, swapped whole by the writer |
 | Run registry | `run_registry: Arc<RunRegistry>` | `DashMap` shards plus per-run atomics |
 | Stream limits | `stream_reservations: DashMap<String, usize>`, `active_stream_limit`, `stream_ttl_secs` | Shard-entry critical sections |
-| WebRTC sessions | `sessions: DashMap<String, SessionEntry>`, `session_slots: AtomicUsize`, `reclaimed_sessions: Mutex<ReclaimedSessions>` | Exact atomic admission; shard entries; short synchronous tombstone-map critical sections |
+| WebRTC sessions | `sessions: DashMap<String, SessionEntry>`, `session_slots: AtomicUsize`, `media_budget`, `media_reservations`, `reclaimed_sessions: Mutex<ReclaimedSessions>` | Exact session admission plus atomic byte/thread reservations; shard entries; short synchronous tombstone-map critical sections |
 | Plumbing | `provider`, `decode_pipeline`, `security_policy`, metrics, `spacetime_client`, `webrtc_config`, `tenant_label_maps`, `ingest_file_roots`, `novelty_config` | Immutable after construction |
 
 Run state is not a mutable row. `RunState` holds only atomics (`created: AtomicBool`, `delete_state: AtomicU8`, `state: AtomicU8` encoding `StreamState`, `last_activity_ms: AtomicU64`, plus an `ArcSwap` principal key and a `Notify`), so once a run exists, ordinary events nudge those atomics in place; a test pins that the registry entry's `Arc` pointer is unchanged across a non-structural event. `RunRegistry` shards runs and a `by_principal` index across two `DashMap`s, and `apply_structural_event` is careful to never hold a lock in one map while touching the other, taking them in the same order as the reader `count_active_runs_for_principal`, so the pair cannot deadlock.
@@ -60,11 +60,21 @@ The entry is held across the check and the remove, so a concurrent reservation f
 WHIP session creation must never leave a live session that nothing watches. `start_whip_session_transaction` orders its steps so every failure path is covered, and `start_whip_session` runs the whole transaction in a detached `tokio::spawn` so an HTTP client that disconnects mid-request cannot cancel it halfway:
 
 1. Reserve the stream slot (`StreamSlotGuard`); on refusal, close the peer connection and return 409.
-2. Append `run_created` durably; on failure, close and return 500. Reclaim and active-run accounting rely on every visible session having a durable `run_created`.
-3. Reserve one `session_slots` count with an atomic compare-and-swap, then `insert_session` into the `DashMap`. The reservation makes the `MAX_WEBRTC_SESSIONS` (100) cap exact under concurrent starts; an ID collision releases it immediately. The ID is claimed under one shard entry so two inserts for the same ID cannot both win. On failure, the just-created run is tombstoned (`run_deleted`) with bounded inline retries and a detached retry task as backstop, then 503.
-4. `spawn_session_reclaimer`, which watches the rustrtc peer state and reclaims the session on `Disconnected`, `Failed`, or `Closed`.
+2. Build a `MediaSessionResources` envelope from the negotiated codec, configured resolution, queue payload limits, pool topology, mode, and fixed worker count. Atomically reserve both process-wide bytes and worker threads; on refusal, close and return 503 without appending `run_created`.
+3. Append `run_created` durably; on failure, close and return 500. Dropping the media permit releases both capacity dimensions.
+4. Reserve one `session_slots` count with an atomic compare-and-swap, then insert the session and its media permit. The reservation makes the `MAX_WEBRTC_SESSIONS` (100) cap exact under concurrent starts; an ID collision releases it immediately. On failure, the just-created run is tombstoned (`run_deleted`) with bounded inline retries and a detached retry task as backstop, then 503.
+5. `spawn_session_reclaimer`, which watches the rustrtc peer state and reclaims the session on `Disconnected`, `Failed`, or `Closed`. The winning removal drops the media permit exactly once.
 
 There is no suspension point between session insertion and reclaimer spawn. The reclaimed-session tombstone update uses a short `std::sync::Mutex` critical section, so cancellation cannot expose a visible session without its watcher. The whole startup transaction also runs in a detached `tokio::spawn`, which lets durable cleanup and response-independent work finish if an HTTP client disconnects. Everything after the reclaimer spawn (channel construction and worker startup) is safe to await because by then the session has an owner that will clean it up.
+
+Worker startup itself is generation-owned. `spawn_pipeline` returns a
+`PipelineRuntime` containing stage-tagged join handles. Partial startup raises
+the shared stop signal and bounded-joins the already-created prefix. After a
+successful start, the supervisor treats the first unexpected exit as a fault,
+closes the peer, stops siblings, waits up to five seconds, and reports a forced
+shutdown if a worker misses that deadline. The peer-state reclaimer still owns
+the durable tombstone, so fault and DELETE races converge on the same
+single-winner removal.
 
 Reclaim itself is race-safe by construction: `remove_session_for_run` uses `DashMap::remove_if` to check run ownership and remove under one shard lock, so exactly one caller (DELETE handler or peer-state watcher) wins cleanup, and the winner writes a `ReclaimedSessions` record so a later DELETE of the same session stays idempotent instead of returning 404. That tombstone map is bounded by both a TTL (`RECLAIMED_SESSION_TTL_MS`, ten minutes) and a cap (`RECLAIMED_SESSION_MAX_ENTRIES`, 1024).
 

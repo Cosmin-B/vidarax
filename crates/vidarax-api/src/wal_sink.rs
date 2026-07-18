@@ -383,9 +383,10 @@ mod tests {
         assert!(ev
             .payload
             .contains("\"coordinate_schema\":\"vidarax.image.v1\""));
-        assert!(ev
-            .payload
-            .contains("\"source_extent\":{\"height\":1080,\"width\":1920}"));
+        let payload: serde_json::Value =
+            serde_json::from_str(&ev.payload).expect("keyframe payload should be valid JSON");
+        assert_eq!(payload["coordinates"]["source_extent"]["width"], 1920);
+        assert_eq!(payload["coordinates"]["source_extent"]["height"], 1080);
 
         let _ = std::fs::remove_file(path);
     }

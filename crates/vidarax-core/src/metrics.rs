@@ -11,6 +11,12 @@
 //! histogram exposition format.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::webrtc::runtime::{PipelineFault, PipelineFaultReason, PipelineShutdown, PipelineStage};
+
+const PIPELINE_STAGE_COUNT: usize = 5;
+const PIPELINE_FAULT_REASON_COUNT: usize = 4;
 
 pub const DECODE_LATENCY_US_BUCKETS: [u64; 8] =
     [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 50_000];
@@ -145,6 +151,15 @@ pub struct PipelineMetrics {
     sessions_created_total: AtomicU64,
     /// WHIP sessions removed (terminated).
     sessions_removed_total: AtomicU64,
+    /// Live, fully-started media-pipeline generations.
+    pipeline_generations_active: AtomicU64,
+    pipeline_generations_started_total: AtomicU64,
+    pipeline_generation_clean_shutdown_total: AtomicU64,
+    pipeline_generation_faulted_shutdown_total: AtomicU64,
+    pipeline_generation_forced_shutdown_total: AtomicU64,
+    pipeline_last_fault_timestamp_seconds: AtomicU64,
+    /// Fixed stage × reason matrix; labels are rendered only at scrape time.
+    pipeline_worker_faults_total: [AtomicU64; PIPELINE_STAGE_COUNT * PIPELINE_FAULT_REASON_COUNT],
 
     /// Per-frame H.264 decode latency in microseconds.
     pub decode_latency_us: LatencyHistogram,
@@ -188,6 +203,13 @@ impl PipelineMetrics {
             loop_detected_total: AtomicU64::new(0),
             sessions_created_total: AtomicU64::new(0),
             sessions_removed_total: AtomicU64::new(0),
+            pipeline_generations_active: AtomicU64::new(0),
+            pipeline_generations_started_total: AtomicU64::new(0),
+            pipeline_generation_clean_shutdown_total: AtomicU64::new(0),
+            pipeline_generation_faulted_shutdown_total: AtomicU64::new(0),
+            pipeline_generation_forced_shutdown_total: AtomicU64::new(0),
+            pipeline_last_fault_timestamp_seconds: AtomicU64::new(0),
+            pipeline_worker_faults_total: std::array::from_fn(|_| AtomicU64::new(0)),
 
             decode_latency_us: LatencyHistogram::new(DECODE_LATENCY_US_BUCKETS),
             gate_latency_us: LatencyHistogram::new(GATE_LATENCY_US_BUCKETS),
@@ -377,6 +399,68 @@ impl PipelineMetrics {
         self.sessions_removed_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn pipeline_generation_started(&self) {
+        self.pipeline_generations_active
+            .fetch_add(1, Ordering::Relaxed);
+        self.pipeline_generations_started_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_pipeline_start_failure(
+        &self,
+        fault: PipelineFault,
+        join_deadline: Option<PipelineFault>,
+    ) {
+        self.record_pipeline_fault(fault);
+        if let Some(overrun) = join_deadline {
+            self.record_pipeline_fault(overrun);
+            self.pipeline_generation_forced_shutdown_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.pipeline_generation_faulted_shutdown_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn pipeline_generation_stopped(&self, outcome: PipelineShutdown) {
+        // One stop is recorded for every successful start. Avoid wrapping if a
+        // future caller violates that invariant; observability must not create
+        // a nonsensical u64 gauge.
+        let _ = self.pipeline_generations_active.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |active| active.checked_sub(1),
+        );
+        match outcome {
+            PipelineShutdown::Clean => {
+                self.pipeline_generation_clean_shutdown_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PipelineShutdown::Faulted(fault) => {
+                self.record_pipeline_fault(fault);
+                self.pipeline_generation_faulted_shutdown_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PipelineShutdown::JoinDeadline { fault, overrun } => {
+                if let Some(fault) = fault {
+                    self.record_pipeline_fault(fault);
+                }
+                self.record_pipeline_fault(overrun);
+                self.pipeline_generation_forced_shutdown_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn record_pipeline_fault(&self, fault: PipelineFault) {
+        let index = fault.stage.index() * PIPELINE_FAULT_REASON_COUNT + fault.reason.index();
+        self.pipeline_worker_faults_total[index].fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        self.pipeline_last_fault_timestamp_seconds
+            .store(timestamp, Ordering::Relaxed);
+    }
+
     /// Render all counters and latency histograms as Prometheus-compatible text.
     pub fn render_prometheus(&self) -> String {
         let rtp = self.rtp_frames_received_total.load(Ordering::Relaxed);
@@ -417,6 +501,22 @@ impl PipelineMetrics {
         let loops = self.loop_detected_total.load(Ordering::Relaxed);
         let sess_created = self.sessions_created_total.load(Ordering::Relaxed);
         let sess_removed = self.sessions_removed_total.load(Ordering::Relaxed);
+        let generations_active = self.pipeline_generations_active.load(Ordering::Relaxed);
+        let generations_started = self
+            .pipeline_generations_started_total
+            .load(Ordering::Relaxed);
+        let generations_clean = self
+            .pipeline_generation_clean_shutdown_total
+            .load(Ordering::Relaxed);
+        let generations_faulted = self
+            .pipeline_generation_faulted_shutdown_total
+            .load(Ordering::Relaxed);
+        let generations_forced = self
+            .pipeline_generation_forced_shutdown_total
+            .load(Ordering::Relaxed);
+        let last_fault_timestamp = self
+            .pipeline_last_fault_timestamp_seconds
+            .load(Ordering::Relaxed);
 
         let mut out = format!(
             "vidarax_pipeline_rtp_frames_received_total {rtp}\n\
@@ -444,7 +544,39 @@ impl PipelineMetrics {
              vidarax_pipeline_novelty_shadow_change_ratio {novelty_shadow_change_ratio}\n\
              vidarax_pipeline_loop_detected_total {loops}\n\
              vidarax_pipeline_sessions_created_total {sess_created}\n\
-             vidarax_pipeline_sessions_removed_total {sess_removed}\n"
+             vidarax_pipeline_sessions_removed_total {sess_removed}\n\
+             vidarax_pipeline_generations_active {generations_active}\n\
+             vidarax_pipeline_generations_started_total {generations_started}\n\
+             vidarax_pipeline_generation_shutdown_total{{outcome=\"clean\"}} {generations_clean}\n\
+             vidarax_pipeline_generation_shutdown_total{{outcome=\"faulted\"}} {generations_faulted}\n\
+             vidarax_pipeline_generation_shutdown_total{{outcome=\"forced\"}} {generations_forced}\n\
+             vidarax_pipeline_generation_shutdown_clean_total {generations_clean}\n\
+             vidarax_pipeline_generation_shutdown_faulted_total {generations_faulted}\n\
+             vidarax_pipeline_generation_shutdown_forced_total {generations_forced}\n\
+             vidarax_pipeline_last_fault_timestamp_seconds {last_fault_timestamp}\n"
+        );
+
+        use std::fmt::Write as _;
+        for stage in PipelineStage::ALL {
+            for reason in PipelineFaultReason::ALL {
+                let index = stage.index() * PIPELINE_FAULT_REASON_COUNT + reason.index();
+                let count = self.pipeline_worker_faults_total[index].load(Ordering::Relaxed);
+                let _ = writeln!(
+                    out,
+                    "vidarax_pipeline_worker_faults_total{{stage=\"{}\",reason=\"{}\"}} {count}",
+                    stage.as_str(),
+                    reason.as_str(),
+                );
+            }
+        }
+        let worker_faults_total = self
+            .pipeline_worker_faults_total
+            .iter()
+            .map(|counter| counter.load(Ordering::Relaxed))
+            .sum::<u64>();
+        let _ = writeln!(
+            out,
+            "vidarax_pipeline_worker_faults_total_all {worker_faults_total}"
         );
 
         out.push_str(
@@ -491,6 +623,9 @@ impl Default for PipelineMetrics {
 #[cfg(test)]
 mod tests {
     use super::{LatencyHistogram, PipelineMetrics};
+    use crate::webrtc::runtime::{
+        PipelineFault, PipelineFaultReason, PipelineShutdown, PipelineStage,
+    };
 
     #[test]
     fn counters_increment_and_render() {
@@ -546,5 +681,23 @@ mod tests {
         assert!(text.contains("vidarax_pipeline_gate_latency_us_count 1"));
         assert!(text.contains("vidarax_pipeline_vlm_latency_ms_count 1"));
         assert!(text.contains("vidarax_pipeline_stdb_emit_latency_ms_count 1"));
+    }
+
+    #[test]
+    fn generation_lifecycle_uses_fixed_stage_and_reason_labels() {
+        let m = PipelineMetrics::new();
+        m.pipeline_generation_started();
+        m.pipeline_generation_stopped(PipelineShutdown::Faulted(PipelineFault {
+            stage: PipelineStage::Decode,
+            reason: PipelineFaultReason::Panic,
+        }));
+
+        let text = m.render_prometheus();
+        assert!(text.contains("vidarax_pipeline_generations_active 0\n"));
+        assert!(text.contains("vidarax_pipeline_generations_started_total 1\n"));
+        assert!(text.contains("vidarax_pipeline_generation_shutdown_total{outcome=\"faulted\"} 1"));
+        assert!(text
+            .contains("vidarax_pipeline_worker_faults_total{stage=\"decode\",reason=\"panic\"} 1"));
+        assert!(!text.contains("session_id="));
     }
 }

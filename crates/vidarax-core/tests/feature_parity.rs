@@ -368,7 +368,7 @@ fn accumulator_emits_clip_after_window_fills() {
         clip_length_seconds: 0.5,
         delay_seconds: 0.0,
     };
-    let mut acc = ClipAccumulator::new(cfg, "run-a".into(), "sess-a".into(), "describe".into());
+    let mut acc = ClipAccumulator::new(cfg, "run-a".into(), "sess-a".into());
 
     // Feed frames at 100ms intervals; 500ms window requires 6 frames (pts 0..500).
     let mut emitted = None;
@@ -387,7 +387,6 @@ fn accumulator_emits_clip_after_window_fills() {
     assert!(clip.pts_end >= clip.pts_start, "pts must be ordered");
     assert_eq!(&*clip.run_id, "run-a");
     assert_eq!(&*clip.session_id, "sess-a");
-    assert_eq!(&*clip.prompt, "describe");
 }
 
 #[test]
@@ -397,7 +396,7 @@ fn accumulator_does_not_emit_before_window_is_full() {
         clip_length_seconds: 2.0, // 2 seconds required
         delay_seconds: 0.0,
     };
-    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into(), "".into());
+    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into());
 
     // Send 10 frames at 100ms each — only 1 second elapsed, below 2s window.
     for i in 0..10u64 {
@@ -417,7 +416,7 @@ fn accumulator_rate_limits_to_target_fps() {
         clip_length_seconds: 2.0, // 2fps * 2s = 4 frames minimum
         delay_seconds: 0.0,
     };
-    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into(), "".into());
+    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into());
 
     // Push 20 frames at 100ms intervals (0, 100, 200, …, 1900ms).
     // At 500ms interval only frames at 0, 500, 1000, 1500, 2000ms are accepted.
@@ -446,7 +445,7 @@ fn accumulator_drops_frames_with_no_jpeg() {
         clip_length_seconds: 0.1,
         delay_seconds: 0.0,
     };
-    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into(), "".into());
+    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into());
 
     let mut no_jpeg = make_stream_frame(0, 0);
     no_jpeg.jpeg = None;
@@ -492,7 +491,7 @@ fn clip_accumulator_delay_suppresses_rapid_second_emission() {
         clip_length_seconds: 0.5,
         delay_seconds: 60.0, // impossible to satisfy in test time
     };
-    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into(), "".into());
+    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into());
 
     // Fill first window (pts 0–600ms) and trigger emission.
     let mut first = None;
@@ -526,7 +525,7 @@ fn accumulator_buffer_cleared_after_emission() {
         clip_length_seconds: 0.5,
         delay_seconds: 0.0,
     };
-    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into(), "".into());
+    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into());
 
     // Trigger first emission.
     let mut first_clip = None;
@@ -554,7 +553,7 @@ fn clip_work_pts_span_covers_window() {
         clip_length_seconds: 0.5,
         delay_seconds: 0.0,
     };
-    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into(), "".into());
+    let mut acc = ClipAccumulator::new(cfg, "r".into(), "s".into());
 
     let mut clip = None;
     for i in 0..8u64 {

@@ -41,7 +41,6 @@ use std::sync::{
     Arc,
 };
 
-use arc_swap::{ArcSwap, ArcSwapOption};
 pub use rustrtc::peer_connection::PeerConnectionState;
 use rustrtc::{
     media::{MediaKind, MediaSample, MediaStreamTrack},
@@ -58,6 +57,9 @@ use crate::webrtc::decode::{
     VideoCodec,
 };
 use crate::webrtc::recycle::{RecycledBytes, VecPool};
+use crate::webrtc::runtime::{
+    PipelineGeneration, SessionCommand, SessionControl, SessionControlError,
+};
 
 /// Annex B start code prepended to every H.264 or H.265 NAL unit.
 ///
@@ -67,6 +69,10 @@ use crate::webrtc::recycle::{RecycledBytes, VecPool};
 /// unchanged.
 const ANNEX_B_START: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
 pub const RTP_FRAME_QUEUE_CAPACITY: usize = 128;
+/// Maximum compressed access-unit payload admitted into the owned RTP queue.
+/// This turns the queue's item bound into a byte bound as well. Oversized
+/// frames are shed before the pipeline-owned copy is made.
+pub const MAX_RTP_ACCESS_UNIT_BYTES: usize = 2 * 1024 * 1024;
 
 pub fn rtp_nal_pool_slots(decode_workers: usize) -> usize {
     RTP_FRAME_QUEUE_CAPACITY + crate::webrtc::workers::per_stream_decode_workers(decode_workers) + 1
@@ -219,14 +225,11 @@ impl Default for WebRtcConfig {
 /// connection closes when all handles are dropped.
 pub struct WebRtcSession {
     pc: PeerConnection,
-    /// Dynamic VLM prompt; updated via `PATCH /v1/stream/whip/{sess_id}/prompt`.
-    pub prompt: Arc<ArcSwap<Arc<str>>>,
-    /// Optional JSON schema string for guided/structured VLM output.
-    ///
-    /// When `Some`, passed as `guided_json` to the VLM inference request and
-    /// `max_tokens` is bumped to 1024 to accommodate structured output.
-    /// Updated via `PATCH /v1/stream/whip/{sess_id}/prompt` with `output_schema`.
-    pub guided_json: Arc<ArcSwapOption<Arc<str>>>,
+    /// Configuration used when the worker generation starts. Live updates move
+    /// through `control`; workers own the accepted values after startup.
+    initial_prompt: Arc<str>,
+    initial_guided_json: Option<Arc<str>>,
+    control: SessionControl,
     /// Token output rate cap (tokens/s) for backpressure in VLM workers.
     pub max_output_tokens_per_second: u32,
     /// Effective region of interest for this session's decode workers. Starts
@@ -274,20 +277,33 @@ impl WebRtcSession {
     #[cfg(any(test, debug_assertions))]
     #[doc(hidden)]
     pub fn new_for_tests() -> Self {
+        Self::new_for_tests_with_generation(PipelineGeneration::INITIAL).0
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn new_for_tests_with_generation(
+        generation: PipelineGeneration,
+    ) -> (Self, tokio::sync::mpsc::Receiver<SessionCommand>) {
         let (shutdown, _shutdown_rx) = tokio::sync::watch::channel(false);
-        Self {
-            pc: PeerConnection::new(Default::default()),
-            prompt: Arc::new(ArcSwap::from(Arc::new(Arc::from("")))),
-            guided_json: Arc::new(ArcSwapOption::from(None::<Arc<Arc<str>>>)),
-            max_output_tokens_per_second: 128,
-            crop: None,
-            codec: VideoCodec::H264,
-            rtp_nal_pool_slots: rtp_nal_pool_slots(1),
-            shutdown,
-            _shutdown_rx,
-            #[cfg(any(test, debug_assertions))]
-            close_calls: AtomicU64::new(0),
-        }
+        let (control, commands) = SessionControl::channel(generation);
+        (
+            Self {
+                pc: PeerConnection::new(Default::default()),
+                initial_prompt: Arc::from(""),
+                initial_guided_json: None,
+                control,
+                max_output_tokens_per_second: 128,
+                crop: None,
+                codec: VideoCodec::H264,
+                rtp_nal_pool_slots: rtp_nal_pool_slots(1),
+                shutdown,
+                _shutdown_rx,
+                #[cfg(any(test, debug_assertions))]
+                close_calls: AtomicU64::new(0),
+            },
+            commands,
+        )
     }
 
     /// Create a new session from a browser SDP offer.
@@ -323,6 +339,18 @@ impl WebRtcSession {
         offer_sdp: &str,
         config: &WebRtcConfig,
     ) -> Result<(Self, String), WebRtcSetupError> {
+        let (session, answer, _commands) =
+            Self::new_with_generation(offer_sdp, config, PipelineGeneration::INITIAL).await?;
+        Ok((session, answer))
+    }
+
+    /// Create a session and the single command receiver for its live pipeline.
+    /// The receiver must be moved into exactly one worker generation.
+    pub async fn new_with_generation(
+        offer_sdp: &str,
+        config: &WebRtcConfig,
+        generation: PipelineGeneration,
+    ) -> Result<(Self, String, tokio::sync::mpsc::Receiver<SessionCommand>), WebRtcSetupError> {
         // Select before handing SDP to rustrtc so the answer, depacketizer,
         // and decode routing use the same codec.
         let selected = select_answer_video_codec_for_offer(offer_sdp);
@@ -450,11 +478,13 @@ impl WebRtcSession {
         let answer_sdp = local.to_sdp_string();
 
         let (shutdown, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (control, commands) = SessionControl::channel(generation);
         Ok((
             Self {
                 pc,
-                prompt: Arc::new(ArcSwap::from(Arc::new(Arc::from("")))),
-                guided_json: Arc::new(ArcSwapOption::from(None::<Arc<Arc<str>>>)),
+                initial_prompt: Arc::from(""),
+                initial_guided_json: None,
+                control,
                 max_output_tokens_per_second: config.max_output_tokens_per_second,
                 crop: config.crop,
                 codec,
@@ -465,6 +495,7 @@ impl WebRtcSession {
                 close_calls: AtomicU64::new(0),
             },
             answer_sdp,
+            commands,
         ))
     }
 
@@ -531,6 +562,7 @@ impl WebRtcSession {
         let seq_counter = Arc::new(AtomicU64::new(0));
         let codec = self.codec;
         let rtp_nal_pool_slots = self.rtp_nal_pool_slots;
+        let control = self.control.clone();
         // Subscribe to the shutdown latch when run() is called, not at first
         // poll. A close() between this call and the first poll bumps the latch,
         // so the loop's top borrow sees it (and changed() is ready); a close()
@@ -614,6 +646,15 @@ impl WebRtcSession {
 
                                         match sample {
                                             Ok(MediaSample::Video(frame)) => {
+                                                if frame.data.len() > MAX_RTP_ACCESS_UNIT_BYTES {
+                                                    metrics.inc_frames_dropped();
+                                                    tracing::warn!(
+                                                        payload_bytes = frame.data.len(),
+                                                        limit_bytes = MAX_RTP_ACCESS_UNIT_BYTES,
+                                                        "dropping oversized RTP video access unit"
+                                                    );
+                                                    continue;
+                                                }
                                                 let nal_seq =
                                                     seq.fetch_add(1, Ordering::Relaxed);
 
@@ -677,43 +718,47 @@ impl WebRtcSession {
             for handle in track_tasks {
                 let _ = handle.await;
             }
+            // Mark the generation as stopping before this future drops its
+            // final frame_tx. That makes the downstream channel closure a
+            // clean shutdown signal rather than an unexpected worker exit.
+            control.stop();
         }
     }
 
-    /// Update the VLM analysis prompt for this session.
-    ///
-    /// Called by `PATCH /v1/stream/whip/{sess_id}/prompt`.  The new prompt is
-    /// picked up by analysis workers on the next keyframe decision.
-    pub fn update_prompt(&self, text: String) {
-        self.prompt.store(Arc::new(Arc::from(text)));
+    /// Set the prompt before the session is shared or its workers are started.
+    pub fn set_initial_prompt(&mut self, text: String) {
+        self.initial_prompt = Arc::from(text);
     }
 
-    /// Read the current VLM prompt (empty string means use the default).
-    ///
-    /// Clones only the `Arc<str>` handle and increments its reference count;
-    /// the string data is not copied or reallocated.
-    pub fn read_prompt(&self) -> Arc<str> {
-        Arc::clone(&*self.prompt.load_full())
+    pub fn initial_prompt(&self) -> Arc<str> {
+        Arc::clone(&self.initial_prompt)
     }
 
-    /// Clone the prompt handle for sharing with analysis workers.
-    pub fn prompt_arc(&self) -> Arc<ArcSwap<Arc<str>>> {
-        Arc::clone(&self.prompt)
+    pub fn initial_guided_json(&self) -> Option<Arc<str>> {
+        self.initial_guided_json.clone()
     }
 
-    /// Update the guided JSON schema for structured VLM output.
-    ///
-    /// Pass `None` to disable structured output and revert to free-text.
-    /// Called by `PATCH /v1/stream/whip/{sess_id}/prompt` when `output_schema`
-    /// is present in the request body.
-    pub fn update_guided_json(&self, schema: Option<String>) {
-        self.guided_json
-            .store(schema.map(|schema| Arc::new(Arc::from(schema))));
+    pub fn generation(&self) -> PipelineGeneration {
+        self.control.generation()
     }
 
-    /// Clone the guided-JSON handle for sharing with VLM worker threads.
-    pub fn guided_json_arc(&self) -> Arc<ArcSwapOption<Arc<str>>> {
-        Arc::clone(&self.guided_json)
+    /// Send a live configuration update and wait until the active generation
+    /// has accepted it. A closed generation rejects the command.
+    pub async fn update_config(
+        &self,
+        prompt: String,
+        guided_json: Option<String>,
+    ) -> Result<(), SessionControlError> {
+        self.control
+            .update_config(
+                Arc::from(prompt),
+                guided_json.map(|schema| Arc::from(schema.as_str())),
+            )
+            .await
+    }
+
+    pub fn stopping_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.control.stopping_flag()
     }
 
     /// Subscribe to rustrtc peer state changes for lifecycle cleanup.
@@ -728,6 +773,7 @@ impl WebRtcSession {
         // Raise the monotonic shutdown latch before closing the peer, so run()
         // observes it even if rustrtc republishes a non-terminal state over the
         // Closed this triggers.
+        self.control.stop();
         let _ = self.shutdown.send(true);
         self.pc.close();
     }
@@ -1398,21 +1444,32 @@ a=rtpmap:111 opus/48000/2\r\n";
     }
 
     #[tokio::test]
-    async fn prompt_and_guided_json_read_latest_updates() {
-        let session = WebRtcSession::new_for_tests();
-
-        session.update_prompt("describe safety events".to_string());
-        session.update_guided_json(Some(r#"{"type":"object"}"#.to_string()));
-
-        assert_eq!(&*session.read_prompt(), "describe safety events");
-        assert_eq!(
+    async fn prompt_and_guided_json_update_is_acknowledged_by_generation() {
+        let generation = crate::webrtc::runtime::PipelineGeneration::new(9);
+        let (session, mut commands) = WebRtcSession::new_for_tests_with_generation(generation);
+        let update = tokio::spawn(async move {
             session
-                .guided_json_arc()
-                .load_full()
-                .as_ref()
-                .map(|schema| schema.as_ref().as_ref()),
-            Some(r#"{"type":"object"}"#)
+                .update_config(
+                    "describe safety events".to_string(),
+                    Some(r#"{"type":"object"}"#.to_string()),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!update.is_finished());
+
+        let mut prompt: Arc<str> = Arc::from("");
+        let mut schema = None;
+        crate::webrtc::runtime::apply_pending_session_commands(
+            &mut commands,
+            generation,
+            &mut prompt,
+            &mut schema,
         );
+
+        assert_eq!(prompt.as_ref(), "describe safety events");
+        assert_eq!(schema.as_deref(), Some(r#"{"type":"object"}"#));
+        assert_eq!(update.await.unwrap(), Ok(()));
     }
 
     /// The stop decision must latch on the session shutdown flag regardless of

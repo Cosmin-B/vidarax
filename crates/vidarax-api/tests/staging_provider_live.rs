@@ -46,6 +46,8 @@ async fn staging_live_provider_e2e_opt_in() {
         cors_allowed_origins: vec![],
         stream_ttl_secs: 3600,
         active_stream_limit: 5,
+        media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+        media_worker_thread_budget: 64,
         transport: TransportMode::H1H2,
         decode_backend: "cpu-ffmpeg".to_string(),
         webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],

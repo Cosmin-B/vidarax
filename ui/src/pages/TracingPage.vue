@@ -4,6 +4,7 @@ import { RefreshCw, Activity, AlertCircle } from 'lucide-vue-next'
 import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
 import PipelineOverview from '@/components/tracing/PipelineOverview.vue'
 import MetricsGrid from '@/components/tracing/MetricsGrid.vue'
+import GenerationHealth from '@/components/tracing/GenerationHealth.vue'
 import { useMetrics } from '@/composables/useMetrics'
 
 // ─── Metrics polling ──────────────────────────────────────────────────────────
@@ -129,6 +130,10 @@ onMounted(() => {
 
     <!-- Main content -->
     <template v-else-if="metrics">
+
+      <section aria-label="Pipeline generation health">
+        <GenerationHealth :metrics="metrics" />
+      </section>
 
       <!-- 1. Pipeline Overview -->
       <section aria-label="Pipeline flow diagram">

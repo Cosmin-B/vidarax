@@ -6,7 +6,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use arc_swap::{ArcSwap, ArcSwapOption};
 use base64::Engine as _;
 
 use crate::coordinates::FrameCoordinates;
@@ -28,6 +27,10 @@ use crate::webrtc::decode::{
     FFMPEG_YUV_PENDING_POOL_ALLOWANCE, FFMPEG_YUV_READER_QUEUE_CAPACITY,
 };
 use crate::webrtc::recycle::{RecycledBytes, VecPool};
+use crate::webrtc::runtime::{
+    apply_pending_session_commands, PipelineGeneration, PipelineRuntime, PipelineStage,
+    PipelineStartError, SessionCommand, StageHandle, StageSpawnError,
+};
 use crate::webrtc::session::{RtpFrame, WebRtcConfig};
 use crate::webrtc::signals::{
     check_frame, crop_yuv, yuv_to_frame_signal_unchecked, yuv_to_jpeg_unchecked, CropPool,
@@ -209,8 +212,6 @@ pub struct KeyframeWork {
     ///
     /// Recycled buffer moved through VLM and storage without copying the payload.
     pub jpeg_bytes: RecycledBytes,
-    /// Semantic prompt to pass to the VLM.
-    pub prompt: Arc<str>,
     /// When `true` the analysis worker detected an active visual loop at the
     /// time this work item was queued.  VLM workers use this flag to skip
     /// inference entirely (the scene has not changed), avoiding redundant
@@ -300,7 +301,6 @@ fn build_clip_stream_frame_from_yuv(
 struct KeyframeContext<'a> {
     run_id: &'a Arc<str>,
     session_id: &'a Arc<str>,
-    prompt: &'a Arc<ArcSwap<Arc<str>>>,
     stdb: &'a Arc<dyn EventSink>,
     metrics: &'a PipelineMetrics,
 }
@@ -429,7 +429,6 @@ impl GateStreamState {
             novelty_score: meta.novelty_score,
             motion_score: meta.motion_score,
             jpeg_bytes,
-            prompt: Arc::clone(&*ctx.prompt.load_full()),
             loop_active: self.loop_active,
         })
     }
@@ -452,7 +451,6 @@ enum SinkState {
         stdb: Arc<dyn EventSink>,
         run_id: Arc<str>,
         session_id: Arc<str>,
-        prompt: Arc<ArcSwap<Arc<str>>>,
     },
     Stream {
         frame_tx: kanal::Sender<StreamFrame>,
@@ -537,6 +535,7 @@ pub struct DecodeWorkerParams {
     pub crop: Option<CropRegion>,
     pub metrics: Arc<PipelineMetrics>,
     pub session_span: tracing::Span,
+    pub stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Downstream wiring for a decode worker.
@@ -569,8 +568,6 @@ pub struct KeyframeSink {
     pub stdb: Arc<dyn EventSink>,
     pub run_id: Arc<str>,
     pub session_id: Arc<str>,
-    /// Live prompt handle, reloaded per keyframe.
-    pub prompt: Arc<ArcSwap<Arc<str>>>,
 }
 
 /// Spawn decode workers for one ordered media stream.
@@ -579,7 +576,7 @@ pub struct KeyframeSink {
 /// frame, and the decoder is rebuilt if a later session uses another codec on
 /// the same worker. `params.workers` is API-compatible only; parallelism is
 /// across sessions, not within one ordered stream.
-pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
+pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<StageHandle> {
     let DecodeWorkerParams {
         workers,
         gpu_available,
@@ -592,6 +589,7 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
         crop,
         metrics,
         session_span,
+        stopping,
     } = params;
     // One ordered stream is one stateful decoder, so this pool is always a single
     // thread; the requested count only scales parallelism across sessions.
@@ -609,14 +607,12 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
             stdb,
             run_id,
             session_id,
-            prompt,
         }) => SinkState::Keyframe {
             gate: GateStreamState::new(gate_config, loop_hamming_threshold, loop_repeat_threshold),
             vlm_tx,
             stdb,
             run_id,
             session_id,
-            prompt,
         },
         DecodeSink::Stream {
             frame_tx,
@@ -627,7 +623,7 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
         },
     };
 
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("vx-decode-0".to_string())
         .spawn(move || {
             use crate::webrtc::decode::VideoCodec;
@@ -648,7 +644,18 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
             // per-frame allocator, matching the JPEG pool above.
             let crop_pool = crop.map(|_| CropPool::new(output_pool_slots));
 
-            'rtp_frames: while let Ok(frame) = rtp_rx.recv() {
+            'rtp_frames: loop {
+                if stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                let frame = match rtp_rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                    Ok(frame) => frame,
+                    Err(kanal::ReceiveErrorTimeout::Timeout) => continue,
+                    Err(
+                        kanal::ReceiveErrorTimeout::Closed
+                        | kanal::ReceiveErrorTimeout::SendClosed,
+                    ) => break,
+                };
                 let _guard = session_span.enter();
                 metrics.inc_rtp_received();
                 let seq = frame.seq;
@@ -679,6 +686,7 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
                 let decode_start = std::time::Instant::now();
                 let yuv = match dec.decode(&frame.nals) {
                     Ok(yuv) => yuv,
+                    Err(DecodeError::Buffered) => continue 'rtp_frames,
                     Err(DecodeError::UnsupportedCodec(codec)) => {
                         tracing::error!(
                             ?codec,
@@ -686,7 +694,21 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
                         );
                         return;
                     }
-                    Err(_) => continue 'rtp_frames,
+                    Err(
+                        err @ (DecodeError::ReaderExited
+                        | DecodeError::WriteError(_)
+                        | DecodeError::FlushError(_)),
+                    ) => {
+                        // The native sidecar boundary is no longer usable.
+                        // Returning faults the whole supervised generation;
+                        // an individual stateful decoder is never restarted.
+                        tracing::error!(%err, "decoder sidecar failed");
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "dropping frame after recoverable decode error");
+                        continue 'rtp_frames;
+                    }
                 };
                 metrics
                     .decode_latency_us
@@ -748,7 +770,6 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
                         stdb,
                         run_id,
                         session_id,
-                        prompt,
                     } => {
                         // A frame whose planes don't match its dimensions can't be
                         // read safely, and its statistics would poison the temporal
@@ -769,7 +790,6 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
                         let ctx = KeyframeContext {
                             run_id,
                             session_id,
-                            prompt,
                             stdb,
                             metrics: &metrics,
                         };
@@ -838,7 +858,7 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<()> {
             }
         })?;
 
-    Ok(())
+    Ok(StageHandle::new(PipelineStage::Decode, handle))
 }
 
 // ─── Analysis workers ─────────────────────────────────────────────────────────
@@ -864,12 +884,12 @@ pub struct AnalysisWorkerParams {
     pub stdb: Arc<dyn EventSink>,
     pub run_id: Arc<str>,
     pub session_id: Arc<str>,
-    pub prompt: Arc<ArcSwap<Arc<str>>>,
     pub metrics: Arc<PipelineMetrics>,
     pub session_span: tracing::Span,
+    pub stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
-pub fn spawn_analysis_workers(params: AnalysisWorkerParams) -> std::io::Result<()> {
+pub fn spawn_analysis_workers(params: AnalysisWorkerParams) -> std::io::Result<Vec<StageHandle>> {
     let AnalysisWorkerParams {
         workers,
         gate_config,
@@ -880,22 +900,23 @@ pub fn spawn_analysis_workers(params: AnalysisWorkerParams) -> std::io::Result<(
         stdb,
         run_id,
         session_id,
-        prompt,
         metrics,
         session_span,
+        stopping,
     } = params;
+    let mut handles = Vec::with_capacity(per_stream_analysis_workers(workers));
     for i in 0..per_stream_analysis_workers(workers) {
         let frame_rx = frame_rx.clone();
         let clip_tx = clip_tx.clone();
         let stdb = Arc::clone(&stdb);
         let run_id = Arc::clone(&run_id);
         let session_id = Arc::clone(&session_id);
-        let prompt = Arc::clone(&prompt);
         let metrics = Arc::clone(&metrics);
         let session_span = session_span.clone();
         let gate_config = gate_config.clone();
+        let stopping = Arc::clone(&stopping);
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(format!("vx-analysis-{i}"))
             .spawn(move || {
                 let mut gate = GateStreamState::new(
@@ -904,13 +925,23 @@ pub fn spawn_analysis_workers(params: AnalysisWorkerParams) -> std::io::Result<(
                     loop_repeat_threshold,
                 );
 
-                while let Ok(sf) = frame_rx.recv() {
+                loop {
+                    if stopping.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let sf = match frame_rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                        Ok(frame) => frame,
+                        Err(kanal::ReceiveErrorTimeout::Timeout) => continue,
+                        Err(
+                            kanal::ReceiveErrorTimeout::Closed
+                            | kanal::ReceiveErrorTimeout::SendClosed,
+                        ) => break,
+                    };
                     let _guard = session_span.enter();
 
                     let ctx = KeyframeContext {
                         run_id: &run_id,
                         session_id: &session_id,
-                        prompt: &prompt,
                         stdb: &stdb,
                         metrics: &metrics,
                     };
@@ -930,9 +961,10 @@ pub fn spawn_analysis_workers(params: AnalysisWorkerParams) -> std::io::Result<(
                     let _ = clip_tx.try_send(sf);
                 }
             })?;
+        handles.push(StageHandle::new(PipelineStage::Analysis, handle));
     }
 
-    Ok(())
+    Ok(handles)
 }
 
 // ─── VLM workers ──────────────────────────────────────────────────────────────
@@ -1072,10 +1104,12 @@ where
     pub provider: Arc<I>,
     pub run_id: Arc<str>,
     pub session_id: Arc<str>,
-    /// Live prompt handle; VLM workers reload it per keyframe.
-    pub prompt: Arc<ArcSwap<Arc<str>>>,
-    /// Optional guided-JSON schema handle.
-    pub guided_json: Arc<ArcSwapOption<Arc<str>>>,
+    /// Initial generation-owned inference configuration.
+    pub initial_prompt: Arc<str>,
+    pub initial_guided_json: Option<Arc<str>>,
+    pub generation: PipelineGeneration,
+    pub commands: tokio::sync::mpsc::Receiver<SessionCommand>,
+    pub stopping: Arc<std::sync::atomic::AtomicBool>,
     pub vlm_config: TieredVlmConfig,
     pub novelty: LiveNoveltyConfig,
     /// When set, run the stream in clip mode instead of the keyframe path.
@@ -1093,9 +1127,12 @@ where
 ///
 /// Decode workers always run. When `wiring.clip_config` is set the stream runs
 /// in clip mode (analysis to clip accumulator to clip VLM); otherwise it runs
-/// the keyframe path (analysis to VLM). Every worker thread is detached and
-/// shuts down when its upstream channel closes.
-pub fn spawn_pipeline<I>(cfg: &WorkerPoolConfig, wiring: PipelineWiring<I>) -> std::io::Result<()>
+/// the keyframe path (analysis to VLM). The returned runtime owns every stage
+/// handle; its supervisor stops and bounded-joins the generation as one unit.
+pub fn spawn_pipeline<I>(
+    cfg: &WorkerPoolConfig,
+    wiring: PipelineWiring<I>,
+) -> Result<PipelineRuntime, PipelineStartError>
 where
     I: InferenceProvider + 'static,
 {
@@ -1109,8 +1146,11 @@ where
         provider,
         run_id,
         session_id,
-        prompt,
-        guided_json,
+        initial_prompt,
+        initial_guided_json,
+        generation,
+        commands,
+        stopping,
         vlm_config,
         novelty,
         clip_config,
@@ -1122,96 +1162,153 @@ where
 
     let output_pool_slots = decode_output_pool_slots(cfg.gpu_available, codec);
     let jpeg_pool_slots = jpeg_pool_slots(cfg.analysis_workers, cfg.vlm_workers);
+    let mut runtime = PipelineRuntime::new(generation, Arc::clone(&stopping));
+
+    macro_rules! start_one {
+        ($stage:expr, $result:expr) => {
+            match $result {
+                Ok(worker) => runtime.push(worker),
+                Err(source) => {
+                    let join_deadline = runtime.abort_startup(std::time::Duration::from_secs(5));
+                    return Err(PipelineStartError::new($stage, source, join_deadline));
+                }
+            }
+        };
+    }
+
+    macro_rules! start_many {
+        ($stage:expr, $result:expr) => {
+            match $result {
+                Ok(workers) => runtime.extend(workers),
+                Err(source) => {
+                    let join_deadline = runtime.abort_startup(std::time::Duration::from_secs(5));
+                    return Err(PipelineStartError::new($stage, source, join_deadline));
+                }
+            }
+        };
+    }
+
+    macro_rules! start_tagged_many {
+        ($result:expr) => {
+            match $result {
+                Ok(workers) => runtime.extend(workers),
+                Err(error) => {
+                    let (stage, source) = error.into_parts();
+                    let join_deadline = runtime.abort_startup(std::time::Duration::from_secs(5));
+                    return Err(PipelineStartError::new(stage, source, join_deadline));
+                }
+            }
+        };
+    }
 
     if let Some(clip_config) = clip_config {
         // Clip mode: the decoder samples before encoding, the analysis worker
         // runs loop detection, and the accumulator builds clip windows.
-        spawn_decode_workers(DecodeWorkerParams {
-            workers: cfg.decode_workers,
-            gpu_available: cfg.gpu_available,
-            decode_width: cfg.decode_width,
-            decode_height: cfg.decode_height,
-            output_pool_slots,
-            jpeg_pool_slots,
-            rtp_rx,
-            sink: DecodeSink::Stream {
-                frame_tx: stream_tx,
-                clip_config: clip_config.clone(),
-            },
-            crop: cfg.crop,
-            metrics: Arc::clone(&metrics),
-            session_span: session_span.clone(),
-        })?;
+        start_one!(
+            PipelineStage::Decode,
+            spawn_decode_workers(DecodeWorkerParams {
+                workers: cfg.decode_workers,
+                gpu_available: cfg.gpu_available,
+                decode_width: cfg.decode_width,
+                decode_height: cfg.decode_height,
+                output_pool_slots,
+                jpeg_pool_slots,
+                rtp_rx,
+                sink: DecodeSink::Stream {
+                    frame_tx: stream_tx,
+                    clip_config: clip_config.clone(),
+                },
+                crop: cfg.crop,
+                metrics: Arc::clone(&metrics),
+                session_span: session_span.clone(),
+                stopping: Arc::clone(&stopping),
+            })
+        );
 
         let (clip_frame_tx, clip_frame_rx) =
             kanal::bounded::<StreamFrame>(CLIP_FRAME_QUEUE_CAPACITY);
         let (clip_tx, clip_rx) = kanal::bounded::<ClipWork>(CLIP_WORK_QUEUE_CAPACITY);
 
-        spawn_analysis_workers(AnalysisWorkerParams {
-            workers: cfg.analysis_workers,
-            gate_config: cfg.gate_config.clone(),
-            loop_hamming_threshold: cfg.loop_hamming_threshold,
-            loop_repeat_threshold: cfg.loop_repeat_threshold,
-            frame_rx: stream_rx,
-            clip_tx: clip_frame_tx,
-            stdb: Arc::clone(&event_sink),
-            run_id: Arc::clone(&run_id),
-            session_id: Arc::clone(&session_id),
-            prompt: Arc::clone(&prompt),
-            metrics: Arc::clone(&metrics),
-            session_span: session_span.clone(),
-        })?;
-        spawn_clip_accumulator(
-            clip_frame_rx,
-            clip_tx,
-            clip_config,
-            Arc::clone(&run_id),
-            Arc::clone(&session_id),
-            // load_full yields Arc<Arc<str>>; deref once so the accumulator gets the inner Arc<str>.
-            Arc::clone(&*prompt.load_full()),
-            session_span.clone(),
-        )?;
-        spawn_clip_vlm_workers(
-            cfg.vlm_workers,
-            clip_rx,
-            provider,
-            event_sink,
-            vlm_config,
-            metrics,
-            session_span,
-            cfg.max_output_tokens_per_second,
-            guided_json,
-            observer,
-        )?;
+        start_many!(
+            PipelineStage::Analysis,
+            spawn_analysis_workers(AnalysisWorkerParams {
+                workers: cfg.analysis_workers,
+                gate_config: cfg.gate_config.clone(),
+                loop_hamming_threshold: cfg.loop_hamming_threshold,
+                loop_repeat_threshold: cfg.loop_repeat_threshold,
+                frame_rx: stream_rx,
+                clip_tx: clip_frame_tx,
+                stdb: Arc::clone(&event_sink),
+                run_id: Arc::clone(&run_id),
+                session_id: Arc::clone(&session_id),
+                metrics: Arc::clone(&metrics),
+                session_span: session_span.clone(),
+                stopping: Arc::clone(&stopping),
+            })
+        );
+        start_one!(
+            PipelineStage::ClipAccumulator,
+            spawn_clip_accumulator(
+                clip_frame_rx,
+                clip_tx,
+                clip_config,
+                Arc::clone(&run_id),
+                Arc::clone(&session_id),
+                session_span.clone(),
+                Arc::clone(&stopping),
+            )
+        );
+        start_many!(
+            PipelineStage::Vlm,
+            spawn_clip_vlm_workers(
+                cfg.vlm_workers,
+                clip_rx,
+                provider,
+                event_sink,
+                vlm_config,
+                metrics,
+                session_span,
+                cfg.max_output_tokens_per_second,
+                initial_prompt,
+                initial_guided_json,
+                generation,
+                commands,
+                Arc::clone(&stopping),
+                observer,
+            )
+        );
     } else {
         // Keyframe mode: the gate runs inline in the decoder, so a JPEG is
         // encoded only for the frames it keeps and handed straight to the VLM
         // workers. There is no separate analysis stage, and the `stream_tx` /
         // `stream_rx` channel the caller allocated goes unused here.
-        spawn_decode_workers(DecodeWorkerParams {
-            workers: cfg.decode_workers,
-            gpu_available: cfg.gpu_available,
-            decode_width: cfg.decode_width,
-            decode_height: cfg.decode_height,
-            output_pool_slots,
-            jpeg_pool_slots,
-            rtp_rx,
-            sink: DecodeSink::Keyframe(KeyframeSink {
-                gate_config: cfg.gate_config.clone(),
-                loop_hamming_threshold: cfg.loop_hamming_threshold,
-                loop_repeat_threshold: cfg.loop_repeat_threshold,
-                vlm_tx,
-                stdb: Arc::clone(&event_sink),
-                run_id,
-                session_id,
-                prompt,
-            }),
-            crop: cfg.crop,
-            metrics: Arc::clone(&metrics),
-            session_span: session_span.clone(),
-        })?;
+        start_one!(
+            PipelineStage::Decode,
+            spawn_decode_workers(DecodeWorkerParams {
+                workers: cfg.decode_workers,
+                gpu_available: cfg.gpu_available,
+                decode_width: cfg.decode_width,
+                decode_height: cfg.decode_height,
+                output_pool_slots,
+                jpeg_pool_slots,
+                rtp_rx,
+                sink: DecodeSink::Keyframe(KeyframeSink {
+                    gate_config: cfg.gate_config.clone(),
+                    loop_hamming_threshold: cfg.loop_hamming_threshold,
+                    loop_repeat_threshold: cfg.loop_repeat_threshold,
+                    vlm_tx,
+                    stdb: Arc::clone(&event_sink),
+                    run_id,
+                    session_id,
+                }),
+                crop: cfg.crop,
+                metrics: Arc::clone(&metrics),
+                session_span: session_span.clone(),
+                stopping: Arc::clone(&stopping),
+            })
+        );
         let _ = (stream_tx, stream_rx);
-        spawn_vlm_workers(VlmWorkerParams {
+        start_tagged_many!(spawn_vlm_workers(VlmWorkerParams {
             workers: cfg.vlm_workers,
             vlm_rx,
             provider,
@@ -1220,13 +1317,18 @@ where
             metrics,
             session_span,
             max_output_tokens_per_second: cfg.max_output_tokens_per_second,
-            guided_json,
+            initial_prompt,
+            initial_guided_json,
+            generation,
+            commands,
+            stopping: Arc::clone(&stopping),
             novelty,
             observer,
-        })?;
+        }));
     }
 
-    Ok(())
+    runtime.mark_healthy();
+    Ok(runtime)
 }
 
 pub struct VlmWorkerParams<I>
@@ -1241,7 +1343,11 @@ where
     pub metrics: Arc<PipelineMetrics>,
     pub session_span: tracing::Span,
     pub max_output_tokens_per_second: u32,
-    pub guided_json: Arc<ArcSwapOption<Arc<str>>>,
+    pub initial_prompt: Arc<str>,
+    pub initial_guided_json: Option<Arc<str>>,
+    pub generation: PipelineGeneration,
+    pub commands: tokio::sync::mpsc::Receiver<SessionCommand>,
+    pub stopping: Arc<std::sync::atomic::AtomicBool>,
     pub novelty: LiveNoveltyConfig,
     /// Where tiered VLM inference outcomes are recorded for `/metrics`. `None`
     /// when the caller has no metrics sink wired up (e.g. tests).
@@ -1283,7 +1389,7 @@ pub(super) fn token_budget_entry<'a>(
 /// order.  The worker count is therefore clamped to one per stream.  Future VLM
 /// parallelism must be stateless or explicitly batched, not racing workers with
 /// independent temporal context.
-pub fn spawn_vlm_workers<I>(params: VlmWorkerParams<I>) -> std::io::Result<()>
+pub fn spawn_vlm_workers<I>(params: VlmWorkerParams<I>) -> Result<Vec<StageHandle>, StageSpawnError>
 where
     I: InferenceProvider + 'static,
 {
@@ -1296,7 +1402,11 @@ where
         metrics,
         session_span,
         max_output_tokens_per_second,
-        guided_json,
+        initial_prompt,
+        initial_guided_json,
+        generation,
+        commands,
+        stopping,
         novelty,
         observer,
     } = params;
@@ -1309,76 +1419,95 @@ where
     let writer_metrics = Arc::clone(&metrics);
 
     // Dedicated writer thread: drains the FIFO and calls blocking sink methods.
-    std::thread::Builder::new()
+    let writer_stopping = Arc::clone(&stopping);
+    let writer_handle = std::thread::Builder::new()
         .name("vx-event-writer".to_string())
-        .spawn(move || {
-            while let Ok(event) = event_rx.recv() {
-                let emit_start = std::time::Instant::now();
-                match event {
-                    SinkEvent::Emit {
-                        run_id,
-                        session_id,
+        .spawn(move || loop {
+            if writer_stopping.load(Ordering::Acquire) {
+                break;
+            }
+            let event = match event_rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                Ok(event) => event,
+                Err(kanal::ReceiveErrorTimeout::Timeout) => continue,
+                Err(
+                    kanal::ReceiveErrorTimeout::Closed | kanal::ReceiveErrorTimeout::SendClosed,
+                ) => break,
+            };
+            let emit_start = std::time::Instant::now();
+            match event {
+                SinkEvent::Emit {
+                    run_id,
+                    session_id,
+                    frame_index,
+                    pts_ms,
+                    coordinates,
+                    event_type,
+                    confidence,
+                    description,
+                } => {
+                    let _ = stdb.emit_event_sync(
+                        &run_id,
+                        &session_id,
                         frame_index,
                         pts_ms,
                         coordinates,
                         event_type,
                         confidence,
-                        description,
-                    } => {
-                        let _ = stdb.emit_event_sync(
-                            &run_id,
-                            &session_id,
-                            frame_index,
-                            pts_ms,
-                            coordinates,
-                            event_type,
-                            confidence,
-                            &description,
-                        );
-                    }
-                    SinkEvent::StoreKeyframe {
-                        run_id,
+                        &description,
+                    );
+                }
+                SinkEvent::StoreKeyframe {
+                    run_id,
+                    frame_index,
+                    pts_ms,
+                    coordinates,
+                    event_type,
+                    description,
+                    jpeg_bytes,
+                    ..
+                } => {
+                    let _ = stdb.store_keyframe_sync(KeyframeEvent {
+                        run_id: &run_id,
                         frame_index,
                         pts_ms,
                         coordinates,
                         event_type,
-                        description,
-                        jpeg_bytes,
-                        ..
-                    } => {
-                        let _ = stdb.store_keyframe_sync(KeyframeEvent {
-                            run_id: &run_id,
-                            frame_index,
-                            pts_ms,
-                            coordinates,
-                            event_type,
-                            description: &description,
-                            jpeg_data: &jpeg_bytes,
-                        });
-                    }
+                        description: &description,
+                        jpeg_data: &jpeg_bytes,
+                    });
                 }
-                let emit_ms = emit_start.elapsed().as_millis() as u64;
-                writer_metrics.stdb_emit_latency_ms.record(emit_ms);
             }
-        })?;
+            let emit_ms = emit_start.elapsed().as_millis() as u64;
+            writer_metrics.stdb_emit_latency_ms.record(emit_ms);
+        })
+        .map_err(|source| StageSpawnError::new(PipelineStage::EventWriter, source))?;
+    let mut handles = vec![StageHandle::new(PipelineStage::EventWriter, writer_handle)];
 
     let jpeg_sink_backlog = JpegSinkBacklog::new();
 
+    debug_assert_eq!(per_stream_vlm_workers(workers), 1);
+    let mut commands = Some(commands);
     for i in 0..per_stream_vlm_workers(workers) {
         let vlm_rx = vlm_rx.clone();
         let provider = Arc::clone(&provider);
-        let event_tx = event_tx.clone();
+        let event_tx_for_worker = event_tx.clone();
         let jpeg_sink_backlog = jpeg_sink_backlog.clone();
         let config = config.clone();
         let metrics = Arc::clone(&metrics);
         let session_span = session_span.clone();
-        let guided_json = Arc::clone(&guided_json);
+        let mut prompt = Arc::clone(&initial_prompt);
+        let mut guided_json = initial_guided_json.clone();
+        let mut commands = commands
+            .take()
+            .expect("one command receiver belongs to one VLM worker");
         let observer = observer.clone();
         let novelty = novelty.clone();
+        let worker_stopping = Arc::clone(&stopping);
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(format!("vx-vlm-{i}"))
             .spawn(move || {
+                let event_tx = event_tx_for_worker;
                 // Per-session token budget: (window_start, tokens_emitted_in_window).
                 // Cloning Arc<str> only updates a refcount; Hash/Eq compare string content.
                 let mut token_budget: std::collections::HashMap<
@@ -1431,7 +1560,24 @@ where
                 let mut jpeg_b64 = String::new();
                 let mut input_images: Vec<InferenceImage> = Vec::with_capacity(1);
 
-                while let Ok(work) = vlm_rx.recv() {
+                loop {
+                    if worker_stopping.load(Ordering::Acquire) {
+                        break;
+                    }
+                    apply_pending_session_commands(
+                        &mut commands,
+                        generation,
+                        &mut prompt,
+                        &mut guided_json,
+                    );
+                    let work = match vlm_rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                        Ok(work) => work,
+                        Err(kanal::ReceiveErrorTimeout::Timeout) => continue,
+                        Err(
+                            kanal::ReceiveErrorTimeout::Closed
+                            | kanal::ReceiveErrorTimeout::SendClosed,
+                        ) => break,
+                    };
                     let _guard = session_span.enter();
 
                     // The analysis worker already fired `loop_detected`; skip
@@ -1502,13 +1648,13 @@ where
 
                     // State diffs are computed server-side below, so the
                     // default prompt only asks for a scene description.
-                    let prompt: Arc<str> = if work.prompt.is_empty() {
+                    let effective_prompt: Arc<str> = if prompt.is_empty() {
                         Arc::clone(&default_prompt)
                     } else {
-                        Arc::clone(&work.prompt)
+                        Arc::clone(&prompt)
                     };
 
-                    let base_prompt: &str = &prompt;
+                    let base_prompt: &str = &effective_prompt;
 
                     prompt_buf.clear();
                     if last_description.is_empty() {
@@ -1530,9 +1676,6 @@ where
                     // First-pass VLM with optional second-pass escalation.
                     let vlm_start = std::time::Instant::now();
                     let inference_outcome = {
-                        // Snapshot the current guided_json schema once per inference.
-                        let current_guided_json: Option<Arc<str>> =
-                            guided_json.load_full().map(|schema| Arc::clone(&*schema));
                         let prompt_arc: Arc<str> = Arc::from(prompt_buf.as_str());
                         let mut request_images = std::mem::take(&mut input_images);
                         if request_images.is_empty() {
@@ -1555,7 +1698,7 @@ where
                             temperature: 0.0,
                             timeout_ms: 5_000,
                             allow_fallback: true,
-                            guided_json: current_guided_json,
+                            guided_json: guided_json.clone(),
                         };
 
                         let tiered_call_start = std::time::Instant::now();
@@ -1712,10 +1855,22 @@ where
                 }
                 // event_tx clone is dropped here; once all worker clones drop,
                 // the outer event_tx also drops, closing the writer channel.
-            })?;
+            });
+        let handle = match handle {
+            Ok(handle) => handle,
+            Err(source) => {
+                stopping.store(true, Ordering::Release);
+                drop(event_tx);
+                for worker in handles {
+                    worker.join();
+                }
+                return Err(StageSpawnError::new(PipelineStage::Vlm, source));
+            }
+        };
+        handles.push(StageHandle::new(PipelineStage::Vlm, handle));
     }
 
-    Ok(())
+    Ok(handles)
 }
 
 // ─── VLM worker helpers ────────────────────────────────────────────────────────
@@ -1853,9 +2008,10 @@ mod tests {
     use crate::gate::FrameSignal;
     use crate::webrtc::clip::ClipRateGate;
     use crate::webrtc::clip::MAX_CLIP_FRAMES_PER_REQUEST;
+    #[cfg(feature = "vp8")]
+    use crate::webrtc::decode::SOFTWARE_YUV_POOL_MIN_SLOTS;
     use crate::webrtc::decode::{
         VideoCodec, YuvFrame, FFMPEG_YUV_PENDING_POOL_ALLOWANCE, FFMPEG_YUV_READER_POOL_MIN_SLOTS,
-        SOFTWARE_YUV_POOL_MIN_SLOTS,
     };
     use crate::webrtc::recycle::VecPool;
     use std::collections::HashMap;
@@ -1946,7 +2102,6 @@ mod tests {
             novelty_score: 0.8,
             motion_score: 0.5,
             jpeg_bytes: [0xFF_u8, 0xD8, 0xFF, 0xD9].into(),
-            prompt: Arc::from(""),
             loop_active: false,
         };
         let _ = kw.clone();
@@ -2033,12 +2188,11 @@ mod tests {
     }
 
     #[test]
-    fn decode_output_pool_is_small_for_synchronous_openh264() {
+    fn decode_output_pool_uses_ffmpeg_for_cpu_h264() {
         assert_eq!(
             decode_output_pool_slots(false, VideoCodec::H264),
-            SOFTWARE_YUV_POOL_MIN_SLOTS
+            FFMPEG_YUV_READER_POOL_MIN_SLOTS
         );
-        const _: () = assert!(SOFTWARE_YUV_POOL_MIN_SLOTS < FFMPEG_YUV_READER_POOL_MIN_SLOTS);
     }
 
     #[test]
@@ -2273,53 +2427,8 @@ mod tests {
     }
 
     #[test]
-    fn gate_stream_state_loads_latest_prompt_for_keyframes() {
-        let sink = MockSink::new();
-        let prompt = Arc::new(arc_swap::ArcSwap::from(Arc::new(Arc::from(""))));
-        let metrics = crate::metrics::PipelineMetrics::new();
-        let stdb = sink as Arc<dyn EventSink>;
-        let run_id: Arc<str> = "run-test".into();
-        let session_id: Arc<str> = "sess-test".into();
-        let mut gate = GateStreamState::new(crate::gate::GateConfig::default(), 6, 3);
-        let ctx = KeyframeContext {
-            run_id: &run_id,
-            session_id: &session_id,
-            prompt: &prompt,
-            stdb: &stdb,
-            metrics: &metrics,
-        };
-
-        let first = gate
-            .on_frame(
-                make_stream_frame(0).signal,
-                0,
-                FrameCoordinates::full_frame(640, 480),
-                &ctx,
-                || Some([0xff_u8, 0xd8, 0xff, 0xd9].into()),
-            )
-            .expect("initial keyframe work");
-        assert_eq!(&*first.prompt, "");
-
-        prompt.store(Arc::new(Arc::from("describe updated prompt")));
-
-        let mut scene_cut = make_stream_frame(1);
-        scene_cut.signal.perceptual_hash = !scene_cut.signal.perceptual_hash;
-        let second = gate
-            .on_frame(
-                scene_cut.signal,
-                scene_cut.pts_ms,
-                scene_cut.coordinates,
-                &ctx,
-                || Some([0xff_u8, 0xd8, 0xff, 0xd9].into()),
-            )
-            .expect("scene-cut keyframe work");
-        assert_eq!(&*second.prompt, "describe updated prompt");
-    }
-
-    #[test]
     fn failed_keyframe_encode_does_not_commit_gate_reference() {
         let sink = MockSink::new();
-        let prompt = Arc::new(arc_swap::ArcSwap::from(Arc::new(Arc::from(""))));
         let metrics = crate::metrics::PipelineMetrics::new();
         let stdb = sink as Arc<dyn EventSink>;
         let run_id: Arc<str> = "run-test".into();
@@ -2328,7 +2437,6 @@ mod tests {
         let ctx = KeyframeContext {
             run_id: &run_id,
             session_id: &session_id,
-            prompt: &prompt,
             stdb: &stdb,
             metrics: &metrics,
         };

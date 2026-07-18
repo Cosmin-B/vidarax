@@ -40,6 +40,8 @@ use vidarax_core::provider::{
     ProviderKind, TokenUsage,
 };
 use vidarax_core::webrtc::clip::ClipConfig as CoreClipConfig;
+use vidarax_core::webrtc::resources::MediaSessionResources;
+use vidarax_core::webrtc::runtime::SessionCommand;
 use vidarax_core::webrtc::session::{
     PeerConnectionState, WebRtcSession, WebRtcSetupError, RTP_FRAME_QUEUE_CAPACITY,
 };
@@ -179,9 +181,15 @@ pub async fn whip_offer(
     };
 
     // Create the rustrtc PeerConnection and negotiate the SDP answer.
-    let (mut session, answer_sdp) = match WebRtcSession::new(offer_sdp, state.webrtc_config()).await
+    let generation = state.next_pipeline_generation();
+    let (mut session, answer_sdp, commands) = match WebRtcSession::new_with_generation(
+        offer_sdp,
+        state.webrtc_config(),
+        generation,
+    )
+    .await
     {
-        Ok(pair) => pair,
+        Ok(parts) => parts,
         Err(e) => {
             tracing::warn!("WHIP offer negotiation failed: {e}");
             let (status, body) = whip_setup_error_response(&e);
@@ -194,7 +202,15 @@ pub async fn whip_offer(
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
 
-    start_whip_session(state, headers, Arc::new(session), answer_sdp, clip_config).await
+    start_whip_session(
+        state,
+        headers,
+        Arc::new(session),
+        answer_sdp,
+        clip_config,
+        commands,
+    )
+    .await
 }
 
 async fn start_whip_session(
@@ -203,6 +219,7 @@ async fn start_whip_session(
     session: Arc<WebRtcSession>,
     answer_sdp: String,
     clip_config: Option<CoreClipConfig>,
+    commands: tokio::sync::mpsc::Receiver<SessionCommand>,
 ) -> Response {
     let sess_id = new_session_id();
     let principal = state.security_policy().principal_key_from_headers(&headers);
@@ -225,6 +242,7 @@ async fn start_whip_session(
         session,
         answer_sdp,
         clip_config,
+        commands,
     ));
 
     // The transaction is detached deliberately: WAL append plus session insert
@@ -299,6 +317,7 @@ async fn start_whip_session_transaction(
     session: Arc<WebRtcSession>,
     answer_sdp: String,
     clip_config: Option<CoreClipConfig>,
+    commands: tokio::sync::mpsc::Receiver<SessionCommand>,
 ) -> Result<WhipSessionStarted, WhipSessionStartError> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -313,6 +332,32 @@ async fn start_whip_session_transaction(
             return Err(WhipSessionStartError {
                 status: StatusCode::CONFLICT,
                 message: "active stream limit exceeded",
+            });
+        }
+    };
+
+    let mut admission_pool_config = WorkerPoolConfig::from(state.webrtc_config());
+    admission_pool_config.max_output_tokens_per_second = session.max_output_tokens_per_second;
+    admission_pool_config.crop = session.crop;
+    let media_resources = MediaSessionResources::for_pipeline(
+        &admission_pool_config,
+        session.codec,
+        clip_config.is_some(),
+    );
+    let media_reservation = match state.try_reserve_media_resources(media_resources) {
+        Some(reservation) => reservation,
+        None => {
+            tracing::warn!(
+                session_id = %sess_id,
+                generation = session.generation().get(),
+                requested_bytes = media_resources.reserved_bytes,
+                requested_worker_threads = media_resources.worker_threads,
+                "WHIP media capacity reservation rejected"
+            );
+            session.close();
+            return Err(WhipSessionStartError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "media process capacity exhausted",
             });
         }
     };
@@ -339,11 +384,12 @@ async fn start_whip_session_transaction(
     // The guard can overlap briefly with the committed run; that only rejects
     // a racing creator early, never admits one beyond the cap.
     // Store the session bound to the requesting principal.
-    if !state.insert_session(
+    if !state.insert_session_with_media_reservation(
         sess_id.clone(),
         principal.clone(),
         Arc::clone(&run_id),
         Arc::clone(&session),
+        media_reservation,
     ) {
         // Collision or global session limit reached.
         tracing::error!("WHIP session insert failed for {sess_id} (collision or limit)");
@@ -433,6 +479,7 @@ async fn start_whip_session_transaction(
     let event_sink_for_workers = Arc::clone(&event_sink);
     let session_span_for_workers = session_span.clone();
     let metrics_for_workers = Arc::clone(&metrics_arc);
+    let metrics_for_supervisor = Arc::clone(&metrics_arc);
     let vlm_config_for_workers = vlm_config.clone();
     let novelty_for_workers = state.novelty_config().clone();
     // Same InferenceMetrics instance /metrics reads from, handed to the
@@ -442,11 +489,10 @@ async fn start_whip_session_transaction(
         Some(Arc::clone(state.inference_metrics_arc()) as Arc<dyn InferenceObserver>);
     let provider = state.admitted_provider(&principal);
     let clip_config_for_workers = clip_config;
-    // Share the session's guided_json handle with VLM workers so that
-    // PATCH /prompt with output_schema takes effect on the next keyframe
-    // without restarting the worker threads.
-    let prompt_for_workers = session.prompt_arc();
-    let guided_json_for_workers = session.guided_json_arc();
+    let initial_prompt = session.initial_prompt();
+    let initial_guided_json = session.initial_guided_json();
+    let generation = session.generation();
+    let stopping = session.stopping_flag();
 
     // Worker threads are long-running OS threads (not tokio tasks).
     // Use spawn_blocking as a bridge from async context to the thread spawns;
@@ -468,7 +514,7 @@ async fn start_whip_session_transaction(
         pool_config.max_output_tokens_per_second = max_output_tokens_per_second;
         pool_config.crop = session_crop;
 
-        if let Err(err) = spawn_pipeline(
+        match spawn_pipeline(
             &pool_config,
             PipelineWiring {
                 rtp_rx: frame_rx,
@@ -480,8 +526,11 @@ async fn start_whip_session_transaction(
                 provider: Arc::new(vlm_provider),
                 run_id: run_id_for_workers,
                 session_id: session_id_for_workers,
-                prompt: prompt_for_workers,
-                guided_json: guided_json_for_workers,
+                initial_prompt,
+                initial_guided_json,
+                generation,
+                commands,
+                stopping,
                 vlm_config: vlm_config_for_workers,
                 novelty: novelty_for_workers,
                 clip_config: clip_config_for_workers,
@@ -491,17 +540,46 @@ async fn start_whip_session_transaction(
                 observer: observer_for_workers,
             },
         ) {
-            // A worker thread failed to spawn, e.g. OS thread-resource
-            // exhaustion (EAGAIN). The offer was already answered, so the
-            // client sees a live session, but its media pipeline is incomplete
-            // and will never produce events. Close the session so the reclaimer
-            // removes it and tombstones the run, instead of leaving a zombie.
-            tracing::error!(
-                session_id = %session_id_for_log,
-                error = %err,
-                "WHIP media pipeline failed to start; closing session"
-            );
-            session.close();
+            Ok(runtime) => {
+                let generation = runtime.generation().get();
+                metrics_for_supervisor.pipeline_generation_started();
+                tracing::info!(
+                    session_id = %session_id_for_log,
+                    generation,
+                    workers = runtime.worker_count(),
+                    "WHIP media pipeline generation started"
+                );
+                let outcome = runtime.supervise(Duration::from_secs(5), |fault| {
+                    tracing::error!(
+                        session_id = %session_id_for_log,
+                        generation,
+                        stage = fault.stage.as_str(),
+                        reason = ?fault.reason,
+                        "WHIP media pipeline generation faulted"
+                    );
+                    session.close();
+                });
+                metrics_for_supervisor.pipeline_generation_stopped(outcome);
+                tracing::info!(
+                    session_id = %session_id_for_log,
+                    generation,
+                    outcome = ?outcome,
+                    "WHIP media pipeline generation stopped"
+                );
+            }
+            Err(err) => {
+                metrics_for_supervisor.record_pipeline_start_failure(err.fault, err.join_deadline);
+                // A worker thread failed to spawn, e.g. OS thread-resource
+                // exhaustion (EAGAIN). Close the peer so the reclaimer removes
+                // the visible session and tombstones its run.
+                tracing::error!(
+                    session_id = %session_id_for_log,
+                    stage = err.fault.stage.as_str(),
+                    error = %err,
+                    "WHIP media pipeline failed to start; closing session"
+                );
+                session.close();
+            }
         }
     });
 
@@ -543,7 +621,7 @@ fn apply_attach_config(
     };
 
     if let Some(prompt) = config.prompt {
-        session.update_prompt(prompt);
+        session.set_initial_prompt(prompt);
     }
     if let Some(max) = config.max_output_tokens_per_second {
         session.max_output_tokens_per_second = max;
@@ -971,8 +1049,21 @@ pub async fn whip_update_prompt(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    session.update_prompt(body.prompt.clone());
-    session.update_guided_json(body.output_schema.as_ref().map(Value::to_string));
+    let update = session.update_config(
+        body.prompt.clone(),
+        body.output_schema.as_ref().map(Value::to_string),
+    );
+    match tokio::time::timeout(Duration::from_secs(2), update).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::warn!(sess_id = %sess_id, error = %err, "WHIP prompt update rejected");
+            return StatusCode::CONFLICT.into_response();
+        }
+        Err(_) => {
+            tracing::warn!(sess_id = %sess_id, "WHIP prompt update acknowledgement timed out");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
     tracing::info!(
         sess_id = %sess_id,
         has_schema = body.output_schema.is_some(),
@@ -1011,6 +1102,16 @@ mod tests {
 
     use crate::security::SecurityPolicy;
     use crate::state::AppState;
+
+    fn test_pipeline_session() -> (
+        Arc<WebRtcSession>,
+        tokio::sync::mpsc::Receiver<vidarax_core::webrtc::runtime::SessionCommand>,
+    ) {
+        let (session, commands) = WebRtcSession::new_for_tests_with_generation(
+            vidarax_core::webrtc::runtime::PipelineGeneration::new(1),
+        );
+        (Arc::new(session), commands)
+    }
 
     #[test]
     fn whip_setup_error_response_classifies_client_vs_server() {
@@ -1084,7 +1185,7 @@ mod tests {
         let clip = apply_attach_config(&mut session, config).unwrap();
 
         assert!(clip.is_none());
-        assert_eq!(session.read_prompt().as_ref(), prompt);
+        assert_eq!(session.initial_prompt().as_ref(), prompt);
     }
 
     #[test]
@@ -1104,7 +1205,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let state = AppState::with_wal_for_tests(dir.join("timeline.wal"));
         state.set_timeline_append_failure_for_tests(true);
-        let session = Arc::new(WebRtcSession::new_for_tests());
+        let (session, commands) = test_pipeline_session();
 
         let response = start_whip_session(
             state.clone(),
@@ -1112,6 +1213,7 @@ mod tests {
             Arc::clone(&session),
             "v=0\r\n".to_string(),
             None,
+            commands,
         )
         .await;
 
@@ -1127,7 +1229,7 @@ mod tests {
             "vidarax-whip-run-header-{}.wal",
             std::process::id()
         )));
-        let session = Arc::new(WebRtcSession::new_for_tests());
+        let (session, commands) = test_pipeline_session();
 
         let response = start_whip_session(
             state,
@@ -1135,6 +1237,7 @@ mod tests {
             Arc::clone(&session),
             "v=0\r\n".to_string(),
             None,
+            commands,
         )
         .await;
         session.close();
@@ -1163,13 +1266,14 @@ mod tests {
         let mut sessions = Vec::new();
 
         for _ in 0..state.active_stream_limit() {
-            let session = Arc::new(WebRtcSession::new_for_tests());
+            let (session, commands) = test_pipeline_session();
             let response = start_whip_session(
                 state.clone(),
                 HeaderMap::new(),
                 Arc::clone(&session),
                 "v=0\r\n".to_string(),
                 None,
+                commands,
             )
             .await;
             assert_eq!(response.status(), StatusCode::CREATED);
@@ -1186,13 +1290,14 @@ mod tests {
             2
         );
 
-        let rejected_session = Arc::new(WebRtcSession::new_for_tests());
+        let (rejected_session, commands) = test_pipeline_session();
         let response = start_whip_session(
             state.clone(),
             HeaderMap::new(),
             Arc::clone(&rejected_session),
             "v=0\r\n".to_string(),
             None,
+            commands,
         )
         .await;
 
@@ -1255,13 +1360,14 @@ mod tests {
             .unwrap()
             .contains("active stream limit exceeded"));
 
-        let rejected_session = Arc::new(WebRtcSession::new_for_tests());
+        let (rejected_session, commands) = test_pipeline_session();
         let whip_response = start_whip_session(
             state,
             HeaderMap::new(),
             Arc::clone(&rejected_session),
             "v=0\r\n".to_string(),
             None,
+            commands,
         )
         .await;
         assert_eq!(whip_response.status(), StatusCode::CONFLICT);

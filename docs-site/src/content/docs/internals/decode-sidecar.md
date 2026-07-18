@@ -13,11 +13,11 @@ The decode sidecar is the long-lived ffmpeg subprocess that turns encoded live v
 |---|---|---|
 | true | H.264 | `NvDec` (ffmpeg sidecar, `-hwaccel auto`) |
 | true | H.265 / HEVC | `NvDec` |
-| false | H.264 | `Software` (openh264 in-process) |
+| false | H.264 | `FfmpegSw` (ffmpeg sidecar, CPU) |
 | false | H.265 / HEVC | `FfmpegSw` (ffmpeg sidecar, CPU) |
 | any | VP8 | `Vp8` (libvpx in-process) with the `vp8` feature, else `Unsupported` |
 
-Only `NvDec` and `FfmpegSw` are sidecar paths; they share all of the machinery below. `Unsupported` is a real variant whose `decode` returns `DecodeError::UnsupportedCodec` so the caller can fail the stream with a precise message instead of panicking.
+All live H.264 and H.265 selections use `NvDec` or `FfmpegSw`, so native decoder faults are contained to a child process. The direct `Software` openh264 variant remains available inside the decoder module but is not selected for a live session. `Unsupported` is a real variant whose `decode` returns `DecodeError::UnsupportedCodec` so the caller can fail the stream with a precise message instead of panicking.
 
 ## Process spawn
 
@@ -27,6 +27,8 @@ Only `NvDec` and `FfmpegSw` are sidecar paths; they share all of the machinery b
 let mut child = Command::new(crate::ingest::ffmpeg_path())
     .args([
         "-hwaccel", "auto",
+        "-threads", "1",
+        "-filter_threads", "1",
         "-f", input_fmt,          // "h264" or "hevc"
         "-i", "pipe:0",
         "-f", "rawvideo",
@@ -40,13 +42,13 @@ let mut child = Command::new(crate::ingest::ffmpeg_path())
     .spawn()
 ```
 
-The input format comes from `VideoCodec::ffmpeg_input_format`, which returns `Some("h264")` or `Some("hevc")` and `None` for VP8 (VP8 never takes the sidecar path). The output contract is fixed: packed planar I420 at the configured `width` x `height`, with no row padding and no per-frame metadata, so a frame on stdout is exactly `w*h + 2*(w/2)*(h/2)` bytes and can be parsed by length alone. `stdin` is taken from the child and owned by the decode side; `stdout` is wrapped in a `BufReader` and moved into the reader thread.
+The input format comes from `VideoCodec::ffmpeg_input_format`, which returns `Some("h264")` or `Some("hevc")` and `None` for VP8 (VP8 never takes the sidecar path). Decoder and filter thread counts are fixed at one so session admission is not undermined by unbounded native thread creation. The output contract is fixed: packed planar I420 at the configured `width` x `height`, with no row padding and no per-frame metadata, so a frame on stdout is exactly `w*h + 2*(w/2)*(h/2)` bytes and can be parsed by length alone. `stdin` is taken from the child and owned by the decode side; `stdout` is wrapped in a `BufReader` and moved into the reader thread.
 
 ## Decoder warm-up
 
 An H.264 decoder commonly cannot emit a frame from its first input. Before any output exists, it needs the SPS and PPS parameter sets (which describe resolution, profile, and reference structure) and an IDR frame to decode against, and those usually arrive across several access units; a first access unit that already carries all three can produce output immediately, though the pipeline may still buffer it. On the WHIP path these arrive as ordinary access units at the head of the stream, forwarded with Annex B framing like everything else (see [WebRTC ingest](/docs/internals/webrtc-ingest/)); the sidecar needs no special casing for them, only tolerance for input that produces no output yet.
 
-Warm-up is exactly the phase that breaks a naive write-then-read loop: the parent must keep writing input while nothing is coming back, and a blocking read after each write would stall forever on the SPS. The sidecar handles this two ways at once. First, output reading happens on a dedicated thread, so writes never wait for reads. Second, "no frame yet" is a first-class result: `decode()` returns `DecodeError::Buffered`, and the decode worker just moves to the next access unit. The in-process openh264 path expresses the same state when its decoder returns no output for an SPS/PPS-only payload.
+Warm-up is exactly the phase that breaks a naive write-then-read loop: the parent must keep writing input while nothing is coming back, and a blocking read after each write would stall forever on the SPS. The sidecar handles this two ways at once. First, output reading happens on a dedicated thread, so writes never wait for reads. Second, "no frame yet" is a first-class result: `decode()` returns `DecodeError::Buffered`, and the decode worker just moves to the next access unit.
 
 ## The reader thread and its bounded channel
 
@@ -101,13 +103,13 @@ Two bounds watch the pending FIFO. `FFMPEG_YUV_PENDING_FIFO_CAPACITY` (reader qu
 |---|---|---|
 | `Ok(YuvFrame)` | Freshest decoded frame | Process it |
 | `Err(Buffered)` | Input accepted, no output ready (warm-up, B-frame delay) | Continue with next access unit |
-| `Err(ReaderExited)` | Reader thread gone: ffmpeg exited or pipe closed | Skip to next RTP frame, decoder kept |
-| `Err(WriteError)` / `Err(FlushError)` | stdin write failed | Skip to next RTP frame, decoder kept |
+| `Err(ReaderExited)` | Reader thread gone: ffmpeg exited or pipe closed | End decode stage; supervisor faults the generation |
+| `Err(WriteError)` / `Err(FlushError)` | stdin write failed | End decode stage; supervisor faults the generation |
 | `Err(SoftwareDecode)` | openh264 hard error (software path only) | Skip to next RTP frame, decoder kept |
 | `Err(Vp8Decode)` | libvpx hard error (`vp8` feature only) | Skip to next RTP frame, decoder kept |
 | `Err(UnsupportedCodec)` | No live decoder for the negotiated codec | End the worker with an error log |
 
-Note the asymmetry: only `UnsupportedCodec` ends the worker. Every other error, including the pipe failures that leave an ffmpeg sidecar effectively dead, makes the worker `continue` to the next RTP frame with the same decoder still in its slot; a dead sidecar is not detected and rebuilt, it just keeps returning errors. The decoder is replaced only when a later frame arrives with a different codec.
+Buffered and per-frame native decode errors remain recoverable. A broken pipe or exited reader is not: the decode worker returns, and the generation supervisor closes the peer and stops every sibling. Vidarax does not restart an individual stateful decoder or temporal worker inside the same generation.
 
 ## Frame pool interaction
 
@@ -119,7 +121,7 @@ Capacity per slot is bucketed, not exact. `required_y_capacity(width, height)` t
 
 ## Teardown
 
-`Decoder` implements `Drop`: the sidecar variants call `child.kill()` best-effort and ignore errors. Killing ffmpeg closes its stdout, which fails the reader thread's `read_exact`, which ends the reader loop and drops the channel sender; any later `decode` call then observes `ReaderExited`. The reader thread is detached and needs no join. In the live pipeline the decode worker owns the `Decoder` on its stack, so the sidecar dies when the worker's RTP channel closes and the thread returns, and also when the worker replaces the decoder after a codec change on the same stream.
+`Decoder` implements `Drop`: the sidecar variants call `child.kill()` best-effort. Killing ffmpeg closes stdout and wakes the reader's `read_exact`; `Drop` then joins the owned reader handle and waits for the child. In the live pipeline the decode worker owns the `Decoder` on its stack, so the sidecar and reader are reaped before the stage handle completes.
 
 ## Edge cases and limits
 
@@ -127,4 +129,4 @@ Capacity per slot is bucketed, not exact. `required_y_capacity(width, height)` t
 - PTS labeling across the pipe is approximate by design; anything needing exact PTS-to-frame mapping must not use the raw-pipe sidecar.
 - `DecoderConfig::auto_detect` probes `nvidia-smi` for GPU availability and defaults to 1920x1080 and H.264; callers are expected to override the codec from the SDP offer.
 - Sidecar construction panics if ffmpeg is missing (`expect` on spawn). This is a deliberate fail-fast at session start rather than a recoverable per-frame error.
-- The `Software` and `Vp8` backends bypass everything on this page except the pools: they decode synchronously in-process and de-stride planes straight into pooled buffers.
+- The retained direct `Software` backend and optional `Vp8` backend bypass everything on this page except the pools. Live H.264 does not select `Software`; VP8 remains an explicit in-process exception when that feature is enabled.

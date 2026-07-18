@@ -27,8 +27,12 @@ pub use models::AttachStreamRequest;
 pub use router::app_router;
 pub use state::{AppState, StreamSlotGuard};
 use vidarax_core::ingest::pipeline::{build_decode_pipeline, DecodePipeline, PipelineBackend};
-use vidarax_core::webrtc::session::{TurnServer, WebRtcConfig};
-use vidarax_core::webrtc::workers::per_stream_analysis_workers;
+use vidarax_core::webrtc::decode::VideoCodec;
+use vidarax_core::webrtc::resources::MediaSessionResources;
+use vidarax_core::webrtc::session::{
+    TurnServer, WebRtcConfig, MAX_RTP_ACCESS_UNIT_BYTES, RTP_FRAME_QUEUE_CAPACITY,
+};
+use vidarax_core::webrtc::workers::{per_stream_analysis_workers, WorkerPoolConfig};
 
 pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     telemetry::init_telemetry();
@@ -70,6 +74,23 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
     };
     let security_policy = security::SecurityPolicy::from_config(&config).map_err(invalid_input)?;
     let webrtc_config = build_webrtc_config(&config);
+    let capacity_worker_config = WorkerPoolConfig::from(&webrtc_config);
+    let keyframe_capacity =
+        MediaSessionResources::for_pipeline(&capacity_worker_config, VideoCodec::H264, false);
+    let clip_capacity =
+        MediaSessionResources::for_pipeline(&capacity_worker_config, VideoCodec::H264, true);
+    tracing::info!(
+        maximum_live_sessions = config.active_stream_limit,
+        worker_thread_budget = config.media_worker_thread_budget,
+        memory_budget_bytes = config.media_memory_budget_bytes,
+        rtp_queue_slots_per_session = RTP_FRAME_QUEUE_CAPACITY,
+        maximum_access_unit_bytes = MAX_RTP_ACCESS_UNIT_BYTES,
+        estimated_keyframe_session_bytes = keyframe_capacity.reserved_bytes,
+        estimated_keyframe_session_threads = keyframe_capacity.worker_threads,
+        estimated_clip_session_bytes = clip_capacity.reserved_bytes,
+        estimated_clip_session_threads = clip_capacity.worker_threads,
+        "live media capacity plan"
+    );
     let decode_pipeline = build_configured_decode_pipeline(&config.decode_backend)?;
     let state = AppState::from_wal(
         wal_path,
@@ -87,6 +108,8 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
             global_waiters: config.inference_waiter_limit,
             wait_timeout: std::time::Duration::from_millis(config.inference_wait_timeout_ms),
         },
+        config.media_memory_budget_bytes,
+        config.media_worker_thread_budget,
     )
     .map_err(invalid_input)?;
     let state = attach_spacetime_client(state, &config);
@@ -261,6 +284,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -528,6 +553,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -889,6 +916,8 @@ mod tests {
                 global_waiters: 128,
                 wait_timeout: std::time::Duration::from_secs(5),
             },
+            u64::MAX,
+            usize::MAX,
         )
         .unwrap();
         let app = app_router(state);
@@ -972,6 +1001,8 @@ mod tests {
                 global_waiters: 128,
                 wait_timeout: std::time::Duration::from_secs(5),
             },
+            u64::MAX,
+            usize::MAX,
         )
         .unwrap();
         let app = app_router(state);
@@ -1045,6 +1076,8 @@ mod tests {
                 global_waiters: 128,
                 wait_timeout: std::time::Duration::from_secs(5),
             },
+            u64::MAX,
+            usize::MAX,
         )
         .unwrap();
         let app = app_router(state);
@@ -2481,6 +2514,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -2548,6 +2583,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -2612,6 +2649,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -2702,6 +2741,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -2772,6 +2813,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -2827,6 +2870,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -3069,6 +3114,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H3Experimental,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -3213,6 +3260,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H3Experimental,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
