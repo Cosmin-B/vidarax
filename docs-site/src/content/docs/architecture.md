@@ -3,7 +3,7 @@ title: Architecture
 description: The control plane on tokio, the media plane on OS threads, event sinks, and WAL persistence.
 ---
 
-Vidarax separates request handling from media processing. HTTP and control logic run on the tokio async runtime. Decode, analysis, and VLM work runs on dedicated OS threads connected by bounded queues. Worker output commits to the local write-ahead log. When SpacetimeDB is configured, blocking WHIP description events are mirrored only after that local commit.
+Vidarax separates request handling from media processing. HTTP and control logic run on the tokio async runtime. Decode, analysis, and VLM work run on dedicated OS threads connected by bounded queues. Each live session is one typed pipeline generation supervised as a unit. Worker output commits to the local write-ahead log. When SpacetimeDB is configured, blocking WHIP description events are mirrored only after that local commit.
 
 ```
  Sources                         vidarax                          Consumers
@@ -37,6 +37,27 @@ The media plane splits by workload. WebRTC ingress is async: the session event l
 One ordered stream uses one stateful decoder, and the analysis and VLM stages own stream-order state, so the per-stream worker count for each stage is clamped to one. Parallelism comes from running many sessions, not from splitting one ordered stream.
 
 Decoding for file and URL sources goes through a pluggable backend registry with two phases: a frame-signal pass that computes statistics for the per-frame filter, then selective JPEG extraction for only the frames the filter keeps. See [Ingest](/docs/ingest/) for the decode paths and [The per-frame filter](/docs/gate/) for what happens to each frame.
+
+## Session generations and control
+
+The stages of a live stream do not fail or restart independently. `PipelineRuntime` owns a stage-tagged join handle for every worker in one process-unique `PipelineGeneration`. The first unexpected exit faults that generation, raises its monotonic stop signal, closes the WebRTC peer, and gives every sibling a bounded interval to finish. A generation that exceeds the join deadline is reported as a forced shutdown. Vidarax never restarts a decoder, novelty worker, or VLM worker underneath temporal state from the old generation.
+
+```
+                        generation N
+                  ┌────────────────────┐
+ stage exits ─────>│ supervisor         │─────> close peer
+                  │ stop + join set    │─────> fault metrics
+                  └────────────────────┘
+
+ PATCH prompt ────> bounded command[N] ──────> VLM owner
+       200 <────── worker acknowledgement <───┘
+```
+
+The VLM worker, not an `ArcSwap`, owns the live prompt and output schema. `PATCH /v1/stream/whip/:sess/prompt` sends an eight-slot, generation-tagged command and waits up to two seconds for the worker acknowledgement. A closed or replaced generation returns 409; an acknowledgement timeout returns 503, and the cancelled command is discarded rather than applied later.
+
+Before `run_created` is appended, process-wide admission reserves a conservative byte and worker-thread envelope for the negotiated generation. The calculation includes bounded RTP input, decoded and JPEG pools, decode and provider scratch space, and a 64 MiB allowance for an ffmpeg sidecar when used. `VIDARAX_MEDIA_MEMORY_BUDGET_BYTES` and `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` cap the sum across sessions. If either reservation cannot fit, creation returns 503 without leaving a durable run behind.
+
+H.264 and H.265 use an ffmpeg child process so a native decoder crash does not abort the API process. The supervisor owns the Rust stages and decoder teardown, but an OS thread cannot safely force-kill another OS thread; a wedged native child that defeats normal teardown remains an explicitly measured join-deadline fault rather than a claim of complete containment. See [Media plane](/docs/internals/media-plane/) and [Decode sidecar](/docs/internals/decode-sidecar/) for the detailed contracts.
 
 ## Event sinks
 

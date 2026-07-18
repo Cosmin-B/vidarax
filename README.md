@@ -25,6 +25,15 @@ are stored as content-addressed blobs and referenced by event metadata.
 └──────────┘   └──────────────────────────────────────────┘   └──────────────┘
 ```
 
+Each live session is admitted as one typed pipeline generation. The process
+reserves that generation's bounded memory and worker-thread envelope before it
+creates a durable run. A supervisor then owns every stage handle: if one
+stateful worker exits unexpectedly, Vidarax stops and joins the sibling stages,
+closes the peer, and reports the fixed stage and reason through metrics instead
+of restarting one worker underneath older temporal state. Live prompt and schema
+changes use a bounded, generation-tagged command and return only after the VLM
+worker acknowledges the new configuration.
+
 ## Performance
 
 Throughput depends on your hardware, the models you run, and the input video, so
@@ -192,7 +201,7 @@ catalog reports only that curated id as available on this backend.
 | Layer | Technology |
 |-------|------------|
 | Backend | Rust, Axum, Hyper (HTTP/1.1 + H2, optional H3) |
-| Gate engine | Deterministic frame analysis on a single-threaded hot path |
+| Frame filter | Deterministic frame analysis on a single-threaded hot path |
 | Inference | vLLM and SGLang through OpenAI-compatible backends with fallback |
 | Decode | ffmpeg CPU, NVDEC, and Apple VideoToolbox; VideoToolbox may fall back to software decode inside ffmpeg when the input or host cannot initialise hardware |
 | Persistence | Local WAL plus content-addressed JPEG blobs; optional SpacetimeDB mirror for blocking WHIP description events |

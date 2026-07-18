@@ -109,7 +109,7 @@ Both feedback routes require the optional SpacetimeDB integration; without `VIDA
 
 ### WebRTC (WHIP)
 
-Success and failure statuses for the four WHIP routes are covered in [WebRTC ingest](/docs/internals/webrtc-ingest/#endpoint-contract). Two things differ from the rest of the API: `POST /v1/stream/whip` answers with raw SDP (plus `Location` and `x-vidarax-run-id` headers) rather than JSON, and WHIP failures return bare status codes or plain-text bodies rather than the JSON envelope. The offer accepts an optional `x-attach-config` header (base64url-encoded JSON, no padding, size-capped) whose `prompt`, `max_output_tokens_per_second`, `clip_mode`, and normalized `crop` fields apply before workers start. Unknown attach fields are rejected. `PATCH /v1/stream/whip/:sess/prompt` accepts `{ prompt, output_schema? }`, where `output_schema` is a JSON Schema object, and returns the applied values. Token caps, crop, and clip mode cannot be changed after start.
+Success and failure statuses for the four WHIP routes are covered in [WebRTC ingest](/docs/internals/webrtc-ingest/#endpoint-contract). Two things differ from the rest of the API: `POST /v1/stream/whip` answers with raw SDP (plus `Location` and `x-vidarax-run-id` headers) rather than JSON, and WHIP failures return bare status codes or plain-text bodies rather than the JSON envelope. The offer accepts an optional `x-attach-config` header (base64url-encoded JSON, no padding, size-capped) whose `prompt`, `max_output_tokens_per_second`, `clip_mode`, and normalized `crop` fields apply before workers start. Unknown attach fields are rejected. `PATCH /v1/stream/whip/:sess/prompt` accepts `{ prompt, output_schema? }`, where `output_schema` is a JSON Schema object, and returns the applied values only after the active generation's VLM worker acknowledges them. An unknown or foreign session returns 404 or 403, a closed generation returns 409, and a two-second acknowledgement timeout returns 503. A timed-out command is discarded rather than applied later. Token caps, crop, and clip mode cannot be changed after start.
 
 ### Health and metrics
 
@@ -162,6 +162,8 @@ Not everything uses the envelope. WHIP routes return raw SDP on success and bare
 | `VIDARAX_DATA_DIR` | `.vidarax-data` | WAL and runtime data directory |
 | `VIDARAX_INGEST_FILE_ROOTS` | unset | Directories local `source_uri` paths may come from |
 | `VIDARAX_ACTIVE_STREAM_LIMIT` | `5` | Max active runs per resolved principal |
+| `VIDARAX_MEDIA_MEMORY_BUDGET_BYTES` | `8589934592` | Process-wide byte reservation for admitted live media generations |
+| `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` | `64` | Process-wide OS-thread reservation for admitted live media generations |
 | `VIDARAX_STREAM_TTL_SECS` | `3600` | Run idle TTL |
 | `VIDARAX_NOVELTY_EMBEDDING_ADDR` | unset | Binary TCP embedding sidecar; setting it enables live semantic novelty |
 | `VIDARAX_NOVELTY_REUSE_THRESHOLD` | `0.01` | Conservative embedding-distance ceiling for description reuse; calibrate it on labelled deployment traffic |

@@ -17,7 +17,7 @@ Vidarax is for teams that run their own inference and need machine-readable answ
 
 - Operators who point the server at an OpenAI-compatible VLM backend (vLLM or SGLang) they already run, or at Gemini through the TOML backend config.
 - Applications that analyze recorded files: upload or reference a video, receive a timeline of markers and semantic events.
-- Applications that watch live streams: WebRTC via WHIP, RTSP cameras, and HLS sources, with a prompt that can be updated while the session runs.
+- Applications that watch live streams: WebRTC via WHIP, RTSP cameras, and HLS sources, with prompt changes acknowledged by the active pipeline generation while the session runs.
 - Consumers who want events as data: a REST API with sequence-numbered events, cross-run query and search, and a typed SDK.
 
 ## What it is not
