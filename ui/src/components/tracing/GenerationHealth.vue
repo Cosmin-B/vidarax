@@ -8,28 +8,33 @@ const props = defineProps<{
   metrics: MetricsData
 }>()
 
-const status = computed(() => ({
-  healthy: {
-    label: 'Healthy',
-    detail: 'All active pipeline generations are supervised.',
-    color: '#2dd4bf',
-  },
-  faulted: {
-    label: 'Faulted',
-    detail: 'A worker fault occurred in the last minute.',
-    color: '#ef4444',
-  },
-  saturated: {
-    label: 'Saturated',
-    detail: 'Inference work is waiting for admitted capacity.',
-    color: '#f59e0b',
-  },
-  idle: {
-    label: 'Idle',
-    detail: 'No media-pipeline generation is active.',
-    color: '#64748b',
-  },
-}[props.metrics.pipelineStatus]))
+const status = computed(() => {
+  const states = {
+    healthy: {
+      label: 'Healthy',
+      detail: 'All active pipeline generations are supervised.',
+      color: '#2dd4bf',
+    },
+    faulted: {
+      label: 'Faulted',
+      detail: props.metrics.detachedWorkersTotal > 0
+        ? `${props.metrics.detachedWorkersTotal.toLocaleString()} worker threads missed shutdown and still hold reserved capacity.`
+        : 'A worker fault occurred in the last minute.',
+      color: '#ef4444',
+    },
+    saturated: {
+      label: 'Saturated',
+      detail: 'Inference work is waiting for admitted capacity.',
+      color: '#f59e0b',
+    },
+    idle: {
+      label: 'Idle',
+      detail: 'No media-pipeline generation is active.',
+      color: '#64748b',
+    },
+  }
+  return states[props.metrics.pipelineStatus]
+})
 
 const fmt = (value: number) => value.toLocaleString()
 </script>
@@ -65,7 +70,7 @@ const fmt = (value: number) => value.toLocaleString()
         </div>
       </div>
 
-      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 flex-1">
+      <div class="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-2 flex-1">
         <div class="rounded-[9px] px-3 py-2.5 bg-white/[0.025] border border-[#1e2633]">
           <div class="flex items-center gap-1.5 text-[#64748b] text-[10px] uppercase tracking-wider">
             <Activity :size="12" /> Active
@@ -95,6 +100,15 @@ const fmt = (value: number) => value.toLocaleString()
             class="mono text-base mt-1"
             :class="metrics.forcedShutdownsTotal ? 'text-[#f59e0b]' : 'text-[#94a3b8]'"
           >{{ fmt(metrics.forcedShutdownsTotal) }}</div>
+        </div>
+        <div class="rounded-[9px] px-3 py-2.5 bg-white/[0.025] border border-[#1e2633]">
+          <div class="flex items-center gap-1.5 text-[#64748b] text-[10px] uppercase tracking-wider">
+            <TimerOff :size="12" /> Detached
+          </div>
+          <div
+            class="mono text-base mt-1"
+            :class="metrics.detachedWorkersTotal ? 'text-[#ef4444]' : 'text-[#94a3b8]'"
+          >{{ fmt(metrics.detachedWorkersTotal) }}</div>
         </div>
       </div>
     </div>

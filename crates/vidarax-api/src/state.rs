@@ -1,6 +1,6 @@
 use arc_swap::ArcSwap;
 use dashmap::mapref::entry::Entry;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -689,6 +689,7 @@ impl AppState {
         session: Arc<WebRtcSession>,
         reservation: Option<MediaResourcePermit>,
     ) -> bool {
+        let protected_run_id = reservation.as_ref().map(|_| run_id.to_string());
         if self
             .session_slots
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
@@ -698,10 +699,21 @@ impl AppState {
         {
             return false;
         }
+        let protection_inserted = protected_run_id.as_ref().is_some_and(|run_id| {
+            self.run_registry
+                .protected_tombstones
+                .insert(run_id.clone())
+        });
         // Claim the id under one shard lock so two inserts for the same id cannot
         // both win.
         match self.sessions.entry(sess_id.clone()) {
             Entry::Occupied(_) => {
+                if protection_inserted {
+                    let run_id = protected_run_id
+                        .as_ref()
+                        .expect("inserted protection has a run id");
+                    self.run_registry.protected_tombstones.remove(run_id);
+                }
                 self.session_slots.fetch_sub(1, Ordering::AcqRel);
                 return false;
             }
@@ -719,11 +731,13 @@ impl AppState {
         true
     }
 
-    /// Release the media reservation for a session. Called by the pipeline
-    /// supervisor after its join loop returns, and skipped on a forced
-    /// shutdown because detached threads still hold their memory.
-    pub(crate) fn release_media_reservation(&self, sess_id: &str) {
+    /// Release the resources retained for a live generation. Called by the
+    /// pipeline supervisor after its join loop returns, and skipped on a
+    /// forced shutdown because detached threads still hold memory and could
+    /// still attempt a late timeline append.
+    pub(crate) fn release_media_generation(&self, sess_id: &str, run_id: &str) {
         self.media_reservations.remove(sess_id);
+        self.run_registry.protected_tombstones.remove(run_id);
     }
 
     pub(crate) fn media_join_deadline(&self) -> std::time::Duration {
@@ -1131,8 +1145,8 @@ impl AppState {
     }
 
     pub fn read_run_events(&self, run_id: &str) -> Result<Vec<TimelineEvent>, String> {
-        // TODO(perf): Full WAL scan per request. A per-run index (run_id → file
-        // offset range) would make this O(1) seek instead of O(total events).
+        // This is a full WAL scan per request. A per-run index from run id to
+        // file offsets would make it O(1) seek instead of O(total events).
         let events = read_all_events(self.wal_path.as_ref()).map_err(|err| err.to_string())?;
         Ok(events
             .into_iter()
@@ -1682,6 +1696,10 @@ pub struct RunRuntimeSnapshot {
 struct RunRegistry {
     runs: DashMap<String, Arc<RunState>>,
     by_principal: DashMap<Arc<str>, HashSet<String>>,
+    /// Runs whose worker generation can still emit events. A tombstone for one
+    /// of these runs must not be evicted from `runs`. The set is bounded by the
+    /// admitted live-session count; forced-shutdown entries last until restart.
+    protected_tombstones: DashSet<String>,
     /// Structural registry writes are owned by the timeline writer thread, so
     /// this FIFO's mutex has no writer contention. The mutex only permits the
     /// registry to remain shared with concurrent readers.
@@ -1740,12 +1758,25 @@ impl RunRegistry {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             deleted_run_order.push_back(event.run_id.clone());
-            if deleted_run_order.len() > DELETED_RUN_RETENTION_CAP {
-                let oldest = deleted_run_order
-                    .pop_front()
-                    .expect("deleted run FIFO exceeded its cap");
-                self.runs
-                    .remove_if(&oldest, |_, run| run.snapshot().deleted);
+            while deleted_run_order.len() > DELETED_RUN_RETENTION_CAP {
+                let candidates = deleted_run_order.len();
+                let mut evicted = false;
+                for _ in 0..candidates {
+                    let oldest = deleted_run_order
+                        .pop_front()
+                        .expect("deleted run FIFO exceeded its cap");
+                    if self.protected_tombstones.contains(&oldest) {
+                        deleted_run_order.push_back(oldest);
+                        continue;
+                    }
+                    self.runs
+                        .remove_if(&oldest, |_, run| run.snapshot().deleted);
+                    evicted = true;
+                    break;
+                }
+                if !evicted {
+                    break;
+                }
             }
         }
     }
@@ -2718,7 +2749,7 @@ mod tests {
             delete_state.append_run_event("run_race", "run_deleted", serde_json::json!({}))
         });
         state.wait_until_timeline_writer_paused_for_tests();
-        state.append_run_event_for_stream_nonblocking(
+        let _ = state.append_run_event_for_stream_nonblocking(
             "run_race",
             "stream-0",
             "note",

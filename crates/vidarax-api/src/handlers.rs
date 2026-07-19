@@ -410,26 +410,45 @@ pub async fn stop_run(
     }
 
     let request_id = state.next_request_id();
-    if let Err(err) = state
-        .append_run_event_async(
-            &run_id,
-            "stop_requested",
-            json!({ "request_id": request_id }),
-        )
-        .await
-    {
-        return internal_error(&state, format!("failed to append stop event: {err}"));
+    let transaction = tokio::spawn(transition_live_run(
+        state.clone(),
+        run_id.clone(),
+        request_id.clone(),
+        "stop_requested",
+        true,
+    ));
+    match transaction.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            return internal_error(&state, format!("failed to stop run: {err}"));
+        }
+        Err(err) => {
+            return internal_error(&state, format!("stop transaction join failure: {err}"));
+        }
     }
-
-    // Stopping must actually stop live work, not only record the intent.
-    // History is preserved: the session reclaim skips the tombstone.
-    state.close_live_session_for_run(&run_id, true);
 
     ok(json!({
         "request_id": request_id,
         "run_id": run_id,
         "status": "cancelled"
     }))
+}
+
+async fn transition_live_run(
+    state: AppState,
+    run_id: String,
+    request_id: String,
+    event_kind: &'static str,
+    preserve_history: bool,
+) -> Result<(), String> {
+    // The durable state transition and live-session close belong to one
+    // detached transaction. Dropping the HTTP request cannot leave a stopped
+    // or deleted run with its media pipeline still running.
+    state
+        .append_run_event_async(&run_id, event_kind, json!({ "request_id": request_id }))
+        .await?;
+    state.close_live_session_for_run(&run_id, preserve_history);
+    Ok(())
 }
 
 pub async fn keepalive_run(
@@ -2970,15 +2989,22 @@ pub async fn delete_run(
         return error;
     }
     let request_id = state.next_request_id();
-    if let Err(err) = state
-        .append_run_event_async(&run_id, "run_deleted", json!({ "request_id": request_id }))
-        .await
-    {
-        return internal_error(&state, format!("failed to append run_deleted event: {err}"));
+    let transaction = tokio::spawn(transition_live_run(
+        state.clone(),
+        run_id.clone(),
+        request_id.clone(),
+        "run_deleted",
+        false,
+    ));
+    match transaction.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            return internal_error(&state, format!("failed to delete run: {err}"));
+        }
+        Err(err) => {
+            return internal_error(&state, format!("delete transaction join failure: {err}"));
+        }
     }
-
-    // Deleting a live WHIP run must also tear its pipeline down.
-    state.close_live_session_for_run(&run_id, false);
 
     ok(json!({
         "request_id": request_id,

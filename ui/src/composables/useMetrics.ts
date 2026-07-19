@@ -59,6 +59,7 @@ export interface MetricsData {
   cleanShutdownsTotal: number
   faultedShutdownsTotal: number
   forcedShutdownsTotal: number
+  detachedWorkersTotal: number
   workerFaultsTotal: number
   pipelineStatus: 'faulted' | 'saturated' | 'healthy' | 'idle'
   lastUpdated: number
@@ -302,6 +303,7 @@ function buildMetrics(
       - get('vidarax_pipeline_sessions_removed_total'),
   )
   const activeGenerations = get('vidarax_pipeline_generations_active')
+  const detachedWorkers = get('vidarax_pipeline_detached_workers_total')
   const lastFaultSeconds = get('vidarax_pipeline_last_fault_timestamp_seconds')
   const faultIsRecent = lastFaultSeconds > 0
     && Math.floor(Date.now() / 1000) - lastFaultSeconds < 60
@@ -315,7 +317,7 @@ function buildMetrics(
   const threadsReserved = get('vidarax_media_capacity_worker_threads_reserved')
   const atCapacity = (memoryLimit > 0 && memoryReserved >= memoryLimit)
     || (threadLimit > 0 && threadsReserved >= threadLimit)
-  const pipelineStatus: MetricsData['pipelineStatus'] = faultIsRecent
+  const pipelineStatus: MetricsData['pipelineStatus'] = detachedWorkers > 0 || faultIsRecent
     ? 'faulted'
     : admissionWaiting > 0 || capacityRejectedRecently || atCapacity
       ? 'saturated'
@@ -432,6 +434,7 @@ function buildMetrics(
     cleanShutdownsTotal: get('vidarax_pipeline_generation_shutdown_clean_total'),
     faultedShutdownsTotal: get('vidarax_pipeline_generation_shutdown_faulted_total'),
     forcedShutdownsTotal: get('vidarax_pipeline_generation_shutdown_forced_total'),
+    detachedWorkersTotal: detachedWorkers,
     workerFaultsTotal: get('vidarax_pipeline_worker_faults_total_all'),
     pipelineStatus,
     lastUpdated: Date.now(),

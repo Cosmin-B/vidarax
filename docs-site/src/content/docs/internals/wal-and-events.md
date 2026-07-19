@@ -103,7 +103,7 @@ Three append flavors, one contract table:
 
 On startup, `AppState::from_wal` reads the whole file, rebuilds the run registry with `apply_structural_event` per event, rebuilds the warm per-run tails, and seeds the writer's sequence counter from the observed maximum, so numbering continues where it left off. Replay is order-tolerant: an event for an unknown run registers the run on first sight, and `insert_event_by_seq` places late arrivals by sequence number and drops exact duplicates.
 
-Reads have two tiers. `read_run_events_from` serves an advancing cursor from the swap-published snapshot when the run's in-memory tail still covers it; otherwise it falls back to `read_all_events`, a full-file scan filtered by run, executed under `spawn_blocking` on the async path. The scan is linear in total events; the source carries a `TODO(perf)` for a per-run offset index.
+Reads have two tiers. `read_run_events_from` serves an advancing cursor from the swap-published snapshot when the run's in-memory tail still covers it; otherwise it falls back to `read_all_events`, a full-file scan filtered by run, executed under `spawn_blocking` on the async path. The scan is linear in total events. A per-run offset index is the clear next step when cold-read volume makes that cost material.
 
 ## Validation: replay and schema gates
 

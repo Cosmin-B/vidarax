@@ -63,7 +63,7 @@ WHIP session creation must never leave a live session that nothing watches. `sta
 2. Build a `MediaSessionResources` envelope from the negotiated codec, configured resolution, queue payload limits, pool topology, mode, and fixed worker count. Atomically reserve both process-wide bytes and worker threads; on refusal, close and return 503 without appending `run_created`.
 3. Append `run_created` durably; on failure, close and return 500. Dropping the media permit releases both capacity dimensions.
 4. Reserve one `session_slots` count with an atomic compare-and-swap, then insert the session and its media permit. The reservation makes the `MAX_WEBRTC_SESSIONS` (100) cap exact under concurrent starts; an ID collision releases it immediately. On failure, the just-created run is tombstoned (`run_deleted`) with bounded inline retries and a detached retry task as backstop, then 503.
-5. `spawn_session_reclaimer`, which watches the rustrtc peer state and reclaims the session on `Disconnected`, `Failed`, or `Closed`. The winning removal drops the media permit exactly once.
+5. `spawn_session_reclaimer`, which watches the rustrtc peer state and reclaims the session on `Disconnected`, `Failed`, or `Closed`. The winning removal transfers cleanup ownership to the supervisor. The supervisor releases the media permit only after every worker joins; a forced shutdown keeps it reserved.
 
 There is no suspension point between session insertion and reclaimer spawn. The reclaimed-session tombstone update uses a short `std::sync::Mutex` critical section, so cancellation cannot expose a visible session without its watcher. The whole startup transaction also runs in a detached `tokio::spawn`, which lets durable cleanup and response-independent work finish if an HTTP client disconnects. Everything after the reclaimer spawn (channel construction and worker startup) is safe to await because by then the session has an owner that will clean it up.
 
@@ -80,6 +80,11 @@ left detached and reported as a forced shutdown, and the session's media
 reservation is kept because the detached thread still holds its memory. The
 peer-state reclaimer still owns the durable tombstone, so fault and DELETE
 races converge on the same single-winner removal.
+
+REST stop and delete use the same cancellation boundary. Their durable event
+and live-session close run in one detached transaction, so a disconnected HTTP
+client cannot commit `stop_requested` or `run_deleted` while leaving the media
+pipeline alive.
 
 Reclaim itself is race-safe by construction: `remove_session_for_run` uses `DashMap::remove_if` to check run ownership and remove under one shard lock, so exactly one caller (DELETE handler or peer-state watcher) wins cleanup, and the winner writes a `ReclaimedSessions` record so a later DELETE of the same session stays idempotent instead of returning 404. That tombstone map is bounded by both a TTL (`RECLAIMED_SESSION_TTL_MS`, ten minutes) and a cap (`RECLAIMED_SESSION_MAX_ENTRIES`, 1024).
 
@@ -112,7 +117,7 @@ fn begin_delete_append(&self) -> RunDeleteState {
 | `InFlight` | Wait on the run's `Notify` until the winner commits or rolls back, then re-loop |
 | `Missing` | Run unknown to the registry (long-forgotten or never created here); append `run_deleted` unconditionally |
 
-Both commit and rollback call `notify_waiters`, so blocked concurrent deleters always make progress. The registry keeps deleted runs visible for idempotency in a FIFO capped at `DELETED_RUN_RETENTION_CAP` (4096); beyond that, the oldest deleted entries are forgotten and a re-DELETE of one takes the `Missing` path, which appends a fresh `run_deleted`, an accepted cost for long-forgotten runs. The nonblocking append API refuses `run_deleted` outright (`"run_deleted requires confirmed append"`): deletion must be confirmed, never fire-and-forget.
+Both commit and rollback call `notify_waiters`, so blocked concurrent deleters always make progress. The registry keeps deleted runs visible for idempotency in a FIFO capped at `DELETED_RUN_RETENTION_CAP` (4096); beyond that, the oldest deleted entries are forgotten and a re-DELETE of one takes the `Missing` path, which appends a fresh `run_deleted`, an accepted cost for long-forgotten runs. Runs with a worker generation that can still emit are exempt from eviction. Clean shutdown removes that protection after every worker joins; a forced shutdown keeps it until process exit, so a detached worker cannot append after its tombstone even after heavy run churn. The nonblocking append API refuses `run_deleted` outright (`"run_deleted requires confirmed append"`): deletion must be confirmed, never fire-and-forget.
 
 ## The swap-published snapshot registry
 

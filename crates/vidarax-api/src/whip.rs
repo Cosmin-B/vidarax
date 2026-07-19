@@ -495,6 +495,7 @@ async fn start_whip_session_transaction(
     let stopping = session.stopping_flag();
     let state_for_supervisor = state.clone();
     let sess_id_for_permit = sess_id.clone();
+    let run_id_for_permit = Arc::clone(&run_id);
 
     // Worker threads are long-running OS threads (not tokio tasks).
     // Use spawn_blocking as a bridge from async context to the thread spawns;
@@ -579,7 +580,8 @@ async fn start_whip_session_transaction(
                         );
                     }
                     _ => {
-                        state_for_supervisor.release_media_reservation(&sess_id_for_permit);
+                        state_for_supervisor
+                            .release_media_generation(&sess_id_for_permit, &run_id_for_permit);
                     }
                 }
                 tracing::info!(
@@ -606,7 +608,8 @@ async fn start_whip_session_transaction(
                 );
                 session.close();
                 if err.detached == 0 {
-                    state_for_supervisor.release_media_reservation(&sess_id_for_permit);
+                    state_for_supervisor
+                        .release_media_generation(&sess_id_for_permit, &run_id_for_permit);
                 } else {
                     // Startup rollback left threads running past its deadline.
                     // They still hold their share of the media budget, so the
@@ -897,7 +900,7 @@ async fn reclaim_whip_session_transaction(
     let Some((_principal, existing_run_id, session)) = state.get_session(&sess_id) else {
         return Ok(());
     };
-    if &*existing_run_id != run_id {
+    if *existing_run_id != run_id {
         return Ok(());
     }
     if !session.try_claim_reclaim() {
