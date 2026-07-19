@@ -306,11 +306,9 @@ pub struct AppStateInner {
     session_slots: AtomicUsize,
     media_budget: MediaResourceBudget,
     media_reservations: MediaReservationMap,
-    /// Runs whose next session reclaim must remove the session without
-    /// appending a tombstone, because a REST stop asked to preserve history.
-    preserve_history_runs: DashMap<String, ()>,
     /// Join deadline for pipeline generations, derived at startup from the
-    /// configured backend fallback count and novelty embedding timeout.
+    /// configured backend fallback count, admission wait, and novelty
+    /// embedding timeout.
     media_join_deadline: std::time::Duration,
     /// Recently reclaimed WHIP sessions, retained so DELETE remains idempotent
     /// after a peer-state watcher has already removed the live session entry.
@@ -431,8 +429,15 @@ impl AppStateConfig {
                 ),
                 media_reservations: DashMap::new(),
                 reclaimed_sessions: Arc::new(Mutex::new(ReclaimedSessions::default())),
-                preserve_history_runs: DashMap::new(),
-                media_join_deadline: vidarax_core::webrtc::runtime::supervise_join_deadline(),
+                media_join_deadline: vidarax_core::webrtc::runtime::supervise_join_deadline_from(
+                    &vidarax_core::webrtc::runtime::JoinDeadlineInputs {
+                        max_serial_inference_attempts: 1,
+                        admission_wait_ms: self.inference_admission_limits.wait_timeout.as_millis()
+                            as u64,
+                        novelty_embedding_timeout_ms: LiveNoveltyConfig::default()
+                            .embedding_timeout_ms,
+                    },
+                ),
                 webrtc_config: WebRtcConfig::default(),
             }),
         }
@@ -458,6 +463,7 @@ impl AppState {
         inference_backend_count: usize,
     ) -> Result<Self, String> {
         let novelty_embedding_timeout_ms = novelty.embedding_timeout_ms;
+        let admission_wait_ms = inference_admission_limits.wait_timeout.as_millis() as u64;
         let existing_events = read_all_events(&wal_path).map_err(|err| err.to_string())?;
         let run_registry = build_run_registry(&existing_events);
         let initial_tails = build_event_tails(&existing_events);
@@ -532,10 +538,12 @@ impl AppState {
                 ),
                 media_reservations: DashMap::new(),
                 reclaimed_sessions: Arc::new(Mutex::new(ReclaimedSessions::default())),
-                preserve_history_runs: DashMap::new(),
-                media_join_deadline: vidarax_core::webrtc::runtime::supervise_join_deadline_for(
-                    inference_backend_count as u64,
-                    novelty_embedding_timeout_ms,
+                media_join_deadline: vidarax_core::webrtc::runtime::supervise_join_deadline_from(
+                    &vidarax_core::webrtc::runtime::JoinDeadlineInputs {
+                        max_serial_inference_attempts: inference_backend_count as u64,
+                        admission_wait_ms,
+                        novelty_embedding_timeout_ms,
+                    },
                 ),
                 webrtc_config,
             }),
@@ -722,23 +730,19 @@ impl AppState {
         self.media_join_deadline
     }
 
-    /// Consume the preserve-history mark for a run, set by a REST stop.
-    pub(crate) fn take_preserve_history(&self, run_id: &str) -> bool {
-        self.preserve_history_runs.remove(run_id).is_some()
-    }
-
     /// Close the live WebRTC session that owns `run_id`, if any. The peer
     /// watcher then reclaims the session and the supervisor tears the
     /// pipeline down, so a REST stop or delete stops live work instead of
-    /// only recording an event. With `preserve_history` the reclaim removes
-    /// the session but skips the run_deleted tombstone, so a stopped run
-    /// stays readable.
+    /// only recording an event. With `preserve_history` the mark is stored
+    /// on the session itself before the close, so exactly the reclaim that
+    /// this close triggers skips the run_deleted tombstone and the stopped
+    /// run stays readable. The mark is set once and never cleared.
     pub(crate) fn close_live_session_for_run(&self, run_id: &str, preserve_history: bool) {
         for entry in self.sessions.iter() {
             let (_principal, existing_run_id, session) = entry.value();
             if &**existing_run_id == run_id {
                 if preserve_history {
-                    self.preserve_history_runs.insert(run_id.to_string(), ());
+                    session.mark_preserve_history();
                 }
                 session.close();
                 break;

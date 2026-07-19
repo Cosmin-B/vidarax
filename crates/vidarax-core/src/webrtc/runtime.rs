@@ -285,28 +285,47 @@ pub const KEYFRAME_SECOND_PASS_TIMEOUT_MS: u64 = 10_000;
 pub const CLIP_FIRST_PASS_TIMEOUT_MS: u64 = 15_000;
 pub const CLIP_SECOND_PASS_TIMEOUT_MS: u64 = 20_000;
 
-/// Join deadline for generation teardown, derived from the work a healthy
-/// worker can legitimately be inside when stop is raised. One tiered call
-/// runs first and second pass sequentially, the provider router may retry
-/// the whole call once per configured backend, and the novelty check can
-/// spend its embedding timeout before inference. The deadline must exceed
-/// that or ordinary teardown gets reported as a forced shutdown and
-/// detaches healthy threads.
-pub fn supervise_join_deadline_for(
-    max_serial_inference_attempts: u64,
-    novelty_embedding_timeout_ms: u64,
-) -> Duration {
-    let per_attempt = CLIP_FIRST_PASS_TIMEOUT_MS + CLIP_SECOND_PASS_TIMEOUT_MS;
-    let attempts = max_serial_inference_attempts.max(1);
-    Duration::from_millis(
-        attempts.saturating_mul(per_attempt) + novelty_embedding_timeout_ms + 5_000,
-    )
+/// Inputs for deriving the supervisor join deadline from configuration.
+pub struct JoinDeadlineInputs {
+    /// Serial inference attempts one call can make (provider fallback chain).
+    pub max_serial_inference_attempts: u64,
+    /// Admission wait before a pass may run (AdmissionLimits::wait_timeout).
+    pub admission_wait_ms: u64,
+    /// Sidecar embedding timeout, which arms each socket operation.
+    pub novelty_embedding_timeout_ms: u64,
 }
 
-/// Single-backend deadline with no novelty allowance. Prefer
-/// supervise_join_deadline_for with real configuration values.
+/// Join deadline for generation teardown, derived from the work a healthy
+/// worker can legitimately be inside when stop is raised: an admission wait
+/// before each of the two tiered passes, the serial fallback attempts of one
+/// tiered call, and one sidecar exchange budgeted as four timeout-armed
+/// socket operations (connect, write, read, slack). A sidecar that drips
+/// bytes slower than that budget counts as wedged on purpose. All arithmetic
+/// saturates and the result is capped at 24 hours.
+pub fn supervise_join_deadline_from(inputs: &JoinDeadlineInputs) -> Duration {
+    const CAP_MS: u64 = 86_400_000;
+    let per_attempt = CLIP_FIRST_PASS_TIMEOUT_MS + CLIP_SECOND_PASS_TIMEOUT_MS;
+    let inference = inputs
+        .max_serial_inference_attempts
+        .max(1)
+        .saturating_mul(per_attempt);
+    let admission = inputs.admission_wait_ms.saturating_mul(2);
+    let novelty = inputs.novelty_embedding_timeout_ms.saturating_mul(4);
+    let total = inference
+        .saturating_add(admission)
+        .saturating_add(novelty)
+        .saturating_add(5_000);
+    Duration::from_millis(total.min(CAP_MS))
+}
+
+/// Single-backend deadline with no admission or novelty allowance. Prefer
+/// supervise_join_deadline_from with real configuration values.
 pub fn supervise_join_deadline() -> Duration {
-    supervise_join_deadline_for(1, 0)
+    supervise_join_deadline_from(&JoinDeadlineInputs {
+        max_serial_inference_attempts: 1,
+        admission_wait_ms: 0,
+        novelty_embedding_timeout_ms: 0,
+    })
 }
 
 #[derive(Debug)]
@@ -537,6 +556,30 @@ impl Drop for PipelineRuntime {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn join_deadline_includes_admission_and_novelty_budgets() {
+        let d = super::supervise_join_deadline_from(&super::JoinDeadlineInputs {
+            max_serial_inference_attempts: 2,
+            admission_wait_ms: 120_000,
+            novelty_embedding_timeout_ms: 1_500,
+        });
+        let expected = 2 * (super::CLIP_FIRST_PASS_TIMEOUT_MS + super::CLIP_SECOND_PASS_TIMEOUT_MS)
+            + 2 * 120_000
+            + 4 * 1_500
+            + 5_000;
+        assert_eq!(d, std::time::Duration::from_millis(expected));
+    }
+
+    #[test]
+    fn join_deadline_saturates_instead_of_overflowing() {
+        let d = super::supervise_join_deadline_from(&super::JoinDeadlineInputs {
+            max_serial_inference_attempts: u64::MAX,
+            admission_wait_ms: u64::MAX,
+            novelty_embedding_timeout_ms: u64::MAX,
+        });
+        assert_eq!(d, std::time::Duration::from_millis(86_400_000));
+    }
+
     use super::{
         apply_pending_session_commands, PipelineFaultReason, PipelineGeneration, PipelineRuntime,
         PipelineShutdown, PipelineStage, SessionControl, SessionControlError, StageHandle,

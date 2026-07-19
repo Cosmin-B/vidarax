@@ -842,9 +842,16 @@ async fn reclaim_whip_session_transaction(
     run_id: String,
     reason: String,
 ) -> Result<(), String> {
-    // A REST stop closes the session but promises to keep the run's history.
-    // Skip the tombstone for that one reclaim so the run stays readable.
-    let preserve_history = state.take_preserve_history(&run_id);
+    // A REST stop marks the session itself before closing it, so the reclaim
+    // triggered by that close reads the mark here and keeps the run's
+    // history. A reclaim racing in for a real peer failure reads false and
+    // tombstones, which is right because the peer actually died. The mark is
+    // set once and never cleared, so there is no window where it can be
+    // consumed by the wrong reclaimer.
+    let preserve_history = state
+        .get_session(&sess_id)
+        .map(|(_, _, session)| session.preserve_history_on_reclaim())
+        .unwrap_or(false);
     if !preserve_history {
         append_whip_run_deleted_once(&state, &run_id, &sess_id, &reason).await?;
     }
@@ -1620,6 +1627,97 @@ mod tests {
         assert_eq!(state.session_count(), 0);
         assert!(state.get_session(sess_id).is_none());
         assert_eq!(session.close_call_count_for_tests(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_marked_session_reclaim_preserves_history() {
+        let state = AppState::with_wal_for_tests(
+            std::env::temp_dir().join(format!("vidarax-whip-stop-{}.wal", std::process::id())),
+        );
+        let sess_id = "sess-stop00000001";
+        let run_id: Arc<str> = Arc::from("run-whip-stop");
+        let principal = "tenant-a";
+
+        state
+            .append_run_event(
+                &run_id,
+                "run_created",
+                serde_json::json!({
+                    "principal_key": principal,
+                    "session_id": sess_id,
+                    "source": "whip",
+                }),
+            )
+            .unwrap();
+        assert!(state.insert_session(
+            sess_id.to_string(),
+            principal.to_string(),
+            Arc::clone(&run_id),
+            Arc::new(WebRtcSession::new_for_tests()),
+        ));
+
+        // The stop handler marks the session before closing it. The reclaim
+        // that follows must remove the session without tombstoning the run.
+        state.close_live_session_for_run(&run_id, true);
+        reclaim_whip_session(&state, sess_id, &run_id, "stop")
+            .await
+            .unwrap();
+
+        let events = state.read_run_events(&run_id).unwrap();
+        assert!(
+            events.iter().all(|event| event.kind != "run_deleted"),
+            "a stop-driven reclaim must not tombstone the run"
+        );
+        assert!(state.get_session(sess_id).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_after_stop_mark_still_tombstones_exactly_once() {
+        let state = AppState::with_wal_for_tests(
+            std::env::temp_dir().join(format!("vidarax-whip-stopdel-{}.wal", std::process::id())),
+        );
+        let sess_id = "sess-stopdel000001";
+        let run_id: Arc<str> = Arc::from("run-whip-stopdel");
+        let principal = "tenant-a";
+
+        state
+            .append_run_event(
+                &run_id,
+                "run_created",
+                serde_json::json!({
+                    "principal_key": principal,
+                    "session_id": sess_id,
+                    "source": "whip",
+                }),
+            )
+            .unwrap();
+        assert!(state.insert_session(
+            sess_id.to_string(),
+            principal.to_string(),
+            Arc::clone(&run_id),
+            Arc::new(WebRtcSession::new_for_tests()),
+        ));
+
+        // Stop marks the session, then a REST delete lands. The delete
+        // handler appends its own tombstone before closing, so the run must
+        // end up deleted exactly once even though the reclaim skips its
+        // duplicate append.
+        state.close_live_session_for_run(&run_id, true);
+        state
+            .append_run_event(&run_id, "run_deleted", serde_json::json!({}))
+            .unwrap();
+        state.close_live_session_for_run(&run_id, false);
+        reclaim_whip_session(&state, sess_id, &run_id, "delete")
+            .await
+            .unwrap();
+
+        let events = state.read_run_events(&run_id).unwrap();
+        let deleted = events
+            .iter()
+            .filter(|event| event.kind == "run_deleted")
+            .count();
+        assert_eq!(deleted, 1, "delete must tombstone exactly once");
+        assert!(state.get_session(sess_id).is_none());
     }
 
     #[tokio::test]

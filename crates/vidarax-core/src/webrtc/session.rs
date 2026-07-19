@@ -37,7 +37,7 @@
 //! ```
 
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 
@@ -225,6 +225,11 @@ impl Default for WebRtcConfig {
 /// connection closes when all handles are dropped.
 pub struct WebRtcSession {
     pc: PeerConnection,
+    /// Set by a REST stop before close() so the reclaim that close triggers
+    /// keeps the run's history. Set once, never cleared, and read by the
+    /// reclaim path. A reclaim racing in for a real peer failure reads false
+    /// and tombstones, which is right because the peer actually died.
+    preserve_history: AtomicBool,
     /// Configuration used when the worker generation starts. Live updates move
     /// through `control`; workers own the accepted values after startup.
     initial_prompt: Arc<str>,
@@ -290,6 +295,7 @@ impl WebRtcSession {
         (
             Self {
                 pc: PeerConnection::new(Default::default()),
+                preserve_history: AtomicBool::new(false),
                 initial_prompt: Arc::from(""),
                 initial_guided_json: None,
                 control,
@@ -482,6 +488,7 @@ impl WebRtcSession {
         Ok((
             Self {
                 pc,
+                preserve_history: AtomicBool::new(false),
                 initial_prompt: Arc::from(""),
                 initial_guided_json: None,
                 control,
@@ -759,6 +766,15 @@ impl WebRtcSession {
 
     pub fn stopping_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.control.stopping_flag()
+    }
+
+    /// Ask the next reclaim of this session to keep the run's history.
+    pub fn mark_preserve_history(&self) {
+        self.preserve_history.store(true, Ordering::Release);
+    }
+
+    pub fn preserve_history_on_reclaim(&self) -> bool {
+        self.preserve_history.load(Ordering::Acquire)
     }
 
     /// Subscribe to rustrtc peer state changes for lifecycle cleanup.
