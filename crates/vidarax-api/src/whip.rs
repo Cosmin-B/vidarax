@@ -767,24 +767,12 @@ pub async fn whip_terminate(
         return StatusCode::FORBIDDEN;
     }
 
-    // A WHIP delete guarantees its own tombstone, exactly like the REST
-    // delete handler. Relying on the reclaim would lose the guarantee when a
-    // stop-marked reclaim already claimed the decision and skips its append.
-    // The append is idempotent, so a duplicate from the reclaim is harmless.
-    if let Err(err) = append_whip_run_deleted_once(&state, &run_id, &sess_id, "delete").await {
-        tracing::error!("WHIP terminate tombstone failed sess={sess_id}: {err}");
-        return StatusCode::INTERNAL_SERVER_ERROR;
-    }
-    // The delete disposition overrides a stop mark for the session cleanup.
-    if let Some((_, _, session)) = state.get_session(&sess_id) {
-        session.mark_close_disposition_delete();
-    }
-    match reclaim_whip_session(&state, &sess_id, &run_id, "delete").await {
+    match terminate_whip_session(&state, &sess_id, &run_id).await {
         Ok(()) => StatusCode::OK,
         Err(err) => {
-            // The tombstone above already committed, which is the delete's
-            // contract. A lost reclaim claim means another reclaimer owns the
-            // session removal and the watcher will finish it.
+            // A committed tombstone satisfies the delete's contract even if
+            // the reclaim is owned elsewhere. The watcher finishes the
+            // session removal in that case.
             if state.run_is_deleted(&run_id) {
                 tracing::info!(
                     "WHIP terminate: tombstone committed, cleanup owned elsewhere sess={sess_id}: {err}"
@@ -795,6 +783,41 @@ pub async fn whip_terminate(
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
+}
+
+async fn terminate_whip_session(
+    state: &AppState,
+    sess_id: &str,
+    run_id: &str,
+) -> Result<(), String> {
+    let state = state.clone();
+    let sess_id = sess_id.to_string();
+    let run_id = run_id.to_string();
+
+    tokio::spawn(async move { terminate_whip_session_transaction(state, sess_id, run_id).await })
+        .await
+        .map_err(|err| format!("WHIP terminate transaction join failure: {err}"))?
+}
+
+async fn terminate_whip_session_transaction(
+    state: AppState,
+    sess_id: String,
+    run_id: String,
+) -> Result<(), String> {
+    // The tombstone, the delete marking, and the reclaim live in one
+    // cancellation-resistant task. A client can drop the request right after
+    // the tombstone commits, and cancelling there would leave a deleted run
+    // with a live session and pipeline still running.
+    //
+    // The delete guarantees its own tombstone, exactly like the REST delete
+    // handler, so a stop-claimed reclaim that skips its append cannot lose
+    // it. The append is idempotent, so a duplicate from the reclaim is
+    // impossible.
+    append_whip_run_deleted_once(&state, &run_id, &sess_id, "delete").await?;
+    if let Some((_, _, session)) = state.get_session(&sess_id) {
+        session.mark_close_disposition_delete();
+    }
+    reclaim_whip_session_transaction(state, sess_id, run_id, "delete".to_string()).await
 }
 
 fn should_reclaim_peer_state(state: PeerConnectionState) -> bool {
@@ -1681,6 +1704,68 @@ mod tests {
         assert_eq!(state.session_count(), 0);
         assert!(state.get_session(sess_id).is_none());
         assert_eq!(session.close_call_count_for_tests(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_whip_terminate_still_deletes_run_and_removes_session() {
+        let state = AppState::with_wal_for_tests(std::env::temp_dir().join(format!(
+            "vidarax-whip-termcancel-{}.wal",
+            std::process::id()
+        )));
+        let sess_id = "sess-termcancel001";
+        let run_id: Arc<str> = Arc::from("run-whip-termcancel");
+        let principal = "tenant-a";
+        let session = Arc::new(WebRtcSession::new_for_tests());
+
+        state
+            .append_run_event(
+                &run_id,
+                "run_created",
+                serde_json::json!({
+                    "principal_key": principal,
+                    "session_id": sess_id,
+                    "source": "whip",
+                }),
+            )
+            .unwrap();
+        assert!(state.insert_session(
+            sess_id.to_string(),
+            principal.to_string(),
+            Arc::clone(&run_id),
+            Arc::clone(&session),
+        ));
+
+        // Cancel the terminate exactly while its tombstone append is in
+        // flight, like a client dropping the request. The spawned transaction
+        // must still finish: run deleted once, session removed.
+        state.pause_timeline_appends_for_tests();
+        let term_state = state.clone();
+        let term_run_id = Arc::clone(&run_id);
+        let term_task = tokio::spawn(async move {
+            super::terminate_whip_session(&term_state, sess_id, &term_run_id).await
+        });
+        state.wait_until_timeline_writer_paused_for_tests();
+        term_task.abort();
+        let _ = term_task.await;
+        state.resume_timeline_appends_for_tests();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.run_is_deleted(&run_id) && state.session_count() == 0 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled terminate must still delete the run and remove the session");
+
+        let events = state.read_run_events(&run_id).unwrap();
+        let deleted = events
+            .iter()
+            .filter(|event| event.kind == "run_deleted")
+            .count();
+        assert_eq!(deleted, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
