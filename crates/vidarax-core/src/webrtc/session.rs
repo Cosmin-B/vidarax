@@ -37,7 +37,7 @@
 //! ```
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
     Arc,
 };
 
@@ -225,11 +225,13 @@ impl Default for WebRtcConfig {
 /// connection closes when all handles are dropped.
 pub struct WebRtcSession {
     pc: PeerConnection,
-    /// Set by a REST stop before close() so the reclaim that close triggers
-    /// keeps the run's history. Set once, never cleared, and read by the
-    /// reclaim path. A reclaim racing in for a real peer failure reads false
-    /// and tombstones, which is right because the peer actually died.
-    preserve_history: AtomicBool,
+    /// Why this session is being closed, if a handler said so before the
+    /// close. 0 none, 1 stop (preserve history), 2 delete. Monotonic via
+    /// fetch_max so a delete always overrides a stop, and the winning
+    /// reclaimer reads it after it owns the removal.
+    close_disposition: AtomicU8,
+    /// Reclaim decision ownership. See try_claim_reclaim.
+    reclaim_claimed: AtomicBool,
     /// Configuration used when the worker generation starts. Live updates move
     /// through `control`; workers own the accepted values after startup.
     initial_prompt: Arc<str>,
@@ -295,7 +297,8 @@ impl WebRtcSession {
         (
             Self {
                 pc: PeerConnection::new(Default::default()),
-                preserve_history: AtomicBool::new(false),
+                close_disposition: AtomicU8::new(0),
+                reclaim_claimed: AtomicBool::new(false),
                 initial_prompt: Arc::from(""),
                 initial_guided_json: None,
                 control,
@@ -488,7 +491,8 @@ impl WebRtcSession {
         Ok((
             Self {
                 pc,
-                preserve_history: AtomicBool::new(false),
+                close_disposition: AtomicU8::new(0),
+                reclaim_claimed: AtomicBool::new(false),
                 initial_prompt: Arc::from(""),
                 initial_guided_json: None,
                 control,
@@ -768,13 +772,34 @@ impl WebRtcSession {
         self.control.stopping_flag()
     }
 
-    /// Ask the next reclaim of this session to keep the run's history.
-    pub fn mark_preserve_history(&self) {
-        self.preserve_history.store(true, Ordering::Release);
+    /// Ask the reclaim of this session to keep the run's history (REST stop).
+    pub fn mark_close_disposition_stop(&self) {
+        self.close_disposition.fetch_max(1, Ordering::AcqRel);
     }
 
-    pub fn preserve_history_on_reclaim(&self) -> bool {
-        self.preserve_history.load(Ordering::Acquire)
+    /// Record that a delete requested this close. Overrides a stop mark, so a
+    /// delete that lands after a stop still tombstones the run.
+    pub fn mark_close_disposition_delete(&self) {
+        self.close_disposition.fetch_max(2, Ordering::AcqRel);
+    }
+
+    /// True only when a stop asked for history preservation and no delete
+    /// overrode it. Read by the reclaimer after it owns the reclaim claim.
+    pub fn close_preserves_history(&self) -> bool {
+        self.close_disposition.load(Ordering::Acquire) == 1
+    }
+
+    /// Claim the right to decide this session's reclaim. Exactly one caller
+    /// wins. The claim is released only when a tombstone append fails, so a
+    /// watcher retry can claim again and finish the cleanup.
+    pub fn try_claim_reclaim(&self) -> bool {
+        self.reclaim_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn release_reclaim_claim(&self) {
+        self.reclaim_claimed.store(false, Ordering::Release);
     }
 
     /// Subscribe to rustrtc peer state changes for lifecycle cleanup.

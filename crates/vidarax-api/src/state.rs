@@ -742,7 +742,9 @@ impl AppState {
             let (_principal, existing_run_id, session) = entry.value();
             if &**existing_run_id == run_id {
                 if preserve_history {
-                    session.mark_preserve_history();
+                    session.mark_close_disposition_stop();
+                } else {
+                    session.mark_close_disposition_delete();
                 }
                 session.close();
                 break;

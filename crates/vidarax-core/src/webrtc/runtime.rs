@@ -298,8 +298,8 @@ pub struct JoinDeadlineInputs {
 /// Join deadline for generation teardown, derived from the work a healthy
 /// worker can legitimately be inside when stop is raised: an admission wait
 /// before each of the two tiered passes, the serial fallback attempts of one
-/// tiered call, and one sidecar exchange budgeted as four timeout-armed
-/// socket operations (connect, write, read, slack). A sidecar that drips
+/// tiered call, and one sidecar exchange budgeted as its five timeout-armed
+/// socket operations (connect, two writes, two reads). A sidecar that drips
 /// bytes slower than that budget counts as wedged on purpose. All arithmetic
 /// saturates and the result is capped at 24 hours.
 pub fn supervise_join_deadline_from(inputs: &JoinDeadlineInputs) -> Duration {
@@ -310,7 +310,7 @@ pub fn supervise_join_deadline_from(inputs: &JoinDeadlineInputs) -> Duration {
         .max(1)
         .saturating_mul(per_attempt);
     let admission = inputs.admission_wait_ms.saturating_mul(2);
-    let novelty = inputs.novelty_embedding_timeout_ms.saturating_mul(4);
+    let novelty = inputs.novelty_embedding_timeout_ms.saturating_mul(5);
     let total = inference
         .saturating_add(admission)
         .saturating_add(novelty)
@@ -565,7 +565,7 @@ mod tests {
         });
         let expected = 2 * (super::CLIP_FIRST_PASS_TIMEOUT_MS + super::CLIP_SECOND_PASS_TIMEOUT_MS)
             + 2 * 120_000
-            + 4 * 1_500
+            + 5 * 1_500
             + 5_000;
         assert_eq!(d, std::time::Duration::from_millis(expected));
     }

@@ -767,6 +767,11 @@ pub async fn whip_terminate(
         return StatusCode::FORBIDDEN;
     }
 
+    // A WHIP delete must tombstone even if a REST stop marked this session
+    // first. The delete disposition overrides the stop mark.
+    if let Some((_, _, session)) = state.get_session(&sess_id) {
+        session.mark_close_disposition_delete();
+    }
     match reclaim_whip_session(&state, &sess_id, &run_id, "delete").await {
         Ok(()) => StatusCode::OK,
         Err(err) => {
@@ -842,18 +847,30 @@ async fn reclaim_whip_session_transaction(
     run_id: String,
     reason: String,
 ) -> Result<(), String> {
-    // A REST stop marks the session itself before closing it, so the reclaim
-    // triggered by that close reads the mark here and keeps the run's
-    // history. A reclaim racing in for a real peer failure reads false and
-    // tombstones, which is right because the peer actually died. The mark is
-    // set once and never cleared, so there is no window where it can be
-    // consumed by the wrong reclaimer.
-    let preserve_history = state
-        .get_session(&sess_id)
-        .map(|(_, _, session)| session.preserve_history_on_reclaim())
-        .unwrap_or(false);
+    // Claim the reclaim on the session itself so exactly one caller decides
+    // the tombstone, and read the disposition only after the claim. That
+    // closes the window where a stop mark lands between a read and the
+    // append. A stop arriving after the claim is racing a peer-death cleanup
+    // and loses, which is right because the peer is already gone. The claim
+    // is released only on a failed append, so the watcher retry can claim
+    // again and finish the cleanup. Tombstone-then-remove order is kept so a
+    // committed tombstone never coexists with a silently dropped session.
+    let Some((_principal, existing_run_id, session)) = state.get_session(&sess_id) else {
+        return Ok(());
+    };
+    if &*existing_run_id != run_id {
+        return Ok(());
+    }
+    if !session.try_claim_reclaim() {
+        return Ok(());
+    }
+
+    let preserve_history = session.close_preserves_history();
     if !preserve_history {
-        append_whip_run_deleted_once(&state, &run_id, &sess_id, &reason).await?;
+        if let Err(err) = append_whip_run_deleted_once(&state, &run_id, &sess_id, &reason).await {
+            session.release_reclaim_claim();
+            return Err(err);
+        }
     }
 
     if let Some((_principal, _existing_run_id, session)) =
@@ -861,7 +878,9 @@ async fn reclaim_whip_session_transaction(
     {
         state.pipeline_metrics().inc_sessions_removed();
         session.close();
-        tracing::info!("WHIP session reclaimed sess_id={sess_id} reason={reason}");
+        tracing::info!(
+            "WHIP session reclaimed sess_id={sess_id} reason={reason} preserve_history={preserve_history}"
+        );
     }
 
     Ok(())
@@ -1627,6 +1646,56 @@ mod tests {
         assert_eq!(state.session_count(), 0);
         assert!(state.get_session(sess_id).is_none());
         assert_eq!(session.close_call_count_for_tests(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn whip_delete_after_stop_mark_still_tombstones() {
+        let state = AppState::with_wal_for_tests(
+            std::env::temp_dir().join(format!("vidarax-whip-wdel-{}.wal", std::process::id())),
+        );
+        let sess_id = "sess-wdel00000001";
+        let run_id: Arc<str> = Arc::from("run-whip-wdel");
+        let principal = "tenant-a";
+
+        state
+            .append_run_event(
+                &run_id,
+                "run_created",
+                serde_json::json!({
+                    "principal_key": principal,
+                    "session_id": sess_id,
+                    "source": "whip",
+                }),
+            )
+            .unwrap();
+        let session = Arc::new(WebRtcSession::new_for_tests());
+        assert!(state.insert_session(
+            sess_id.to_string(),
+            principal.to_string(),
+            Arc::clone(&run_id),
+            Arc::clone(&session),
+        ));
+
+        // A stop marks the session first, then a WHIP DELETE lands. The
+        // delete disposition overrides the stop mark, and the reclaim itself
+        // must append the tombstone because WHIP DELETE has no handler-side
+        // append of its own.
+        session.mark_close_disposition_stop();
+        session.mark_close_disposition_delete();
+        reclaim_whip_session(&state, sess_id, &run_id, "delete")
+            .await
+            .unwrap();
+
+        let events = state.read_run_events(&run_id).unwrap();
+        let deleted = events
+            .iter()
+            .filter(|event| event.kind == "run_deleted")
+            .count();
+        assert_eq!(
+            deleted, 1,
+            "WHIP delete must tombstone despite the stop mark"
+        );
+        assert!(state.get_session(sess_id).is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
