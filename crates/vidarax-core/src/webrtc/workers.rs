@@ -1696,7 +1696,7 @@ where
                             input_videos: Vec::new(),
                             max_tokens: 128,
                             temperature: 0.0,
-                            timeout_ms: 5_000,
+                            timeout_ms: crate::webrtc::runtime::KEYFRAME_FIRST_PASS_TIMEOUT_MS,
                             allow_fallback: true,
                             guided_json: guided_json.clone(),
                         };
@@ -1707,7 +1707,7 @@ where
                             &config,
                             request,
                             1024,
-                            10_000,
+                            crate::webrtc::runtime::KEYFRAME_SECOND_PASS_TIMEOUT_MS,
                             observer.as_deref(),
                         ) {
                             Ok(output) => {

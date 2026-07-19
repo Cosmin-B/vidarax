@@ -14,12 +14,13 @@ mod security;
 mod semantic;
 mod semantic_infer;
 mod server;
+// Stays pub: integration tests and doctests construct SpacetimeClient directly.
 pub mod spacetime_client;
 mod state;
 pub mod telemetry;
 mod tenant_labels;
 mod validation;
-pub mod wal_sink;
+pub(crate) mod wal_sink;
 mod whip;
 
 pub use config::{resolve_wal_path, ServerConfig, TransportMode};

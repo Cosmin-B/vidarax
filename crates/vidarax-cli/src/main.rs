@@ -21,7 +21,10 @@ use vidarax_contracts::lifecycle::StreamState;
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8080";
 const API_TIMEOUT_SECS: u64 = 10;
-const DEFAULT_ANALYZE_MODEL: &str = "vidarax-medium";
+// Must be an id the server's model contract accepts, and it matches the
+// TypeScript SDK's default. A made-up id here means the headline command
+// fails with 422 on a fresh install.
+const DEFAULT_ANALYZE_MODEL: &str = "Qwen/Qwen3-VL-2B-Instruct";
 const ANALYZE_PROGRESS_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
@@ -137,6 +140,10 @@ enum RunsCommands {
     Show { run_id: String },
     /// Create a run.
     Create(RunCreateArgs),
+    /// Stop a run without deleting its history.
+    Stop { run_id: String },
+    /// Extend a live run's idle deadline.
+    Keepalive { run_id: String },
     /// Delete a run.
     Rm { run_id: String },
 }
@@ -256,7 +263,17 @@ impl CropArg {
 #[derive(Args, Debug, Clone)]
 struct AnalyzeArgs {
     /// Local video file to analyze.
-    file: PathBuf,
+    #[arg(value_name = "FILE", required_unless_present = "source_uri")]
+    file: Option<PathBuf>,
+    /// Analyze a source the server can reach directly (http(s), rtsp, hls, or
+    /// a server-local path) instead of uploading a local file.
+    #[arg(long, value_name = "URI", conflicts_with = "file")]
+    source_uri: Option<String>,
+    /// Also run the ingest pass, which writes frame-signal events and gives
+    /// the progress bar a total. Off by default because reason decodes the
+    /// source itself, so ingest doubles the decode work.
+    #[arg(long)]
+    with_ingest: bool,
     /// Optional semantic prompt.
     #[arg(long, value_name = "TEXT")]
     prompt: Option<String>,
@@ -414,6 +431,10 @@ async fn dispatch(
             RunsCommands::List => cmd_runs_list(config, output).await,
             RunsCommands::Show { run_id } => cmd_runs_show(config, output, &run_id).await,
             RunsCommands::Create(args) => cmd_run_create(config, output, &args).await,
+            RunsCommands::Stop { run_id } => cmd_runs_stop(config, output, &run_id).await,
+            RunsCommands::Keepalive { run_id } => {
+                cmd_runs_keepalive(config, output, &run_id).await
+            }
             RunsCommands::Rm { run_id } => cmd_runs_rm(config, output, &run_id).await,
         },
         Commands::Events(args) => cmd_events(config, output, &args).await,
@@ -578,7 +599,11 @@ fn load_config_file() -> Result<HashMap<String, String>, String> {
 }
 
 fn config_file_path() -> Option<PathBuf> {
-    env::var_os("VIDARAX_CONFIG")
+    // The server reads VIDARAX_CONFIG as the path to its backend TOML file.
+    // The CLI used the same name for its own KEY=VALUE connection file, so a
+    // shell exporting it for the server silently broke the CLI. The CLI now
+    // has its own variable.
+    env::var_os("VIDARAX_CLI_CONFIG")
         .map(PathBuf::from)
         .or_else(|| {
             env::var_os("HOME").map(|home| {
@@ -687,25 +712,50 @@ impl ApiClient {
         body: Option<&Value>,
     ) -> Result<Value, String> {
         let url = format!("{}{}", self.opts.base_url, path);
-        let mut request = self.http.request(method, &url);
-        if !query.is_empty() {
-            request = request.query(query);
-        }
-        if let Some(api_key) = &self.opts.api_key {
-            request = request.header("x-api-key", api_key);
-        }
-        if let Some(tenant_id) = &self.opts.tenant_id {
-            request = request.header("x-tenant-id", tenant_id);
-        }
-        if let Some(body) = body {
-            request = request.json(body);
-        }
+        // Retry transient failures using the shared classification from
+        // vidarax-contracts, mirroring the TypeScript SDK's retry behavior.
+        // Multipart uploads are not retried because the form body is consumed
+        // by send.
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut attempt = 1;
+        loop {
+            let mut request = self.http.request(method.clone(), &url);
+            if !query.is_empty() {
+                request = request.query(query);
+            }
+            if let Some(api_key) = &self.opts.api_key {
+                request = request.header("x-api-key", api_key);
+            }
+            if let Some(tenant_id) = &self.opts.tenant_id {
+                request = request.header("x-tenant-id", tenant_id);
+            }
+            if let Some(body) = body {
+                request = request.json(body);
+            }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| format!("request to {url} failed: {e}"))?;
-        decode_json_response(&url, response).await
+            let backoff = Duration::from_millis(200 * u64::from(attempt));
+            match request.send().await {
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    if attempt < MAX_ATTEMPTS
+                        && vidarax_contracts::errors::classify_status_code(status).is_retryable()
+                    {
+                        attempt += 1;
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    return decode_json_response(&url, response).await;
+                }
+                Err(e) => {
+                    if attempt < MAX_ATTEMPTS {
+                        attempt += 1;
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    return Err(format!("request to {url} failed: {e}"));
+                }
+            }
+        }
     }
 }
 
@@ -879,6 +929,46 @@ async fn cmd_run_create(
         color_status(status, output.color)
     );
     Ok(())
+}
+
+async fn cmd_runs_stop(
+    config: RuntimeConfig,
+    output: OutputMode,
+    run_id: &str,
+) -> Result<(), String> {
+    let client = ApiClient::new(config.api_opts())?;
+    let body = client
+        .post_json(&format!("/v1/runs/{run_id}/stop"), &json!({}))
+        .await?;
+    if output.json {
+        return print_json(&body);
+    }
+    println!("stopped run {run_id}");
+    Ok(())
+}
+
+async fn cmd_runs_keepalive(
+    config: RuntimeConfig,
+    output: OutputMode,
+    run_id: &str,
+) -> Result<(), String> {
+    let client = ApiClient::new(config.api_opts())?;
+    let body = client
+        .post_json(&format!("/v1/runs/{run_id}/keepalive"), &json!({}))
+        .await?;
+    if output.json {
+        return print_json(&body);
+    }
+    println!("extended run {run_id}");
+    Ok(())
+}
+
+// Used after a partial analyze failure. Ignores errors on purpose, because
+// the run may already be terminal and the original error matters more.
+async fn best_effort_stop(client: &ApiClient, run_id: &str) {
+    let _ = client
+        .post_json(&format!("/v1/runs/{run_id}/stop"), &json!({}))
+        .await;
 }
 
 async fn cmd_runs_rm(
@@ -1071,10 +1161,14 @@ async fn cmd_analyze(
     validate_analyze_args(args)?;
     let client = ApiClient::new_without_timeout(config.api_opts())?;
 
-    status_line(output, "uploading...");
-    let file_path = upload_analyze_file(&client, &args.file)
-        .await
-        .map_err(|e| format!("upload failed: {e}"))?;
+    let file_path = if let Some(file) = &args.file {
+        status_line(output, "uploading...");
+        upload_analyze_file(&client, file)
+            .await
+            .map_err(|e| format!("upload failed: {e}"))?
+    } else {
+        args.source_uri.clone().unwrap_or_default()
+    };
 
     status_line(output, "creating run...");
     let run_response = client
@@ -1085,18 +1179,30 @@ async fn cmd_analyze(
         .ok_or_else(|| "create run failed: response missing string field run_id".to_string())?
         .to_string();
 
-    status_line(output, "ingesting...");
-    let ingest_response = client
-        .post_json(
-            &format!("/v1/runs/{run_id}/ingest"),
-            &args.ingest_body(&file_path),
-        )
-        .await
-        .map_err(|e| format!("ingest failed: {e}"))?;
-    let decoded_frames = u64_field(&ingest_response, "decoded_frames");
-    let source_fps = ingest_response.get("source_fps").and_then(Value::as_f64);
-    let estimated_chunks =
-        estimate_reason_chunks(decoded_frames, source_fps, args.fixed_fps, args.chunk_size);
+    // Reason decodes the source itself, so the ingest pass is opt-in. It adds
+    // frame-signal events and a progress total at the cost of a second decode.
+    let estimated_chunks = if args.with_ingest {
+        status_line(output, "ingesting...");
+        match client
+            .post_json(
+                &format!("/v1/runs/{run_id}/ingest"),
+                &args.ingest_body(&file_path),
+            )
+            .await
+        {
+            Ok(ingest_response) => {
+                let decoded_frames = u64_field(&ingest_response, "decoded_frames");
+                let source_fps = ingest_response.get("source_fps").and_then(Value::as_f64);
+                estimate_reason_chunks(decoded_frames, source_fps, args.fixed_fps, args.chunk_size)
+            }
+            Err(e) => {
+                best_effort_stop(&client, &run_id).await;
+                return Err(format!("ingest failed: {e}"));
+            }
+        }
+    } else {
+        None
+    };
 
     status_line(output, "reasoning...");
     let progress = AnalyzeProgress::new(output, estimated_chunks);
@@ -1128,6 +1234,9 @@ async fn cmd_analyze(
         Ok(response) => response,
         Err(e) => {
             progress.clear();
+            // Without this the failed run stays live until its TTL and keeps
+            // occupying the caller's run limit.
+            best_effort_stop(&client, &run_id).await;
             return Err(format!("reason failed: {e}"));
         }
     };
@@ -1143,8 +1252,18 @@ async fn cmd_analyze(
 }
 
 fn validate_analyze_args(args: &AnalyzeArgs) -> Result<(), String> {
-    if !args.file.is_file() {
-        return Err(format!("{} is not a file", args.file.display()));
+    match (&args.file, &args.source_uri) {
+        (Some(file), None) => {
+            if !file.is_file() {
+                return Err(format!("{} is not a file", file.display()));
+            }
+        }
+        (None, Some(uri)) => {
+            if non_empty_opt(uri).is_none() {
+                return Err("--source-uri must not be empty".to_string());
+            }
+        }
+        _ => return Err("provide a FILE or --source-uri".to_string()),
     }
     if args.fixed_fps <= 0.0 {
         return Err("--fixed-fps must be greater than 0".to_string());
@@ -2144,11 +2263,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn default_analyze_model_is_in_catalog() {
+        assert_eq!(
+            vidarax_contracts::models::normalize_model_id(DEFAULT_ANALYZE_MODEL),
+            Some(DEFAULT_ANALYZE_MODEL),
+            "the CLI default must be a model id the server accepts"
+        );
+    }
+
     fn analyze_args() -> AnalyzeArgs {
         AnalyzeArgs {
-            file: PathBuf::from("clip.mp4"),
+            file: Some(PathBuf::from("clip.mp4")),
+            source_uri: None,
+            with_ingest: false,
             prompt: None,
-            model: "vidarax-medium".to_string(),
+            model: DEFAULT_ANALYZE_MODEL.to_string(),
             mode: None,
             fixed_fps: 1.0,
             chunk_size: 25,

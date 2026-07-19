@@ -157,6 +157,7 @@ pub struct PipelineMetrics {
     pipeline_generation_clean_shutdown_total: AtomicU64,
     pipeline_generation_faulted_shutdown_total: AtomicU64,
     pipeline_generation_forced_shutdown_total: AtomicU64,
+    pipeline_detached_workers_total: AtomicU64,
     pipeline_last_fault_timestamp_seconds: AtomicU64,
     /// Fixed stage × reason matrix; labels are rendered only at scrape time.
     pipeline_worker_faults_total: [AtomicU64; PIPELINE_STAGE_COUNT * PIPELINE_FAULT_REASON_COUNT],
@@ -208,6 +209,7 @@ impl PipelineMetrics {
             pipeline_generation_clean_shutdown_total: AtomicU64::new(0),
             pipeline_generation_faulted_shutdown_total: AtomicU64::new(0),
             pipeline_generation_forced_shutdown_total: AtomicU64::new(0),
+            pipeline_detached_workers_total: AtomicU64::new(0),
             pipeline_last_fault_timestamp_seconds: AtomicU64::new(0),
             pipeline_worker_faults_total: std::array::from_fn(|_| AtomicU64::new(0)),
 
@@ -440,13 +442,22 @@ impl PipelineMetrics {
                 self.pipeline_generation_faulted_shutdown_total
                     .fetch_add(1, Ordering::Relaxed);
             }
-            PipelineShutdown::JoinDeadline { fault, overrun } => {
+            PipelineShutdown::JoinDeadline {
+                fault,
+                overrun,
+                detached,
+            } => {
                 if let Some(fault) = fault {
                     self.record_pipeline_fault(fault);
                 }
                 self.record_pipeline_fault(overrun);
                 self.pipeline_generation_forced_shutdown_total
                     .fetch_add(1, Ordering::Relaxed);
+                // The active gauge goes down because the generation is over,
+                // but these threads are still running. Track them separately
+                // so a forced shutdown is not mistaken for a full cleanup.
+                self.pipeline_detached_workers_total
+                    .fetch_add(u64::from(detached), Ordering::Relaxed);
             }
         }
     }
@@ -511,6 +522,7 @@ impl PipelineMetrics {
         let generations_faulted = self
             .pipeline_generation_faulted_shutdown_total
             .load(Ordering::Relaxed);
+        let detached_workers = self.pipeline_detached_workers_total.load(Ordering::Relaxed);
         let generations_forced = self
             .pipeline_generation_forced_shutdown_total
             .load(Ordering::Relaxed);
@@ -553,6 +565,7 @@ impl PipelineMetrics {
              vidarax_pipeline_generation_shutdown_clean_total {generations_clean}\n\
              vidarax_pipeline_generation_shutdown_faulted_total {generations_faulted}\n\
              vidarax_pipeline_generation_shutdown_forced_total {generations_forced}\n\
+             vidarax_pipeline_detached_workers_total {detached_workers}\n\
              vidarax_pipeline_last_fault_timestamp_seconds {last_fault_timestamp}\n"
         );
 

@@ -42,6 +42,7 @@ const v = new Vidarax(baseUrl, options?)
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `apiKey` | `string` | -- | `x-api-key` header sent with every request. |
+| `tenantId` | `string` | -- | `x-tenant-id` header sent with every request. Servers started with `VIDARAX_REQUIRE_TENANT_ID` reject requests without it. |
 | `maxRetries` | `number` | `3` | Retry count for transient failures. |
 | `retryBaseDelayMs` | `number` | `200` | Starting back-off delay in ms. |
 | `timeoutMs` | `number` | `30000` | Per-request timeout in ms. |

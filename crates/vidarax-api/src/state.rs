@@ -696,6 +696,27 @@ impl AppState {
         true
     }
 
+    /// Release the media reservation for a session. Called by the pipeline
+    /// supervisor after its join loop returns, and skipped on a forced
+    /// shutdown because detached threads still hold their memory.
+    pub(crate) fn release_media_reservation(&self, sess_id: &str) {
+        self.media_reservations.remove(sess_id);
+    }
+
+    /// Close the live WebRTC session that owns `run_id`, if any. The peer
+    /// watcher then reclaims the session and the supervisor tears the
+    /// pipeline down, so a REST stop or delete stops live work instead of
+    /// only recording an event.
+    pub(crate) fn close_live_session_for_run(&self, run_id: &str) {
+        for entry in self.sessions.iter() {
+            let (_principal, existing_run_id, session) = entry.value();
+            if &**existing_run_id == run_id {
+                session.close();
+                break;
+            }
+        }
+    }
+
     /// Look up a WebRTC session by ID.  Returns `None` if not found.
     pub fn get_session(&self, sess_id: &str) -> Option<SessionEntry> {
         self.sessions
@@ -720,7 +741,11 @@ impl AppState {
                 &**existing_run_id == run_id
             })?;
         self.session_slots.fetch_sub(1, Ordering::AcqRel);
-        self.media_reservations.remove(sess_id);
+        // The media reservation is NOT released here. Session removal happens
+        // on peer teardown, while the generation's OS threads may still be
+        // joining. The supervisor releases the permit after the join loop
+        // finishes, so the budget cannot be re-admitted while the old
+        // generation's threads are still running.
         let (principal, existing_run_id, _session) = &entry;
         self.reclaimed_sessions
             .lock()
@@ -984,6 +1009,11 @@ impl AppState {
         &self,
         request: TimelineAppendRequest,
     ) -> Result<TimelineEvent, String> {
+        // A worker detached by a forced shutdown can outlive its run's
+        // deletion. Never append ordinary events after the tombstone.
+        if self.run_is_deleted(&request.run_id) {
+            return Err(format!("run {} is deleted", request.run_id));
+        }
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let mut command = TimelineCommand::Append {
             request: Some(request),

@@ -40,7 +40,7 @@ Decoding for file and URL sources goes through a pluggable backend registry with
 
 ## Session generations and control
 
-The stages of a live stream do not fail or restart independently. `PipelineRuntime` owns a stage-tagged join handle for every worker in one process-unique `PipelineGeneration`. The first unexpected exit faults that generation, raises its monotonic stop signal, closes the WebRTC peer, and gives every sibling a bounded interval to finish. A generation that exceeds the join deadline is reported as a forced shutdown. Vidarax never restarts a decoder, novelty worker, or VLM worker underneath temporal state from the old generation.
+The stages of a live stream do not fail or restart independently. `PipelineRuntime` owns a stage-tagged join handle for every worker in one process-unique `PipelineGeneration`. The first unexpected exit faults that generation, raises its monotonic stop signal, closes the WebRTC peer, and gives every sibling a join deadline derived from the VLM request timeouts, so ordinary teardown during an in-flight inference call is not misjudged. A generation that exceeds that deadline is reported as a forced shutdown. Its stragglers keep running detached and are counted in `vidarax_pipeline_detached_workers_total`, and the session's media reservation is kept because those threads still hold that memory. Vidarax never restarts a decoder or VLM worker (including its inline novelty check) underneath temporal state from the old generation.
 
 ```
                         generation N

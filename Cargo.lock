@@ -4782,6 +4782,7 @@ dependencies = [
  "getrandom 0.4.3",
  "governor 0.6.3",
  "http-body-util",
+ "jsonschema",
  "kanal",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -4816,7 +4817,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vidarax-contracts",
- "vidarax-core",
 ]
 
 [[package]]

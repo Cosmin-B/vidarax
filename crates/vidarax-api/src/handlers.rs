@@ -38,8 +38,8 @@ use crate::models::{
     RealtimeReasonResponse, SamplingPolicy, SearchHit, SearchRequest, SearchResponse, TokenMetrics,
 };
 use crate::response::{
-    conflict_error, internal_error, not_found_error, ok, service_unavailable, validation_error,
-    ApiResponse,
+    bad_request_error, conflict_error, internal_error, not_found_error, ok, service_unavailable,
+    validation_error, ApiResponse,
 };
 use crate::semantic::{build_marker_lifecycle, MarkerConfig};
 use crate::semantic_infer::{
@@ -204,7 +204,7 @@ pub async fn ingest_run(
                 )],
             );
         };
-        if !(0.2..=120.0).contains(&sample_fps) {
+        if !(vidarax_contracts::processing::REQUEST_FPS_MIN..=vidarax_contracts::processing::REQUEST_FPS_MAX).contains(&sample_fps) {
             return validation_error(
                 &state,
                 "invalid ingest request",
@@ -417,6 +417,9 @@ pub async fn stop_run(
     {
         return internal_error(&state, format!("failed to append stop event: {err}"));
     }
+
+    // Stopping must actually stop live work, not only record the intent.
+    state.close_live_session_for_run(&run_id);
 
     ok(json!({
         "request_id": request_id,
@@ -886,7 +889,7 @@ pub async fn analyze_run(
                     )],
                 );
             };
-            if !(0.2..=120.0).contains(&fixed) {
+            if !(vidarax_contracts::processing::REQUEST_FPS_MIN..=vidarax_contracts::processing::REQUEST_FPS_MAX).contains(&fixed) {
                 return validation_error(
                     &state,
                     "invalid analyze payload",
@@ -1208,7 +1211,7 @@ fn validate_realtime_reason_params(
     }
 
     let fixed_fps = payload.fixed_fps.unwrap_or(1.0);
-    if sampling_policy == SamplingPolicy::Fixed && !(0.2..=120.0).contains(&fixed_fps) {
+    if sampling_policy == SamplingPolicy::Fixed && !(vidarax_contracts::processing::REQUEST_FPS_MIN..=vidarax_contracts::processing::REQUEST_FPS_MAX).contains(&fixed_fps) {
         return Err(validation_error(
             state,
             "invalid realtime reason request",
@@ -2479,7 +2482,7 @@ fn infer_execution_error_to_response(state: &AppState, err: InferExecutionError)
         );
     }
     if err.code == "provider_saturated" {
-        return service_unavailable(state, err.message);
+        return service_unavailable(state, err.code, err.message);
     }
     internal_error(state, err.message)
 }
@@ -2791,8 +2794,13 @@ pub async fn submit_feedback(
         return error;
     }
 
+    // SpacetimeDB is an optional dependency, so its absence is a 503, not a 500.
     let Some(stdb) = state.spacetime_client() else {
-        return internal_error(&state, "spacetimedb client not configured");
+        return service_unavailable(
+            &state,
+            "spacetimedb_not_configured",
+            "feedback requires SpacetimeDB, which is not configured",
+        );
     };
 
     let req = crate::spacetime_client::SubmitFeedbackRequest {
@@ -2815,8 +2823,13 @@ pub async fn submit_feedback(
 
 #[tracing::instrument(name = "api.list_feedback", skip_all)]
 pub async fn list_feedback(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    // SpacetimeDB is an optional dependency, so its absence is a 503, not a 500.
     let Some(stdb) = state.spacetime_client() else {
-        return internal_error(&state, "spacetimedb client not configured");
+        return service_unavailable(
+            &state,
+            "spacetimedb_not_configured",
+            "feedback requires SpacetimeDB, which is not configured",
+        );
     };
     let principal = state.security_policy().principal_key_from_headers(&headers);
     let all_events = match state.read_all_events_async().await {
@@ -2952,6 +2965,10 @@ pub async fn delete_run(
     {
         return internal_error(&state, format!("failed to append run_deleted event: {err}"));
     }
+
+    // Deleting a live WHIP run must also tear its pipeline down.
+    state.close_live_session_for_run(&run_id);
+
     ok(json!({
         "request_id": request_id,
         "run_id": run_id,
@@ -2978,16 +2995,26 @@ pub async fn serve_file(
 
     // Reject filenames with path separators or obvious traversal attempts.
     if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Body::from("invalid filename"))
-            .unwrap();
+        return bad_request_error(
+            &state,
+            "invalid filename",
+            vec![field_error(
+                "filename",
+                "filename must not contain path separators or traversal sequences".to_string(),
+            )],
+        )
+        .into_response();
     }
     if !allowed_served_file_extension(&filename) {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Body::from("unsupported file type"))
-            .unwrap();
+        return bad_request_error(
+            &state,
+            "unsupported file type",
+            vec![field_error(
+                "filename",
+                "only mp4, webm, mov, or avi files are served".to_string(),
+            )],
+        )
+        .into_response();
     }
     let principal = state.security_policy().principal_key_from_headers(&headers);
     let owner_prefix = upload_owner_prefix_from_principal(&principal);
@@ -3044,10 +3071,12 @@ pub async fn serve_file(
             .unwrap();
     }
 
-    Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .body(Body::from("file not found"))
-        .unwrap()
+    not_found_error(
+        &state,
+        "file not found",
+        vec![field_error("filename", filename)],
+    )
+    .into_response()
 }
 
 /// Return a raw JPEG referenced by a `keyframe_stored` event on an owned run.

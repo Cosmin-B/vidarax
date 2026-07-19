@@ -272,7 +272,25 @@ pub enum PipelineShutdown {
     JoinDeadline {
         fault: Option<PipelineFault>,
         overrun: PipelineFault,
+        /// Workers that were still running at the deadline. Their OS threads
+        /// keep running detached and keep their memory until process exit.
+        detached: u32,
     },
+}
+
+/// VLM request timeouts for one work item. Shared here so the join deadline
+/// below can be derived from them instead of drifting apart.
+pub const KEYFRAME_FIRST_PASS_TIMEOUT_MS: u64 = 5_000;
+pub const KEYFRAME_SECOND_PASS_TIMEOUT_MS: u64 = 10_000;
+pub const CLIP_FIRST_PASS_TIMEOUT_MS: u64 = 15_000;
+pub const CLIP_SECOND_PASS_TIMEOUT_MS: u64 = 20_000;
+
+/// Join deadline for generation teardown. A VLM worker can legitimately sit
+/// inside one tiered call for the sum of both pass timeouts, so the deadline
+/// must exceed the slowest path (clip mode) or ordinary teardown during an
+/// in-flight call gets reported as a forced shutdown and detaches threads.
+pub fn supervise_join_deadline() -> Duration {
+    Duration::from_millis(CLIP_FIRST_PASS_TIMEOUT_MS + CLIP_SECOND_PASS_TIMEOUT_MS + 5_000)
 }
 
 #[derive(Debug)]
@@ -482,6 +500,7 @@ impl PipelineRuntime {
                         stage,
                         reason: PipelineFaultReason::JoinDeadline,
                     },
+                    detached: self.workers.len() as u32,
                 };
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -629,6 +648,7 @@ mod tests {
                     stage: PipelineStage::Analysis,
                     reason: PipelineFaultReason::JoinDeadline,
                 },
+                detached: 1,
             }
         );
     }

@@ -89,19 +89,19 @@ The API is served over HTTP/1.1 and HTTP/2, with optional HTTP/3 behind the `h3-
 
 ### Feedback
 
-Both feedback routes require the optional SpacetimeDB integration; without `VIDARAX_SPACETIMEDB_URL` they return 500 with a "spacetimedb client not configured" message.
+Both feedback routes require the optional SpacetimeDB integration. Without `VIDARAX_SPACETIMEDB_URL` they return 503 with code `spacetimedb_not_configured`, because a missing optional dependency is unavailability, not a server fault.
 
 | Route | Request | Success (200) | Failures |
 |---|---|---|---|
-| `POST /v1/runs/:id/feedback` | `{ rating, category, feedback? }`; rating in [0, 10], category non-empty | `{ request_id, run_id, status: "submitted" }` | 404, 422, 500 |
-| `GET /v1/feedback` | none | `{ request_id, feedback[] }`, filtered to caller-owned runs | 500 |
+| `POST /v1/runs/:id/feedback` | `{ rating, category, feedback? }`; rating in [0, 10], category non-empty | `{ request_id, run_id, status: "submitted" }` | 404, 422, 500, 503 SpacetimeDB not configured |
+| `GET /v1/feedback` | none | `{ request_id, feedback[] }`, filtered to caller-owned runs | 500, 503 SpacetimeDB not configured |
 
 ### Files
 
 | Route | Request | Success | Failures | Notes |
 |---|---|---|---|---|
 | `POST /v1/upload` | multipart form with a `file` field; body capped at 200 MiB by the route's body limit | 200 `{ file_path }`, the server-side path to use as `source_uri` | 422 unsupported type or invalid media container, 500 | Filenames are sanitized and prefixed per principal; the content must validate as a media container, not a playlist |
-| `GET /v1/files/:filename` | bare filename only | 200 file bytes with a video content type and `Accept-Ranges: bytes` | 400, 404 | Errors are raw text bodies, not the JSON envelope. Uploads are only visible to the uploading principal; operator-configured roots are shared |
+| `GET /v1/files/:filename` | bare filename only | 200 file bytes with a video content type and `Accept-Ranges: bytes` | 400 `bad_request`, 404 `not_found` | Errors use the structured JSON envelope. Uploads are only visible to the uploading principal; operator-configured roots are shared |
 
 ### Keyframe blobs
 
@@ -138,6 +138,7 @@ Handler errors share one JSON shape. The `request_id` is a string and lives insi
 | Status | Code | When |
 |--------|------|------|
 | 400 | `validation_error` | CORS preflight without an `Origin` header. |
+| 400 | `bad_request` | File route filename with separators, traversal sequences, or an unsupported extension. |
 | 401 | `unauthorized` | Missing or invalid `x-api-key`; missing `x-tenant-id` when required. |
 | 403 | `cors_forbidden` | Preflight from an origin outside the allowlist. |
 | 404 | `not_found` | Unknown, deleted, or other-principal `run_id`. |
@@ -146,8 +147,9 @@ Handler errors share one JSON shape. The `request_id` is a string and lives insi
 | 429 | `rate_limited` | Global or per-principal rate limit exceeded. |
 | 500 | `internal_error` | Internal failure; the message is sanitized and details are logged server-side. |
 | 503 | `metrics_unavailable` | Metrics auth enabled with no API keys configured. |
+| 503 | `spacetimedb_not_configured` | Feedback routes without `VIDARAX_SPACETIMEDB_URL` set. |
 
-Not everything uses the envelope. WHIP routes return raw SDP on success and bare status codes or plain text on failure; `GET /v1/files` failures are plain text; and requests rejected before a handler runs (malformed JSON bodies, unknown routes, oversized uploads) get the framework's default plain responses.
+Not everything uses the envelope. WHIP routes return raw SDP on success and bare status codes or plain text on failure, and requests rejected before a handler runs (malformed JSON bodies, unknown routes, oversized uploads) get the framework's default plain responses.
 
 ## Configuration
 

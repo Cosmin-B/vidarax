@@ -71,10 +71,13 @@ Worker startup itself is generation-owned. `spawn_pipeline` returns a
 `PipelineRuntime` containing stage-tagged join handles. Partial startup raises
 the shared stop signal and bounded-joins the already-created prefix. After a
 successful start, the supervisor treats the first unexpected exit as a fault,
-closes the peer, stops siblings, waits up to five seconds, and reports a forced
-shutdown if a worker misses that deadline. The peer-state reclaimer still owns
-the durable tombstone, so fault and DELETE races converge on the same
-single-winner removal.
+closes the peer, stops siblings, and waits out a join deadline derived from
+the VLM pass timeouts (`supervise_join_deadline`, 40 seconds), long enough for
+an in-flight inference call to drain. A worker that misses that deadline is
+left detached and reported as a forced shutdown, and the session's media
+reservation is kept because the detached thread still holds its memory. The
+peer-state reclaimer still owns the durable tombstone, so fault and DELETE
+races converge on the same single-winner removal.
 
 Reclaim itself is race-safe by construction: `remove_session_for_run` uses `DashMap::remove_if` to check run ownership and remove under one shard lock, so exactly one caller (DELETE handler or peer-state watcher) wins cleanup, and the winner writes a `ReclaimedSessions` record so a later DELETE of the same session stays idempotent instead of returning 404. That tombstone map is bounded by both a TTL (`RECLAIMED_SESSION_TTL_MS`, ten minutes) and a cap (`RECLAIMED_SESSION_MAX_ENTRIES`, 1024).
 

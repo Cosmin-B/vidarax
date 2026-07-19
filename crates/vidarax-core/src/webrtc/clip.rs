@@ -443,7 +443,7 @@ where
                         // Allow more tokens and time for multi-frame analysis.
                         max_tokens: 256,
                         temperature: 0.0,
-                        timeout_ms: 15_000,
+                        timeout_ms: crate::webrtc::runtime::CLIP_FIRST_PASS_TIMEOUT_MS,
                         allow_fallback: true,
                         guided_json: guided_json.clone(),
                     };
@@ -454,7 +454,7 @@ where
                         &config,
                         request,
                         1024,
-                        20_000,
+                        crate::webrtc::runtime::CLIP_SECOND_PASS_TIMEOUT_MS,
                         observer.as_deref(),
                     ) {
                         Ok(output) => (output.result.output_text, output.used_second_pass),
@@ -472,6 +472,13 @@ where
                             (format!("clip_vlm_error: {:?}", err.error), false)
                         }
                     };
+
+                    // run_tiered can take tens of seconds. If the generation
+                    // began stopping meanwhile, drop this result instead of
+                    // writing events for a run that is shutting down.
+                    if stopping.load(Ordering::Acquire) {
+                        break;
+                    }
 
                     if max_output_tokens_per_second > 0 {
                         let token_count = (description.len() / 4).max(1) as u32;

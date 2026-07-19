@@ -1,3 +1,7 @@
+//! Model catalog: the VLM model ids vidarax accepts, plus alias
+//! normalization. Domain request and response types live in
+//! vidarax-api, not here.
+
 pub const REQUIRED_MEDIUM_MODELS: &[&str] = &[
     "Qwen/Qwen3.5-35B-A3B-FP8",
     "Qwen/Qwen3.5-9B",
@@ -62,7 +66,7 @@ pub fn normalize_model_id(input: &str) -> Option<&'static str> {
         "gemini-3.1-flash-lite"
         | "gemini-3.1-flash-lite-preview"
         | "gemini-flash-lite-latest"
-        | "gemini-flash-latest" => Some("gemini-3.1-flash-lite"),
+        | "gemini-flash-latest" => Some(GEMINI_MODELS[0]),
         _ => None,
     }
 }

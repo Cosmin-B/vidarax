@@ -40,3 +40,4 @@ opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "trace"] }
 
 [dev-dependencies]
+jsonschema = "0.43"

@@ -493,6 +493,8 @@ async fn start_whip_session_transaction(
     let initial_guided_json = session.initial_guided_json();
     let generation = session.generation();
     let stopping = session.stopping_flag();
+    let state_for_supervisor = state.clone();
+    let sess_id_for_permit = sess_id.clone();
 
     // Worker threads are long-running OS threads (not tokio tasks).
     // Use spawn_blocking as a bridge from async context to the thread spawns;
@@ -549,7 +551,9 @@ async fn start_whip_session_transaction(
                     workers = runtime.worker_count(),
                     "WHIP media pipeline generation started"
                 );
-                let outcome = runtime.supervise(Duration::from_secs(5), |fault| {
+                let outcome = runtime.supervise(
+                    vidarax_core::webrtc::runtime::supervise_join_deadline(),
+                    |fault| {
                     tracing::error!(
                         session_id = %session_id_for_log,
                         generation,
@@ -557,9 +561,29 @@ async fn start_whip_session_transaction(
                         reason = ?fault.reason,
                         "WHIP media pipeline generation faulted"
                     );
-                    session.close();
-                });
+                        session.close();
+                    },
+                );
                 metrics_for_supervisor.pipeline_generation_stopped(outcome);
+                match outcome {
+                    vidarax_core::webrtc::runtime::PipelineShutdown::JoinDeadline {
+                        detached,
+                        ..
+                    } => {
+                        // Detached threads still hold their share of the media
+                        // budget. Keep the reservation so new sessions are not
+                        // admitted against memory that is still in use.
+                        tracing::error!(
+                            session_id = %session_id_for_log,
+                            generation,
+                            detached,
+                            "forced shutdown left threads detached; media reservation kept"
+                        );
+                    }
+                    _ => {
+                        state_for_supervisor.release_media_reservation(&sess_id_for_permit);
+                    }
+                }
                 tracing::info!(
                     session_id = %session_id_for_log,
                     generation,
@@ -579,6 +603,7 @@ async fn start_whip_session_transaction(
                     "WHIP media pipeline failed to start; closing session"
                 );
                 session.close();
+                state_for_supervisor.release_media_reservation(&sess_id_for_permit);
             }
         }
     });
@@ -1022,8 +1047,11 @@ struct UpdatePromptResponse {
 /// `PATCH /v1/stream/whip/{sess_id}/prompt`
 ///
 /// Replaces the VLM analysis prompt for a running WebRTC session and
-/// optionally sets a JSON schema for structured output.
-/// The new prompt and schema are used by VLM workers on the next keyframe.
+/// optionally sets a JSON schema for structured output. The update is sent
+/// to the live pipeline as a generation-tagged command, and the handler
+/// waits up to two seconds for a VLM worker acknowledgement. The worker
+/// applies the new values before its next work item, so `200 OK` means the
+/// update is actually in effect, not merely queued.
 ///
 /// Body: `{ "prompt": "new prompt text", "output_schema": {...} }`
 ///
@@ -1031,6 +1059,8 @@ struct UpdatePromptResponse {
 /// - `200 OK` with `{ "session_id": "...", "prompt": "...", "output_schema": ... }`
 /// - `404 Not Found` — unknown session
 /// - `403 Forbidden` — caller is not the session owner
+/// - `409 Conflict` — the session's generation was closed or replaced, so the update was rejected
+/// - `503 Service Unavailable` — no acknowledgement within two seconds. The command was discarded rather than applied later, so the caller must retry.
 #[tracing::instrument(name = "whip.update_prompt", skip_all, fields(sess_id))]
 pub async fn whip_update_prompt(
     State(state): State<AppState>,

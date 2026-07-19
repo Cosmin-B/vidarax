@@ -15,7 +15,10 @@
     "annotations",
     "confidence",
     "trace",
-    "ordering_key"
+    "ordering_key",
+    "sampling_policy",
+    "sample_fps",
+    "finish_reason"
   ],
   "properties": {
     "run_id": {
@@ -47,10 +50,18 @@
         "analysis_extent"
       ],
       "properties": {
-        "source_extent": { "$ref": "#/$defs/pixelExtent" },
-        "requested_region": { "$ref": "#/$defs/normalizedRect" },
-        "resolved_region": { "$ref": "#/$defs/pixelRect" },
-        "analysis_extent": { "$ref": "#/$defs/pixelExtent" }
+        "source_extent": {
+          "$ref": "#/$defs/pixelExtent"
+        },
+        "requested_region": {
+          "$ref": "#/$defs/normalizedRect"
+        },
+        "resolved_region": {
+          "$ref": "#/$defs/pixelRect"
+        },
+        "analysis_extent": {
+          "$ref": "#/$defs/pixelExtent"
+        }
       }
     },
     "mode": {
@@ -72,7 +83,8 @@
       "required": [
         "start_ms",
         "end_ms",
-        "segment_id"
+        "segment_id",
+        "source"
       ],
       "properties": {
         "start_ms": {
@@ -88,12 +100,7 @@
           "minLength": 1
         },
         "source": {
-          "type": "string",
-          "enum": [
-            "frame",
-            "segment",
-            "interpolated"
-          ]
+          "type": "string"
         }
       }
     },
@@ -213,38 +220,98 @@
     "ordering_key": {
       "type": "string",
       "description": "Deterministic key format: run_id:pts_ms:seq"
+    },
+    "sampling_policy": {
+      "type": "string"
+    },
+    "sample_fps": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "finish_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "$defs": {
     "pixelExtent": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["width", "height"],
+      "required": [
+        "width",
+        "height"
+      ],
       "properties": {
-        "width": { "type": "integer", "minimum": 1 },
-        "height": { "type": "integer", "minimum": 1 }
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        }
       }
     },
     "pixelRect": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["x", "y", "width", "height"],
+      "required": [
+        "x",
+        "y",
+        "width",
+        "height"
+      ],
       "properties": {
-        "x": { "type": "integer", "minimum": 0 },
-        "y": { "type": "integer", "minimum": 0 },
-        "width": { "type": "integer", "minimum": 1 },
-        "height": { "type": "integer", "minimum": 1 }
+        "x": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "y": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        }
       }
     },
     "normalizedRect": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["x", "y", "width", "height"],
+      "required": [
+        "x",
+        "y",
+        "width",
+        "height"
+      ],
       "properties": {
-        "x": { "type": "number", "minimum": 0, "maximum": 1 },
-        "y": { "type": "number", "minimum": 0, "maximum": 1 },
-        "width": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
-        "height": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }
+        "x": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "y": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "width": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        },
+        "height": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        }
       }
     }
   }
