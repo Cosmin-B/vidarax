@@ -52,6 +52,10 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
             std::env::var("VIDARAX_CONFIG").unwrap_or_else(|_| "vidarax.toml".to_string());
         config::load_backend_config(&config_path).map_err(invalid_input)?
     };
+    // The supervisor's join deadline scales with how many backends one
+    // inference call can try serially, so capture the count before the list
+    // is consumed by provider construction.
+    let inference_backend_count = backend_config.backends.len().max(1);
     let provider = if backend_config.backends.is_empty() {
         None
     } else {
@@ -111,6 +115,7 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
         },
         config.media_memory_budget_bytes,
         config.media_worker_thread_budget,
+        inference_backend_count,
     )
     .map_err(invalid_input)?;
     let state = attach_spacetime_client(state, &config);
@@ -919,6 +924,7 @@ mod tests {
             },
             u64::MAX,
             usize::MAX,
+            1,
         )
         .unwrap();
         let app = app_router(state);
@@ -1004,6 +1010,7 @@ mod tests {
             },
             u64::MAX,
             usize::MAX,
+            1,
         )
         .unwrap();
         let app = app_router(state);
@@ -1079,6 +1086,7 @@ mod tests {
             },
             u64::MAX,
             usize::MAX,
+            1,
         )
         .unwrap();
         let app = app_router(state);

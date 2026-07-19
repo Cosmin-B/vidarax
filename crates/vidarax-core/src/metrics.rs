@@ -412,6 +412,7 @@ impl PipelineMetrics {
         &self,
         fault: PipelineFault,
         join_deadline: Option<PipelineFault>,
+        detached: u32,
     ) {
         self.record_pipeline_fault(fault);
         if let Some(overrun) = join_deadline {
@@ -419,6 +420,8 @@ impl PipelineMetrics {
             self.pipeline_generation_forced_shutdown_total
                 .fetch_add(1, Ordering::Relaxed);
         }
+        self.pipeline_detached_workers_total
+            .fetch_add(u64::from(detached), Ordering::Relaxed);
         self.pipeline_generation_faulted_shutdown_total
             .fetch_add(1, Ordering::Relaxed);
     }

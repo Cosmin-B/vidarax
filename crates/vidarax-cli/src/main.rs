@@ -432,9 +432,7 @@ async fn dispatch(
             RunsCommands::Show { run_id } => cmd_runs_show(config, output, &run_id).await,
             RunsCommands::Create(args) => cmd_run_create(config, output, &args).await,
             RunsCommands::Stop { run_id } => cmd_runs_stop(config, output, &run_id).await,
-            RunsCommands::Keepalive { run_id } => {
-                cmd_runs_keepalive(config, output, &run_id).await
-            }
+            RunsCommands::Keepalive { run_id } => cmd_runs_keepalive(config, output, &run_id).await,
             RunsCommands::Rm { run_id } => cmd_runs_rm(config, output, &run_id).await,
         },
         Commands::Events(args) => cmd_events(config, output, &args).await,
@@ -717,6 +715,10 @@ impl ApiClient {
         // Multipart uploads are not retried because the form body is consumed
         // by send.
         const MAX_ATTEMPTS: u32 = 3;
+        // Only GET and DELETE retry. POST endpoints like run creation and
+        // reason are not idempotent, and a retry after an ambiguous failure
+        // could run them twice.
+        let retry_allowed = matches!(method, Method::GET | Method::DELETE);
         let mut attempt = 1;
         loop {
             let mut request = self.http.request(method.clone(), &url);
@@ -737,7 +739,8 @@ impl ApiClient {
             match request.send().await {
                 Ok(response) => {
                     let status = response.status().as_u16();
-                    if attempt < MAX_ATTEMPTS
+                    if retry_allowed
+                        && attempt < MAX_ATTEMPTS
                         && vidarax_contracts::errors::classify_status_code(status).is_retryable()
                     {
                         attempt += 1;
@@ -747,7 +750,7 @@ impl ApiClient {
                     return decode_json_response(&url, response).await;
                 }
                 Err(e) => {
-                    if attempt < MAX_ATTEMPTS {
+                    if retry_allowed && attempt < MAX_ATTEMPTS {
                         attempt += 1;
                         tokio::time::sleep(backoff).await;
                         continue;
@@ -964,11 +967,15 @@ async fn cmd_runs_keepalive(
 }
 
 // Used after a partial analyze failure. Ignores errors on purpose, because
-// the run may already be terminal and the original error matters more.
+// the run may already be terminal and the original error matters more. The
+// analyze client has no timeout, so the rollback is bounded here to keep a
+// hung stop from hiding the original failure.
 async fn best_effort_stop(client: &ApiClient, run_id: &str) {
-    let _ = client
-        .post_json(&format!("/v1/runs/{run_id}/stop"), &json!({}))
-        .await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.post_json(&format!("/v1/runs/{run_id}/stop"), &json!({})),
+    )
+    .await;
 }
 
 async fn cmd_runs_rm(

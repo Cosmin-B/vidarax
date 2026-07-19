@@ -306,6 +306,12 @@ pub struct AppStateInner {
     session_slots: AtomicUsize,
     media_budget: MediaResourceBudget,
     media_reservations: MediaReservationMap,
+    /// Runs whose next session reclaim must remove the session without
+    /// appending a tombstone, because a REST stop asked to preserve history.
+    preserve_history_runs: DashMap<String, ()>,
+    /// Join deadline for pipeline generations, derived at startup from the
+    /// configured backend fallback count and novelty embedding timeout.
+    media_join_deadline: std::time::Duration,
     /// Recently reclaimed WHIP sessions, retained so DELETE remains idempotent
     /// after a peer-state watcher has already removed the live session entry.
     reclaimed_sessions: ReclaimedSessionMap,
@@ -425,6 +431,8 @@ impl AppStateConfig {
                 ),
                 media_reservations: DashMap::new(),
                 reclaimed_sessions: Arc::new(Mutex::new(ReclaimedSessions::default())),
+                preserve_history_runs: DashMap::new(),
+                media_join_deadline: vidarax_core::webrtc::runtime::supervise_join_deadline(),
                 webrtc_config: WebRtcConfig::default(),
             }),
         }
@@ -447,7 +455,9 @@ impl AppState {
         inference_admission_limits: AdmissionLimits,
         media_memory_budget_bytes: u64,
         media_worker_thread_budget: usize,
+        inference_backend_count: usize,
     ) -> Result<Self, String> {
+        let novelty_embedding_timeout_ms = novelty.embedding_timeout_ms;
         let existing_events = read_all_events(&wal_path).map_err(|err| err.to_string())?;
         let run_registry = build_run_registry(&existing_events);
         let initial_tails = build_event_tails(&existing_events);
@@ -522,6 +532,11 @@ impl AppState {
                 ),
                 media_reservations: DashMap::new(),
                 reclaimed_sessions: Arc::new(Mutex::new(ReclaimedSessions::default())),
+                preserve_history_runs: DashMap::new(),
+                media_join_deadline: vidarax_core::webrtc::runtime::supervise_join_deadline_for(
+                    inference_backend_count as u64,
+                    novelty_embedding_timeout_ms,
+                ),
                 webrtc_config,
             }),
         })
@@ -703,14 +718,28 @@ impl AppState {
         self.media_reservations.remove(sess_id);
     }
 
+    pub(crate) fn media_join_deadline(&self) -> std::time::Duration {
+        self.media_join_deadline
+    }
+
+    /// Consume the preserve-history mark for a run, set by a REST stop.
+    pub(crate) fn take_preserve_history(&self, run_id: &str) -> bool {
+        self.preserve_history_runs.remove(run_id).is_some()
+    }
+
     /// Close the live WebRTC session that owns `run_id`, if any. The peer
     /// watcher then reclaims the session and the supervisor tears the
     /// pipeline down, so a REST stop or delete stops live work instead of
-    /// only recording an event.
-    pub(crate) fn close_live_session_for_run(&self, run_id: &str) {
+    /// only recording an event. With `preserve_history` the reclaim removes
+    /// the session but skips the run_deleted tombstone, so a stopped run
+    /// stays readable.
+    pub(crate) fn close_live_session_for_run(&self, run_id: &str, preserve_history: bool) {
         for entry in self.sessions.iter() {
             let (_principal, existing_run_id, session) = entry.value();
             if &**existing_run_id == run_id {
+                if preserve_history {
+                    self.preserve_history_runs.insert(run_id.to_string(), ());
+                }
                 session.close();
                 break;
             }
@@ -1526,6 +1555,19 @@ impl TimelineWriter {
     }
 
     fn append(&mut self, mut request: TimelineAppendRequest) -> Result<TimelineEvent, String> {
+        // Checked here, at dequeue time, because an ordinary event can sit in
+        // the queue behind a run_deleted for the same run. The API-level check
+        // cannot see that ordering, this one can.
+        if request.kind != "run_deleted"
+            && self
+                .registry
+                .runs
+                .get(&request.run_id)
+                .map(|summary| summary.snapshot().deleted)
+                .unwrap_or(false)
+        {
+            return Err(format!("run {} is deleted", request.run_id));
+        }
         self.next_seq = self.next_seq.saturating_add(1);
         let event = TimelineEvent {
             seq: self.next_seq,
@@ -2646,6 +2688,57 @@ mod tests {
         assert!(state.try_reserve_stream_slot(principal, now_ms).is_some());
         drop(guards);
         assert!(state.try_reserve_stream_slot(principal, now_ms).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordinary_append_queued_behind_tombstone_is_rejected() {
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-state-tombstone-race-{}.wal",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&wal_path);
+        let state = AppState::with_wal_for_tests(wal_path.clone());
+
+        state
+            .append_run_event("run_race", "run_created", serde_json::json!({}))
+            .expect("create run");
+
+        // Pause the writer, then queue the tombstone and an ordinary event so
+        // the ordinary event sits in the queue behind the deletion. The old
+        // API-level guard could not see this ordering.
+        state.pause_timeline_appends_for_tests();
+        let delete_state = state.clone();
+        let delete_task = tokio::task::spawn_blocking(move || {
+            delete_state.append_run_event("run_race", "run_deleted", serde_json::json!({}))
+        });
+        state.wait_until_timeline_writer_paused_for_tests();
+        state.append_run_event_for_stream_nonblocking(
+            "run_race",
+            "stream-0",
+            "note",
+            serde_json::json!({"text": "late"}),
+        );
+        state.resume_timeline_appends_for_tests();
+
+        delete_task
+            .await
+            .expect("join delete task")
+            .expect("tombstone append");
+
+        // Drain the writer with one more synchronous command, then check the
+        // late ordinary event was rejected at dequeue time.
+        assert!(state
+            .append_run_event("run_race", "note", serde_json::json!({}))
+            .is_err());
+        let events = read_all_events(&wal_path).expect("read events");
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.run_id == "run_race")
+                .all(|event| event.kind != "note"),
+            "no ordinary event may land after the tombstone"
+        );
+        let _ = std::fs::remove_file(&wal_path);
     }
 
     #[test]

@@ -787,6 +787,9 @@ export class Vidarax {
         if (this.apiKey !== undefined) {
           xhr.setRequestHeader("x-api-key", this.apiKey);
         }
+        if (this.tenantId !== undefined) {
+          xhr.setRequestHeader("x-tenant-id", this.tenantId);
+        }
         xhr.setRequestHeader("Accept", "application/json");
 
         xhr.upload.addEventListener("progress", (event) => {
@@ -837,6 +840,9 @@ export class Vidarax {
       const fetchHeaders: Record<string, string> = { Accept: "application/json" };
       if (this.apiKey !== undefined) {
         fetchHeaders["x-api-key"] = this.apiKey;
+      }
+      if (this.tenantId !== undefined) {
+        fetchHeaders["x-tenant-id"] = this.tenantId;
       }
       response = await fetch(url, {
         method: "POST",
@@ -966,6 +972,9 @@ export class Vidarax {
     if (this.apiKey !== undefined) {
       headers["x-api-key"] = this.apiKey;
     }
+    if (this.tenantId !== undefined) {
+      headers["x-tenant-id"] = this.tenantId;
+    }
     if (attachConfig !== undefined) {
       headers["x-attach-config"] = base64UrlEncodeUtf8(JSON.stringify(attachConfig));
     }
@@ -1028,6 +1037,9 @@ export class Vidarax {
       };
       if (this.apiKey !== undefined) {
         headers["x-api-key"] = this.apiKey;
+      }
+      if (this.tenantId !== undefined) {
+        headers["x-tenant-id"] = this.tenantId;
       }
       const response = await fetch(url, {
         method: "PATCH",

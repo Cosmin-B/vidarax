@@ -285,18 +285,37 @@ pub const KEYFRAME_SECOND_PASS_TIMEOUT_MS: u64 = 10_000;
 pub const CLIP_FIRST_PASS_TIMEOUT_MS: u64 = 15_000;
 pub const CLIP_SECOND_PASS_TIMEOUT_MS: u64 = 20_000;
 
-/// Join deadline for generation teardown. A VLM worker can legitimately sit
-/// inside one tiered call for the sum of both pass timeouts, so the deadline
-/// must exceed the slowest path (clip mode) or ordinary teardown during an
-/// in-flight call gets reported as a forced shutdown and detaches threads.
+/// Join deadline for generation teardown, derived from the work a healthy
+/// worker can legitimately be inside when stop is raised. One tiered call
+/// runs first and second pass sequentially, the provider router may retry
+/// the whole call once per configured backend, and the novelty check can
+/// spend its embedding timeout before inference. The deadline must exceed
+/// that or ordinary teardown gets reported as a forced shutdown and
+/// detaches healthy threads.
+pub fn supervise_join_deadline_for(
+    max_serial_inference_attempts: u64,
+    novelty_embedding_timeout_ms: u64,
+) -> Duration {
+    let per_attempt = CLIP_FIRST_PASS_TIMEOUT_MS + CLIP_SECOND_PASS_TIMEOUT_MS;
+    let attempts = max_serial_inference_attempts.max(1);
+    Duration::from_millis(
+        attempts.saturating_mul(per_attempt) + novelty_embedding_timeout_ms + 5_000,
+    )
+}
+
+/// Single-backend deadline with no novelty allowance. Prefer
+/// supervise_join_deadline_for with real configuration values.
 pub fn supervise_join_deadline() -> Duration {
-    Duration::from_millis(CLIP_FIRST_PASS_TIMEOUT_MS + CLIP_SECOND_PASS_TIMEOUT_MS + 5_000)
+    supervise_join_deadline_for(1, 0)
 }
 
 #[derive(Debug)]
 pub struct PipelineStartError {
     pub fault: PipelineFault,
     pub join_deadline: Option<PipelineFault>,
+    /// Workers still running when the startup abort hit its deadline. They
+    /// keep running detached and keep their memory.
+    pub detached: u32,
     source: io::Error,
 }
 
@@ -321,6 +340,7 @@ impl PipelineStartError {
         stage: PipelineStage,
         source: io::Error,
         join_deadline: Option<PipelineFault>,
+        detached: u32,
     ) -> Self {
         Self {
             fault: PipelineFault {
@@ -328,6 +348,7 @@ impl PipelineStartError {
                 reason: PipelineFaultReason::SpawnFailure,
             },
             join_deadline,
+            detached,
             source,
         }
     }

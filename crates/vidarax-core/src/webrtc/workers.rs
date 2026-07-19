@@ -1170,7 +1170,13 @@ where
                 Ok(worker) => runtime.push(worker),
                 Err(source) => {
                     let join_deadline = runtime.abort_startup(std::time::Duration::from_secs(5));
-                    return Err(PipelineStartError::new($stage, source, join_deadline));
+                    let detached = runtime.worker_count() as u32;
+                    return Err(PipelineStartError::new(
+                        $stage,
+                        source,
+                        join_deadline,
+                        detached,
+                    ));
                 }
             }
         };
@@ -1182,7 +1188,13 @@ where
                 Ok(workers) => runtime.extend(workers),
                 Err(source) => {
                     let join_deadline = runtime.abort_startup(std::time::Duration::from_secs(5));
-                    return Err(PipelineStartError::new($stage, source, join_deadline));
+                    let detached = runtime.worker_count() as u32;
+                    return Err(PipelineStartError::new(
+                        $stage,
+                        source,
+                        join_deadline,
+                        detached,
+                    ));
                 }
             }
         };
@@ -1195,7 +1207,13 @@ where
                 Err(error) => {
                     let (stage, source) = error.into_parts();
                     let join_deadline = runtime.abort_startup(std::time::Duration::from_secs(5));
-                    return Err(PipelineStartError::new(stage, source, join_deadline));
+                    let detached = runtime.worker_count() as u32;
+                    return Err(PipelineStartError::new(
+                        stage,
+                        source,
+                        join_deadline,
+                        detached,
+                    ));
                 }
             }
         };

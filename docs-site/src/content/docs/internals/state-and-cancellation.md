@@ -72,7 +72,8 @@ Worker startup itself is generation-owned. `spawn_pipeline` returns a
 the shared stop signal and bounded-joins the already-created prefix. After a
 successful start, the supervisor treats the first unexpected exit as a fault,
 closes the peer, stops siblings, and waits out a join deadline derived from
-the VLM pass timeouts (`supervise_join_deadline`, 40 seconds), long enough for
+the configured VLM pass timeouts, the backend fallback count, and the novelty
+embedding timeout (`supervise_join_deadline_for`), long enough for
 an in-flight inference call to drain. A worker that misses that deadline is
 left detached and reported as a forced shutdown, and the session's media
 reservation is kept because the detached thread still holds its memory. The

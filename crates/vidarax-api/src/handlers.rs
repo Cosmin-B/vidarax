@@ -204,7 +204,10 @@ pub async fn ingest_run(
                 )],
             );
         };
-        if !(vidarax_contracts::processing::REQUEST_FPS_MIN..=vidarax_contracts::processing::REQUEST_FPS_MAX).contains(&sample_fps) {
+        if !(vidarax_contracts::processing::REQUEST_FPS_MIN
+            ..=vidarax_contracts::processing::REQUEST_FPS_MAX)
+            .contains(&sample_fps)
+        {
             return validation_error(
                 &state,
                 "invalid ingest request",
@@ -419,7 +422,8 @@ pub async fn stop_run(
     }
 
     // Stopping must actually stop live work, not only record the intent.
-    state.close_live_session_for_run(&run_id);
+    // History is preserved: the session reclaim skips the tombstone.
+    state.close_live_session_for_run(&run_id, true);
 
     ok(json!({
         "request_id": request_id,
@@ -889,7 +893,10 @@ pub async fn analyze_run(
                     )],
                 );
             };
-            if !(vidarax_contracts::processing::REQUEST_FPS_MIN..=vidarax_contracts::processing::REQUEST_FPS_MAX).contains(&fixed) {
+            if !(vidarax_contracts::processing::REQUEST_FPS_MIN
+                ..=vidarax_contracts::processing::REQUEST_FPS_MAX)
+                .contains(&fixed)
+            {
                 return validation_error(
                     &state,
                     "invalid analyze payload",
@@ -1211,7 +1218,11 @@ fn validate_realtime_reason_params(
     }
 
     let fixed_fps = payload.fixed_fps.unwrap_or(1.0);
-    if sampling_policy == SamplingPolicy::Fixed && !(vidarax_contracts::processing::REQUEST_FPS_MIN..=vidarax_contracts::processing::REQUEST_FPS_MAX).contains(&fixed_fps) {
+    if sampling_policy == SamplingPolicy::Fixed
+        && !(vidarax_contracts::processing::REQUEST_FPS_MIN
+            ..=vidarax_contracts::processing::REQUEST_FPS_MAX)
+            .contains(&fixed_fps)
+    {
         return Err(validation_error(
             state,
             "invalid realtime reason request",
@@ -2967,7 +2978,7 @@ pub async fn delete_run(
     }
 
     // Deleting a live WHIP run must also tear its pipeline down.
-    state.close_live_session_for_run(&run_id);
+    state.close_live_session_for_run(&run_id, false);
 
     ok(json!({
         "request_id": request_id,

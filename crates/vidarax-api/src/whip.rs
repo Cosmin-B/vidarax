@@ -551,19 +551,17 @@ async fn start_whip_session_transaction(
                     workers = runtime.worker_count(),
                     "WHIP media pipeline generation started"
                 );
-                let outcome = runtime.supervise(
-                    vidarax_core::webrtc::runtime::supervise_join_deadline(),
-                    |fault| {
-                    tracing::error!(
-                        session_id = %session_id_for_log,
-                        generation,
-                        stage = fault.stage.as_str(),
-                        reason = ?fault.reason,
-                        "WHIP media pipeline generation faulted"
-                    );
+                let outcome =
+                    runtime.supervise(state_for_supervisor.media_join_deadline(), |fault| {
+                        tracing::error!(
+                            session_id = %session_id_for_log,
+                            generation,
+                            stage = fault.stage.as_str(),
+                            reason = ?fault.reason,
+                            "WHIP media pipeline generation faulted"
+                        );
                         session.close();
-                    },
-                );
+                    });
                 metrics_for_supervisor.pipeline_generation_stopped(outcome);
                 match outcome {
                     vidarax_core::webrtc::runtime::PipelineShutdown::JoinDeadline {
@@ -592,7 +590,11 @@ async fn start_whip_session_transaction(
                 );
             }
             Err(err) => {
-                metrics_for_supervisor.record_pipeline_start_failure(err.fault, err.join_deadline);
+                metrics_for_supervisor.record_pipeline_start_failure(
+                    err.fault,
+                    err.join_deadline,
+                    err.detached,
+                );
                 // A worker thread failed to spawn, e.g. OS thread-resource
                 // exhaustion (EAGAIN). Close the peer so the reclaimer removes
                 // the visible session and tombstones its run.
@@ -603,7 +605,18 @@ async fn start_whip_session_transaction(
                     "WHIP media pipeline failed to start; closing session"
                 );
                 session.close();
-                state_for_supervisor.release_media_reservation(&sess_id_for_permit);
+                if err.detached == 0 {
+                    state_for_supervisor.release_media_reservation(&sess_id_for_permit);
+                } else {
+                    // Startup rollback left threads running past its deadline.
+                    // They still hold their share of the media budget, so the
+                    // reservation stays, same as a forced shutdown.
+                    tracing::error!(
+                        session_id = %session_id_for_log,
+                        detached = err.detached,
+                        "startup abort left threads detached; media reservation kept"
+                    );
+                }
             }
         }
     });
@@ -829,7 +842,12 @@ async fn reclaim_whip_session_transaction(
     run_id: String,
     reason: String,
 ) -> Result<(), String> {
-    append_whip_run_deleted_once(&state, &run_id, &sess_id, &reason).await?;
+    // A REST stop closes the session but promises to keep the run's history.
+    // Skip the tombstone for that one reclaim so the run stays readable.
+    let preserve_history = state.take_preserve_history(&run_id);
+    if !preserve_history {
+        append_whip_run_deleted_once(&state, &run_id, &sess_id, &reason).await?;
+    }
 
     if let Some((_principal, _existing_run_id, session)) =
         state.remove_session_for_run(&sess_id, &run_id)

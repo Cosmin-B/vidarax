@@ -739,9 +739,18 @@ mod schema_sync_tests {
         let min = fps["minimum"].as_f64().expect("fps minimum");
         let max = fps["maximum"].as_f64().expect("fps maximum");
         let base = defaults_for_mode(ProcessingMode::Custom);
-        let ok_min = ProcessingConfig { fps: min as f32, ..base.clone() };
-        let ok_max = ProcessingConfig { fps: max as f32, ..base.clone() };
-        let too_high = ProcessingConfig { fps: (max + 0.01) as f32, ..base };
+        let ok_min = ProcessingConfig {
+            fps: min as f32,
+            ..base.clone()
+        };
+        let ok_max = ProcessingConfig {
+            fps: max as f32,
+            ..base.clone()
+        };
+        let too_high = ProcessingConfig {
+            fps: (max + 0.01) as f32,
+            ..base
+        };
         assert!(validate_processing_config(&ok_min).is_ok());
         assert!(validate_processing_config(&ok_max).is_ok());
         assert!(validate_processing_config(&too_high).is_err());

@@ -38,13 +38,15 @@ release yet.
 
 ### Changed
 
-- The generation join deadline is derived from the VLM pass timeouts (40
-  seconds) instead of a flat 5 seconds, so teardown during an in-flight VLM
-  call is not misreported as a forced shutdown.
+- The generation join deadline is derived from the VLM pass timeouts, the
+  configured backend fallback count, and the novelty embedding timeout
+  instead of a flat 5 seconds, so teardown during an in-flight call is not
+  misreported as a forced shutdown.
 - A forced shutdown keeps the session's media reservation, because detached
   worker threads still hold that memory until process exit.
 - REST run stop and delete now close a live WHIP session instead of only
-  recording the intent.
+  recording the intent. Stop preserves the run's history, so the session
+  reclaim skips the tombstone for that one close.
 - Deleted runs reject further event appends, so a worker that outlives its
   run cannot write past the tombstone.
 - The CLI default analyze model is `Qwen/Qwen3-VL-2B-Instruct`.
