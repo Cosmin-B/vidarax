@@ -767,14 +767,30 @@ pub async fn whip_terminate(
         return StatusCode::FORBIDDEN;
     }
 
-    // A WHIP delete must tombstone even if a REST stop marked this session
-    // first. The delete disposition overrides the stop mark.
+    // A WHIP delete guarantees its own tombstone, exactly like the REST
+    // delete handler. Relying on the reclaim would lose the guarantee when a
+    // stop-marked reclaim already claimed the decision and skips its append.
+    // The append is idempotent, so a duplicate from the reclaim is harmless.
+    if let Err(err) = append_whip_run_deleted_once(&state, &run_id, &sess_id, "delete").await {
+        tracing::error!("WHIP terminate tombstone failed sess={sess_id}: {err}");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+    // The delete disposition overrides a stop mark for the session cleanup.
     if let Some((_, _, session)) = state.get_session(&sess_id) {
         session.mark_close_disposition_delete();
     }
     match reclaim_whip_session(&state, &sess_id, &run_id, "delete").await {
         Ok(()) => StatusCode::OK,
         Err(err) => {
+            // The tombstone above already committed, which is the delete's
+            // contract. A lost reclaim claim means another reclaimer owns the
+            // session removal and the watcher will finish it.
+            if state.run_is_deleted(&run_id) {
+                tracing::info!(
+                    "WHIP terminate: tombstone committed, cleanup owned elsewhere sess={sess_id}: {err}"
+                );
+                return StatusCode::OK;
+            }
             tracing::error!("WHIP terminate cleanup incomplete sess={sess_id}: {err}");
             StatusCode::INTERNAL_SERVER_ERROR
         }
@@ -862,7 +878,26 @@ async fn reclaim_whip_session_transaction(
         return Ok(());
     }
     if !session.try_claim_reclaim() {
-        return Ok(());
+        // Another reclaimer owns the decision right now. Wait for it to
+        // finish (session removed) or fail and release the claim (claim
+        // becomes ours). Returning Ok while the session is still visible
+        // would strand it: the owner may fail its append after we reported
+        // success, and a satisfied caller never retries. The wait is bounded
+        // so a stuck owner turns into a retryable error instead of a hang.
+        let mut claimed = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if state.get_session(&sess_id).is_none() {
+                return Ok(());
+            }
+            if session.try_claim_reclaim() {
+                claimed = true;
+                break;
+            }
+        }
+        if !claimed {
+            return Err(format!("reclaim of {sess_id} still owned; retry"));
+        }
     }
 
     let preserve_history = session.close_preserves_history();
@@ -1646,6 +1681,68 @@ mod tests {
         assert_eq!(state.session_count(), 0);
         assert!(state.get_session(sess_id).is_none());
         assert_eq!(session.close_call_count_for_tests(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_overlapping_claimed_stop_reclaim_still_ends_deleted() {
+        let state = AppState::with_wal_for_tests(
+            std::env::temp_dir().join(format!("vidarax-whip-overlap-{}.wal", std::process::id())),
+        );
+        let sess_id = "sess-overlap000001";
+        let run_id: Arc<str> = Arc::from("run-whip-overlap");
+        let principal = "tenant-a";
+
+        state
+            .append_run_event(
+                &run_id,
+                "run_created",
+                serde_json::json!({
+                    "principal_key": principal,
+                    "session_id": sess_id,
+                    "source": "whip",
+                }),
+            )
+            .unwrap();
+        let session = Arc::new(WebRtcSession::new_for_tests());
+        assert!(state.insert_session(
+            sess_id.to_string(),
+            principal.to_string(),
+            Arc::clone(&run_id),
+            Arc::clone(&session),
+        ));
+
+        // A stop reclaimer has read preserve=true and holds the claim.
+        session.mark_close_disposition_stop();
+        assert!(session.try_claim_reclaim());
+
+        // A WHIP delete lands in that window. Its endpoint appends the
+        // tombstone itself, so the delete contract holds no matter who wins
+        // the session cleanup. The overlapping reclaim call must report a
+        // retryable error, not false success.
+        super::append_whip_run_deleted_once(&state, &run_id, sess_id, "delete")
+            .await
+            .unwrap();
+        session.mark_close_disposition_delete();
+        assert!(reclaim_whip_session(&state, sess_id, &run_id, "delete")
+            .await
+            .is_err());
+        assert!(state.run_is_deleted(&run_id));
+
+        // The stop reclaimer finishes: it read preserve before the delete
+        // upgrade, skips its own append, and removes the session. The run
+        // stays deleted through the endpoint's tombstone.
+        session.release_reclaim_claim();
+        reclaim_whip_session(&state, sess_id, &run_id, "peer_failed")
+            .await
+            .unwrap();
+
+        let events = state.read_run_events(&run_id).unwrap();
+        let deleted = events
+            .iter()
+            .filter(|event| event.kind == "run_deleted")
+            .count();
+        assert_eq!(deleted, 1, "the endpoint tombstone must be the only one");
+        assert!(state.get_session(sess_id).is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
