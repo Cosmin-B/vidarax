@@ -1,6 +1,6 @@
 //! Gemini VLM provider using the native `generateContent` API.
 //!
-//! Supports both inline media (< 20 MB) and the File API for larger payloads.
+//! Supports inline legacy media and raw binary video through the File API.
 //!
 //! # Examples
 //!
@@ -16,6 +16,7 @@
 //! assert_eq!(provider.kind(), ProviderKind::Gemini);
 //! ```
 
+use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -109,6 +110,14 @@ impl GeminiProvider {
         &self,
         request: &InferenceRequest,
     ) -> Result<String, ProviderError> {
+        self.build_payload_with_max_tokens(request, request.max_tokens)
+    }
+
+    fn build_payload_with_max_tokens(
+        &self,
+        request: &InferenceRequest,
+        max_tokens: u32,
+    ) -> Result<String, ProviderError> {
         // Media parts first (Gemini best practice), text prompt last.
         let mut parts: Vec<Value> = Vec::new();
 
@@ -124,8 +133,15 @@ impl GeminiProvider {
 
         // Videos — inline if small, File API if large
         for video in &request.input_videos {
-            let approx_bytes = video.data_base64.len() * 3 / 4;
-            if approx_bytes < INLINE_SIZE_LIMIT {
+            if video.raw_bytes.is_some() {
+                let uri = self.upload_file(video, request.timeout_ms)?;
+                parts.push(serde_json::json!({
+                    "fileData": {
+                        "mimeType": video.media_type,
+                        "fileUri": uri
+                    }
+                }));
+            } else if video.data_base64.len() * 3 / 4 < INLINE_SIZE_LIMIT {
                 parts.push(serde_json::json!({
                     "inlineData": {
                         "mimeType": video.media_type,
@@ -133,7 +149,7 @@ impl GeminiProvider {
                     }
                 }));
             } else {
-                let uri = self.upload_file(video)?;
+                let uri = self.upload_file(video, request.timeout_ms)?;
                 parts.push(serde_json::json!({
                     "fileData": {
                         "mimeType": video.media_type,
@@ -147,7 +163,7 @@ impl GeminiProvider {
         parts.push(serde_json::json!({"text": &*request.prompt}));
 
         let mut gen_config = serde_json::json!({
-            "maxOutputTokens": request.max_tokens,
+            "maxOutputTokens": max_tokens,
             "temperature": request.temperature
         });
 
@@ -169,12 +185,28 @@ impl GeminiProvider {
 
     /// Upload `video` via the Gemini File API (resumable upload) and return
     /// the file URI. Polls until the file reaches `ACTIVE` state.
-    fn upload_file(&self, video: &InferenceVideo) -> Result<String, ProviderError> {
-        let raw_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&video.data_base64)
-            .map_err(|e| ProviderError::Transport(format!("base64 decode failed: {e}")))?;
-
-        let byte_count = raw_bytes.len();
+    fn upload_file(
+        &self,
+        video: &InferenceVideo,
+        timeout_ms: u64,
+    ) -> Result<String, ProviderError> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+        let (upload_body, byte_count) = match &video.raw_bytes {
+            Some(bytes) => (
+                reqwest::blocking::Body::sized(Cursor::new(Arc::clone(bytes)), bytes.len() as u64),
+                bytes.len(),
+            ),
+            None => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&video.data_base64)
+                    .map_err(|e| ProviderError::Transport(format!("base64 decode failed: {e}")))?;
+                let byte_count = bytes.len();
+                (
+                    reqwest::blocking::Body::sized(Cursor::new(bytes), byte_count as u64),
+                    byte_count,
+                )
+            }
+        };
 
         // Step 1: initiate the resumable upload, get the upload URL.
         let init_url = format!(
@@ -192,6 +224,7 @@ impl GeminiProvider {
             )
             .header("X-Goog-Upload-Header-Content-Type", video.media_type)
             .header("content-type", "application/json")
+            .timeout(remaining_upload_time(deadline)?)
             .body(r#"{"file":{"display_name":"vidarax_upload"}}"#)
             .send()
             .map_err(|e| {
@@ -224,7 +257,8 @@ impl GeminiProvider {
             .header("X-Goog-Upload-Offset", "0")
             .header("X-Goog-Upload-Command", "upload, finalize")
             .header("content-type", video.media_type)
-            .body(raw_bytes)
+            .timeout(remaining_upload_time(deadline)?)
+            .body(upload_body)
             .send()
             .map_err(|e| {
                 ProviderError::Transport(format!("file API upload failed: {}", redact_url(e)))
@@ -254,24 +288,27 @@ impl GeminiProvider {
             })?
             .to_string();
 
-        // Step 3: poll until ACTIVE (typically 1–5 s, timeout 60 s).
-        self.poll_file_active(&file_name)?;
+        // Step 3: poll until ACTIVE, within the caller's inference deadline.
+        self.poll_file_active(&file_name, deadline)?;
 
         Ok(file_uri)
     }
 
-    /// Poll `GET /v1beta/files/{name}` until `state == "ACTIVE"`, with a 60 s timeout.
-    fn poll_file_active(&self, file_name: &str) -> Result<(), ProviderError> {
+    /// Poll `GET /v1beta/files/{name}` until `state == "ACTIVE"`.
+    fn poll_file_active(&self, file_name: &str, deadline: Instant) -> Result<(), ProviderError> {
         let poll_url = format!(
             "{}/v1beta/{}?key={}",
             GEMINI_API_BASE, file_name, self.api_key
         );
-        let deadline = Instant::now() + Duration::from_secs(60);
-
         loop {
-            let resp = self.client.get(&poll_url).send().map_err(|e| {
-                ProviderError::Transport(format!("file poll failed: {}", redact_url(e)))
-            })?;
+            let resp = self
+                .client
+                .get(&poll_url)
+                .timeout(remaining_upload_time(deadline)?)
+                .send()
+                .map_err(|e| {
+                    ProviderError::Transport(format!("file poll failed: {}", redact_url(e)))
+                })?;
 
             let st = resp.status();
             if !st.is_success() {
@@ -293,13 +330,7 @@ impl GeminiProvider {
                 _ => {} // PROCESSING or unknown — keep polling
             }
 
-            if Instant::now() >= deadline {
-                return Err(ProviderError::Transport(
-                    "Timed out waiting for file to become ACTIVE (60 s)".to_string(),
-                ));
-            }
-
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(remaining_upload_time(deadline)?.min(Duration::from_millis(500)));
         }
     }
 
@@ -310,18 +341,9 @@ impl GeminiProvider {
         &self,
         request: &InferenceRequest,
         model: &str,
-        reserve: bool,
+        body: &str,
+        start: Instant,
     ) -> Result<InferenceResult, ProviderError> {
-        let start = Instant::now();
-
-        let body = if reserve {
-            let mut req = request.clone();
-            req.max_tokens = req.max_tokens.saturating_add(GEMINI_THINKING_HEADROOM);
-            self.build_payload(&req)?
-        } else {
-            self.build_payload(request)?
-        };
-
         let url = format!(
             "{}/v1beta/models/{}:generateContent?key={}",
             GEMINI_API_BASE, model, self.api_key
@@ -332,7 +354,7 @@ impl GeminiProvider {
             .post(&url)
             .header("content-type", "application/json")
             .timeout(Duration::from_millis(request.timeout_ms.max(1)))
-            .body(body)
+            .body(body.to_owned())
             .send()
             .map_err(|e| ProviderError::Transport(redact_url(e)))?;
 
@@ -429,7 +451,18 @@ impl InferenceProvider for GeminiProvider {
         // previously seen to starve its output on hidden reasoning, pre-reserve
         // output headroom so the first attempt already lands valid JSON.
         let reserve = self.is_learned_thinking(model);
-        let result = self.attempt(request, model, reserve)?;
+        let started = Instant::now();
+        let max_tokens = if reserve {
+            request.max_tokens.saturating_add(GEMINI_THINKING_HEADROOM)
+        } else {
+            request.max_tokens
+        };
+        let body = if reserve {
+            self.build_payload_with_max_tokens(request, max_tokens)?
+        } else {
+            self.build_payload(request)?
+        };
+        let result = self.attempt(request, model, &body, started)?;
 
         // First encounter with a thinking model: the response itself reports the
         // starvation (MAX_TOKENS + thoughtsTokenCount + empty text). Learn it and
@@ -437,7 +470,12 @@ impl InferenceProvider for GeminiProvider {
         // reserve, so this can never loop.
         if !reserve && is_thinking_starved(&result) {
             self.learn_thinking(model);
-            let mut retry = self.attempt(request, model, true)?;
+            let retry_started = Instant::now();
+            let retry_body = payload_with_max_output_tokens(
+                &body,
+                request.max_tokens.saturating_add(GEMINI_THINKING_HEADROOM),
+            )?;
+            let mut retry = self.attempt(request, model, &retry_body, retry_started)?;
             // The starved first attempt was still billed (prompt + hidden
             // thinking tokens) and cost wall-clock time. Fold it into the
             // surfaced totals so token/latency accounting reflects the whole
@@ -481,6 +519,23 @@ fn map_finish_reason(raw: &str) -> String {
         "SAFETY" => "content_filter".to_string(),
         other => other.to_ascii_lowercase(),
     }
+}
+
+fn remaining_upload_time(deadline: Instant) -> Result<Duration, ProviderError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| ProviderError::Transport("Gemini file upload timed out".to_string()))
+}
+
+fn payload_with_max_output_tokens(body: &str, max_tokens: u32) -> Result<String, ProviderError> {
+    let mut payload: Value = serde_json::from_str(body).map_err(|e| {
+        ProviderError::InvalidResponse(
+            format!("failed to reuse Gemini request payload: {e}").into(),
+        )
+    })?;
+    payload["generationConfig"]["maxOutputTokens"] = Value::from(max_tokens);
+    Ok(payload.to_string())
 }
 
 /// Whether a completed response shows the model was starved by its own hidden
@@ -575,6 +630,7 @@ mod tests {
         // A tiny base64 string decodes well under 20 MB
         req.input_videos = vec![InferenceVideo {
             media_type: "video/mp4",
+            raw_bytes: None,
             data_base64: "dmlkZW8=".to_string(),
         }];
         let body = p.build_payload(&req).unwrap();
@@ -608,6 +664,22 @@ mod tests {
         assert!(
             cfg.get("thinkingConfig").is_none(),
             "build_payload must never emit a thinkingConfig"
+        );
+    }
+
+    #[test]
+    fn retry_payload_reuses_media_reference_and_only_changes_token_budget() {
+        let body = r#"{"contents":[{"parts":[{"fileData":{"fileUri":"files/clip"}}]}],"generationConfig":{"maxOutputTokens":160,"temperature":0.0}}"#;
+        let retry = payload_with_max_output_tokens(body, 2208).unwrap();
+        let value: Value = serde_json::from_str(&retry).unwrap();
+
+        assert_eq!(
+            value["contents"][0]["parts"][0]["fileData"]["fileUri"],
+            "files/clip"
+        );
+        assert_eq!(
+            value["generationConfig"]["maxOutputTokens"].as_u64(),
+            Some(2208)
         );
     }
 
@@ -910,6 +982,7 @@ mod tests {
             input_images: vec![],
             input_videos: vec![crate::provider::InferenceVideo {
                 media_type: "video/mp4",
+                raw_bytes: None,
                 data_base64: b64,
             }],
             max_tokens: 100,

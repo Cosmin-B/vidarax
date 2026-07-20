@@ -58,7 +58,7 @@ pub struct SemanticOverlay {
     pub confidence: f32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ChunkSemanticResult {
     pub overlay: Option<SemanticOverlay>,
     pub raw_output: Option<Value>,
@@ -325,6 +325,7 @@ pub async fn run_semantic_dispatch(
     temporal_chain: bool,
     vlm_concurrency: usize,
     observer: Option<Arc<dyn InferenceObserver>>,
+    completion_tx: Option<tokio::sync::mpsc::Sender<(usize, ChunkSemanticResult)>>,
 ) -> (Vec<Option<ChunkSemanticResult>>, Vec<Instant>) {
     let num_chunks = chunk_preps.len();
     let mut semantic_results: Vec<Option<ChunkSemanticResult>> =
@@ -392,6 +393,9 @@ pub async fn run_semantic_dispatch(
                 last_pts_ms = prep.pts_end_ms;
             }
 
+            if let Some(tx) = &completion_tx {
+                let _ = tx.send((chunk_idx, result.clone())).await;
+            }
             semantic_results[chunk_idx] = Some(result);
             task_end_times[chunk_idx] = Instant::now();
         }
@@ -421,6 +425,9 @@ pub async fn run_semantic_dispatch(
             match joined {
                 Ok((task_id, (idx, result, finished))) => {
                     task_chunks.remove(&task_id);
+                    if let Some(tx) = &completion_tx {
+                        let _ = tx.send((idx, result.clone())).await;
+                    }
                     semantic_results[idx] = Some(result);
                     task_end_times[idx] = finished;
                 }
@@ -428,7 +435,11 @@ pub async fn run_semantic_dispatch(
                     let finished = Instant::now();
                     let task_id = err.id();
                     if let Some(idx) = task_chunks.remove(&task_id) {
-                        semantic_results[idx] = Some(semantic_join_failure_result(err));
+                        let result = semantic_join_failure_result(err);
+                        if let Some(tx) = &completion_tx {
+                            let _ = tx.send((idx, result.clone())).await;
+                        }
+                        semantic_results[idx] = Some(result);
                         task_end_times[idx] = finished;
                     } else {
                         tracing::warn!(
@@ -615,7 +626,8 @@ pub async fn infer_chunk_semantics(
     let (images, videos) = if let Some(clip_bytes) = video_clip {
         let vids = vec![InferenceVideo {
             media_type: "video/mp4",
-            data_base64: BASE64_STANDARD.encode(clip_bytes.as_ref()),
+            raw_bytes: Some(Arc::clone(&clip_bytes)),
+            data_base64: String::new(),
         }];
         (Vec::new(), vids)
     } else {
@@ -1105,7 +1117,8 @@ Ignore this trailing {not json}."#;
 
         let chunk_preps: Vec<ChunkPrep> = (0..5).map(test_chunk_prep).collect();
         let provider: Arc<dyn InferenceProvider + Send + Sync> = Arc::new(SemanticTestProvider);
-        let (results, _finished) = run_semantic_dispatch(
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(2);
+        let dispatch = run_semantic_dispatch(
             &chunk_preps,
             Some(provider),
             true,
@@ -1118,12 +1131,27 @@ Ignore this trailing {not json}."#;
             false,
             2,
             None,
-        )
-        .await;
+            Some(completion_tx),
+        );
+        let collect_completions = async {
+            let mut completions = Vec::new();
+            while let Some(completion) = completion_rx.recv().await {
+                completions.push(completion);
+            }
+            completions
+        };
+        let ((results, _finished), completions) = tokio::join!(dispatch, collect_completions);
 
         SEMANTIC_TASK_PANIC_CHUNK_FOR_TESTS.store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
 
         assert_eq!(results.len(), 5);
+        assert_eq!(completions.len(), 5);
+        let mut completed_indices = completions
+            .iter()
+            .map(|(chunk_idx, _)| *chunk_idx)
+            .collect::<Vec<_>>();
+        completed_indices.sort_unstable();
+        assert_eq!(completed_indices, vec![0, 1, 2, 3, 4]);
         for idx in [0usize, 2, 3, 4] {
             let result = results[idx].as_ref().expect("chunk should complete");
             assert!(result.attempted, "chunk {idx} should be attempted");

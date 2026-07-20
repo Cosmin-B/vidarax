@@ -45,6 +45,8 @@ Run lifecycle and analysis kinds written by the API handlers, with the payload f
 | `keepalive_refreshed` | The run's idle TTL was refreshed. | `request_id` |
 | `run_deleted` | The run was soft-deleted. | `request_id` (WHIP reclaim and tombstone paths carry reclaim metadata instead) |
 
+With concurrent semantic inference, `semantic_chunk_inferred` records are appended as chunks finish and can therefore arrive out of `chunk_index` order. Use the WAL sequence for observation order and `chunk_index` for source order.
+
 Live sessions add streaming kinds through the event sink. The worker's `event_type` string becomes the WAL `kind`, and all of them share one payload shape, `{ session_id, frame_index, pts_ms, coordinate_schema, coordinates, confidence, description }`, where this `pts_ms` is media time:
 
 | Kind | Emitted by |
