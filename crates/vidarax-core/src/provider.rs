@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -688,15 +689,16 @@ fn build_payload(model: &str, request: &InferenceRequest) -> String {
             }));
         }
         for video in &request.input_videos {
-            let data_base64 = video.data_base64.clone();
-            let data_base64 = if data_base64.is_empty() {
+            let data_base64 = if video.data_base64.is_empty() {
                 video
                     .raw_bytes
                     .as_ref()
-                    .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+                    .map(|bytes| {
+                        Cow::Owned(base64::engine::general_purpose::STANDARD.encode(bytes))
+                    })
                     .unwrap_or_default()
             } else {
-                data_base64
+                Cow::Borrowed(video.data_base64.as_str())
             };
             content.push(serde_json::json!({
                 "type": "video_url",
@@ -1146,6 +1148,24 @@ mod tests {
         let content = value["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content[0]["type"].as_str(), Some("text"));
         assert_eq!(content[1]["type"].as_str(), Some("video_url"));
+        assert_eq!(
+            content[1]["video_url"]["url"].as_str(),
+            Some("data:video/mp4;base64,dmlk")
+        );
+    }
+
+    #[test]
+    fn payload_lazily_encodes_raw_video_for_openai_compatibility() {
+        let mut req = request();
+        req.input_videos = vec![InferenceVideo {
+            media_type: "video/mp4",
+            raw_bytes: Some(Arc::from(&b"vid"[..])),
+            data_base64: String::new(),
+        }];
+
+        let body = build_payload("openbmb/MiniCPM-V-4_5", &req);
+        let value: Value = serde_json::from_str(&body).unwrap();
+        let content = value["messages"][0]["content"].as_array().unwrap();
         assert_eq!(
             content[1]["video_url"]["url"].as_str(),
             Some("data:video/mp4;base64,dmlk")

@@ -61,6 +61,8 @@ Handler-appended kinds, by string literal in `handlers.rs` (all through `append_
 | `keepalive_refreshed` | `POST /v1/runs/{id}/keepalive` |
 | `run_deleted` | `DELETE /v1/runs/{id}`, WHIP reclaim, or creation-failure tombstoning |
 
+Concurrent semantic workers publish `semantic_chunk_inferred` as each chunk finishes, so WAL sequence captures completion order rather than `chunk_index` order. Consumers that reconstruct source order must sort by `chunk_index`.
+
 Worker-emitted kinds arrive through the `EventSink` trait rather than a handler. The sink writes the worker's `event_type` string straight through as the WAL `kind`:
 
 | Kind | Emitted by |

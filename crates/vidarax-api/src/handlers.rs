@@ -1786,7 +1786,7 @@ pub async fn reason_realtime_run(
             Arc::clone(state.inference_metrics_arc()),
             Arc::clone(state.pipeline_metrics_arc()),
         )));
-    let (semantic_event_tx, mut semantic_event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (semantic_event_tx, mut semantic_event_rx) = tokio::sync::mpsc::channel(vlm_concurrency);
     let semantic_dispatch = run_semantic_dispatch(
         &chunk_preps,
         providers,
