@@ -93,9 +93,35 @@ pub struct TieredVlmError {
 pub fn run_tiered<I>(
     provider: &I,
     config: &TieredVlmConfig,
+    request: InferenceRequest,
+    guided_json_first_max_tokens: u32,
+    second_pass_timeout_ms: u64,
+    observer: Option<&dyn InferenceObserver>,
+) -> Result<TieredVlmRun, TieredVlmError>
+where
+    I: InferenceProvider + ?Sized,
+{
+    run_tiered_with_second_pass_schema(
+        provider,
+        config,
+        request,
+        guided_json_first_max_tokens,
+        second_pass_timeout_ms,
+        None,
+        observer,
+    )
+}
+
+/// Run tiered inference while optionally overriding the schema used by the
+/// second pass. Callers that omit the override retain the teacher-label schema.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+pub fn run_tiered_with_second_pass_schema<I>(
+    provider: &I,
+    config: &TieredVlmConfig,
     mut request: InferenceRequest,
     guided_json_first_max_tokens: u32,
     second_pass_timeout_ms: u64,
+    second_pass_guided_json: Option<Arc<str>>,
     observer: Option<&dyn InferenceObserver>,
 ) -> Result<TieredVlmRun, TieredVlmError>
 where
@@ -123,7 +149,8 @@ where
         request.model = Arc::clone(&config.second_pass_model);
         request.max_tokens = config.second_pass_max_tokens;
         request.timeout_ms = second_pass_timeout_ms;
-        request.guided_json = Some(Arc::from(teacher_label_schema()));
+        request.guided_json =
+            Some(second_pass_guided_json.unwrap_or_else(|| Arc::from(teacher_label_schema())));
         let second_pass_started = std::time::Instant::now();
         match provider.infer(&request) {
             Ok(mut result) => {
@@ -287,6 +314,48 @@ mod tests {
             requests[1].guided_json.as_deref(),
             Some(teacher_label_schema())
         );
+    }
+
+    #[test]
+    fn tiered_run_can_preserve_a_caller_selected_second_pass_schema() {
+        let provider = RecordingProvider {
+            requests: Mutex::new(Vec::new()),
+        };
+        let config = TieredVlmConfig {
+            first_pass_model: Arc::from("small"),
+            second_pass_model: Arc::from("teacher"),
+            second_pass_threshold: 0.7,
+            second_pass_max_tokens: 512,
+        };
+        let schema: Arc<str> = Arc::from(r#"{"type":"object","required":["summary"]}"#);
+        let request = InferenceRequest {
+            model: Arc::from("placeholder"),
+            prompt: Arc::from("prompt"),
+            input_images: Vec::new(),
+            input_videos: Vec::new(),
+            max_tokens: 128,
+            temperature: 0.0,
+            timeout_ms: 1000,
+            allow_fallback: true,
+            guided_json: Some(Arc::clone(&schema)),
+        };
+
+        let output = run_tiered_with_second_pass_schema(
+            &provider,
+            &config,
+            request,
+            320,
+            1000,
+            Some(Arc::clone(&schema)),
+            None,
+        )
+        .unwrap();
+
+        assert!(output.used_second_pass);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].guided_json.as_deref(), Some(&*schema));
+        assert_eq!(requests[1].guided_json.as_deref(), Some(&*schema));
     }
 
     // ── InferenceObserver attribution ───────────────────────────────────────

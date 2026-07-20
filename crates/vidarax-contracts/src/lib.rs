@@ -36,6 +36,25 @@ mod tests {
     }
 
     #[test]
+    fn required_models_is_medium_plus_small() {
+        use crate::models::{REQUIRED_MEDIUM_MODELS, REQUIRED_MODELS, REQUIRED_SMALL_MODELS};
+        let combined: Vec<&str> = REQUIRED_MEDIUM_MODELS
+            .iter()
+            .chain(REQUIRED_SMALL_MODELS.iter())
+            .copied()
+            .collect();
+        assert_eq!(REQUIRED_MODELS, combined.as_slice());
+    }
+
+    #[test]
+    fn gemini_models_resolve_through_catalog() {
+        use crate::models::{normalize_model_id, GEMINI_MODELS};
+        for id in GEMINI_MODELS {
+            assert_eq!(normalize_model_id(id), Some(*id));
+        }
+    }
+
+    #[test]
     fn mode_defaults_validate() {
         let cfg = defaults_for_mode(ProcessingMode::Balanced);
         assert!(validate_processing_config(&cfg).is_ok());

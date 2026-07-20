@@ -66,8 +66,8 @@ The API is served over HTTP/1.1 and HTTP/2, with optional HTTP/3 behind the `h3-
 | Route | Request | Success (200) | Failures | Side effects |
 |---|---|---|---|---|
 | `POST /v1/runs/:id/ingest` | `{ source_uri, sampling_policy?, fixed_fps?, sample_fps?, max_frames?, stream_id? }`. `source_uri` is required and must resolve under an ingest root or the upload root. `sampling_policy` is `source_fps_adaptive` (default) or `fixed`; `fixed_fps` must be in [0.2, 120] and is required for `fixed`; `max_frames` is in [1, 500000], default 512. Unknown fields are rejected. | `{ request_id, run_id, status: "processing", decoded_frames, source_uri, sampling_policy, source_fps, sample_fps }` | 404, 409 terminal run, 422 (including source validation), 500 | Appends `ingest_received` and `frames_decoded` |
-| `POST /v1/runs/:id/analyze` | `{ model, mode?, stream_id?, sampling_policy?, fixed_fps?, frames?, window_size?, segment_ms?, trace_id? }`. Supply 1 to 4096 frames with normalized scores, or omit `frames` to reuse signals from the run's latest `frames_decoded` event. `window_size` is in [2, 256]; `segment_ms` is in [50, 60000]. | `{ request_id, run_id, generated, metadata[], markers[] }` | 404, 409 terminal run, 422, 500 | Appends one `marker_emitted` per marker, then `analysis_generated` |
-| `POST /v1/runs/:id/reason` | `{ source_uri, model, ... }` with `chunk_size` in [5, 500], `window_size` in [2, 256], `segment_ms >= 1`, `max_frames` in [1, 500000], `semantic_inference?`, `semantic_frames_per_chunk` in [1, 4], `semantic_frame_max_edge` in [64, 4096], `crop?: { x, y, width, height }` as normalized fractions, `semantic_timeout_ms` in [100, 120000], `semantic_prompt` up to 4096 bytes, `output_schema?`, `first_pass_model?`, `second_pass_model?`, `second_pass_threshold?`, `index_name?`, `temporal_chain?`, `visual_diff?`, `video_clip_mode?`, `video_clip_duration_s` in (0, 60], `vlm_concurrency?` clamped to [1, 64] | `{ request_id, run_id, generated, markers_emitted, decoded_frames, sample_fps, lag_p95_ms, lag_p99_ms, tokens, metadata[], markers[] }` | 404, 409 terminal run, 422, 500 | Appends `semantic_chunk_inferred` and `semantic_chunk_generated` per chunk, `marker_emitted` per marker, `semantic_fallback_activated` when semantic inference was requested with no provider, and `run_completed` |
+| `POST /v1/runs/:id/analyze` | `{ model, mode?, stream_id?, sampling_policy?, fixed_fps?, frames?, window_size?, segment_ms?, trace_id? }`. Supply 1 to 4096 frames with normalized scores, or omit `frames` to reuse signals from the run's latest `frames_decoded` event. `window_size` is in [2, 256]; `segment_ms` is in [50, 60000]. | `{ request_id, run_id, generated, metadata[], markers[] }`. Metadata sourced from decoded video includes `coordinate_schema` and `coordinates`; caller-supplied signal arrays do not claim image provenance. | 404, 409 terminal run, 422, 500 | Appends one `marker_emitted` per marker, then `analysis_generated` |
+| `POST /v1/runs/:id/reason` | `{ source_uri, model, ... }` with `chunk_size` in [5, 500], `window_size` in [2, 256], `segment_ms >= 1`, `max_frames` in [1, 500000], `semantic_inference?`, `semantic_frames_per_chunk` in [1, 4], `semantic_frame_max_edge` in [64, 4096], `crop?: { x, y, width, height }` as normalized fractions, `semantic_timeout_ms` in [100, 120000], `semantic_prompt` up to 4096 bytes, `output_schema?`, `first_pass_model?`, `second_pass_model?`, `second_pass_threshold?`, `index_name?`, `temporal_chain?`, `visual_diff?`, `video_clip_mode?`, `video_clip_duration_s` in (0, 60], `vlm_concurrency?` clamped to [1, 64] | `{ request_id, run_id, generated, markers_emitted, decoded_frames, sample_fps, lag_p95_ms, lag_p99_ms, tokens, metadata[], markers[] }`; metadata carries the `vidarax.image.v1` source/crop/analysis transform. | 404, 409 terminal run, 422, 500 | Appends `semantic_chunk_inferred` and `semantic_chunk_generated` per chunk, `marker_emitted` per marker, `semantic_fallback_activated` when semantic inference was requested with no provider, and `run_completed` |
 
 ### Reading events and markers
 
@@ -89,19 +89,19 @@ The API is served over HTTP/1.1 and HTTP/2, with optional HTTP/3 behind the `h3-
 
 ### Feedback
 
-Both feedback routes require the optional SpacetimeDB integration; without `VIDARAX_SPACETIMEDB_URL` they return 500 with a "spacetimedb client not configured" message.
+Both feedback routes require the optional SpacetimeDB integration. Without `VIDARAX_SPACETIMEDB_URL` they return 503 with code `spacetimedb_not_configured`, because a missing optional dependency is unavailability, not a server fault.
 
 | Route | Request | Success (200) | Failures |
 |---|---|---|---|
-| `POST /v1/runs/:id/feedback` | `{ rating, category, feedback? }`; rating in [0, 10], category non-empty | `{ request_id, run_id, status: "submitted" }` | 404, 422, 500 |
-| `GET /v1/feedback` | none | `{ request_id, feedback[] }`, filtered to caller-owned runs | 500 |
+| `POST /v1/runs/:id/feedback` | `{ rating, category, feedback? }`; rating in [0, 10], category non-empty | `{ request_id, run_id, status: "submitted" }` | 404, 422, 500, 503 SpacetimeDB not configured |
+| `GET /v1/feedback` | none | `{ request_id, feedback[] }`, filtered to caller-owned runs | 500, 503 SpacetimeDB not configured |
 
 ### Files
 
 | Route | Request | Success | Failures | Notes |
 |---|---|---|---|---|
 | `POST /v1/upload` | multipart form with a `file` field; body capped at 200 MiB by the route's body limit | 200 `{ file_path }`, the server-side path to use as `source_uri` | 422 unsupported type or invalid media container, 500 | Filenames are sanitized and prefixed per principal; the content must validate as a media container, not a playlist |
-| `GET /v1/files/:filename` | bare filename only | 200 file bytes with a video content type and `Accept-Ranges: bytes` | 400, 404 | Errors are raw text bodies, not the JSON envelope. Uploads are only visible to the uploading principal; operator-configured roots are shared |
+| `GET /v1/files/:filename` | bare filename only | 200 file bytes with a video content type and `Accept-Ranges: bytes` | 400 `bad_request`, 404 `not_found` | Errors use the structured JSON envelope. Uploads are only visible to the uploading principal; operator-configured roots are shared |
 
 ### Keyframe blobs
 
@@ -109,7 +109,7 @@ Both feedback routes require the optional SpacetimeDB integration; without `VIDA
 
 ### WebRTC (WHIP)
 
-Success and failure statuses for the four WHIP routes are covered in [WebRTC ingest](/internals/webrtc-ingest/#endpoint-contract). Two things differ from the rest of the API: `POST /v1/stream/whip` answers with raw SDP (plus `Location` and `x-vidarax-run-id` headers) rather than JSON, and WHIP failures return bare status codes or plain-text bodies rather than the JSON envelope. The offer accepts an optional `x-attach-config` header (base64url-encoded JSON, no padding, size-capped) whose `prompt`, `max_output_tokens_per_second`, `clip_mode`, and normalized `crop` fields apply before workers start. Unknown attach fields are rejected. `PATCH /v1/stream/whip/:sess/prompt` accepts `{ prompt, output_schema? }`, where `output_schema` is a JSON Schema object, and returns the applied values. Token caps, crop, and clip mode cannot be changed after start.
+Success and failure statuses for the four WHIP routes are covered in [WebRTC ingest](/docs/internals/webrtc-ingest/#endpoint-contract). Two things differ from the rest of the API: `POST /v1/stream/whip` answers with raw SDP (plus `Location` and `x-vidarax-run-id` headers) rather than JSON, and WHIP failures return bare status codes or plain-text bodies rather than the JSON envelope. The offer accepts an optional `x-attach-config` header (base64url-encoded JSON, no padding, size-capped) whose `prompt`, `max_output_tokens_per_second`, `clip_mode`, and normalized `crop` fields apply before workers start. Unknown attach fields are rejected. `PATCH /v1/stream/whip/:sess/prompt` accepts `{ prompt, output_schema? }`, where `output_schema` is a JSON Schema object, and returns the applied values only after the active generation's VLM worker acknowledges them. An unknown or foreign session returns 404 or 403, a closed generation returns 409, and a two-second acknowledgement timeout returns 503. A timed-out command is discarded rather than applied later. Token caps, crop, and clip mode cannot be changed after start.
 
 ### Health and metrics
 
@@ -138,6 +138,7 @@ Handler errors share one JSON shape. The `request_id` is a string and lives insi
 | Status | Code | When |
 |--------|------|------|
 | 400 | `validation_error` | CORS preflight without an `Origin` header. |
+| 400 | `bad_request` | File route filename with separators, traversal sequences, or an unsupported extension. |
 | 401 | `unauthorized` | Missing or invalid `x-api-key`; missing `x-tenant-id` when required. |
 | 403 | `cors_forbidden` | Preflight from an origin outside the allowlist. |
 | 404 | `not_found` | Unknown, deleted, or other-principal `run_id`. |
@@ -146,8 +147,9 @@ Handler errors share one JSON shape. The `request_id` is a string and lives insi
 | 429 | `rate_limited` | Global or per-principal rate limit exceeded. |
 | 500 | `internal_error` | Internal failure; the message is sanitized and details are logged server-side. |
 | 503 | `metrics_unavailable` | Metrics auth enabled with no API keys configured. |
+| 503 | `spacetimedb_not_configured` | Feedback routes without `VIDARAX_SPACETIMEDB_URL` set. |
 
-Not everything uses the envelope. WHIP routes return raw SDP on success and bare status codes or plain text on failure; `GET /v1/files` failures are plain text; and requests rejected before a handler runs (malformed JSON bodies, unknown routes, oversized uploads) get the framework's default plain responses.
+Not everything uses the envelope. WHIP routes return raw SDP on success and bare status codes or plain text on failure, and requests rejected before a handler runs (malformed JSON bodies, unknown routes, oversized uploads) get the framework's default plain responses.
 
 ## Configuration
 
@@ -162,10 +164,12 @@ Not everything uses the envelope. WHIP routes return raw SDP on success and bare
 | `VIDARAX_DATA_DIR` | `.vidarax-data` | WAL and runtime data directory |
 | `VIDARAX_INGEST_FILE_ROOTS` | unset | Directories local `source_uri` paths may come from |
 | `VIDARAX_ACTIVE_STREAM_LIMIT` | `5` | Max active runs per resolved principal |
+| `VIDARAX_MEDIA_MEMORY_BUDGET_BYTES` | `8589934592` | Process-wide byte reservation for admitted live media generations |
+| `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` | `64` | Process-wide OS-thread reservation for admitted live media generations |
 | `VIDARAX_STREAM_TTL_SECS` | `3600` | Run idle TTL |
 | `VIDARAX_NOVELTY_EMBEDDING_ADDR` | unset | Binary TCP embedding sidecar; setting it enables live semantic novelty |
 | `VIDARAX_NOVELTY_REUSE_THRESHOLD` | `0.01` | Conservative embedding-distance ceiling for description reuse; calibrate it on labelled deployment traffic |
 
 When neither backend URL is set, the server reads a TOML config file (`VIDARAX_CONFIG`, default `vidarax.toml`) that declares backends in priority order; the parser supports `openai_compat` and `gemini` backend types, and string fields interpolate `${ENV_VAR}` references. When either explicit URL is set, the TOML file is not read.
 
-The full configuration reference, including decode backend selection, CORS, rate limits, WebRTC and TURN settings, and SpacetimeDB, lives in `docs/deployment.md` in the repository. The hardening-relevant variables are summarized in [Operations](/operations/#security-and-hardening).
+The full configuration reference, including decode backend selection, CORS, rate limits, WebRTC and TURN settings, and SpacetimeDB, lives in `docs/deployment.md` in the repository. The hardening-relevant variables are summarized in [Operations](/docs/operations/#security-and-hardening).

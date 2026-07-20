@@ -4,6 +4,8 @@ import starlight from '@astrojs/starlight';
 import markdoc from '@astrojs/markdoc';
 
 export default defineConfig({
+  site: 'https://vidarax.cosminbararu.com',
+  base: '/docs',
   integrations: [
     markdoc(),
     starlight({

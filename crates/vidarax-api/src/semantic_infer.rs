@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::{Id as TaskId, JoinError, JoinSet};
+use vidarax_core::coordinates::{FrameCoordinates, IMAGE_COORDINATE_SCHEMA};
 use vidarax_core::gate::{FrameSignal, GateEventType};
 use vidarax_core::ingest::pipeline::DecodePipeline;
 use vidarax_core::ingest::{DecodedJpegFrame, PreparedSource};
@@ -13,7 +14,7 @@ use vidarax_core::provider::{
     InferenceImage, InferenceObserver, InferenceProvider, InferenceRequest, InferenceVideo,
     ProviderError, TokenUsage,
 };
-use vidarax_core::tiered_vlm::{run_tiered, TieredVlmConfig};
+use vidarax_core::tiered_vlm::{run_tiered_with_second_pass_schema, TieredVlmConfig};
 use vidarax_core::timeline::TimelineEvent;
 
 use crate::models::{
@@ -27,10 +28,25 @@ use crate::state::AppState;
 static SEMANTIC_TASK_PANIC_CHUNK_FOR_TESTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(usize::MAX);
 
+const SEMANTIC_OVERLAY_SCHEMA: &str = r#"{
+  "type": "object",
+  "properties": {
+    "event_type": { "type": "string" },
+    "object_label": { "type": "string" },
+    "summary": { "type": "string" },
+    "description": { "type": "string" },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+  },
+  "required": ["event_type", "object_label", "summary", "description", "confidence"]
+}"#;
+const DEFAULT_SEMANTIC_MAX_TOKENS: u32 = 320;
+const CUSTOM_SCHEMA_MAX_TOKENS: u32 = 1024;
+
 pub struct DecodedSignals {
     pub signals: Vec<FrameSignal>,
     pub sampling_policy: SamplingPolicy,
     pub sample_fps: f32,
+    pub coordinates: Option<FrameCoordinates>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +68,7 @@ pub struct ChunkSemanticResult {
     pub error: Option<String>,
     pub attempted: bool,
     pub finish_reason: Option<String>,
+    pub response_chars: Option<usize>,
     /// Token spend for this chunk's analysis (summed across tiered passes).
     pub usage: TokenUsage,
     /// Wall-clock inference latency for this chunk (summed across passes).
@@ -74,6 +91,8 @@ impl ChunkSemanticResult {
                 "provider_fallback_used": self.provider_fallback_used,
                 "semantic_fallback_used": self.used_fallback,
                 "semantic_error": self.error,
+                "finish_reason": self.finish_reason,
+                "response_chars": self.response_chars,
                 "event_type": self.overlay.as_ref().map(|o| o.event_type.clone()),
                 "object_label": self.overlay.as_ref().map(|o| o.object_label.clone()),
                 "summary": self.overlay.as_ref().map(|o| o.summary.clone()),
@@ -189,11 +208,28 @@ pub fn load_decoded_signals_from_events(
         .map(|value| value as f32)
         .or_else(|| estimate_sample_fps(&out))
         .unwrap_or(1.0);
+    let coordinates = match payload
+        .get("coordinate_schema")
+        .and_then(|value| value.as_str())
+    {
+        Some(IMAGE_COORDINATE_SCHEMA) => {
+            let value = payload
+                .get("coordinates")
+                .cloned()
+                .ok_or_else(|| "decoded ingest payload is missing coordinates".to_string())?;
+            Some(
+                serde_json::from_value(value)
+                    .map_err(|_| "decoded ingest coordinates are invalid".to_string())?,
+            )
+        }
+        _ => None,
+    };
 
     Ok(DecodedSignals {
         signals: out,
         sampling_policy,
         sample_fps,
+        coordinates,
     })
 }
 
@@ -609,16 +645,28 @@ pub async fn infer_chunk_semantics(
         (imgs, Vec::new())
     };
 
+    let has_custom_output_schema = guided_json.is_some();
+    let first_pass_max_tokens = if has_custom_output_schema {
+        CUSTOM_SCHEMA_MAX_TOKENS
+    } else {
+        DEFAULT_SEMANTIC_MAX_TOKENS
+    };
+    let request_guided_json = guided_json
+        .as_ref()
+        .map(Arc::clone)
+        .or_else(|| Some(Arc::from(SEMANTIC_OVERLAY_SCHEMA)));
+    let second_pass_guided_json =
+        (!has_custom_output_schema).then(|| Arc::from(SEMANTIC_OVERLAY_SCHEMA));
     let request = InferenceRequest {
         model: tiered_config.first_pass_model.clone(),
         prompt: Arc::from(prompt),
         input_images: images,
         input_videos: videos,
-        max_tokens: 160,
+        max_tokens: first_pass_max_tokens,
         temperature: 0.0,
         timeout_ms,
         allow_fallback: true,
-        guided_json: guided_json.as_ref().map(Arc::clone),
+        guided_json: request_guided_json,
     };
 
     // Capture the failing model's backend kind before the closure moves
@@ -631,12 +679,13 @@ pub async fn infer_chunk_semantics(
         let provider = Arc::clone(&provider);
         let observer_for_call = observer.clone();
         move || {
-            run_tiered(
+            run_tiered_with_second_pass_schema(
                 provider.as_ref(),
                 &tiered_config,
                 request,
-                1024,
+                first_pass_max_tokens,
                 timeout_ms,
+                second_pass_guided_json,
                 observer_for_call.as_deref(),
             )
         }
@@ -657,6 +706,7 @@ pub async fn infer_chunk_semantics(
                 ProviderError::HttpStatus(code) => format!("http_status_{code}"),
                 ProviderError::Transport(_) => "transport_error".to_string(),
                 ProviderError::InvalidResponse(_) => "invalid_response".to_string(),
+                ProviderError::Saturated { .. } => "provider_saturated".to_string(),
             });
             return result;
         }
@@ -673,10 +723,11 @@ pub async fn infer_chunk_semantics(
     result.provider = Some(provider_result.provider.name().to_string());
     result.provider_fallback_used = provider_result.fallback_used;
     result.finish_reason = provider_result.finish_reason.clone();
+    result.response_chars = Some(provider_result.output_text.chars().count());
     result.usage = provider_result.usage;
     result.inference_latency_ms = provider_result.inference_latency_ms;
 
-    if guided_json.is_some() {
+    if has_custom_output_schema {
         let parsed = serde_json::from_str::<Value>(&provider_result.output_text)
             .unwrap_or_else(|_| json!({"raw": provider_result.output_text}));
         result.raw_output = Some(parsed);
@@ -684,14 +735,20 @@ pub async fn infer_chunk_semantics(
         result
     } else {
         match parse_semantic_overlay(&provider_result.output_text) {
-            Some(overlay) => {
+            Ok(overlay) => {
                 result.overlay = Some(overlay);
                 result.used_fallback = provider_result.fallback_used;
                 result
             }
-            None => {
+            Err(parse_error) => {
+                tracing::warn!(
+                    error = parse_error.as_str(),
+                    finish_reason = result.finish_reason.as_deref().unwrap_or("unknown"),
+                    response_chars = result.response_chars.unwrap_or(0),
+                    "semantic output did not match the overlay contract"
+                );
                 result.used_fallback = true;
-                result.error = Some("semantic_parse_failed".to_string());
+                result.error = Some(format!("semantic_parse_failed:{}", parse_error.as_str()));
                 result
             }
         }
@@ -726,62 +783,124 @@ pub fn select_semantic_images(
     out
 }
 
-fn parse_semantic_overlay(raw: &str) -> Option<SemanticOverlay> {
+#[derive(Debug, PartialEq, Eq)]
+enum SemanticParseError {
+    EmptyResponse,
+    JsonObjectNotFound,
+    InvalidJson,
+    SchemaMismatch,
+}
+
+impl SemanticParseError {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::EmptyResponse => "empty_response",
+            Self::JsonObjectNotFound => "json_object_not_found",
+            Self::InvalidJson => "invalid_json",
+            Self::SchemaMismatch => "schema_mismatch",
+        }
+    }
+}
+
+fn parse_semantic_overlay(raw: &str) -> Result<SemanticOverlay, SemanticParseError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return None;
+        return Err(SemanticParseError::EmptyResponse);
     }
-    let json_text = if trimmed.starts_with('{') && trimmed.ends_with('}') {
-        trimmed
-    } else {
-        let start = trimmed.find('{')?;
-        let end = trimmed.rfind('}')?;
-        if start >= end {
-            return None;
-        }
-        &trimmed[start..=end]
-    };
-    let value: Value = serde_json::from_str(json_text).ok()?;
+    let value = parse_first_json_object(trimmed)?;
 
-    let event_type = normalize_semantic_event(
-        value
-            .get("event_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("context_observation"),
-    );
-    let object_label = normalize_semantic_object(
-        value
-            .get("object_label")
-            .and_then(|v| v.as_str())
-            .unwrap_or("frame_context"),
-    );
-    let summary = value
-        .get("summary")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("semantic summary unavailable")
-        .to_string();
-    let description = value
-        .get("description")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("semantic description unavailable")
-        .to_string();
+    let event_type = normalize_semantic_event(required_string(&value, "event_type")?);
+    let object_label = normalize_semantic_object(required_string(&value, "object_label")?);
+    let summary = required_string(&value, "summary")?.trim();
+    let summary = if summary.is_empty() {
+        "semantic summary unavailable"
+    } else {
+        summary
+    }
+    .to_string();
+    let description = required_string(&value, "description")?.trim();
+    let description = if description.is_empty() {
+        "semantic description unavailable"
+    } else {
+        description
+    }
+    .to_string();
     let confidence = value
         .get("confidence")
         .and_then(|v| v.as_f64())
-        .map(|v| (v as f32).clamp(0.0, 1.0))
-        .unwrap_or(0.5);
+        .filter(|v| (0.0..=1.0).contains(v))
+        .ok_or(SemanticParseError::SchemaMismatch)? as f32;
 
-    Some(SemanticOverlay {
+    Ok(SemanticOverlay {
         event_type,
         object_label,
         summary,
         description,
         confidence,
     })
+}
+
+fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, SemanticParseError> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or(SemanticParseError::SchemaMismatch)
+}
+
+fn parse_first_json_object(raw: &str) -> Result<Value, SemanticParseError> {
+    let mut saw_balanced_object = false;
+    for (start, ch) in raw.char_indices() {
+        if ch != '{' {
+            continue;
+        }
+        let Some(candidate) = extract_balanced_json_object(&raw[start..]) else {
+            continue;
+        };
+        saw_balanced_object = true;
+        if let Ok(value) = serde_json::from_str(candidate) {
+            return Ok(value);
+        }
+    }
+    if saw_balanced_object {
+        Err(SemanticParseError::InvalidJson)
+    } else {
+        Err(SemanticParseError::JsonObjectNotFound)
+    }
+}
+
+fn extract_balanced_json_object(raw: &str) -> Option<&str> {
+    if !raw.starts_with('{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, ch) in raw.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&raw[..=offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn truncate_context(text: &str, max_chars: usize) -> &str {
@@ -809,10 +928,37 @@ mod tests {
         }
 
         fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+            assert_eq!(
+                request.guided_json.as_deref(),
+                Some(SEMANTIC_OVERLAY_SCHEMA)
+            );
+            assert_eq!(request.max_tokens, DEFAULT_SEMANTIC_MAX_TOKENS);
             Ok(InferenceResult {
                 provider: ProviderKind::Vllm,
                 model: Arc::clone(&request.model),
                 output_text: r#"{"event_type":"context_observation","object_label":"frame_context","summary":"ok","description":"chunk completed","confidence":0.95}"#.to_string(),
+                fallback_used: false,
+                finish_reason: Some("stop".to_string()),
+                inference_latency_ms: 1,
+                usage: TokenUsage::default(),
+            })
+        }
+    }
+
+    struct CustomSchemaTestProvider;
+
+    impl InferenceProvider for CustomSchemaTestProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Vllm
+        }
+
+        fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+            assert_eq!(request.guided_json.as_deref(), Some(r#"{"type":"object"}"#));
+            assert_eq!(request.max_tokens, CUSTOM_SCHEMA_MAX_TOKENS);
+            Ok(InferenceResult {
+                provider: ProviderKind::Vllm,
+                model: Arc::clone(&request.model),
+                output_text: r#"{"custom":"ok"}"#.to_string(),
                 fallback_used: false,
                 finish_reason: Some("stop".to_string()),
                 inference_latency_ms: 1,
@@ -849,6 +995,8 @@ mod tests {
                 confidence: 0.91,
             }),
             attempted: true,
+            finish_reason: Some("stop".to_string()),
+            response_chars: Some(128),
             ..ChunkSemanticResult::default()
         };
 
@@ -864,6 +1012,97 @@ mod tests {
             payload.get("description").and_then(Value::as_str),
             Some("A person walks past the front desk carrying a bag.")
         );
+        assert_eq!(
+            payload.get("finish_reason").and_then(Value::as_str),
+            Some("stop")
+        );
+        assert_eq!(
+            payload.get("response_chars").and_then(Value::as_u64),
+            Some(128)
+        );
+    }
+
+    #[test]
+    fn semantic_overlay_parser_accepts_fenced_json_with_braces_in_strings() {
+        let raw = r#"Result:
+```json
+{"event_type":"context_observation","object_label":"subject","summary":"turn {left}","description":"The subject oscillates before contact.","confidence":0.8}
+```
+Ignore this trailing {not json}."#;
+
+        let overlay = parse_semantic_overlay(raw).expect("fenced overlay should parse");
+        assert_eq!(overlay.object_label, "subject");
+        assert_eq!(overlay.summary, "turn {left}");
+        assert_eq!(overlay.confidence, 0.8);
+    }
+
+    #[test]
+    fn semantic_overlay_parser_reports_actionable_failure_categories() {
+        assert_eq!(
+            parse_semantic_overlay("   ").unwrap_err(),
+            SemanticParseError::EmptyResponse
+        );
+        assert_eq!(
+            parse_semantic_overlay("plain prose only").unwrap_err(),
+            SemanticParseError::JsonObjectNotFound
+        );
+        assert_eq!(
+            parse_semantic_overlay("prefix {not-json} suffix").unwrap_err(),
+            SemanticParseError::InvalidJson
+        );
+        assert_eq!(
+            parse_semantic_overlay("{\"summary\": \"truncated\"").unwrap_err(),
+            SemanticParseError::JsonObjectNotFound
+        );
+        assert_eq!(
+            parse_semantic_overlay("{}").unwrap_err(),
+            SemanticParseError::SchemaMismatch
+        );
+        assert_eq!(
+            parse_semantic_overlay(
+                r#"{"event_type":"event","object_label":"object","summary":"summary","description":"description","confidence":2}"#
+            )
+            .unwrap_err(),
+            SemanticParseError::SchemaMismatch
+        );
+    }
+
+    #[test]
+    fn semantic_overlay_parser_skips_invalid_balanced_braces_before_valid_json() {
+        let raw = r#"The set {left, right} resolves to {"event_type":"scene_cut","object_label":"subject","summary":"left turn","description":"The subject turns left.","confidence":0.8}."#;
+        let overlay = parse_semantic_overlay(raw).expect("later valid object should parse");
+        assert_eq!(overlay.event_type, "scene_cut");
+        assert_eq!(overlay.confidence, 0.8);
+    }
+
+    #[tokio::test]
+    async fn custom_output_schema_preserves_raw_output_and_larger_token_cap() {
+        let provider: Arc<dyn InferenceProvider + Send + Sync> = Arc::new(CustomSchemaTestProvider);
+        let jpeg = DecodedJpegFrame {
+            frame_index: 0,
+            jpeg_bytes: Arc::from(vec![0xff, 0xd8, 0xff, 0xd9]),
+        };
+        let result = infer_chunk_semantics(
+            Some(provider),
+            true,
+            "classify",
+            1_000,
+            1,
+            &[jpeg],
+            0,
+            0,
+            33,
+            TieredVlmConfig::single_model("test-model"),
+            Some(Arc::from(r#"{"type":"object"}"#)),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(result.raw_output, Some(json!({"custom": "ok"})));
+        assert!(result.overlay.is_none());
+        assert_eq!(result.error, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1011,6 +1250,7 @@ pub fn compose_frame_metadata(
     request_id: &str,
     trace_id: &str,
     m: FrameMetadata,
+    coordinates: Option<FrameCoordinates>,
     semantic: Option<&SemanticOverlay>,
     semantic_fallback: bool,
     finish_reason: Option<String>,
@@ -1058,6 +1298,8 @@ pub fn compose_frame_metadata(
             stream_id: stream_id.to_string(),
             frame_index: m.frame_index,
             pts_ms: m.pts_ms,
+            coordinate_schema: coordinates.map(|_| IMAGE_COORDINATE_SCHEMA),
+            coordinates,
             mode: mode.to_string(),
             model: model.to_string(),
             sampling_policy: sampling_policy.as_str().to_string(),

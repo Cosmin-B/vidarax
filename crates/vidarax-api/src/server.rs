@@ -78,6 +78,9 @@ use tokio_quiche::http3::driver::{
 use tokio_quiche::http3::settings::Http3Settings;
 #[cfg(feature = "h3-experimental")]
 use tokio_quiche::metrics::DefaultMetrics;
+
+#[cfg(feature = "h3-experimental")]
+type ParsedRequestHead = (Method, String, Vec<(HeaderName, HeaderValue)>);
 #[cfg(feature = "h3-experimental")]
 use tokio_quiche::quiche::h3::Header;
 #[cfg(feature = "h3-experimental")]
@@ -232,9 +235,7 @@ async fn build_http_request_from_h3(
 }
 
 #[cfg(feature = "h3-experimental")]
-fn parse_h3_request_head(
-    headers: &[Header],
-) -> Result<(Method, String, Vec<(HeaderName, HeaderValue)>), String> {
+fn parse_h3_request_head(headers: &[Header]) -> Result<ParsedRequestHead, String> {
     let mut method: Option<Method> = None;
     let mut path: Option<String> = None;
     let mut normal_headers: Vec<(HeaderName, HeaderValue)> = Vec::with_capacity(headers.len());
@@ -284,7 +285,7 @@ async fn read_h3_request_body(
         if let InboundFrame::Body(chunk, fin) = frame {
             let bytes: &[u8] = chunk.as_ref();
             if body.len().saturating_add(bytes.len()) > MAX_H3_BODY_BYTES {
-                return Err(format!("request body exceeds {} bytes", MAX_H3_BODY_BYTES));
+                return Err(format!("request body exceeds {MAX_H3_BODY_BYTES} bytes"));
             }
             body.extend_from_slice(bytes);
             if fin {

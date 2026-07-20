@@ -1,8 +1,7 @@
 //! WebRTC video decoders for H.264, H.265 / HEVC, and unsupported negotiated codecs.
 //!
-//! GPU H.264 and H.265 use a long-lived ffmpeg sidecar; software H.264 uses
-//! openh264 in-process. Software H.265 uses the ffmpeg sidecar. With
-//! `--features vp8`, VP8 uses libvpx in-process.
+//! H.264 and H.265 use a long-lived ffmpeg sidecar so native decoder faults are
+//! process-isolated. With `--features vp8`, VP8 uses libvpx in-process.
 
 // The crate denies unsafe (see lib.rs). The libvpx VP8 path calls a C API
 // through raw pointers, so it needs unsafe; the allow is scoped to this module
@@ -193,10 +192,9 @@ impl VideoCodec {
     }
 
     /// Whether Vidarax can both depacketize and decode this codec on the live
-    /// WebRTC path. H.264 uses rustrtc depacketization plus openh264 or nvdec
-    /// decode. VP8 is serveable only with the `vp8` feature. H.265 uses the
-    /// in-crate HEVC RTP depacketizer (RFC 7798) plus nvdec or the ffmpeg hevc
-    /// software sidecar.
+    /// WebRTC path. H.264 uses rustrtc depacketization plus an ffmpeg sidecar.
+    /// VP8 is serveable only with the `vp8` feature. H.265 uses the in-crate
+    /// HEVC RTP depacketizer (RFC 7798) plus an ffmpeg sidecar.
     fn is_live_serveable(self) -> bool {
         match self {
             VideoCodec::H264 => true,
@@ -318,7 +316,8 @@ pub fn select_answer_video_codec_for_offer(sdp: &str) -> Option<OfferedVideoCode
 pub enum DecoderBackend {
     /// GPU ffmpeg pipe path.
     NvDec,
-    /// In-process openh264 path.
+    /// In-process openh264 path retained for direct decoder use. Live backend
+    /// selection routes H.264 through `FfmpegSw` for process isolation.
     Software,
     /// CPU ffmpeg pipe path.
     FfmpegSw,
@@ -337,7 +336,10 @@ impl DecoderBackend {
             #[cfg(not(feature = "vp8"))]
             (_, VideoCodec::Vp8) => DecoderBackend::Unsupported,
             (true, VideoCodec::H264) => DecoderBackend::NvDec,
-            (false, VideoCodec::H264) => DecoderBackend::Software,
+            // H.264 is also kept behind the ffmpeg process boundary. A native
+            // decoder crash must terminate one supervised generation, not the
+            // whole `panic = abort` API process.
+            (false, VideoCodec::H264) => DecoderBackend::FfmpegSw,
             (true, VideoCodec::H265) => DecoderBackend::NvDec,
             (false, VideoCodec::H265) => DecoderBackend::FfmpegSw,
         }
@@ -624,6 +626,7 @@ pub enum Decoder {
         child: Child,
         stdin: ChildStdin,
         frame_rx: YuvFrameReceiver,
+        reader: Option<std::thread::JoinHandle<()>>,
         pending: VecDeque<YuvFrame>,
         pending_warned: bool,
         metrics: Option<Arc<PipelineMetrics>>,
@@ -647,6 +650,7 @@ pub enum Decoder {
         child: Child,
         stdin: ChildStdin,
         frame_rx: YuvFrameReceiver,
+        reader: Option<std::thread::JoinHandle<()>>,
         pending: VecDeque<YuvFrame>,
         pending_warned: bool,
         metrics: Option<Arc<PipelineMetrics>>,
@@ -676,11 +680,11 @@ fn spawn_frame_reader(
     width: u32,
     height: u32,
     output_pool_slots: usize,
-) -> YuvFrameReceiver {
+) -> (YuvFrameReceiver, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::sync_channel(FFMPEG_YUV_READER_QUEUE_CAPACITY);
     let output_pool_slots = output_pool_slots.max(FFMPEG_YUV_READER_POOL_MIN_SLOTS);
     let pools = YuvPlanePools::new(width, height, output_pool_slots);
-    std::thread::spawn(move || {
+    let reader = std::thread::spawn(move || {
         let w = width as usize;
         let h = height as usize;
         let y_size = w * h;
@@ -718,7 +722,7 @@ fn spawn_frame_reader(
             }
         }
     });
-    YuvFrameReceiver { rx }
+    (YuvFrameReceiver { rx }, reader)
 }
 
 fn send_yuv_frame_lossless(tx: &mpsc::SyncSender<YuvFrame>, frame: YuvFrame) -> bool {
@@ -834,17 +838,17 @@ impl Decoder {
     /// | `true`          | H.264            | `NvDec`     |
     /// | `true`          | H.265 / HEVC     | `NvDec`     |
     /// | `true`          | VP8              | `Vp8` with `--features vp8`; otherwise `Unsupported` |
-    /// | `false`         | H.264            | `Software`  |
+    /// | `false`         | H.264            | `FfmpegSw`  |
     /// | `false`         | H.265 / HEVC     | `FfmpegSw`  |
     /// | `false`         | VP8              | `Vp8` with `--features vp8`; otherwise `Unsupported` |
     ///
-    /// H.265 / HEVC uses the ffmpeg sidecar, including software ffmpeg when no
-    /// GPU is available.
+    /// H.264 and H.265 / HEVC use the ffmpeg sidecar, including software
+    /// ffmpeg when no GPU is available.
     ///
     /// # Panics
     ///
-    /// Panics if the selected backend cannot be initialised (ffmpeg not found
-    /// for `NvDec`, or openh264 library init failure for `Software`).
+    /// Panics if the selected backend cannot be initialised (for example,
+    /// when ffmpeg is not found).
     pub fn new(config: &DecoderConfig) -> Self {
         Self::new_inner(config, None)
     }
@@ -917,6 +921,10 @@ impl Decoder {
             .args([
                 "-hwaccel",
                 "auto",
+                "-threads",
+                "1",
+                "-filter_threads",
+                "1",
                 "-f",
                 input_fmt,
                 "-i",
@@ -937,12 +945,13 @@ impl Decoder {
 
         let stdin = child.stdin.take().expect("ffmpeg stdin missing");
         let stdout = BufReader::new(child.stdout.take().expect("ffmpeg stdout missing"));
-        let frame_rx = spawn_frame_reader(stdout, width, height, output_pool_slots);
+        let (frame_rx, reader) = spawn_frame_reader(stdout, width, height, output_pool_slots);
 
         Decoder::NvDec {
             child,
             stdin,
             frame_rx,
+            reader: Some(reader),
             pending: VecDeque::with_capacity(FFMPEG_YUV_PENDING_FIFO_CAPACITY),
             pending_warned: false,
             metrics,
@@ -966,6 +975,10 @@ impl Decoder {
             .expect("ffmpeg sidecar requires a codec with an input demuxer format");
         let mut child = Command::new(crate::ingest::ffmpeg_path())
             .args([
+                "-threads",
+                "1",
+                "-filter_threads",
+                "1",
                 "-f",
                 input_fmt,
                 "-i",
@@ -986,12 +999,13 @@ impl Decoder {
 
         let stdin = child.stdin.take().expect("ffmpeg stdin missing");
         let stdout = BufReader::new(child.stdout.take().expect("ffmpeg stdout missing"));
-        let frame_rx = spawn_frame_reader(stdout, width, height, output_pool_slots);
+        let (frame_rx, reader) = spawn_frame_reader(stdout, width, height, output_pool_slots);
 
         Decoder::FfmpegSw {
             child,
             stdin,
             frame_rx,
+            reader: Some(reader),
             pending: VecDeque::with_capacity(FFMPEG_YUV_PENDING_FIFO_CAPACITY),
             pending_warned: false,
             metrics,
@@ -1255,9 +1269,13 @@ unsafe fn c_string_or_default(ptr: *const std::os::raw::c_char, default: &str) -
 impl Drop for Decoder {
     fn drop(&mut self) {
         match self {
-            Decoder::NvDec { child, .. } | Decoder::FfmpegSw { child, .. } => {
-                // Best-effort kill; ignore errors during shutdown.
+            Decoder::NvDec { child, reader, .. } | Decoder::FfmpegSw { child, reader, .. } => {
+                // Killing the sidecar closes stdout and wakes the owned reader.
                 let _ = child.kill();
+                if let Some(reader) = reader.take() {
+                    let _ = reader.join();
+                }
+                let _ = child.wait();
             }
             #[cfg(feature = "vp8")]
             Decoder::Vp8 { .. } => {}

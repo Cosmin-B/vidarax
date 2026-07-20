@@ -5,7 +5,9 @@
 // new unsafe block anywhere else fails the build instead of slipping in.
 #![deny(unsafe_code)]
 
+pub mod admission;
 pub mod backends;
+pub mod coordinates;
 pub mod crop;
 pub mod dedup;
 pub mod embedding_sidecar;
@@ -17,7 +19,6 @@ pub mod metrics;
 pub mod novelty;
 pub mod pipeline;
 pub mod provider;
-pub mod semantic_merge;
 pub mod tiered_vlm;
 pub mod timeline;
 pub mod webrtc;

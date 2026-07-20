@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use vidarax_core::webrtc::workers::EventSink;
+use vidarax_core::coordinates::{FrameCoordinates, IMAGE_COORDINATE_SCHEMA};
+use vidarax_core::webrtc::workers::{EventSink, KeyframeEvent};
 
 use crate::spacetime_client::{EmitEventArgs, SpacetimeClient};
 use crate::state::AppState;
@@ -137,6 +138,7 @@ impl EventSink for WalEventSink {
         session_id: &str,
         frame_index: u64,
         pts_ms: u64,
+        coordinates: FrameCoordinates,
         event_type: &str,
         confidence: f32,
         description: &str,
@@ -145,6 +147,8 @@ impl EventSink for WalEventSink {
             "session_id": session_id,
             "frame_index": frame_index,
             "pts_ms": pts_ms,
+            "coordinate_schema": IMAGE_COORDINATE_SCHEMA,
+            "coordinates": coordinates,
             "confidence": confidence,
             "description": description,
         });
@@ -172,6 +176,7 @@ impl EventSink for WalEventSink {
         session_id: &str,
         frame_index: u64,
         pts_ms: u64,
+        coordinates: FrameCoordinates,
         event_type: &str,
         confidence: f32,
         description: &str,
@@ -180,6 +185,8 @@ impl EventSink for WalEventSink {
             "session_id": session_id,
             "frame_index": frame_index,
             "pts_ms": pts_ms,
+            "coordinate_schema": IMAGE_COORDINATE_SCHEMA,
+            "coordinates": coordinates,
             "confidence": confidence,
             "description": description,
         });
@@ -190,17 +197,9 @@ impl EventSink for WalEventSink {
     }
 
     /// Write the JPEG before appending its metadata event.
-    fn store_keyframe_sync(
-        &self,
-        run_id: &str,
-        frame_index: u64,
-        pts_ms: u64,
-        event_type: &str,
-        description: &str,
-        jpeg_data: &[u8],
-    ) -> Result<(), String> {
+    fn store_keyframe_sync(&self, event: KeyframeEvent<'_>) -> Result<(), String> {
         let started = std::time::Instant::now();
-        let blob = match self.persist_keyframe_blob(jpeg_data) {
+        let blob = match self.persist_keyframe_blob(event.jpeg_data) {
             Ok(blob) => blob,
             Err(err) => {
                 self.state.pipeline_metrics().inc_keyframe_blob_failure();
@@ -223,10 +222,12 @@ impl EventSink for WalEventSink {
             self.state.pipeline_metrics().inc_keyframe_blob_reused();
         }
         let payload = json!({
-            "frame_index": frame_index,
-            "pts_ms": pts_ms,
-            "event_type": event_type,
-            "description": description,
+            "frame_index": event.frame_index,
+            "pts_ms": event.pts_ms,
+            "coordinate_schema": IMAGE_COORDINATE_SCHEMA,
+            "coordinates": event.coordinates,
+            "event_type": event.event_type,
+            "description": event.description,
             "image_ref": blob.image_ref,
             "image_media_type": "image/jpeg",
             "image_bytes": blob.bytes,
@@ -234,7 +235,7 @@ impl EventSink for WalEventSink {
         });
 
         self.state
-            .append_run_event(run_id, "keyframe_stored", payload)
+            .append_run_event(event.run_id, "keyframe_stored", payload)
             .map(|_| ())
     }
 }
@@ -246,7 +247,8 @@ mod tests {
     use super::WalEventSink;
     use crate::state::AppState;
     use std::sync::Arc;
-    use vidarax_core::webrtc::workers::EventSink;
+    use vidarax_core::coordinates::FrameCoordinates;
+    use vidarax_core::webrtc::workers::{EventSink, KeyframeEvent};
 
     fn temp_wal() -> std::path::PathBuf {
         // A per-call unique path. A bare nanosecond timestamp collided when two
@@ -284,8 +286,17 @@ mod tests {
         let run_id = "run-abcdef1234567890";
 
         let sink = WalEventSink::new(state.clone());
-        sink.emit_event_sync(run_id, "sess-01", 42, 1400, "vlm", 0.92, "a dog is running")
-            .expect("emit_event_sync should succeed");
+        sink.emit_event_sync(
+            run_id,
+            "sess-01",
+            42,
+            1400,
+            FrameCoordinates::full_frame(1920, 1080),
+            "vlm",
+            0.92,
+            "a dog is running",
+        )
+        .expect("emit_event_sync should succeed");
 
         let events = state
             .read_run_events(run_id)
@@ -317,6 +328,7 @@ mod tests {
             "sess-01",
             3,
             99,
+            FrameCoordinates::full_frame(1280, 720),
             "loop_detected",
             0.9,
             "loop detected via perceptual-hash ring buffer",
@@ -349,14 +361,15 @@ mod tests {
         let run_id = "run-deadbeef00000000";
 
         let sink = WalEventSink::new(state.clone());
-        sink.store_keyframe_sync(
+        sink.store_keyframe_sync(KeyframeEvent {
             run_id,
-            7,
-            231,
-            "scene_cut",
-            "a park scene",
-            b"\xff\xd8\xff\xd9",
-        )
+            frame_index: 7,
+            pts_ms: 231,
+            coordinates: FrameCoordinates::full_frame(1920, 1080),
+            event_type: "scene_cut",
+            description: "a park scene",
+            jpeg_data: b"\xff\xd8\xff\xd9",
+        })
         .expect("store_keyframe_sync should succeed");
 
         let events = state
@@ -367,6 +380,13 @@ mod tests {
         assert_eq!(ev.kind, "keyframe_stored");
         assert!(ev.payload.contains("scene_cut"));
         assert!(ev.payload.contains("a park scene"));
+        assert!(ev
+            .payload
+            .contains("\"coordinate_schema\":\"vidarax.image.v1\""));
+        let payload: serde_json::Value =
+            serde_json::from_str(&ev.payload).expect("keyframe payload should be valid JSON");
+        assert_eq!(payload["coordinates"]["source_extent"]["width"], 1920);
+        assert_eq!(payload["coordinates"]["source_extent"]["height"], 1080);
 
         let _ = std::fs::remove_file(path);
     }
@@ -383,14 +403,23 @@ mod tests {
                 "sess-multi",
                 i,
                 i * 33,
+                FrameCoordinates::full_frame(640, 480),
                 "vlm",
                 0.8,
                 "frame description",
             )
             .unwrap();
         }
-        sink.store_keyframe_sync(run_id, 3, 99, "periodic_keepalive", "desc", b"")
-            .unwrap();
+        sink.store_keyframe_sync(KeyframeEvent {
+            run_id,
+            frame_index: 3,
+            pts_ms: 99,
+            coordinates: FrameCoordinates::full_frame(640, 480),
+            event_type: "periodic_keepalive",
+            description: "desc",
+            jpeg_data: b"",
+        })
+        .unwrap();
 
         let events = state
             .read_run_events(run_id)

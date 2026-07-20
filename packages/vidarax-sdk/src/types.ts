@@ -25,8 +25,34 @@ export interface CropRegion {
   height: number;
 }
 
+/** Pixel dimensions in the `vidarax.image.v1` coordinate contract. */
+export interface PixelExtent {
+  width: number;
+  height: number;
+}
+
+/** Exact rectangle in source-frame pixels, with a top-left origin. */
+export interface PixelRect extends PixelExtent {
+  x: number;
+  y: number;
+}
+
+/** Spatial provenance for the filter input, before optional model transport resizing. */
+export interface FrameCoordinates {
+  source_extent: PixelExtent;
+  requested_region: CropRegion;
+  resolved_region: PixelRect;
+  analysis_extent: PixelExtent;
+}
+
 /** Run lifecycle state (lowercased Debug repr from Rust). */
-export type RunStatus = "pending" | "processing" | "completed" | "cancelled" | "failed";
+export type RunStatus =
+  | "pending"
+  | "processing"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "expired";
 
 /** Model tier. */
 export type ModelTier = "small" | "medium";
@@ -211,6 +237,8 @@ export interface AnalyzeFrameMetadata {
   stream_id: string;
   frame_index: number;
   pts_ms: EpochMs;
+  coordinate_schema?: "vidarax.image.v1";
+  coordinates?: FrameCoordinates;
   mode: string;
   model: string;
   sampling_policy: string;
@@ -261,7 +289,13 @@ export interface ClipConfig {
 
 // ─── Realtime reason ─────────────────────────────────────────────────────────
 
-/** Request body for POST /v1/runs/{id}/reason. Maps to `RealtimeReasonRequest`. */
+/**
+ * Request body for POST /v1/runs/{id}/reason. Maps to `RealtimeReasonRequest`.
+ *
+ * This interface mirrors the wire JSON exactly, so field names are snake_case.
+ * The convenience option types like `AnalyzeOptions` are camelCase and
+ * translated by the client.
+ */
 export interface RealtimeReasonRequest {
   source_uri: string;
   model: string;
@@ -633,6 +667,10 @@ export interface AnalyzeOptions {
  * Supply `output_schema` with a JSON Schema object to request structured JSON
  * output from the model.  The schema is forwarded to the backend as
  * `guided_json`.  Parse the structured response with `InferResult.resultJson()`.
+ *
+ * This interface mirrors the wire JSON exactly, so field names are snake_case.
+ * The convenience option types like `AnalyzeOptions` are camelCase and
+ * translated by the client.
  */
 export interface InferOptions {
   /** Model to use for inference. */
@@ -697,6 +735,11 @@ export interface SearchResponse {
 export interface VidaraxOptions {
   /** Optional bearer / x-api-key value sent with every request. */
   apiKey?: string;
+  /**
+   * Sent as the x-tenant-id header. Servers started with
+   * VIDARAX_REQUIRE_TENANT_ID reject requests without it.
+   */
+  tenantId?: string;
   /** Maximum number of automatic retries on transient failures (default: 3). */
   maxRetries?: number;
   /** Base delay in ms for exponential back-off (default: 200). */

@@ -18,6 +18,10 @@ use crate::webrtc::recycle::{RecycledBytes, VecPool};
 /// actually moving through it. A frame that needs more still grows from here —
 /// this is a floor, not a cap.
 const JPEG_TYPICAL_CAPACITY: usize = 256 * 1024;
+/// Hard bound for a JPEG payload that can enter downstream queues. The encoder
+/// writes into owned memory first; an oversized result is recycled immediately
+/// and never becomes queued work.
+pub const MAX_JPEG_BYTES_PER_FRAME: usize = 2 * 1024 * 1024;
 
 /// Compute a 64-bit perceptual hash from the Y (luma) plane.
 ///
@@ -481,7 +485,15 @@ pub(crate) fn yuv_to_jpeg_unchecked(
     // path this handle drops at the end of the match and the slot goes back.
     let bytes = output_pool.recycle(buf);
     match outcome {
-        Ok(()) => Ok(bytes),
+        Ok(()) if bytes.len() <= MAX_JPEG_BYTES_PER_FRAME => Ok(bytes),
+        Ok(()) => Err(JpegEncodeError {
+            width: yuv.width,
+            height: yuv.height,
+            detail: format!(
+                "encoded payload exceeds the {} byte pipeline limit",
+                MAX_JPEG_BYTES_PER_FRAME
+            ),
+        }),
         Err(err) => Err(JpegEncodeError {
             width: yuv.width,
             height: yuv.height,

@@ -136,11 +136,11 @@ fn select_expr_is_order_and_dedup_independent() {
 
 #[test]
 fn select_expr_partial_final_chunk_keeps_bulk_collapsed() {
-    // THE production case: 833 frames, chunk_size=5, 1 frame/chunk. The 166
+    // Production-sized case: 833 frames, chunk_size=5, 1 frame/chunk. The 166
     // full chunks give evenly-strided midpoints 2,7,..,827; the trailing
     // 3-frame chunk's midpoint lands at 831 (stride 4, not 5). The dense bulk
     // must still collapse to one term — only the stray tail frame spills to an
-    // eq() — or ffmpeg's parser OOMs on the ~167-term sum (bead vidarax-lvi).
+    // eq() — or ffmpeg's parser OOMs on the roughly 167-term sum.
     let mut indices: Vec<u64> = (0..166).map(|k| 2 + 5 * k).collect();
     indices.push(831);
     assert_eq!(
@@ -266,7 +266,7 @@ fn select_expr_property_matches_structured_blocks() {
 
 #[test]
 fn select_expr_normalizes_unsorted_input() {
-    // Regression: unsorted input used to silently select only the
+    // Unsorted input used to silently select only the
     // first index. It now normalizes, so selection is order-independent.
     let expr = build_select_expr(&[10, 1, 2, 3]);
     assert_eq!(selected_frames(&expr, 10), vec![1, 2, 3, 10]);
@@ -280,7 +280,7 @@ fn select_expr_dedups_duplicates() {
 
 #[test]
 fn select_expr_duplicate_u64_max_does_not_panic() {
-    // Regression: `*hi + 1` overflowed (debug panic) on duplicate
+    // `*hi + 1` used to overflow (debug panic) on duplicate
     // MAX before normalization collapsed it to a single index.
     let expr = build_select_expr(&[u64::MAX, u64::MAX]);
     assert_eq!(expr, format!("select='eq(n\\,{})'", u64::MAX));

@@ -2,7 +2,7 @@
 
 Self-hosted video intelligence for live streams and recorded files.
 
-Vidarax decodes video, applies deterministic frame gates, and sends selected
+Vidarax decodes video, applies a deterministic per-frame filter, and sends selected
 frames to a configured vision-language model. Live capture can also use an
 embedding sidecar to reuse recent descriptions while a scene remains
 semantically stable. Events commit to a local write-ahead log; selected JPEGs
@@ -11,26 +11,37 @@ are stored as content-addressed blobs and referenced by event metadata.
 ## Architecture
 
 ```
-  Sources                        vidarax                         Consumers
+ Sources                         vidarax                          Consumers
 ┌──────────┐   ┌──────────────────────────────────────────┐   ┌──────────────┐
 │ MP4/File │──>│                                          │──>│ REST API     │
-│ WebRTC   │──>│  Decode ──> Gate Engine ──> VLM Tiering  │──>│ TypeScript   │
-│ RTSP/HLS │──>│               │                │         │──>│   SDK        │
-│ Upload   │──>│          Markers +         Semantic      │──>│ Vue 3 UI     │
-│          │   │          Keyframes         Events        │   │ Prometheus   │
-│          │   │               │                │         │   │ Optional     │
-│          │   │            WAL event log      │          │   │ SpacetimeDB  │
+│ WebRTC   │──>│ Decode ──> Frame Filter ──> VLM Tiering   │──>│ TypeScript   │
+│ RTSP/HLS │──>│              │                │          │──>│ SDK          │
+│ Upload   │──>│              v                v          │──>│ Vue 3 UI     │
+│          │   │        Markers +         Semantic       │   │ Prometheus   │
+│          │   │        Keyframes          Events        │   │ Optional     │
+│          │   │              └───────┬────────┘          │   │ SpacetimeDB  │
+│          │   │                      v                   │   │              │
+│          │   │                WAL event log             │   │              │
 └──────────┘   └──────────────────────────────────────────┘   └──────────────┘
 ```
+
+Each live session is admitted as one typed pipeline generation. The process
+reserves that generation's bounded memory and worker-thread envelope before it
+creates a durable run. A supervisor then owns every stage handle: if one
+stateful worker exits unexpectedly, Vidarax stops and joins the sibling stages,
+closes the peer, and reports the fixed stage and reason through metrics instead
+of restarting one worker underneath older temporal state. Live prompt and schema
+changes use a bounded, generation-tagged command and return only after the VLM
+worker acknowledges the new configuration.
 
 ## Performance
 
 Throughput depends on your hardware, the models you run, and the input video, so
 there is no single headline number worth quoting. Measure on your own setup: the
 Python harnesses in `benchmarks/`, the bench binaries under `crates/*/src/bin`,
-and the scripts in `scripts/` cover the gate engine, provider transport, and the
-end-to-end API path. The deterministic gate is the cheap per-frame stage. The
-optional semantic novelty gate reduces repeat model calls, while bounded tiering
+and the scripts in `scripts/` cover the per-frame filter, provider transport, and the
+end-to-end API path. The deterministic filter is the cheap per-frame stage. The
+optional semantic novelty filter reduces repeat model calls, while bounded tiering
 can escalate an uncertain first pass to a second model. Calibration and
 provider/hardware measurements are deployment-specific; see
 [deployment and evidence](docs/deployment.md#live-semantic-novelty-and-evidence).
@@ -54,8 +65,14 @@ cd ui && npm install && npm run dev
 ### SDK
 
 ```bash
-npm install vidarax
+cd packages/vidarax-sdk
+npm install
+npm run build
+npm link
 ```
+
+Until the first npm release, install the SDK from this workspace and link it
+into your application with `npm link vidarax`.
 
 ```typescript
 import { Vidarax } from 'vidarax'
@@ -131,6 +148,8 @@ The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via
 | `VIDARAX_TRANSPORT` | `h1h2` | Transport mode (`h1h2` or `h3`) |
 | `VIDARAX_DATA_DIR` | `.vidarax-data` | WAL and runtime data directory |
 | `VIDARAX_ACTIVE_STREAM_LIMIT` | `5` | Max active runs per resolved principal |
+| `VIDARAX_MEDIA_MEMORY_BUDGET_BYTES` | `8589934592` | Process-wide reservation budget for live media payloads |
+| `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` | `64` | Process-wide reservation budget for live pipeline OS threads |
 | `VIDARAX_STREAM_TTL_SECS` | `3600` | Run idle TTL |
 
 Full configuration reference in [docs/deployment.md](docs/deployment.md).
@@ -159,6 +178,8 @@ name = "mlx"
 type = "openai_compat"
 openai_kind = "mlx"
 base_url = "http://127.0.0.1:8080"
+model = "Qwen/Qwen3-VL-4B-Instruct"
+upstream_model = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
 priority = 1
 ```
 
@@ -171,17 +192,18 @@ vidarax checks every request's `model` id against its supported-model contract
 and rejects unknown ids before it opens a connection, so the first-pass and
 second-pass models you configure must be supported ids, for example
 `Qwen/Qwen3-VL-4B-Instruct`, not a raw `mlx-community/...-4bit` conversion name.
-Load the matching conversion under mlx-vlm and make sure its server answers to
-that id.
+`model` declares the curated Vidarax id this backend serves, while
+`upstream_model` maps it to the conversion id mlx-vlm actually loads. The model
+catalog reports only that curated id as available on this backend.
 
 ## Tech stack
 
 | Layer | Technology |
 |-------|------------|
 | Backend | Rust, Axum, Hyper (HTTP/1.1 + H2, optional H3) |
-| Gate engine | Deterministic frame analysis on a single-threaded hot path |
+| Frame filter | Deterministic frame analysis on a single-threaded hot path |
 | Inference | vLLM and SGLang through OpenAI-compatible backends with fallback |
-| Decode | ffmpeg CPU, NVDEC, and Apple VideoToolbox (the MLX decode backend); VideoToolbox may fall back to software decode inside ffmpeg when the input or host cannot initialise hardware |
+| Decode | ffmpeg CPU, NVDEC, and Apple VideoToolbox; VideoToolbox may fall back to software decode inside ffmpeg when the input or host cannot initialise hardware |
 | Persistence | Local WAL plus content-addressed JPEG blobs; optional SpacetimeDB mirror for blocking WHIP description events |
 | Frontend | Vue 3, dark command-center UI |
 | Streaming | WebRTC via WHIP (RFC 9725) |
@@ -192,7 +214,7 @@ that id.
 
 ```
 crates/
-  vidarax-core/         Lock-free primitives, gate engine, ingest pipeline
+  vidarax-core/         Frame filter, media primitives, ingest pipeline
   vidarax-contracts/    Shared model contracts and error mapping
   vidarax-api/          Axum HTTP server, handlers, WHIP, security
   vidarax-cli/          CLI tooling

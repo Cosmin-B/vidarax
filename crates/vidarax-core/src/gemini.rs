@@ -461,6 +461,25 @@ impl InferenceProvider for GeminiProvider {
 
         Ok(result)
     }
+
+    fn available_kinds(&self) -> Vec<ProviderKind> {
+        let url = format!(
+            "{}/v1beta/models/{}?key={}",
+            GEMINI_API_BASE, self.default_model, self.api_key
+        );
+        match self.client.get(url).timeout(Duration::from_secs(2)).send() {
+            Ok(response) if response.status().is_success() => vec![ProviderKind::Gemini],
+            Ok(_) | Err(_) => Vec::new(),
+        }
+    }
+
+    fn configured_kinds_for_model(&self, model: &str) -> Vec<ProviderKind> {
+        if model == self.default_model {
+            vec![ProviderKind::Gemini]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

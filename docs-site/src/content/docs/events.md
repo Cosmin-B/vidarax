@@ -33,10 +33,10 @@ Run lifecycle and analysis kinds written by the API handlers, with the payload f
 |------|---------|----------------|
 | `run_created` | The run was created. | `request_id`, `mode`, `model`, `principal_key`, `tenant_id`; WHIP sessions write `principal_key`, `session_id`, `source: "whip"` instead |
 | `ingest_received` | An ingest request was accepted for the run. | `request_id`, `ingest` (echo of the request body); decoded sources add `decoded_frames`, `source_uri`, `sampling_policy`, `sample_fps` |
-| `frames_decoded` | A decode pass finished and reported its frames. | `request_id`, `source_uri`, `stream_id`, `sampling_policy`, `source_fps`, `sample_fps`, `decoded_frames`, `width`, `height`, `pixel_format`, `signals` (per-frame signal array) |
+| `frames_decoded` | A decode pass finished and reported its frames. | `request_id`, `source_uri`, `stream_id`, `sampling_policy`, `source_fps`, `sample_fps`, `decoded_frames`, `width`, `height`, `pixel_format`, `coordinate_schema`, `coordinates`, `signals` (per-frame signal array) |
 | `marker_emitted` | The analysis pass produced a marker; the payload is the marker object. | `marker_id`, `run_id`, `stream_id`, `event_type`, `status`, `start_frame`, `end_frame`, `start_pts_ms`, `end_pts_ms`, `confidence`, `supersedes_marker_id` |
 | `analysis_generated` | A deterministic analysis pass produced its result. | `request_id`, `stream_id`, `frames`, `window_size`, `segment_ms`, `sampling_policy`, `sample_fps`, `mode`, `model`, `markers` |
-| `semantic_chunk_inferred` | A chunk finished tiered VLM inference. | `request_id`, `stream_id`, `chunk_index`, `provider`, `provider_fallback_used`, `semantic_fallback_used`, `semantic_error`, `event_type`, `object_label`, `summary`, `description`, `confidence`, `raw_output`, token counts (`prompt_tokens`, `completion_tokens`, `thinking_tokens`, `total_tokens`), `inference_latency_ms`, optional `index_name` |
+| `semantic_chunk_inferred` | A chunk finished tiered VLM inference. | `request_id`, `stream_id`, `chunk_index`, `provider`, `provider_fallback_used`, `semantic_fallback_used`, `semantic_error`, `finish_reason`, `response_chars`, `event_type`, `object_label`, `summary`, `description`, `confidence`, `raw_output`, token counts (`prompt_tokens`, `completion_tokens`, `thinking_tokens`, `total_tokens`), `inference_latency_ms`, optional `index_name` |
 | `semantic_chunk_generated` | A semantic result for a chunk was recorded. | `request_id`, `stream_id`, `chunk_index`, `chunk_frames`, `process_ms`, `source_span_ms`, `lag_ms`, `index_name`, token counts, `inference_latency_ms` |
 | `semantic_fallback_activated` | The semantic path fell back (for example, no provider). | `request_id`, `stream_id`, `reason` |
 | `inference_completed` | A direct inference request completed. | `request_id`, `provider`, `model`, `fallback_used`, `prompt_bytes`, `output_bytes` |
@@ -45,7 +45,7 @@ Run lifecycle and analysis kinds written by the API handlers, with the payload f
 | `keepalive_refreshed` | The run's idle TTL was refreshed. | `request_id` |
 | `run_deleted` | The run was soft-deleted. | `request_id` (WHIP reclaim and tombstone paths carry reclaim metadata instead) |
 
-Live sessions add streaming kinds through the event sink. The worker's `event_type` string becomes the WAL `kind`, and all of them share one payload shape, `{ session_id, frame_index, pts_ms, confidence, description }`, where this `pts_ms` is media time:
+Live sessions add streaming kinds through the event sink. The worker's `event_type` string becomes the WAL `kind`, and all of them share one payload shape, `{ session_id, frame_index, pts_ms, coordinate_schema, coordinates, confidence, description }`, where this `pts_ms` is media time:
 
 | Kind | Emitted by |
 |------|------------|
@@ -53,9 +53,32 @@ Live sessions add streaming kinds through the event sink. The worker's `event_ty
 | `clip_vlm` / `clip_vlm_tiered` | Clip VLM worker |
 | `state_transition` | VLM worker, when consecutive descriptions diverge past the word-overlap threshold |
 | `loop_detected` | Gate or analysis worker, once per loop entry |
-| `keyframe_stored` | The sink's keyframe path. The payload includes `frame_index`, `pts_ms`, `event_type`, `description`, `image_ref`, `image_media_type`, `image_bytes`, and `image_sha256`. Raw JPEG bytes live in the content-addressed sidecar, not in JSON or the WAL. |
+| `keyframe_stored` | The sink's keyframe path. The payload includes `frame_index`, `pts_ms`, `coordinate_schema`, `coordinates`, `event_type`, `description`, `image_ref`, `image_media_type`, `image_bytes`, and `image_sha256`. Raw JPEG bytes live in the content-addressed sidecar, not in JSON or the WAL. |
 
-Payload compatibility is not versioned: fields are added at the serialization sites in `handlers.rs` and the event sink, and there is no schema negotiation on the wire. Consumers should tolerate unknown fields.
+The outer payload remains add-only and has no schema negotiation. Spatial metadata is different: `coordinate_schema: "vidarax.image.v1"` versions the meaning of the nested `coordinates` object. Consumers should still tolerate unknown fields.
+
+## Image coordinate contract
+
+`vidarax.image.v1` describes the transform from the source video frame to the pixels Vidarax analyzed. Pixel coordinates start at the source image's top-left; `x` increases right and `y` increases down. Normalized coordinates use the same origin and axes in `[0, 1]`.
+
+```json
+{
+  "coordinate_schema": "vidarax.image.v1",
+  "coordinates": {
+    "source_extent": { "width": 1920, "height": 1080 },
+    "requested_region": { "x": 0.25, "y": 0.1, "width": 0.5, "height": 0.5 },
+    "resolved_region": { "x": 480, "y": 108, "width": 960, "height": 540 },
+    "analysis_extent": { "width": 960, "height": 540 }
+  }
+}
+```
+
+- `source_extent` is the decoded extent before crop or resize.
+- `requested_region` preserves the caller's normalized crop.
+- `resolved_region` is the exact even-aligned source-pixel rectangle used by the 4:2:0 pipeline.
+- `analysis_extent` is the post-crop extent inspected by the deterministic filter. `semantic_frame_max_edge` may preserve that region while resizing the JPEG sent to a model; this schema does not claim the model transport's pixel dimensions.
+
+The value is carried as fixed-size frame metadata. It does not own image bytes or allocate when copied between stages. This is image-space provenance, not a camera-extrinsics or robot-world transform; embodied consumers must attach those calibration transforms downstream.
 
 ## Markers
 
@@ -72,7 +95,7 @@ Each marker has a `status` with three values:
 
 The filters compose as range overlap: `from_frame` matches markers whose `end_frame` is at or past it, `to_frame` matches markers whose `start_frame` is at or before it, and `status` and `event_type` are exact matches. Results are sorted by `start_frame`, then `end_frame`, then `marker_id`.
 
-The reference fixtures for frame metadata and processing configuration are validated against the published JSON Schemas, `schemas/frame-metadata.schema.json` and `schemas/processing-config.schema.json`, by the replay test the release gates run (`scripts/validate_replay_and_schema.sh`). That test validates the checked-in fixtures; it does not validate the server's live output against the schemas.
+The reference fixtures for frame metadata and processing configuration are validated against the published JSON Schemas, `schemas/frame-metadata.schema.json` and `schemas/processing-config.schema.json`, by the replay release check (`scripts/validate_replay_and_schema.sh`). That test validates the checked-in fixtures; it does not validate the server's live output against the schemas.
 
 ## Query and search
 

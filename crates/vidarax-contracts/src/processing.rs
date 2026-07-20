@@ -27,6 +27,19 @@ impl ProcessingMode {
     }
 }
 
+/// Bounds for the HTTP API's user-supplied frame rates (fixed_fps and
+/// sample_fps in ingest and analyze requests). vidarax-api validates against
+/// these constants so the contract and the live checks cannot drift.
+///
+/// These are wider than the profile fps below on purpose. A processing
+/// profile describes sustained VLM sampling, while a request fps controls
+/// decode sampling and may legitimately run much faster.
+pub const REQUEST_FPS_MIN: f32 = 0.2;
+pub const REQUEST_FPS_MAX: f32 = 120.0;
+
+/// Processing profile contract. Mirrors schemas/processing-config.schema.json,
+/// including the fps bound of [0.2, 4.0]. Do not confuse this with the request
+/// fps bounds above.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProcessingConfig {
     pub mode: ProcessingMode,

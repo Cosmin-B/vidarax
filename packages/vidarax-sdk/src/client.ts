@@ -134,6 +134,7 @@ function base64UrlEncodeUtf8(input: string): string {
 export class Vidarax {
   private readonly baseUrl: string;
   private readonly apiKey: string | undefined;
+  private readonly tenantId: string | undefined;
   private readonly maxRetries: number;
   private readonly retryBaseDelayMs: number;
   private readonly timeoutMs: number;
@@ -146,6 +147,7 @@ export class Vidarax {
   constructor(baseUrl: string, options: VidaraxOptions = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.apiKey = options.apiKey;
+    this.tenantId = options.tenantId;
     this.maxRetries = options.maxRetries ?? 3;
     this.retryBaseDelayMs = options.retryBaseDelayMs ?? 200;
     this.timeoutMs = options.timeoutMs ?? 30_000;
@@ -164,6 +166,9 @@ export class Vidarax {
     };
     if (this.apiKey !== undefined) {
       headers["x-api-key"] = this.apiKey;
+    }
+    if (this.tenantId !== undefined) {
+      headers["x-tenant-id"] = this.tenantId;
     }
     return headers;
   }
@@ -782,6 +787,9 @@ export class Vidarax {
         if (this.apiKey !== undefined) {
           xhr.setRequestHeader("x-api-key", this.apiKey);
         }
+        if (this.tenantId !== undefined) {
+          xhr.setRequestHeader("x-tenant-id", this.tenantId);
+        }
         xhr.setRequestHeader("Accept", "application/json");
 
         xhr.upload.addEventListener("progress", (event) => {
@@ -832,6 +840,9 @@ export class Vidarax {
       const fetchHeaders: Record<string, string> = { Accept: "application/json" };
       if (this.apiKey !== undefined) {
         fetchHeaders["x-api-key"] = this.apiKey;
+      }
+      if (this.tenantId !== undefined) {
+        fetchHeaders["x-tenant-id"] = this.tenantId;
       }
       response = await fetch(url, {
         method: "POST",
@@ -961,6 +972,9 @@ export class Vidarax {
     if (this.apiKey !== undefined) {
       headers["x-api-key"] = this.apiKey;
     }
+    if (this.tenantId !== undefined) {
+      headers["x-tenant-id"] = this.tenantId;
+    }
     if (attachConfig !== undefined) {
       headers["x-attach-config"] = base64UrlEncodeUtf8(JSON.stringify(attachConfig));
     }
@@ -1024,6 +1038,9 @@ export class Vidarax {
       if (this.apiKey !== undefined) {
         headers["x-api-key"] = this.apiKey;
       }
+      if (this.tenantId !== undefined) {
+        headers["x-tenant-id"] = this.tenantId;
+      }
       const response = await fetch(url, {
         method: "PATCH",
         headers,
@@ -1049,6 +1066,11 @@ export class Vidarax {
    *
    * @param sessionId  The session ID returned from `whipOffer()`.
    * @param update     New prompt and optional structured-output schema.
+   * @throws {HttpError} With status 409 when the live generation was closed
+   *                     or replaced.
+   * @throws {HttpError} With status 503 when the worker acknowledgement timed
+   *                     out after 2 seconds. The update was discarded and the
+   *                     caller must retry.
    */
   async whipUpdatePrompt(
     sessionId: string,

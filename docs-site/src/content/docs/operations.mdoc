@@ -1,6 +1,6 @@
 ---
 title: Operations
-description: Deployment, observability, hardening, and the release gates.
+description: Deployment, observability, hardening, and release checks.
 ---
 
 This page covers what a deployment consists of, what the server exposes for observability, and the release-gate practice the project uses before shipping.
@@ -35,12 +35,19 @@ Check readiness with:
 curl -fsS http://127.0.0.1:8080/v1/health
 ```
 
+That endpoint covers the HTTP server. Query `GET /v1/models` to check live
+provider reachability and per-model readiness. For mlx-vlm, an
+`openai_compat` backend should set `model` to the curated Vidarax id and
+`upstream_model` to the quantized `mlx-community/...` conversion id.
+The backend rejects other curated model ids instead of silently sending them
+to the mapped conversion.
+
 ## Observability
 
-Three signals come out of the server:
+Four signals come out of the server:
 
-- Metrics. `GET /v1/metrics` serves Prometheus-format metrics covering runs, events, inference, novelty decisions, embedding latency, and keyframe-blob durability. Live WHIP traffic and recorded-file `ingest`, `analyze`, and `reason` work contribute to the shared decode and gate series. `vidarax_pipeline_gate_frames_analyzed_total` counts gate inputs, while `vidarax_pipeline_gate_keyframes_selected_total` counts gate decisions before downstream queueing; `vidarax_pipeline_keyframes_total` remains the number actually forwarded to VLM workers. Metrics require an API key by default (`VIDARAX_METRICS_REQUIRE_API_KEY`); the checked-in compose scraper sends its local development key.
-- Browser dashboards. When the UI and API use different origins, include the exact UI origin in `VIDARAX_CORS_ALLOWED_ORIGINS`. A healthy `curl` response does not imply that a browser may read the endpoint without the matching CORS response header.
+- Metrics. `GET /v1/metrics` serves Prometheus-format metrics covering runs, events, inference, novelty decisions, embedding latency, keyframe-blob durability, generation lifecycle, and process media capacity. Live WHIP traffic and recorded-file `ingest`, `analyze`, and `reason` work contribute to the shared decode and gate series. `vidarax_pipeline_worker_faults_total{stage,reason}` uses fixed labels, generation shutdowns distinguish clean, faulted, and forced outcomes, and `vidarax_media_capacity_*` exposes reserved bytes, worker threads, limits, and rejections. Metrics require an API key by default (`VIDARAX_METRICS_REQUIRE_API_KEY`); the checked-in compose scraper sends its local development key.
+- Browser dashboards. The Pipeline Observability page derives an explicit healthy, faulted, saturated, or idle generation state from those backend metrics. It never fabricates telemetry when the scrape is unavailable. When the UI and API use different origins, include the exact UI origin in `VIDARAX_CORS_ALLOWED_ORIGINS`.
 - Logs. Tracing output goes to stdout in human-readable form and to stderr as structured JSON. The filter is `RUST_LOG` (default `info`). Shipping the stderr stream to a log store is left to the deployment; the compose stack runs VictoriaLogs but does not wire a shipper.
 - Traces. An OpenTelemetry layer bridges tracing spans to OTLP over gRPC when `VIDARAX_TRACES_ENDPOINT` is set; when unset, spans are dropped. The compose stack points this at VictoriaTraces.
 
@@ -55,16 +62,16 @@ Read `docs/security.md` in the repository before exposing a deployment to untrus
 - Keep the insecure media toggles (`VIDARAX_ALLOW_INSECURE_HTTP`, `VIDARAX_ALLOW_UNENCRYPTED_RTSP`, `VIDARAX_ALLOW_REMOTE_HLS`, `VIDARAX_ALLOW_INSECURE_TLS`) disabled unless the source network is trusted.
 - Remote ingest applies application-level SSRF mitigations, but redirects or nested playlist resources that resolve to private addresses over an allowed scheme cannot be fully blocked in the application. Deployments that ingest untrusted sources need network-level egress controls: an egress proxy or resolver that enforces a public-IP policy on every connection.
 
-## Release gates
+## Release checks
 
-Before a release, `scripts/release_gates.sh` runs a fixed sequence of checks. Each check compares an observed value against a configured ceiling and fails the gate on regression; the ceilings live in environment variables (`VIDARAX_MAX_CLI_SIZE_BYTES`, `VIDARAX_MAX_API_SIZE_BYTES`, `VIDARAX_MAX_ALLOC_PER_FRAME`, and a timing ceiling) so they can be tightened or relaxed without editing the script.
+Before a release, `scripts/release_gates.sh` runs a fixed sequence of checks. Each one compares an observed value against a configured ceiling and exits non-zero on regression. The ceilings live in environment variables (`VIDARAX_MAX_CLI_SIZE_BYTES`, `VIDARAX_MAX_API_SIZE_BYTES`, `VIDARAX_MAX_ALLOC_TOTAL`, and a timing ceiling) so they can be tightened or relaxed without editing the script.
 
-Conceptually, the gates check four things:
+The checks cover four things:
 
 1. Correctness is reproducible. `scripts/validate_replay_and_schema.sh` runs the deterministic replay and schema tests: the same input must produce the same events, and the published JSON Schemas must accept their reference fixtures and reject invalid ones.
-2. The hot path does not silently start allocating. `scripts/bench_regression.sh` runs an allocation probe and fails if per-frame allocations exceed the configured budget.
+2. The measured hot path does not silently start allocating. `scripts/bench_regression.sh` fails on the first counted allocation after warmup by default (`VIDARAX_MAX_ALLOC_TOTAL=0`).
 3. The shipped binaries do not silently grow. The script builds release binaries for the CLI and the API server and compares their sizes against configured ceilings.
-4. The gate engine's hot path is covered by an automated timing regression gate.
+4. The per-frame filter's hot path is covered by an automated timing regression check.
 
 Run the full sequence from the repository root:
 
@@ -72,4 +79,4 @@ Run the full sequence from the repository root:
 scripts/release_gates.sh
 ```
 
-The individual scripts can also be run alone. Beyond the gates, `scripts/` contains smoke and integration harnesses: `smoke_v1.sh` and `smoke_mp4_pipeline.sh` boot the server and exercise the API path, `e2e_integration_test.sh` runs an end-to-end pass over a generated test video (`generate_test_video.sh`), and `staging_provider_e2e.sh` runs the live provider integration test when the staging backend URLs are set. Throughput depends on hardware, models, and input, so the repository publishes no headline numbers; measure on your own setup with the harnesses in `benchmarks/`, the bench binaries under `crates/*/src/bin`, and the scripts in `scripts/`.
+The individual scripts can also be run alone. Beyond these checks, `scripts/` contains smoke and integration harnesses: `smoke_v1.sh` and `smoke_mp4_pipeline.sh` boot the server and exercise the API path, `e2e_integration_test.sh` runs an end-to-end pass over a generated test video (`generate_test_video.sh`), and `staging_provider_e2e.sh` runs the live provider integration test when the staging backend URLs are set. Throughput depends on hardware, models, and input, so the repository publishes no universal headline number; measure the provider and hardware combination you deploy.

@@ -14,12 +14,13 @@ mod security;
 mod semantic;
 mod semantic_infer;
 mod server;
+// Stays pub: integration tests and doctests construct SpacetimeClient directly.
 pub mod spacetime_client;
 mod state;
 pub mod telemetry;
 mod tenant_labels;
 mod validation;
-pub mod wal_sink;
+pub(crate) mod wal_sink;
 mod whip;
 
 pub use config::{resolve_wal_path, ServerConfig, TransportMode};
@@ -27,8 +28,12 @@ pub use models::AttachStreamRequest;
 pub use router::app_router;
 pub use state::{AppState, StreamSlotGuard};
 use vidarax_core::ingest::pipeline::{build_decode_pipeline, DecodePipeline, PipelineBackend};
-use vidarax_core::webrtc::session::{TurnServer, WebRtcConfig};
-use vidarax_core::webrtc::workers::per_stream_analysis_workers;
+use vidarax_core::webrtc::decode::VideoCodec;
+use vidarax_core::webrtc::resources::MediaSessionResources;
+use vidarax_core::webrtc::session::{
+    TurnServer, WebRtcConfig, MAX_RTP_ACCESS_UNIT_BYTES, RTP_FRAME_QUEUE_CAPACITY,
+};
+use vidarax_core::webrtc::workers::{per_stream_analysis_workers, WorkerPoolConfig};
 
 pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     telemetry::init_telemetry();
@@ -47,6 +52,10 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
             std::env::var("VIDARAX_CONFIG").unwrap_or_else(|_| "vidarax.toml".to_string());
         config::load_backend_config(&config_path).map_err(invalid_input)?
     };
+    // The supervisor's join deadline scales with how many backends one
+    // inference call can try serially, so capture the count before the list
+    // is consumed by provider construction.
+    let inference_backend_count = backend_config.backends.len().max(1);
     let provider = if backend_config.backends.is_empty() {
         None
     } else {
@@ -70,6 +79,23 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
     };
     let security_policy = security::SecurityPolicy::from_config(&config).map_err(invalid_input)?;
     let webrtc_config = build_webrtc_config(&config);
+    let capacity_worker_config = WorkerPoolConfig::from(&webrtc_config);
+    let keyframe_capacity =
+        MediaSessionResources::for_pipeline(&capacity_worker_config, VideoCodec::H264, false);
+    let clip_capacity =
+        MediaSessionResources::for_pipeline(&capacity_worker_config, VideoCodec::H264, true);
+    tracing::info!(
+        maximum_live_sessions = config.active_stream_limit,
+        worker_thread_budget = config.media_worker_thread_budget,
+        memory_budget_bytes = config.media_memory_budget_bytes,
+        rtp_queue_slots_per_session = RTP_FRAME_QUEUE_CAPACITY,
+        maximum_access_unit_bytes = MAX_RTP_ACCESS_UNIT_BYTES,
+        estimated_keyframe_session_bytes = keyframe_capacity.reserved_bytes,
+        estimated_keyframe_session_threads = keyframe_capacity.worker_threads,
+        estimated_clip_session_bytes = clip_capacity.reserved_bytes,
+        estimated_clip_session_threads = clip_capacity.worker_threads,
+        "live media capacity plan"
+    );
     let decode_pipeline = build_configured_decode_pipeline(&config.decode_backend)?;
     let state = AppState::from_wal(
         wal_path,
@@ -81,6 +107,15 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
         config.active_stream_limit,
         webrtc_config,
         config.novelty.clone(),
+        vidarax_core::admission::AdmissionLimits {
+            global_in_flight: config.inference_global_limit,
+            per_principal_in_flight: config.inference_per_principal_limit,
+            global_waiters: config.inference_waiter_limit,
+            wait_timeout: std::time::Duration::from_millis(config.inference_wait_timeout_ms),
+        },
+        config.media_memory_budget_bytes,
+        config.media_worker_thread_budget,
+        inference_backend_count,
     )
     .map_err(invalid_input)?;
     let state = attach_spacetime_client(state, &config);
@@ -135,6 +170,7 @@ fn backend_entries_from_explicit_urls(
             base_url: Some(base_url.clone()),
             api_key: None,
             model: None,
+            upstream_model: None,
             openai_kind: Some("vllm".to_string()),
             priority: 1,
         });
@@ -146,6 +182,7 @@ fn backend_entries_from_explicit_urls(
             base_url: Some(base_url.clone()),
             api_key: None,
             model: None,
+            upstream_model: None,
             openai_kind: Some("sglang".to_string()),
             priority: 2,
         });
@@ -239,6 +276,10 @@ mod tests {
             ingest_file_roots: vec![std::env::temp_dir()],
             inference_vllm_base_url: None,
             inference_sglang_base_url: None,
+            inference_global_limit: 8,
+            inference_per_principal_limit: 4,
+            inference_waiter_limit: 128,
+            inference_wait_timeout_ms: 5_000,
             security_require_api_key: false,
             security_api_keys: vec![],
             security_require_tenant_id: false,
@@ -249,6 +290,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -280,6 +323,7 @@ mod tests {
             base_url: Some(base_url.to_string()),
             api_key: None,
             model: None,
+            upstream_model: None,
             openai_kind: None,
             priority: 1,
         };
@@ -501,6 +545,10 @@ mod tests {
             ingest_file_roots: vec![std::env::temp_dir()],
             inference_vllm_base_url: Some("http://127.0.0.1:8081/v1".to_string()),
             inference_sglang_base_url: Some("http://127.0.0.1:8082/v1".to_string()),
+            inference_global_limit: 8,
+            inference_per_principal_limit: 4,
+            inference_waiter_limit: 128,
+            inference_wait_timeout_ms: 5_000,
             security_require_api_key: false,
             security_api_keys: vec![],
             security_require_tenant_id: false,
@@ -511,6 +559,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -866,6 +916,15 @@ mod tests {
             5,
             WebRtcConfig::default(),
             vidarax_core::novelty::LiveNoveltyConfig::default(),
+            vidarax_core::admission::AdmissionLimits {
+                global_in_flight: 8,
+                per_principal_in_flight: 4,
+                global_waiters: 128,
+                wait_timeout: std::time::Duration::from_secs(5),
+            },
+            u64::MAX,
+            usize::MAX,
+            1,
         )
         .unwrap();
         let app = app_router(state);
@@ -943,6 +1002,15 @@ mod tests {
             5,
             WebRtcConfig::default(),
             vidarax_core::novelty::LiveNoveltyConfig::default(),
+            vidarax_core::admission::AdmissionLimits {
+                global_in_flight: 8,
+                per_principal_in_flight: 4,
+                global_waiters: 128,
+                wait_timeout: std::time::Duration::from_secs(5),
+            },
+            u64::MAX,
+            usize::MAX,
+            1,
         )
         .unwrap();
         let app = app_router(state);
@@ -1010,6 +1078,15 @@ mod tests {
             5,
             WebRtcConfig::default(),
             vidarax_core::novelty::LiveNoveltyConfig::default(),
+            vidarax_core::admission::AdmissionLimits {
+                global_in_flight: 8,
+                per_principal_in_flight: 4,
+                global_waiters: 128,
+                wait_timeout: std::time::Duration::from_secs(5),
+            },
+            u64::MAX,
+            usize::MAX,
+            1,
         )
         .unwrap();
         let app = app_router(state);
@@ -2118,6 +2195,28 @@ mod tests {
                 .unwrap_or(0)
                 >= 1
         );
+        let first_metadata = analyze_json
+            .get("metadata")
+            .and_then(|value| value.as_array())
+            .and_then(|rows| rows.first())
+            .expect("decoded analysis should return frame metadata");
+        assert_eq!(
+            first_metadata
+                .get("coordinate_schema")
+                .and_then(|value| value.as_str()),
+            Some("vidarax.image.v1")
+        );
+        let coordinates = first_metadata
+            .get("coordinates")
+            .expect("decoded analysis should preserve image provenance");
+        assert_eq!(
+            coordinates.pointer("/requested_region/width"),
+            Some(&json!(1.0))
+        );
+        assert_eq!(
+            coordinates.pointer("/analysis_extent"),
+            coordinates.pointer("/source_extent")
+        );
 
         let query_req = Request::builder()
             .uri("/v1/query")
@@ -2410,6 +2509,10 @@ mod tests {
             ingest_file_roots: vec![std::env::temp_dir()],
             inference_vllm_base_url: None,
             inference_sglang_base_url: None,
+            inference_global_limit: 8,
+            inference_per_principal_limit: 4,
+            inference_waiter_limit: 128,
+            inference_wait_timeout_ms: 5_000,
             security_require_api_key: true,
             security_api_keys: vec!["test-key".to_string()],
             security_require_tenant_id: false,
@@ -2420,6 +2523,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -2473,6 +2578,10 @@ mod tests {
             ingest_file_roots: vec![std::env::temp_dir()],
             inference_vllm_base_url: None,
             inference_sglang_base_url: None,
+            inference_global_limit: 8,
+            inference_per_principal_limit: 4,
+            inference_waiter_limit: 128,
+            inference_wait_timeout_ms: 5_000,
             security_require_api_key: false,
             security_api_keys: vec![],
             security_require_tenant_id: false,
@@ -2483,6 +2592,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -2533,6 +2644,10 @@ mod tests {
             ingest_file_roots: vec![std::env::temp_dir()],
             inference_vllm_base_url: None,
             inference_sglang_base_url: None,
+            inference_global_limit: 8,
+            inference_per_principal_limit: 4,
+            inference_waiter_limit: 128,
+            inference_wait_timeout_ms: 5_000,
             security_require_api_key: true,
             security_api_keys: vec!["key-a".to_string(), "key-b".to_string()],
             security_require_tenant_id: false,
@@ -2543,6 +2658,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -2619,6 +2736,10 @@ mod tests {
             ingest_file_roots: vec![std::env::temp_dir()],
             inference_vllm_base_url: None,
             inference_sglang_base_url: None,
+            inference_global_limit: 8,
+            inference_per_principal_limit: 4,
+            inference_waiter_limit: 128,
+            inference_wait_timeout_ms: 5_000,
             security_require_api_key: true,
             security_api_keys: vec!["test-key".to_string()],
             security_require_tenant_id: true,
@@ -2629,6 +2750,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -2685,6 +2808,10 @@ mod tests {
             ingest_file_roots: vec![std::env::temp_dir()],
             inference_vllm_base_url: None,
             inference_sglang_base_url: None,
+            inference_global_limit: 8,
+            inference_per_principal_limit: 4,
+            inference_waiter_limit: 128,
+            inference_wait_timeout_ms: 5_000,
             security_require_api_key: false,
             security_api_keys: vec![],
             security_require_tenant_id: true,
@@ -2695,6 +2822,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -2736,6 +2865,10 @@ mod tests {
             ingest_file_roots: vec![std::env::temp_dir()],
             inference_vllm_base_url: None,
             inference_sglang_base_url: None,
+            inference_global_limit: 8,
+            inference_per_principal_limit: 4,
+            inference_waiter_limit: 128,
+            inference_wait_timeout_ms: 5_000,
             security_require_api_key: false,
             security_api_keys: vec!["metrics-key".to_string()],
             security_require_tenant_id: false,
@@ -2746,6 +2879,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -2974,6 +3109,10 @@ mod tests {
             ingest_file_roots: vec![std::env::temp_dir()],
             inference_vllm_base_url: None,
             inference_sglang_base_url: None,
+            inference_global_limit: 8,
+            inference_per_principal_limit: 4,
+            inference_waiter_limit: 128,
+            inference_wait_timeout_ms: 5_000,
             security_require_api_key: false,
             security_api_keys: vec![],
             security_require_tenant_id: false,
@@ -2984,6 +3123,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H3Experimental,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -3114,6 +3255,10 @@ mod tests {
             ingest_file_roots: vec![std::env::temp_dir()],
             inference_vllm_base_url: None,
             inference_sglang_base_url: None,
+            inference_global_limit: 8,
+            inference_per_principal_limit: 4,
+            inference_waiter_limit: 128,
+            inference_wait_timeout_ms: 5_000,
             security_require_api_key: false,
             security_api_keys: vec![],
             security_require_tenant_id: false,
@@ -3124,6 +3269,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H3Experimental,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],

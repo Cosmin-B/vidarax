@@ -41,7 +41,7 @@ The exact rules a maintainer or operator can rely on, as implemented today:
 
 ## Who appends, and every kind
 
-All appends funnel through one thread, `vidarax-timeline-writer`, which owns the `WalWriter`, assigns `seq`, stamps `pts_ms` with wall-clock milliseconds, applies the event to the run registry, updates the in-memory tails, and publishes a fresh snapshot. Async handlers reach it through `AppState::append_run_event_async`; the append is acknowledged over a oneshot channel only after the WAL write succeeded, and a failed write rolls the writer's sequence counter back so the numbering stays dense.
+All appends funnel through one thread, `vidarax-timeline-writer`, which owns the `WalWriter`, assigns `seq`, stamps `pts_ms` with wall-clock milliseconds, applies the event to the run registry, updates the in-memory tails, and publishes a fresh snapshot. Async handlers reach it through `AppState::append_run_event_async`; the append is acknowledged over a oneshot channel only after the WAL write succeeded, and a failed write rolls the writer's sequence counter back so the numbering stays dense. Cancellation has one linearization point: before the bounded-channel send completes, the caller still owns the command and no append occurs; after it completes, the writer owns the command and finishes it even if the request disappears while waiting for the acknowledgement. Retried state transitions therefore need an idempotency rule; `run_deleted` has one, while ordinary telemetry events are append-only observations.
 
 Handler-appended kinds, by string literal in `handlers.rs` (all through `append_run_event_async`):
 
@@ -85,9 +85,9 @@ pub struct WalEventSink {
 }
 ```
 
-`emit_event_sync` wraps the worker fields (`session_id`, `frame_index`, `pts_ms`, `confidence`, `description`) in JSON and calls the confirmed local append. After that succeeds, it attempts the SpacetimeDB mirror; mirror failure is logged and does not undo local durability. `emit_event_nonblocking` uses the detached local append and never mirrors because a network call would violate its nonblocking contract. When the writer queue (capacity `TIMELINE_WRITER_QUEUE_CAP`, 1024) is full, that detached event is dropped with a warning.
+`emit_event_sync` wraps the worker fields (`session_id`, `frame_index`, `pts_ms`, `coordinate_schema`, `coordinates`, `confidence`, `description`) in JSON and calls the confirmed local append. After that succeeds, it attempts the SpacetimeDB mirror; mirror failure is logged and does not undo local durability. `emit_event_nonblocking` uses the detached local append and never mirrors because a network call would violate its nonblocking contract. When the writer queue (capacity `TIMELINE_WRITER_QUEUE_CAP`, 1024) is full, that detached event is dropped with a warning.
 
-`store_keyframe_sync` hashes the raw JPEG, atomically writes a `0o600` content-addressed blob if the hash is new, and then appends `keyframe_stored` with `image_ref`, media type, byte count, and SHA-256. The blob write is flushed but not fsynced. If the blob write fails, no metadata event is appended; duplicate content reuses the existing file.
+`store_keyframe_sync` hashes the raw JPEG, atomically writes a `0o600` content-addressed blob if the hash is new, and then appends `keyframe_stored` with `image_ref`, media type, byte count, SHA-256, and `vidarax.image.v1` coordinate provenance. The blob write is flushed but not fsynced. If the blob write fails, no metadata event is appended; duplicate content reuses the existing file. A crash after the blob rename but before the WAL append can leave an unreferenced blob. Automatic startup reconciliation or retention-based garbage collection is not implemented yet.
 
 Three append flavors, one contract table:
 
@@ -97,13 +97,13 @@ Three append flavors, one contract table:
 | `append_run_event` | worker threads | blocks on ack | yield-and-retry | yes, via the idempotent claim |
 | `append_run_event_nonblocking` | hot paths | no | drops event | refused with an error |
 
-`run_deleted` is special-cased on every path: it routes through the single-winner claim described in [State and cancellation](/internals/state-and-cancellation/#single-winner-deletion), so the deletion event is appended exactly once per run while the deletion claim is retained, and only through a confirmed append. The retention is bounded: deleted-run records live in a FIFO capped at 4,096 entries, and once a record is evicted, a later DELETE of the same run takes the unknown-run path and appends another `run_deleted`.
+`run_deleted` is special-cased on every path: it routes through the single-winner claim described in [State and cancellation](/docs/internals/state-and-cancellation/#single-winner-deletion), so the deletion event is appended exactly once per run while the deletion claim is retained, and only through a confirmed append. The retention is bounded: deleted-run records live in a FIFO capped at 4,096 entries, and once a record is evicted, a later DELETE of the same run takes the unknown-run path and appends another `run_deleted`.
 
 ## Replay and reads
 
 On startup, `AppState::from_wal` reads the whole file, rebuilds the run registry with `apply_structural_event` per event, rebuilds the warm per-run tails, and seeds the writer's sequence counter from the observed maximum, so numbering continues where it left off. Replay is order-tolerant: an event for an unknown run registers the run on first sight, and `insert_event_by_seq` places late arrivals by sequence number and drops exact duplicates.
 
-Reads have two tiers. `read_run_events_from` serves an advancing cursor from the swap-published snapshot when the run's in-memory tail still covers it; otherwise it falls back to `read_all_events`, a full-file scan filtered by run, executed under `spawn_blocking` on the async path. The scan is linear in total events; the source carries a `TODO(perf)` for a per-run offset index.
+Reads have two tiers. `read_run_events_from` serves an advancing cursor from the swap-published snapshot when the run's in-memory tail still covers it; otherwise it falls back to `read_all_events`, a full-file scan filtered by run, executed under `spawn_blocking` on the async path. The scan is linear in total events. A per-run offset index is the clear next step when cold-read volume makes that cost material.
 
 ## Validation: replay and schema gates
 
@@ -119,7 +119,7 @@ The `replay_schema` integration test (`crates/vidarax-core/tests/replay_schema.r
 - Schema acceptance. `schemas/processing-config.schema.json` and `schemas/frame-metadata.schema.json` must accept their reference fixtures.
 - Schema rejection. A frame-metadata instance missing required fields must fail validation, proving the schema actually constrains.
 
-The same script is the first step of `scripts/release_gates.sh`, so no release ships with drifted gate behavior or schemas; see [Allocation discipline](/internals/allocation-discipline/#the-release-gate-scripts) for the rest of that pipeline.
+The same script is the first step of `scripts/release_gates.sh`, so no release ships with drifted gate behavior or schemas; see [Allocation discipline](/docs/internals/allocation-discipline/#the-release-gate-scripts) for the rest of that pipeline.
 
 ## Edge cases and limits
 

@@ -3,9 +3,11 @@ title: What is vidarax
 description: A self-hosted video intelligence engine that turns video streams into structured semantic events.
 ---
 
+[← Vidarax](/)
+
 Vidarax is a self-hosted video intelligence engine. Video streams go in, structured semantic events come out.
 
-It decodes live or file-based video, runs a deterministic gate engine over every frame (scene cuts, flicker, ghosting, exposure shifts, loop detection), samples a subset of frames through tiered vision language models for semantic analysis, and emits structured events in real time. The server, storage, and event pipeline run on infrastructure you operate. Inference goes to a VLM backend you configure: a self-hosted OpenAI-compatible endpoint (vLLM or SGLang), or optionally Google's Gemini API. No SaaS dependency is required, but the Gemini integration exists for deployments that want it.
+It decodes live or file-based video, runs a deterministic per-frame filter (scene cuts, flicker, ghosting, exposure shifts, and loop detection), sends a selected subset through tiered vision-language models, and emits structured events. The server, storage, and event pipeline run on infrastructure you operate. Inference goes to a VLM backend you configure: a self-hosted OpenAI-compatible endpoint (vLLM or SGLang), or optionally Google's Gemini API. No SaaS dependency is required, but the Gemini integration exists for deployments that want it.
 
 The engine is a Rust workspace. Axum serves the HTTP API. Events commit to a local write-ahead log; selected keyframe JPEGs live in a content-addressed blob sidecar. An optional SpacetimeDB client mirrors blocking WHIP description events after the local commit. A TypeScript SDK, a Vue 3 UI, and Prometheus-format metrics sit on the consumer side.
 
@@ -15,7 +17,7 @@ Vidarax is for teams that run their own inference and need machine-readable answ
 
 - Operators who point the server at an OpenAI-compatible VLM backend (vLLM or SGLang) they already run, or at Gemini through the TOML backend config.
 - Applications that analyze recorded files: upload or reference a video, receive a timeline of markers and semantic events.
-- Applications that watch live streams: WebRTC via WHIP, RTSP cameras, and HLS sources, with a prompt that can be updated while the session runs.
+- Applications that watch live streams: WebRTC via WHIP, RTSP cameras, and HLS sources, with prompt changes acknowledged by the active pipeline generation while the session runs.
 - Consumers who want events as data: a REST API with sequence-numbered events, cross-run query and search, and a typed SDK.
 
 ## What it is not
@@ -27,6 +29,6 @@ Vidarax is for teams that run their own inference and need machine-readable answ
 
 ## Where to go next
 
-- [Quickstart](/quickstart/): run the server and get events from a video.
-- [Architecture](/architecture/): the control plane, the media plane, and how state persists.
-- [API reference](/api/): endpoints and configuration.
+- [Quickstart](/docs/quickstart/): run the server and get events from a video.
+- [Architecture](/docs/architecture/): the control plane, the media plane, and how state persists.
+- [API reference](/docs/api/): endpoints and configuration.

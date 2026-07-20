@@ -14,6 +14,7 @@ use tokio::task::JoinSet;
 use vidarax_contracts::models::{
     fallback_candidates, REQUIRED_MEDIUM_MODELS, REQUIRED_SMALL_MODELS,
 };
+use vidarax_core::coordinates::{FrameCoordinates, IMAGE_COORDINATE_SCHEMA};
 use vidarax_core::gate::{FrameSignal, GateEventType};
 use vidarax_core::ingest::{
     compute_semantic_frame_indices, prepare_source_for_reuse, probe_source_fps, DecodedJpegFrame,
@@ -28,7 +29,7 @@ use vidarax_core::timeline::TimelineEvent;
 use crate::auth::{header_value, strong_hash_hex, HEADER_TENANT_ID};
 use crate::config::UPLOAD_DIR_NAME;
 use crate::ids::validate_run_id;
-use crate::inference_metrics::PipelineInferenceObserver;
+use crate::inference_metrics::{InferenceMetrics, PipelineInferenceObserver};
 use crate::models::{
     AnalyzeFrameMetadata, AnalyzeFramesRequest, AnalyzeFramesResponse, AnalyzeMarker,
     CreateRunRequest, CreateRunResponse, FieldError, InferBatchItemError, InferBatchItemResult,
@@ -37,7 +38,8 @@ use crate::models::{
     RealtimeReasonResponse, SamplingPolicy, SearchHit, SearchRequest, SearchResponse, TokenMetrics,
 };
 use crate::response::{
-    conflict_error, internal_error, not_found_error, ok, validation_error, ApiResponse,
+    bad_request_error, conflict_error, internal_error, not_found_error, ok, service_unavailable,
+    validation_error, ApiResponse,
 };
 use crate::semantic::{build_marker_lifecycle, MarkerConfig};
 use crate::semantic_infer::{
@@ -202,7 +204,10 @@ pub async fn ingest_run(
                 )],
             );
         };
-        if !(0.2..=120.0).contains(&sample_fps) {
+        if !(vidarax_contracts::processing::REQUEST_FPS_MIN
+            ..=vidarax_contracts::processing::REQUEST_FPS_MAX)
+            .contains(&sample_fps)
+        {
             return validation_error(
                 &state,
                 "invalid ingest request",
@@ -354,6 +359,8 @@ pub async fn ingest_run(
                 "width": decoded.width,
                 "height": decoded.height,
                 "pixel_format": decoded.pixel_format,
+                "coordinate_schema": IMAGE_COORDINATE_SCHEMA,
+                "coordinates": decoded.coordinates,
                 "signals": signals
             }),
         )
@@ -403,15 +410,21 @@ pub async fn stop_run(
     }
 
     let request_id = state.next_request_id();
-    if let Err(err) = state
-        .append_run_event_async(
-            &run_id,
-            "stop_requested",
-            json!({ "request_id": request_id }),
-        )
-        .await
-    {
-        return internal_error(&state, format!("failed to append stop event: {err}"));
+    let transaction = tokio::spawn(transition_live_run(
+        state.clone(),
+        run_id.clone(),
+        request_id.clone(),
+        "stop_requested",
+        true,
+    ));
+    match transaction.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            return internal_error(&state, format!("failed to stop run: {err}"));
+        }
+        Err(err) => {
+            return internal_error(&state, format!("stop transaction join failure: {err}"));
+        }
     }
 
     ok(json!({
@@ -419,6 +432,23 @@ pub async fn stop_run(
         "run_id": run_id,
         "status": "cancelled"
     }))
+}
+
+async fn transition_live_run(
+    state: AppState,
+    run_id: String,
+    request_id: String,
+    event_kind: &'static str,
+    preserve_history: bool,
+) -> Result<(), String> {
+    // The durable state transition and live-session close belong to one
+    // detached transaction. Dropping the HTTP request cannot leave a stopped
+    // or deleted run with its media pipeline still running.
+    state
+        .append_run_event_async(&run_id, event_kind, json!({ "request_id": request_id }))
+        .await?;
+    state.close_live_session_for_run(&run_id, preserve_history);
+    Ok(())
 }
 
 pub async fn keepalive_run(
@@ -802,13 +832,18 @@ pub async fn analyze_run(
         );
     }
 
-    let (signals, sampling_policy, sample_fps) = if payload.frames.is_empty() {
+    let (signals, sampling_policy, sample_fps, coordinates) = if payload.frames.is_empty() {
         let events = match load_existing_events(&state, &run_id).await {
             Ok(events) => events,
             Err(error) => return error,
         };
         match load_decoded_signals_from_events(&events) {
-            Ok(decoded) => (decoded.signals, decoded.sampling_policy, decoded.sample_fps),
+            Ok(decoded) => (
+                decoded.signals,
+                decoded.sampling_policy,
+                decoded.sample_fps,
+                decoded.coordinates,
+            ),
             Err(message) => {
                 return validation_error(
                     &state,
@@ -877,7 +912,10 @@ pub async fn analyze_run(
                     )],
                 );
             };
-            if !(0.2..=120.0).contains(&fixed) {
+            if !(vidarax_contracts::processing::REQUEST_FPS_MIN
+                ..=vidarax_contracts::processing::REQUEST_FPS_MAX)
+                .contains(&fixed)
+            {
                 return validation_error(
                     &state,
                     "invalid analyze payload",
@@ -891,7 +929,7 @@ pub async fn analyze_run(
         } else {
             estimate_sample_fps(&signals).unwrap_or(1.0)
         };
-        (signals, sampling_policy, sample_fps)
+        (signals, sampling_policy, sample_fps, None)
     };
 
     let principal = state.security_policy().principal_key_from_headers(&headers);
@@ -938,6 +976,7 @@ pub async fn analyze_run(
                 &request_id,
                 &trace_id,
                 m,
+                coordinates,
                 None,
                 false,
                 None,
@@ -969,23 +1008,24 @@ pub async fn analyze_run(
         }
     }
 
+    let mut analysis_event = json!({
+        "request_id": request_id,
+        "stream_id": stream_id,
+        "frames": metadata.len(),
+        "window_size": window_size,
+        "segment_ms": segment_ms,
+        "sampling_policy": sampling_policy.as_str(),
+        "sample_fps": sample_fps,
+        "mode": mode,
+        "model": model,
+        "markers": markers.len()
+    });
+    if let Some(coordinates) = coordinates {
+        analysis_event["coordinate_schema"] = json!(IMAGE_COORDINATE_SCHEMA);
+        analysis_event["coordinates"] = json!(coordinates);
+    }
     if let Err(err) = state
-        .append_run_event_async(
-            &run_id,
-            "analysis_generated",
-            json!({
-                "request_id": request_id,
-                "stream_id": stream_id,
-                "frames": metadata.len(),
-                "window_size": window_size,
-                "segment_ms": segment_ms,
-                "sampling_policy": sampling_policy.as_str(),
-                "sample_fps": sample_fps,
-                "mode": mode,
-                "model": model,
-                "markers": markers.len()
-            }),
-        )
+        .append_run_event_async(&run_id, "analysis_generated", analysis_event)
         .await
     {
         return internal_error(
@@ -1197,7 +1237,11 @@ fn validate_realtime_reason_params(
     }
 
     let fixed_fps = payload.fixed_fps.unwrap_or(1.0);
-    if sampling_policy == SamplingPolicy::Fixed && !(0.2..=120.0).contains(&fixed_fps) {
+    if sampling_policy == SamplingPolicy::Fixed
+        && !(vidarax_contracts::processing::REQUEST_FPS_MIN
+            ..=vidarax_contracts::processing::REQUEST_FPS_MAX)
+            .contains(&fixed_fps)
+    {
         return Err(validation_error(
             state,
             "invalid realtime reason request",
@@ -1292,6 +1336,7 @@ async fn assemble_realtime_reason_response(
     sampling_policy: SamplingPolicy,
     sample_fps: f32,
     source_fps: Option<f32>,
+    coordinates: FrameCoordinates,
     semantic_segment_ms: u64,
     request_id: &str,
     trace_id: &str,
@@ -1326,6 +1371,7 @@ async fn assemble_realtime_reason_response(
                 request_id,
                 trace_id,
                 frame,
+                Some(coordinates),
                 semantic_overlay.overlay.as_ref(),
                 semantic_overlay.used_fallback,
                 semantic_overlay.finish_reason.clone(),
@@ -1433,6 +1479,8 @@ async fn assemble_realtime_reason_response(
                 "sampling_policy": sampling_policy.as_str(),
                 "source_fps": source_fps,
                 "sample_fps": sample_fps,
+                "coordinate_schema": IMAGE_COORDINATE_SCHEMA,
+                "coordinates": coordinates,
                 "lag_p95_ms": lag_p95_ms,
                 "lag_p99_ms": lag_p99_ms,
                 "mode": mode,
@@ -1643,6 +1691,8 @@ pub async fn reason_realtime_run(
                 "request_id": request_id,
                 "source_uri": payload.source_uri.as_str(),
                 "index_name": index_name,
+                "coordinate_schema": IMAGE_COORDINATE_SCHEMA,
+                "coordinates": decoded.coordinates,
             }),
         )
         .await
@@ -1666,7 +1716,7 @@ pub async fn reason_realtime_run(
         state.webrtc_config().gate_config.clone(),
     );
 
-    let providers = state.provider().cloned();
+    let providers = state.admitted_provider(&principal);
     let semantic_available = semantic_inference && providers.is_some();
     let semantic_segment_ms = segment_ms;
     if semantic_inference && !semantic_available {
@@ -1785,6 +1835,7 @@ pub async fn reason_realtime_run(
         sampling_policy,
         sample_fps,
         source_fps,
+        decoded.coordinates,
         semantic_segment_ms,
         &request_id,
         &trace_id,
@@ -1880,9 +1931,10 @@ pub async fn get_markers(
 pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
     let request_id = state.next_request_id();
     let provider = state.provider().cloned();
+    let provider_for_probe = provider.clone();
     let is_saturated = state.inference_metrics().is_high_latency();
     let availability = match tokio::task::spawn_blocking(move || {
-        runtime_model_availability(provider, is_saturated)
+        runtime_model_availability(provider_for_probe, is_saturated)
     })
     .await
     {
@@ -1891,16 +1943,15 @@ pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
             return internal_error(&state, format!("model catalog worker join failure: {err}"));
         }
     };
-    let providers_available = availability.providers;
-    let status = availability.status;
-
     let mut models = Vec::with_capacity(REQUIRED_MEDIUM_MODELS.len() + REQUIRED_SMALL_MODELS.len());
     for model in REQUIRED_MEDIUM_MODELS {
+        let (status, providers_available) =
+            model_availability(provider.as_ref(), &availability, model);
         models.push(ModelCatalogItem {
             id: (*model).to_string(),
             tier: "medium".to_string(),
             availability: status.to_string(),
-            providers_available: providers_available.clone(),
+            providers_available,
             fallback_candidates: fallback_candidates(model)
                 .iter()
                 .map(ToString::to_string)
@@ -1908,11 +1959,13 @@ pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
         });
     }
     for model in REQUIRED_SMALL_MODELS {
+        let (status, providers_available) =
+            model_availability(provider.as_ref(), &availability, model);
         models.push(ModelCatalogItem {
             id: (*model).to_string(),
             tier: "small".to_string(),
             availability: status.to_string(),
-            providers_available: providers_available.clone(),
+            providers_available,
             fallback_candidates: fallback_candidates(model)
                 .iter()
                 .map(ToString::to_string)
@@ -2218,7 +2271,11 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     let mut metrics =
         format!("vidarax_runs_created_total {runs}\nvidarax_timeline_events_total {events}\n");
     metrics.push_str(&state.inference_metrics().render_prometheus());
+    metrics.push_str(&InferenceMetrics::render_admission_prometheus(
+        state.inference_admission(),
+    ));
     metrics.push_str(&state.pipeline_metrics().render_prometheus());
+    metrics.push_str(&state.render_media_capacity_prometheus());
     (axum::http::StatusCode::OK, metrics)
 }
 
@@ -2227,6 +2284,7 @@ struct PreparedInferRequest {
     run_id: Option<String>,
     request: InferenceRequest,
     primary_provider: ProviderKind,
+    principal: String,
 }
 
 struct InferExecutionError {
@@ -2354,6 +2412,7 @@ async fn validate_infer_request(
                 .map(|schema| Arc::from(schema.to_string())),
         },
         primary_provider,
+        principal: state.security_policy().principal_key_from_headers(headers),
     })
 }
 
@@ -2361,10 +2420,12 @@ async fn execute_infer_request(
     state: AppState,
     prepared: PreparedInferRequest,
 ) -> Result<InferResponse, InferExecutionError> {
-    let provider = state.provider().cloned().ok_or(InferExecutionError {
-        code: "internal_error",
-        message: "inference providers are not configured".to_string(),
-    })?;
+    let provider = state
+        .admitted_provider(&prepared.principal)
+        .ok_or(InferExecutionError {
+            code: "internal_error",
+            message: "inference providers are not configured".to_string(),
+        })?;
 
     let request_id = state.next_request_id();
     let started = Instant::now();
@@ -2464,6 +2525,10 @@ fn map_provider_execution_error(err: ProviderError) -> InferExecutionError {
             code: "provider_invalid_response",
             message: format!("inference provider invalid response: {message}"),
         },
+        ProviderError::Saturated { .. } => InferExecutionError {
+            code: "provider_saturated",
+            message: "inference capacity is temporarily unavailable".to_string(),
+        },
     }
 }
 
@@ -2474,6 +2539,9 @@ fn infer_execution_error_to_response(state: &AppState, err: InferExecutionError)
             "invalid infer payload",
             vec![field_error("model", err.message)],
         );
+    }
+    if err.code == "provider_saturated" {
+        return service_unavailable(state, err.code, err.message);
     }
     internal_error(state, err.message)
 }
@@ -2785,8 +2853,13 @@ pub async fn submit_feedback(
         return error;
     }
 
+    // SpacetimeDB is an optional dependency, so its absence is a 503, not a 500.
     let Some(stdb) = state.spacetime_client() else {
-        return internal_error(&state, "spacetimedb client not configured");
+        return service_unavailable(
+            &state,
+            "spacetimedb_not_configured",
+            "feedback requires SpacetimeDB, which is not configured",
+        );
     };
 
     let req = crate::spacetime_client::SubmitFeedbackRequest {
@@ -2809,8 +2882,13 @@ pub async fn submit_feedback(
 
 #[tracing::instrument(name = "api.list_feedback", skip_all)]
 pub async fn list_feedback(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    // SpacetimeDB is an optional dependency, so its absence is a 503, not a 500.
     let Some(stdb) = state.spacetime_client() else {
-        return internal_error(&state, "spacetimedb client not configured");
+        return service_unavailable(
+            &state,
+            "spacetimedb_not_configured",
+            "feedback requires SpacetimeDB, which is not configured",
+        );
     };
     let principal = state.security_policy().principal_key_from_headers(&headers);
     let all_events = match state.read_all_events_async().await {
@@ -2940,12 +3018,23 @@ pub async fn delete_run(
         return error;
     }
     let request_id = state.next_request_id();
-    if let Err(err) = state
-        .append_run_event_async(&run_id, "run_deleted", json!({ "request_id": request_id }))
-        .await
-    {
-        return internal_error(&state, format!("failed to append run_deleted event: {err}"));
+    let transaction = tokio::spawn(transition_live_run(
+        state.clone(),
+        run_id.clone(),
+        request_id.clone(),
+        "run_deleted",
+        false,
+    ));
+    match transaction.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            return internal_error(&state, format!("failed to delete run: {err}"));
+        }
+        Err(err) => {
+            return internal_error(&state, format!("delete transaction join failure: {err}"));
+        }
     }
+
     ok(json!({
         "request_id": request_id,
         "run_id": run_id,
@@ -2972,16 +3061,26 @@ pub async fn serve_file(
 
     // Reject filenames with path separators or obvious traversal attempts.
     if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Body::from("invalid filename"))
-            .unwrap();
+        return bad_request_error(
+            &state,
+            "invalid filename",
+            vec![field_error(
+                "filename",
+                "filename must not contain path separators or traversal sequences".to_string(),
+            )],
+        )
+        .into_response();
     }
     if !allowed_served_file_extension(&filename) {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Body::from("unsupported file type"))
-            .unwrap();
+        return bad_request_error(
+            &state,
+            "unsupported file type",
+            vec![field_error(
+                "filename",
+                "only mp4, webm, mov, or avi files are served".to_string(),
+            )],
+        )
+        .into_response();
     }
     let principal = state.security_policy().principal_key_from_headers(&headers);
     let owner_prefix = upload_owner_prefix_from_principal(&principal);
@@ -3038,10 +3137,12 @@ pub async fn serve_file(
             .unwrap();
     }
 
-    Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .body(Body::from("file not found"))
-        .unwrap()
+    not_found_error(
+        &state,
+        "file not found",
+        vec![field_error("filename", filename)],
+    )
+    .into_response()
 }
 
 /// Return a raw JPEG referenced by a `keyframe_stored` event on an owned run.
@@ -3612,8 +3713,8 @@ fn parse_payload(raw: &str) -> Value {
 }
 
 struct RuntimeAvailability {
-    status: &'static str,
-    providers: Vec<String>,
+    saturated: bool,
+    providers: Vec<ProviderKind>,
 }
 
 fn runtime_model_availability(
@@ -3622,19 +3723,38 @@ fn runtime_model_availability(
 ) -> RuntimeAvailability {
     let Some(provider) = provider else {
         return RuntimeAvailability {
-            status: "unavailable",
+            saturated: false,
             providers: Vec::new(),
         };
     };
-    // With the abstract provider layer, we report the top-level kind as
-    // available.  Health-checking individual backends is deferred to a future
-    // backends health endpoint.
-    let kind_name = provider.kind().name().to_string();
-    let status = if is_saturated { "saturated" } else { "ready" };
     RuntimeAvailability {
-        status,
-        providers: vec![kind_name],
+        saturated: is_saturated,
+        providers: provider.available_kinds(),
     }
+}
+
+fn model_availability(
+    provider: Option<&Arc<dyn InferenceProvider + Send + Sync>>,
+    runtime: &RuntimeAvailability,
+    model: &str,
+) -> (&'static str, Vec<String>) {
+    let Some(provider) = provider else {
+        return ("unavailable", Vec::new());
+    };
+    let providers = provider
+        .configured_kinds_for_model(model)
+        .into_iter()
+        .filter(|kind| runtime.providers.contains(kind))
+        .map(|kind| kind.name().to_string())
+        .collect::<Vec<_>>();
+    let status = if providers.is_empty() {
+        "unavailable"
+    } else if runtime.saturated {
+        "saturated"
+    } else {
+        "ready"
+    };
+    (status, providers)
 }
 
 fn now_epoch_ms() -> u64 {

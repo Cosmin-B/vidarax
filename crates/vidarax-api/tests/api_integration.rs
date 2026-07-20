@@ -223,8 +223,9 @@ async fn feedback_empty_category_returns_unprocessable_entity() {
 }
 
 #[tokio::test]
-async fn feedback_without_spacetimedb_returns_internal_error() {
+async fn feedback_without_spacetimedb_returns_service_unavailable() {
     // AppState::with_wal_for_tests has no SpacetimeDB client attached.
+    // SpacetimeDB is optional, so the endpoint reports 503, not a server error.
     let state = AppState::with_wal_for_tests(tmp_wal("fb-stdb"));
     state
         .append_run_event(
@@ -243,11 +244,11 @@ async fn feedback_without_spacetimedb_returns_internal_error() {
         .await
         .unwrap();
 
-    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = collect_json(res.into_body()).await;
     assert_eq!(
         body["error"]["code"].as_str().unwrap_or(""),
-        "internal_error"
+        "spacetimedb_not_configured"
     );
 }
 

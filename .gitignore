@@ -29,11 +29,7 @@ __pycache__/
 .dolt/
 *.db
 
-# Local agent/dev tooling (not part of the project)
-.agents/
-.beads/
 .mlx-venv/
-.serena/
 
 # Local dogfood scratch (not part of the project)
 .dogfood-data/

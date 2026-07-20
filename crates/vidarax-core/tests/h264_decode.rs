@@ -3,7 +3,7 @@ use vidarax_core::webrtc::decode::{
 };
 
 #[test]
-fn software_decoder_creates_without_panic() {
+fn cpu_h264_decoder_uses_ffmpeg_sidecar() {
     let config = DecoderConfig {
         gpu_available: false,
         codec: VideoCodec::H264,
@@ -12,7 +12,7 @@ fn software_decoder_creates_without_panic() {
         output_pool_slots: 1,
     };
     let decoder = Decoder::new(&config);
-    assert!(matches!(decoder, Decoder::Software { .. }));
+    assert!(matches!(decoder, Decoder::FfmpegSw { .. }));
 }
 
 #[test]

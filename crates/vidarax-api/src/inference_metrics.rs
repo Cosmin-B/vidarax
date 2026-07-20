@@ -1,10 +1,13 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use vidarax_core::admission::InferenceAdmission;
 use vidarax_core::metrics::PipelineMetrics;
 use vidarax_core::provider::{InferenceObserver, ProviderKind, TokenUsage};
 
-const LATENCY_BUCKETS_MS: [u64; 10] = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
+const LATENCY_BUCKETS_MS: [u64; 14] = [
+    10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 15000, 20000, 30000, 60000,
+];
 
 pub struct InferenceMetrics {
     vllm: ProviderMetrics,
@@ -70,6 +73,46 @@ impl InferenceMetrics {
         self.render_provider("sglang", &self.sglang, &mut out);
         self.render_provider("gemini", &self.gemini, &mut out);
         self.render_provider("mlx", &self.mlx, &mut out);
+        out
+    }
+
+    pub fn render_admission_prometheus(admission: &InferenceAdmission) -> String {
+        use std::fmt::Write as _;
+
+        let snapshot = admission.snapshot();
+        let mut out = String::new();
+        let _ = writeln!(out, "vidarax_infer_admission_active {}", snapshot.active);
+        let _ = writeln!(out, "vidarax_infer_admission_waiting {}", snapshot.waiting);
+        let _ = writeln!(
+            out,
+            "vidarax_infer_admission_acquired_total {}",
+            snapshot.acquired_total
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_admission_timeouts_total{{limit=\"global\"}} {}",
+            snapshot.timeout_global_total
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_admission_timeouts_total{{limit=\"principal\"}} {}",
+            snapshot.timeout_principal_total
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_admission_waiter_rejections_total {}",
+            snapshot.waiter_rejected_total
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_admission_wait_duration_us_sum {}",
+            snapshot.wait_duration_us
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_admission_wait_duration_us_count {}",
+            snapshot.wait_duration_count
+        );
         out
     }
 
@@ -255,7 +298,7 @@ impl ProviderMetrics {
         if total < 10 {
             return false; // too few samples
         }
-        // LATENCY_BUCKETS_MS = [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]
+        // LATENCY_BUCKETS_MS includes 10 ms through 60 s.
         // Index 8 (inclusive) gives cumulative count ≤ 5 000 ms.
         let within_5s: u64 = self
             .latency_buckets
@@ -281,7 +324,10 @@ impl ProviderMetrics {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::InferenceMetrics;
+    use vidarax_core::admission::{AdmissionLimits, InferenceAdmission};
     use vidarax_core::provider::{ProviderKind, TokenUsage};
 
     #[test]
@@ -307,6 +353,26 @@ mod tests {
         assert!(
             text.contains("vidarax_infer_tokens_total{provider=\"vllm\",kind=\"completion\"} 45")
         );
+    }
+
+    #[test]
+    fn renders_admission_metrics_without_principal_labels() {
+        let admission = InferenceAdmission::new(AdmissionLimits {
+            global_in_flight: 2,
+            per_principal_in_flight: 1,
+            global_waiters: 2,
+            wait_timeout: Duration::from_millis(5),
+        })
+        .unwrap();
+        let _permit = admission.acquire("secret-tenant-name").unwrap();
+        let _ = admission.acquire("secret-tenant-name");
+
+        let text = InferenceMetrics::render_admission_prometheus(&admission);
+
+        assert!(text.contains("vidarax_infer_admission_active 1"));
+        assert!(text.contains("vidarax_infer_admission_timeouts_total{limit=\"principal\"} 1"));
+        assert!(text.contains("vidarax_infer_admission_wait_duration_us_count 2"));
+        assert!(!text.contains("secret-tenant-name"));
     }
 
     #[test]

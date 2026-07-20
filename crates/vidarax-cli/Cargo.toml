@@ -2,12 +2,12 @@
 name = "vidarax-cli"
 edition.workspace = true
 version.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
 [dependencies]
 vidarax-contracts = { path = "../vidarax-contracts" }
-vidarax-core = { path = "../vidarax-core" }
 clap = { version = "4", features = ["derive"] }
 comfy-table = "7"
 indicatif = "0.17"

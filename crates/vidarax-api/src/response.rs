@@ -53,6 +53,20 @@ pub fn conflict_error(
     )
 }
 
+pub fn bad_request_error(
+    state: &AppState,
+    message: impl Into<String>,
+    details: Vec<FieldError>,
+) -> ApiResponse {
+    structured_error(
+        state.next_request_id(),
+        StatusCode::BAD_REQUEST,
+        "bad_request",
+        message,
+        details,
+    )
+}
+
 pub fn internal_error(state: &AppState, message: impl Into<String>) -> ApiResponse {
     let message = message.into();
     let request_id = state.next_request_id();
@@ -62,6 +76,20 @@ pub fn internal_error(state: &AppState, message: impl Into<String>) -> ApiRespon
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal_error",
         "internal server error",
+        Vec::new(),
+    )
+}
+
+pub fn service_unavailable(
+    state: &AppState,
+    code: &'static str,
+    message: impl Into<String>,
+) -> ApiResponse {
+    structured_error(
+        state.next_request_id(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        code,
+        message,
         Vec::new(),
     )
 }

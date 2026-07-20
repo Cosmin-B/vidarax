@@ -4,8 +4,16 @@ TypeScript SDK for the Vidarax video analysis API.
 
 ## Installation
 
+The package has not had its first npm release. Build and link it from this
+workspace:
+
 ```bash
-npm install vidarax
+cd packages/vidarax-sdk
+npm install
+npm run build
+npm link
+# In your application:
+npm link vidarax
 ```
 
 Requires Node.js 18+ or any modern browser.
@@ -34,6 +42,7 @@ const v = new Vidarax(baseUrl, options?)
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `apiKey` | `string` | -- | `x-api-key` header sent with every request. |
+| `tenantId` | `string` | -- | `x-tenant-id` header sent with every request. Servers started with `VIDARAX_REQUIRE_TENANT_ID` reject requests without it. |
 | `maxRetries` | `number` | `3` | Retry count for transient failures. |
 | `retryBaseDelayMs` | `number` | `200` | Starting back-off delay in ms. |
 | `timeoutMs` | `number` | `30000` | Per-request timeout in ms. |

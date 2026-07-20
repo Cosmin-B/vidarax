@@ -3,7 +3,7 @@ title: Ingest
 description: Supported sources, the ffmpeg decode sidecar, the drain-before-write rule, and decoder warm-up.
 ---
 
-Ingest turns a source into decoded frames the gate engine can score. There are two decode paths: an ffmpeg subprocess path for files and URLs, and a long-lived decoder pipeline for live WebRTC streams.
+Ingest turns a source into decoded frames the per-frame filter can score. There are two decode paths: an ffmpeg subprocess path for files and URLs, and a long-lived decoder pipeline for live WebRTC streams.
 
 ## Supported sources
 
@@ -14,7 +14,7 @@ Ingest turns a source into decoded frames the gate engine can score. There are t
 - RTSP cameras: `rtsps://` is accepted; unencrypted `rtsp://` requires `VIDARAX_ALLOW_UNENCRYPTED_RTSP=true`.
 - WebRTC: live streams over WHIP (RFC 9725), processed through per-session worker pools rather than ffmpeg's demuxer.
 
-Remote sources pass application-level SSRF checks before decode: embedded credentials, localhost names, private and link-local IP literals, blocked DNS resolutions, and unsafe redirects are rejected. On the downloadable HTTP(S) path, a response that content-sniffs as an HLS playlist is also rejected; an explicitly selected HLS source is accepted when remote HLS is enabled. Each source kind also gets the narrowest useful ffmpeg protocol whitelist. See the [security notes](/operations/#security-and-hardening) for the residual that remains and the recommended egress control.
+Remote sources pass application-level SSRF checks before decode: embedded credentials, localhost names, private and link-local IP literals, blocked DNS resolutions, and unsafe redirects are rejected. On the downloadable HTTP(S) path, a response that content-sniffs as an HLS playlist is also rejected; an explicitly selected HLS source is accepted when remote HLS is enabled. Each source kind also gets the narrowest useful ffmpeg protocol whitelist. See the [security notes](/docs/operations/#security-and-hardening) for the residual that remains and the recommended egress control.
 
 ## Decode backends for files and URLs
 
@@ -34,9 +34,9 @@ Ingest requests control sampling: a `sampling_policy` (for example `fixed` with 
 
 ## The ffmpeg decode sidecar for live streams
 
-Live WebRTC video needs a stateful decoder that survives across frames. GPU H.264 and H.265 use a long-lived ffmpeg sidecar process; software H.264 uses openh264 in-process; software H.265 uses the ffmpeg sidecar; VP8 uses libvpx in-process when the `vp8` build feature is enabled.
+Live WebRTC video needs a stateful decoder that survives across frames. H.264 and H.265 use a long-lived ffmpeg sidecar process on both CPU and GPU paths so a native decoder crash cannot abort the API process. VP8 uses libvpx in-process when the `vp8` build feature is enabled; that optional path does not have process isolation.
 
-The sidecar paths are built around one hazard: a subprocess connected by two pipes can deadlock. If the parent blocks writing encoded input while ffmpeg blocks writing decoded output, neither side ever makes progress. Vidarax removes that interleaving hazard with a dedicated reader thread and a strict ordering rule.
+The sidecar paths are built around one hazard: a subprocess connected by two pipes can deadlock. If the parent blocks writing encoded input while ffmpeg blocks writing decoded output, neither side makes progress. Vidarax narrows that interleaving window with a dedicated reader thread and a strict ordering rule.
 
 ### The reader thread and the bounded channel
 
@@ -48,7 +48,7 @@ Each frame is read directly into buffers acquired from a bounded pool. Recycled 
 
 The decode side owns ffmpeg's stdin, and it follows one ownership rule: drain before write. Every `decode()` call first drains all currently ready YUV frames out of the bounded channel into a decoder-local FIFO, and only then writes the next encoded input to ffmpeg.
 
-This ordering removes the known two-pipe interleaving deadlock. The parent can block on the reader channel being full, but it has just emptied that channel before writing; the reader can block on the same channel, and the decode side comes back and drains it before it writes again. A full handoff channel is therefore never the standing reason both sides are stuck, and no decoded output is dropped by the handoff itself. The argument assumes healthy pipes and a bounded amount of output per written input; it does not make every failure mode impossible.
+The channel holds 16 frames and the reader uses blocking sends. Draining it before each write makes room for output already produced, but the reader can still block when a new output burst fills the handoff. The current implementation does not establish a maximum decoded-output burst per input write, so this ordering reduces the deadlock window rather than proving it absent. No decoded output is dropped by the handoff itself.
 
 Under real-time backlog the decoder-local FIFO sheds older decoded frames and returns the freshest ready frame, so downstream labels stay close to the current stream position. Shedding happens after the lossless handoff, as an explicit freshness policy, not as a side effect of a full pipe.
 
@@ -59,3 +59,8 @@ A live H.264 decoder commonly cannot emit a frame from its first input: it needs
 Warm-up also applies to memory: pooled frame buffers are grown to their working size during the first frames, and because recycled buffers keep their capacity, later resizes do not reallocate.
 
 Codec detection is lazy. The decoder is created on the first frame, when the codec is known, and rebuilt if a later session negotiates a different codec on the same worker. The codec and the decoder travel together in a single slot so they cannot drift apart.
+
+A broken ffmpeg pipe or exited reader ends the decode stage. The per-session
+supervisor faults that generation, closes the peer, stops and joins its sibling
+stages, and lets the single-winner reclaimer tombstone the run. It never restarts
+one decoder while temporal workers still belong to the old generation.

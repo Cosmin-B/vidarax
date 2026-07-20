@@ -1,9 +1,9 @@
 ---
 title: Decode sidecar
-description: The long-lived ffmpeg subprocess, its reader thread and bounded handoff, and the drain-before-write rule that removes the two-pipe interleaving deadlock.
+description: The long-lived ffmpeg subprocess, its reader thread and bounded handoff, and the limits of the drain-before-write rule.
 ---
 
-The decode sidecar is the long-lived ffmpeg subprocess that turns encoded live video into raw YUV frames, implemented in `crates/vidarax-core/src/webrtc/decode.rs`. Its design removes the classic two-pipe interleaving deadlock between parent and child, keeps the handoff of decoded frames lossless, and makes the steady-state decode loop allocate from bounded pools rather than the heap. This page walks the process spawn, decoder warm-up, the reader thread and its bounded channel, the drain-before-write rule, pool interaction, and teardown. Where these frames go next is covered in [Media plane](/internals/media-plane/); the higher-level view of ingest paths is in [Ingest](/ingest/).
+The decode sidecar is the long-lived ffmpeg subprocess that turns encoded live video into raw YUV frames, implemented in `crates/vidarax-core/src/webrtc/decode.rs`. A dedicated reader and a drain-before-write rule reduce the classic two-pipe deadlock window between parent and child. The handoff of decoded frames is lossless, and the steady-state decode loop draws from bounded pools rather than allocating a fresh buffer per frame. This page walks the process spawn, decoder warm-up, the reader thread and its bounded channel, the drain-before-write rule, pool interaction, and teardown. Where these frames go next is covered in [Media plane](/docs/internals/media-plane/); the higher-level view of ingest paths is in [Ingest](/docs/ingest/).
 
 ## Backend selection
 
@@ -13,11 +13,11 @@ The decode sidecar is the long-lived ffmpeg subprocess that turns encoded live v
 |---|---|---|
 | true | H.264 | `NvDec` (ffmpeg sidecar, `-hwaccel auto`) |
 | true | H.265 / HEVC | `NvDec` |
-| false | H.264 | `Software` (openh264 in-process) |
+| false | H.264 | `FfmpegSw` (ffmpeg sidecar, CPU) |
 | false | H.265 / HEVC | `FfmpegSw` (ffmpeg sidecar, CPU) |
 | any | VP8 | `Vp8` (libvpx in-process) with the `vp8` feature, else `Unsupported` |
 
-Only `NvDec` and `FfmpegSw` are sidecar paths; they share all of the machinery below. `Unsupported` is a real variant whose `decode` returns `DecodeError::UnsupportedCodec` so the caller can fail the stream with a precise message instead of panicking.
+All live H.264 and H.265 selections use `NvDec` or `FfmpegSw`, so native decoder faults are contained to a child process. The direct `Software` openh264 variant remains available inside the decoder module but is not selected for a live session. `Unsupported` is a real variant whose `decode` returns `DecodeError::UnsupportedCodec` so the caller can fail the stream with a precise message instead of panicking.
 
 ## Process spawn
 
@@ -27,6 +27,8 @@ Only `NvDec` and `FfmpegSw` are sidecar paths; they share all of the machinery b
 let mut child = Command::new(crate::ingest::ffmpeg_path())
     .args([
         "-hwaccel", "auto",
+        "-threads", "1",
+        "-filter_threads", "1",
         "-f", input_fmt,          // "h264" or "hevc"
         "-i", "pipe:0",
         "-f", "rawvideo",
@@ -40,13 +42,13 @@ let mut child = Command::new(crate::ingest::ffmpeg_path())
     .spawn()
 ```
 
-The input format comes from `VideoCodec::ffmpeg_input_format`, which returns `Some("h264")` or `Some("hevc")` and `None` for VP8 (VP8 never takes the sidecar path). The output contract is fixed: packed planar I420 at the configured `width` x `height`, with no row padding and no per-frame metadata, so a frame on stdout is exactly `w*h + 2*(w/2)*(h/2)` bytes and can be parsed by length alone. `stdin` is taken from the child and owned by the decode side; `stdout` is wrapped in a `BufReader` and moved into the reader thread.
+The input format comes from `VideoCodec::ffmpeg_input_format`, which returns `Some("h264")` or `Some("hevc")` and `None` for VP8 (VP8 never takes the sidecar path). Decoder and filter thread counts are fixed at one so session admission is not undermined by unbounded native thread creation. The output contract is fixed: packed planar I420 at the configured `width` x `height`, with no row padding and no per-frame metadata, so a frame on stdout is exactly `w*h + 2*(w/2)*(h/2)` bytes and can be parsed by length alone. `stdin` is taken from the child and owned by the decode side; `stdout` is wrapped in a `BufReader` and moved into the reader thread.
 
 ## Decoder warm-up
 
-An H.264 decoder commonly cannot emit a frame from its first input. Before any output exists, it needs the SPS and PPS parameter sets (which describe resolution, profile, and reference structure) and an IDR frame to decode against, and those usually arrive across several access units; a first access unit that already carries all three can produce output immediately, though the pipeline may still buffer it. On the WHIP path these arrive as ordinary access units at the head of the stream, forwarded with Annex B framing like everything else (see [WebRTC ingest](/internals/webrtc-ingest/)); the sidecar needs no special casing for them, only tolerance for input that produces no output yet.
+An H.264 decoder commonly cannot emit a frame from its first input. Before any output exists, it needs the SPS and PPS parameter sets (which describe resolution, profile, and reference structure) and an IDR frame to decode against, and those usually arrive across several access units; a first access unit that already carries all three can produce output immediately, though the pipeline may still buffer it. On the WHIP path these arrive as ordinary access units at the head of the stream, forwarded with Annex B framing like everything else (see [WebRTC ingest](/docs/internals/webrtc-ingest/)); the sidecar needs no special casing for them, only tolerance for input that produces no output yet.
 
-Warm-up is exactly the phase that breaks a naive write-then-read loop: the parent must keep writing input while nothing is coming back, and a blocking read after each write would stall forever on the SPS. The sidecar handles this two ways at once. First, output reading happens on a dedicated thread, so writes never wait for reads. Second, "no frame yet" is a first-class result: `decode()` returns `DecodeError::Buffered`, and the decode worker just moves to the next access unit. The in-process openh264 path expresses the same state when its decoder returns no output for an SPS/PPS-only payload.
+Warm-up is exactly the phase that breaks a naive write-then-read loop: the parent must keep writing input while nothing is coming back, and a blocking read after each write would stall forever on the SPS. The sidecar handles this two ways at once. First, output reading happens on a dedicated thread, so writes never wait for reads. Second, "no frame yet" is a first-class result: `decode()` returns `DecodeError::Buffered`, and the decode worker just moves to the next access unit.
 
 ## The reader thread and its bounded channel
 
@@ -62,7 +64,7 @@ if stdout.read_exact(&mut y).is_err() { break; }
 if !send_yuv_frame_lossless(&tx, frame) { break; }
 ```
 
-The channel holds `FFMPEG_YUV_READER_QUEUE_CAPACITY` (16) frames. The send is blocking and the handoff is lossless: the reader never drops or evicts a decoded frame. When the channel is full the reader parks, which in turn stops it reading stdout, which lets the pipe fill, which is fine, because the decode side is guaranteed to come back and drain (next section). Reading directly into pooled buffers means the frame handed downstream is the one ffmpeg wrote, with no intermediate copy, and recycled buffers keep their capacity so the `resize` stops allocating after warm-up.
+The channel holds `FFMPEG_YUV_READER_QUEUE_CAPACITY` (16) frames. The send is blocking and the handoff is lossless: the reader never drops or evicts a decoded frame. When the channel is full the reader parks, stops reading stdout, and can let the pipe fill. The decode side drains before its next write, but the code does not yet prove a bound on how much output one input can produce before that drain. Reading directly into pooled buffers means the frame handed downstream is the one ffmpeg wrote, with no intermediate copy, and recycled buffers keep their capacity so the `resize` stops allocating after warm-up.
 
 The reader exits when `read_exact` fails (ffmpeg closed stdout) or when the receiver side is gone (send fails). There is no separate shutdown signal.
 
@@ -89,7 +91,7 @@ if let Some(frame) = pending.pop_back() {
 
 `drain_ready_yuv_frames` is a non-blocking `try_recv` loop that moves every ready frame from the channel into the decoder-local `pending: VecDeque<YuvFrame>` and reports whether the reader has exited.
 
-The deadlock argument is short, and it targets one specific hazard: the interleaving deadlock where the parent blocks writing stdin while ffmpeg blocks writing stdout. The parent can only block writing stdin when ffmpeg's stdin pipe is full; ffmpeg only stops consuming stdin when its stdout pipe is full; stdout only stays full when the reader thread is parked on a full channel; and the parent emptied that channel immediately before writing. So a full handoff channel can never be the standing reason both sides are stuck: the reader always has room for at least one blocking send after each drain, which unblocks ffmpeg's stdout, which unblocks its stdin consumption. No decoded output is ever dropped by the handoff itself. The argument assumes healthy pipes and that one written input produces a bounded amount of output before the next drain; it removes the known interleaving deadlock rather than proving every hang impossible.
+The rule targets one specific hazard: the parent entering a blocking stdin write while decoded output is already waiting. Draining first gives the reader up to 16 frames of handoff capacity before the write. It does not make the two-pipe topology deadlock-proof. If one input can cause more output than the available channel and pipe capacity before ffmpeg resumes consuming stdin, the reader can still park and the pipes can still form a cycle. No decoded output is dropped by the handoff itself, but a complete proof needs a measured or enforced per-input output-burst bound.
 
 Dropping does happen, but as policy rather than pipe pressure: after the write, `pop_back` returns the freshest pending frame and everything older is shed and counted through `inc_frames_dropped_by`. Under real-time backlog this keeps downstream labels close to the current RTP timestamp instead of replaying a growing latency queue. The label itself is best-effort: the raw pipe has no metadata channel, so a returned frame is attributed to the current access unit.
 
@@ -101,17 +103,17 @@ Two bounds watch the pending FIFO. `FFMPEG_YUV_PENDING_FIFO_CAPACITY` (reader qu
 |---|---|---|
 | `Ok(YuvFrame)` | Freshest decoded frame | Process it |
 | `Err(Buffered)` | Input accepted, no output ready (warm-up, B-frame delay) | Continue with next access unit |
-| `Err(ReaderExited)` | Reader thread gone: ffmpeg exited or pipe closed | Skip to next RTP frame, decoder kept |
-| `Err(WriteError)` / `Err(FlushError)` | stdin write failed | Skip to next RTP frame, decoder kept |
+| `Err(ReaderExited)` | Reader thread gone: ffmpeg exited or pipe closed | End decode stage; supervisor faults the generation |
+| `Err(WriteError)` / `Err(FlushError)` | stdin write failed | End decode stage; supervisor faults the generation |
 | `Err(SoftwareDecode)` | openh264 hard error (software path only) | Skip to next RTP frame, decoder kept |
 | `Err(Vp8Decode)` | libvpx hard error (`vp8` feature only) | Skip to next RTP frame, decoder kept |
 | `Err(UnsupportedCodec)` | No live decoder for the negotiated codec | End the worker with an error log |
 
-Note the asymmetry: only `UnsupportedCodec` ends the worker. Every other error, including the pipe failures that leave an ffmpeg sidecar effectively dead, makes the worker `continue` to the next RTP frame with the same decoder still in its slot; a dead sidecar is not detected and rebuilt, it just keeps returning errors. The decoder is replaced only when a later frame arrives with a different codec.
+Buffered and per-frame native decode errors remain recoverable. A broken pipe or exited reader is not: the decode worker returns, and the generation supervisor closes the peer and stops every sibling. Vidarax does not restart an individual stateful decoder or temporal worker inside the same generation.
 
 ## Frame pool interaction
 
-Plane buffers come from `YuvPlanePools`, three `VecPool` free-lists (Y, U, V) sized together. The reader-path pool minimum is `FFMPEG_YUV_READER_POOL_MIN_SLOTS` (22): a full reader channel (16), the steady-state pending allowance (4), one frame under construction, one held by the consumer. This is the same sum `decode_output_pool_slots` computes in `workers.rs`; see [Media plane](/internals/media-plane/#the-yuv-decode-output-pool) for the derivation.
+Plane buffers come from `YuvPlanePools`, three `VecPool` free-lists (Y, U, V) sized together. The reader-path pool minimum is `FFMPEG_YUV_READER_POOL_MIN_SLOTS` (22): a full reader channel (16), the steady-state pending allowance (4), one frame under construction, one held by the consumer. This is the same sum `decode_output_pool_slots` computes in `workers.rs`; see [Media plane](/docs/internals/media-plane/#the-yuv-decode-output-pool) for the derivation.
 
 Capacity per slot is bucketed, not exact. `required_y_capacity(width, height)` takes the larger of the luma requirement and the chroma requirement expressed in luma terms (covering odd dimensions where truncated `(w/2)*(h/2)` math would under-provision), clamps to `MAX_POOL_Y_CAPACITY` (`1 << 25` bytes), and rounds up to a power of two. Bucketing means an untrusted sender that ramps or oscillates resolution rebuilds the free-lists a bounded number of times, once per bucket crossing, instead of once per distinct size; the cap means a hostile stream declaring an enormous resolution cannot force a giant speculative pre-allocation (a genuinely larger frame still decodes; the copy path grows that one buffer).
 
@@ -119,7 +121,7 @@ Capacity per slot is bucketed, not exact. `required_y_capacity(width, height)` t
 
 ## Teardown
 
-`Decoder` implements `Drop`: the sidecar variants call `child.kill()` best-effort and ignore errors. Killing ffmpeg closes its stdout, which fails the reader thread's `read_exact`, which ends the reader loop and drops the channel sender; any later `decode` call then observes `ReaderExited`. The reader thread is detached and needs no join. In the live pipeline the decode worker owns the `Decoder` on its stack, so the sidecar dies when the worker's RTP channel closes and the thread returns, and also when the worker replaces the decoder after a codec change on the same stream.
+`Decoder` implements `Drop`: the sidecar variants call `child.kill()` best-effort. Killing ffmpeg closes stdout and wakes the reader's `read_exact`; `Drop` then joins the owned reader handle and waits for the child. In the live pipeline the decode worker owns the `Decoder` on its stack, so the sidecar and reader are reaped before the stage handle completes.
 
 ## Edge cases and limits
 
@@ -127,4 +129,4 @@ Capacity per slot is bucketed, not exact. `required_y_capacity(width, height)` t
 - PTS labeling across the pipe is approximate by design; anything needing exact PTS-to-frame mapping must not use the raw-pipe sidecar.
 - `DecoderConfig::auto_detect` probes `nvidia-smi` for GPU availability and defaults to 1920x1080 and H.264; callers are expected to override the codec from the SDP offer.
 - Sidecar construction panics if ffmpeg is missing (`expect` on spawn). This is a deliberate fail-fast at session start rather than a recoverable per-frame error.
-- The `Software` and `Vp8` backends bypass everything on this page except the pools: they decode synchronously in-process and de-stride planes straight into pooled buffers.
+- The retained direct `Software` backend and optional `Vp8` backend bypass everything on this page except the pools. Live H.264 does not select `Software`; VP8 remains an explicit in-process exception when that feature is enabled.

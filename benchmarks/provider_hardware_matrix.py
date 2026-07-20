@@ -98,7 +98,22 @@ def histogram_quantile(
     if count <= 0:
         return None
     target = count * quantile
-    for upper_bound in (10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000):
+    for upper_bound in (
+        10,
+        25,
+        50,
+        100,
+        250,
+        500,
+        1000,
+        2500,
+        5000,
+        10000,
+        15000,
+        20000,
+        30000,
+        60000,
+    ):
         key = (
             'vidarax_infer_latency_ms_bucket'
             f'{{provider="{provider}",le="{upper_bound}"}}'
@@ -164,6 +179,33 @@ def run_row(
     latency_count_key = f'vidarax_infer_latency_ms_count{{provider="{provider}"}}'
     latency_sum = delta(after, before, latency_sum_key)
     latency_count = delta(after, before, latency_count_key)
+    frames_decoded = delta(
+        after, before, "vidarax_pipeline_frames_decoded_total"
+    )
+    gate_analyzed = delta(
+        after, before, "vidarax_pipeline_gate_frames_analyzed_total"
+    )
+    gate_selected = delta(
+        after, before, "vidarax_pipeline_gate_keyframes_selected_total"
+    )
+    decode_latency_sum_us = delta(
+        after, before, "vidarax_pipeline_decode_latency_us_sum"
+    )
+    decode_latency_count = delta(
+        after, before, "vidarax_pipeline_decode_latency_us_count"
+    )
+    gate_latency_sum_us = delta(
+        after, before, "vidarax_pipeline_gate_latency_us_sum"
+    )
+    gate_latency_count = delta(
+        after, before, "vidarax_pipeline_gate_latency_us_count"
+    )
+    novelty_evaluated = delta(
+        after, before, "vidarax_pipeline_novelty_evaluated_total"
+    )
+    novelty_reused = delta(
+        after, before, "vidarax_pipeline_novelty_reused_total"
+    )
     result.update(
         {
             "name": row["name"],
@@ -190,6 +232,43 @@ def run_row(
             ),
             "provider_p95_latency_ms_upper_bound": histogram_quantile(
                 after, before, provider, 0.95
+            ),
+            "frames_decoded": int(frames_decoded),
+            "decode_mean_latency_ms": round(
+                decode_latency_sum_us / decode_latency_count / 1000, 2
+            )
+            if decode_latency_count > 0
+            else None,
+            "gate_frames_analyzed": int(gate_analyzed),
+            "gate_keyframes_selected": int(gate_selected),
+            "gate_selection_ratio": round(gate_selected / gate_analyzed, 4)
+            if gate_analyzed > 0
+            else None,
+            "gate_mean_latency_us": round(gate_latency_sum_us / gate_latency_count, 2)
+            if gate_latency_count > 0
+            else None,
+            "vlm_inferences": int(
+                delta(after, before, "vidarax_pipeline_vlm_inferences_total")
+            ),
+            "semantic_novelty_applicable": novelty_evaluated > 0,
+            "novelty_evaluated": int(novelty_evaluated),
+            "novelty_reused": int(novelty_reused),
+            "novelty_reuse_ratio": round(novelty_reused / novelty_evaluated, 4)
+            if novelty_evaluated > 0
+            else None,
+            "novelty_forced_refresh": int(
+                delta(
+                    after,
+                    before,
+                    "vidarax_pipeline_novelty_forced_refresh_total",
+                )
+            ),
+            "novelty_embedding_unavailable": int(
+                delta(
+                    after,
+                    before,
+                    "vidarax_pipeline_novelty_embedding_unavailable_total",
+                )
             ),
             "runs": runs,
         }

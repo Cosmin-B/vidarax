@@ -33,6 +33,7 @@ pub fn load_backend_config(
                     base_url: Some(url),
                     api_key: None,
                     model: None,
+                    upstream_model: None,
                     openai_kind: Some("vllm".to_string()),
                     priority: 1,
                 });
@@ -44,6 +45,7 @@ pub fn load_backend_config(
                     base_url: Some(url),
                     api_key: None,
                     model: None,
+                    upstream_model: None,
                     openai_kind: Some("sglang".to_string()),
                     priority: 2,
                 });
@@ -88,6 +90,10 @@ pub struct ServerConfig {
     pub ingest_file_roots: Vec<PathBuf>,
     pub inference_vllm_base_url: Option<String>,
     pub inference_sglang_base_url: Option<String>,
+    pub inference_global_limit: usize,
+    pub inference_per_principal_limit: usize,
+    pub inference_waiter_limit: usize,
+    pub inference_wait_timeout_ms: u64,
     pub security_require_api_key: bool,
     pub security_api_keys: Vec<String>,
     pub security_require_tenant_id: bool,
@@ -98,6 +104,10 @@ pub struct ServerConfig {
     pub cors_allowed_origins: Vec<String>,
     pub stream_ttl_secs: u64,
     pub active_stream_limit: usize,
+    /// Process-wide live media payload reservation budget.
+    pub media_memory_budget_bytes: u64,
+    /// Process-wide OS worker-thread reservation budget for live pipelines.
+    pub media_worker_thread_budget: usize,
     pub transport: TransportMode,
     pub decode_backend: String,
     /// STUN server URIs (comma-separated). Defaults to Google's public STUN server.
@@ -158,6 +168,20 @@ impl ServerConfig {
         let ingest_file_roots = parse_ingest_roots_env("VIDARAX_INGEST_FILE_ROOTS")?;
         let inference_vllm_base_url = env::var("VIDARAX_VLLM_BASE_URL").ok();
         let inference_sglang_base_url = env::var("VIDARAX_SGLANG_BASE_URL").ok();
+        let inference_global_limit =
+            parse_bounded_usize_env("VIDARAX_INFERENCE_GLOBAL_LIMIT", 8, 1, 1024)?;
+        let inference_per_principal_limit =
+            parse_bounded_usize_env("VIDARAX_INFERENCE_PER_PRINCIPAL_LIMIT", 4, 1, 1024)?;
+        if inference_per_principal_limit > inference_global_limit {
+            return Err(
+                "VIDARAX_INFERENCE_PER_PRINCIPAL_LIMIT must not exceed VIDARAX_INFERENCE_GLOBAL_LIMIT"
+                    .to_string(),
+            );
+        }
+        let inference_waiter_limit =
+            parse_bounded_usize_env("VIDARAX_INFERENCE_WAITER_LIMIT", 128, 1, 65_536)?;
+        let inference_wait_timeout_ms =
+            parse_bounded_u64_env("VIDARAX_INFERENCE_WAIT_TIMEOUT_MS", 5_000, 1, 120_000)?;
         let security_require_api_key = parse_bool_env("VIDARAX_REQUIRE_API_KEY", true)?;
         let security_api_keys = parse_csv_env("VIDARAX_API_KEYS");
         let security_require_tenant_id = parse_bool_env("VIDARAX_REQUIRE_TENANT_ID", false)?;
@@ -179,6 +203,14 @@ impl ServerConfig {
             return Err("VIDARAX_STREAM_TTL_SECS must be in [60, 86400]".to_string());
         }
         let active_stream_limit = parse_usize_env("VIDARAX_ACTIVE_STREAM_LIMIT", 5)?.clamp(1, 1024);
+        let media_memory_budget_bytes = parse_bounded_u64_env(
+            "VIDARAX_MEDIA_MEMORY_BUDGET_BYTES",
+            8 * 1024 * 1024 * 1024,
+            256 * 1024 * 1024,
+            1024 * 1024 * 1024 * 1024,
+        )?;
+        let media_worker_thread_budget =
+            parse_usize_env("VIDARAX_MEDIA_WORKER_THREAD_BUDGET", 64)?.clamp(1, 4096);
         let webrtc_stun_servers = {
             let v = parse_csv_env("VIDARAX_WEBRTC_STUN_SERVERS");
             if v.is_empty() {
@@ -227,6 +259,10 @@ impl ServerConfig {
             ingest_file_roots,
             inference_vllm_base_url,
             inference_sglang_base_url,
+            inference_global_limit,
+            inference_per_principal_limit,
+            inference_waiter_limit,
+            inference_wait_timeout_ms,
             security_require_api_key,
             security_api_keys,
             security_require_tenant_id,
@@ -237,6 +273,8 @@ impl ServerConfig {
             cors_allowed_origins,
             stream_ttl_secs,
             active_stream_limit,
+            media_memory_budget_bytes,
+            media_worker_thread_budget,
             transport,
             decode_backend,
             webrtc_stun_servers,
@@ -258,6 +296,27 @@ impl ServerConfig {
             novelty,
         })
     }
+}
+
+fn parse_bounded_usize_env(
+    var: &str,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> Result<usize, String> {
+    let value = parse_usize_env(var, default)?;
+    if !(min..=max).contains(&value) {
+        return Err(format!("{var} must be in [{min}, {max}]"));
+    }
+    Ok(value)
+}
+
+fn parse_bounded_u64_env(var: &str, default: u64, min: u64, max: u64) -> Result<u64, String> {
+    let value = parse_u64_env_with_default(var, default)?;
+    if !(min..=max).contains(&value) {
+        return Err(format!("{var} must be in [{min}, {max}]"));
+    }
+    Ok(value)
 }
 
 fn parse_ingest_roots_env(var: &str) -> Result<Vec<PathBuf>, String> {
@@ -692,6 +751,59 @@ mod tests {
     }
 
     #[test]
+    fn inference_admission_defaults_are_bounded() {
+        let _guard = env_guard();
+        let _require_api_key = set_env("VIDARAX_REQUIRE_API_KEY", Some("false"));
+        let _global = set_env("VIDARAX_INFERENCE_GLOBAL_LIMIT", None);
+        let _principal = set_env("VIDARAX_INFERENCE_PER_PRINCIPAL_LIMIT", None);
+        let _waiters = set_env("VIDARAX_INFERENCE_WAITER_LIMIT", None);
+        let _timeout = set_env("VIDARAX_INFERENCE_WAIT_TIMEOUT_MS", None);
+
+        let cfg = ServerConfig::from_env().expect("admission defaults");
+
+        assert_eq!(cfg.inference_global_limit, 8);
+        assert_eq!(cfg.inference_per_principal_limit, 4);
+        assert_eq!(cfg.inference_waiter_limit, 128);
+        assert_eq!(cfg.inference_wait_timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn inference_admission_rejects_zero_waiter_limit() {
+        let _guard = env_guard();
+        let _require_api_key = set_env("VIDARAX_REQUIRE_API_KEY", Some("false"));
+        let _global = set_env("VIDARAX_INFERENCE_GLOBAL_LIMIT", Some("2"));
+        let _principal = set_env("VIDARAX_INFERENCE_PER_PRINCIPAL_LIMIT", Some("2"));
+        let _waiters = set_env("VIDARAX_INFERENCE_WAITER_LIMIT", Some("0"));
+
+        let err = ServerConfig::from_env().unwrap_err();
+
+        assert!(err.contains("VIDARAX_INFERENCE_WAITER_LIMIT"));
+    }
+
+    #[test]
+    fn inference_admission_rejects_principal_limit_above_global() {
+        let _guard = env_guard();
+        let _require_api_key = set_env("VIDARAX_REQUIRE_API_KEY", Some("false"));
+        let _global = set_env("VIDARAX_INFERENCE_GLOBAL_LIMIT", Some("2"));
+        let _principal = set_env("VIDARAX_INFERENCE_PER_PRINCIPAL_LIMIT", Some("3"));
+
+        let err = ServerConfig::from_env().unwrap_err();
+
+        assert!(err.contains("VIDARAX_INFERENCE_PER_PRINCIPAL_LIMIT"));
+    }
+
+    #[test]
+    fn inference_admission_rejects_unbounded_values() {
+        let _guard = env_guard();
+        let _require_api_key = set_env("VIDARAX_REQUIRE_API_KEY", Some("false"));
+        let _global = set_env("VIDARAX_INFERENCE_GLOBAL_LIMIT", Some("1025"));
+
+        let err = ServerConfig::from_env().unwrap_err();
+
+        assert!(err.contains("VIDARAX_INFERENCE_GLOBAL_LIMIT"));
+    }
+
+    #[test]
     fn server_config_default_ingest_roots_are_empty() {
         let _guard = env_guard();
         let _ingest_roots = set_env("VIDARAX_INGEST_FILE_ROOTS", None);
@@ -843,6 +955,10 @@ mod tests {
             ingest_file_roots: vec![],
             inference_vllm_base_url: None,
             inference_sglang_base_url: None,
+            inference_global_limit: 8,
+            inference_per_principal_limit: 4,
+            inference_waiter_limit: 128,
+            inference_wait_timeout_ms: 5_000,
             security_require_api_key: false,
             security_api_keys: vec![],
             security_require_tenant_id: false,
@@ -853,6 +969,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:custom.example.com:3478".into()],
@@ -901,6 +1019,10 @@ mod tests {
             ingest_file_roots: vec![],
             inference_vllm_base_url: None,
             inference_sglang_base_url: None,
+            inference_global_limit: 8,
+            inference_per_principal_limit: 4,
+            inference_waiter_limit: 128,
+            inference_wait_timeout_ms: 5_000,
             security_require_api_key: false,
             security_api_keys: vec![],
             security_require_tenant_id: false,
@@ -911,6 +1033,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".into()],
@@ -1169,6 +1293,10 @@ mod tests {
             ingest_file_roots: vec![],
             inference_vllm_base_url: None,
             inference_sglang_base_url: None,
+            inference_global_limit: 8,
+            inference_per_principal_limit: 4,
+            inference_waiter_limit: 128,
+            inference_wait_timeout_ms: 5_000,
             security_require_api_key: false,
             security_api_keys: vec![],
             security_require_tenant_id: false,
@@ -1179,6 +1307,8 @@ mod tests {
             cors_allowed_origins: vec![],
             stream_ttl_secs: 3600,
             active_stream_limit: 5,
+            media_memory_budget_bytes: 8 * 1024 * 1024 * 1024,
+            media_worker_thread_budget: 64,
             transport: TransportMode::H1H2,
             decode_backend: "cpu-ffmpeg".to_string(),
             webrtc_stun_servers: vec!["stun:stun.l.google.com:19302".into()],

@@ -2,6 +2,7 @@
 name = "vidarax-api"
 edition.workspace = true
 version.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
@@ -39,3 +40,4 @@ opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "trace"] }
 
 [dev-dependencies]
+jsonschema = "0.43"

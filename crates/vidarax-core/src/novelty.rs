@@ -378,7 +378,6 @@ impl KeptRing {
 /// `dot(a,b) · scale_a · scale_b ≈ cosine(a,b)`. `127·127·dim` stays well
 /// inside `i32` for realistic embedding dimensions.
 ///
-/// Shared with [`crate::semantic_merge`] so both gates score cosine the same way.
 #[inline]
 pub(crate) fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
     let mut acc = 0i32;
@@ -401,7 +400,6 @@ pub(crate) fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
 /// through, and only that same prefix of `src` feeds the norm so a
 /// longer-than-configured vector cannot skew the scale.
 ///
-/// Shared with [`crate::semantic_merge`]; see [`dot_i8`] for the paired scorer.
 pub(crate) fn quantize_unit_into(src: &[f32], dst: &mut [i8]) -> f32 {
     let n = src.len().min(dst.len());
     // Zero any dst lane the source cannot fill so a shorter candidate never

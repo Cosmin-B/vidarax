@@ -54,6 +54,14 @@ export interface MetricsData {
   keyframeBlobFailuresTotal: number
   keyframeBlobBytesTotal: number
   activeSessions: number
+  activeGenerations: number
+  generationsStartedTotal: number
+  cleanShutdownsTotal: number
+  faultedShutdownsTotal: number
+  forcedShutdownsTotal: number
+  detachedWorkersTotal: number
+  workerFaultsTotal: number
+  pipelineStatus: 'faulted' | 'saturated' | 'healthy' | 'idle'
   lastUpdated: number
   /** Real histogram percentiles from the backend, indexed by stage name. */
   histograms: Record<string, HistogramPercentiles>
@@ -294,6 +302,28 @@ function buildMetrics(
     get('vidarax_pipeline_sessions_created_total')
       - get('vidarax_pipeline_sessions_removed_total'),
   )
+  const activeGenerations = get('vidarax_pipeline_generations_active')
+  const detachedWorkers = get('vidarax_pipeline_detached_workers_total')
+  const lastFaultSeconds = get('vidarax_pipeline_last_fault_timestamp_seconds')
+  const faultIsRecent = lastFaultSeconds > 0
+    && Math.floor(Date.now() / 1000) - lastFaultSeconds < 60
+  const admissionWaiting = get('vidarax_infer_admission_waiting')
+  const capacityRejectedSeconds = get('vidarax_media_capacity_last_rejection_timestamp_seconds')
+  const capacityRejectedRecently = capacityRejectedSeconds > 0
+    && Math.floor(Date.now() / 1000) - capacityRejectedSeconds < 60
+  const memoryLimit = get('vidarax_media_capacity_memory_limit_bytes')
+  const memoryReserved = get('vidarax_media_capacity_memory_reserved_bytes')
+  const threadLimit = get('vidarax_media_capacity_worker_thread_limit')
+  const threadsReserved = get('vidarax_media_capacity_worker_threads_reserved')
+  const atCapacity = (memoryLimit > 0 && memoryReserved >= memoryLimit)
+    || (threadLimit > 0 && threadsReserved >= threadLimit)
+  const pipelineStatus: MetricsData['pipelineStatus'] = detachedWorkers > 0 || faultIsRecent
+    ? 'faulted'
+    : admissionWaiting > 0 || capacityRejectedRecently || atCapacity
+      ? 'saturated'
+      : activeGenerations > 0
+        ? 'healthy'
+        : 'idle'
   const rtpFrames = get('vidarax_pipeline_rtp_frames_received_total')
   const decodedFrames = get('vidarax_pipeline_frames_decoded_total')
   const droppedFrames = get('vidarax_pipeline_frames_dropped_total')
@@ -399,6 +429,14 @@ function buildMetrics(
     keyframeBlobFailuresTotal: keyframeBlobFailures,
     keyframeBlobBytesTotal: get('vidarax_pipeline_keyframe_blob_bytes_total'),
     activeSessions: sessions,
+    activeGenerations,
+    generationsStartedTotal: get('vidarax_pipeline_generations_started_total'),
+    cleanShutdownsTotal: get('vidarax_pipeline_generation_shutdown_clean_total'),
+    faultedShutdownsTotal: get('vidarax_pipeline_generation_shutdown_faulted_total'),
+    forcedShutdownsTotal: get('vidarax_pipeline_generation_shutdown_forced_total'),
+    detachedWorkersTotal: detachedWorkers,
+    workerFaultsTotal: get('vidarax_pipeline_worker_faults_total_all'),
+    pipelineStatus,
     lastUpdated: Date.now(),
     histograms: histogramsOut,
   }
