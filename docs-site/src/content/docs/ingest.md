@@ -7,14 +7,14 @@ Ingest turns a source into decoded frames the per-frame filter can score. There 
 
 ## Supported sources
 
-- Local files: video files (for example MP4), referenced by path or `file://` URI. Paths must sit under a directory listed in `VIDARAX_INGEST_FILE_ROOTS`; the list defaults to empty and paths are canonicalized at startup.
+- Local files: video files (for example MP4), referenced by path or `file://` URI. Paths must sit under a directory listed in `VIDARAX_INGEST_FILE_ROOTS`. The list defaults to empty and paths are canonicalized at startup.
 - Uploads: `POST /v1/upload` stores a file under a dedicated upload root, owned by the uploading principal.
 - HTTP(S) URLs: downloadable media is validated and prefetched to a bounded local file before decode. Plain `http://` sources require `VIDARAX_ALLOW_INSECURE_HTTP=true`.
 - HLS: `.m3u8` manifests, handled natively by ffmpeg's `hls` demuxer. Remote manifests require `VIDARAX_ALLOW_REMOTE_HLS=true`.
-- RTSP cameras: `rtsps://` is accepted; unencrypted `rtsp://` requires `VIDARAX_ALLOW_UNENCRYPTED_RTSP=true`.
-- WebRTC: live streams over WHIP (RFC 9725), processed through per-session worker pools rather than ffmpeg's demuxer.
+- RTSP cameras: `rtsps://` is accepted. Unencrypted `rtsp://` requires `VIDARAX_ALLOW_UNENCRYPTED_RTSP=true`.
+- WebRTC: live streams over WHIP (RFC 9725), processed through per-session worker pools. This path bypasses ffmpeg's demuxer.
 
-Remote sources pass application-level SSRF checks before decode: embedded credentials, localhost names, private and link-local IP literals, blocked DNS resolutions, and unsafe redirects are rejected. On the downloadable HTTP(S) path, a response that content-sniffs as an HLS playlist is also rejected; an explicitly selected HLS source is accepted when remote HLS is enabled. Each source kind also gets the narrowest useful ffmpeg protocol whitelist. See the [security notes](/docs/operations/#security-and-hardening) for the residual that remains and the recommended egress control.
+Remote sources pass application-level SSRF checks before decode: embedded credentials, localhost names, private and link-local IP literals, blocked DNS resolutions, and unsafe redirects are rejected. On the downloadable HTTP(S) path, a response that content-sniffs as an HLS playlist is also rejected. An explicitly selected HLS source is accepted when remote HLS is enabled. Each source kind also gets the narrowest useful ffmpeg protocol whitelist. See the [security notes](/docs/operations/#security-and-hardening) for the residual that remains and the recommended egress control.
 
 ## Decode backends for files and URLs
 
@@ -23,8 +23,8 @@ File and URL decode goes through a backend registry with two phases: a signal-ex
 | Backend | Selection | Behavior |
 |---------|-----------|----------|
 | `cpu-ffmpeg` | `cpu`, `ffmpeg`, `cpu-ffmpeg` | ffmpeg subprocess, CPU decode, CPU JPEG encode. Works everywhere. |
-| `nvdec-cuda` | `nvdec`, `cuda`, `nvdec-cuda`, `gpu` | ffmpeg with `-hwaccel nvdec` decodes on the GPU; frames are downloaded and JPEG-encoded on the CPU. Requires an NVIDIA GPU. |
-| `videotoolbox` | `mlx`, `apple`, `metal`, `videotoolbox` | ffmpeg uses VideoToolbox for the selective JPEG phase on Apple Silicon; the signal pass remains on CPU. If hardware initialization fails for an input, ffmpeg may fall back to software decode. |
+| `nvdec-cuda` | `nvdec`, `cuda`, `nvdec-cuda`, `gpu` | ffmpeg with `-hwaccel nvdec` decodes on the GPU. Frames are downloaded and JPEG-encoded on the CPU. Requires an NVIDIA GPU. |
+| `videotoolbox` | `mlx`, `apple`, `metal`, `videotoolbox` | ffmpeg uses VideoToolbox for the selective JPEG phase on Apple Silicon. The signal pass remains on CPU. If hardware initialization fails for an input, ffmpeg may fall back to software decode. |
 
 Any other `VIDARAX_DECODE_BACKEND` value fails at startup with an unknown-backend error.
 
@@ -34,13 +34,13 @@ Ingest requests control sampling: a `sampling_policy` (for example `fixed` with 
 
 ## The ffmpeg decode sidecar for live streams
 
-Live WebRTC video needs a stateful decoder that survives across frames. H.264 and H.265 use a long-lived ffmpeg sidecar process on both CPU and GPU paths so a native decoder crash cannot abort the API process. VP8 uses libvpx in-process when the `vp8` build feature is enabled; that optional path does not have process isolation.
+Live WebRTC video needs a stateful decoder that survives across frames. H.264 and H.265 use a long-lived ffmpeg sidecar process on both CPU and GPU paths so a native decoder crash cannot abort the API process. VP8 uses libvpx in-process when the `vp8` build feature is enabled. That optional path does not have process isolation.
 
 The sidecar paths are built around one hazard: a subprocess connected by two pipes can deadlock. If the parent blocks writing encoded input while ffmpeg blocks writing decoded output, neither side makes progress. Vidarax narrows that interleaving window with a dedicated reader thread and a strict ordering rule.
 
 ### The reader thread and the bounded channel
 
-A reader thread owns ffmpeg's stdout. It continuously reads complete YUV frames and hands them to the decode side through a bounded channel using blocking sends. The handoff is lossless: the reader never drops or evicts a decoded frame; when the channel is full, the reader blocks.
+A reader thread owns ffmpeg's stdout. It continuously reads complete YUV frames and hands them to the decode side through a bounded channel using blocking sends. The handoff is lossless: the reader never drops or evicts a decoded frame. When the channel is full, the reader blocks.
 
 Each frame is read directly into buffers acquired from a bounded pool. Recycled buffers keep their capacity, so once the pool has been through its first cycles the steady-state read loop does not allocate. The pool is sized to cover every place a frame can legally exist at once: the full reader channel, the decoder's small pending FIFO, the frame the reader is currently assembling, and the frame the consumer currently holds.
 
@@ -48,13 +48,13 @@ Each frame is read directly into buffers acquired from a bounded pool. Recycled 
 
 The decode side owns ffmpeg's stdin, and it follows one ownership rule: drain before write. Every `decode()` call first drains all currently ready YUV frames out of the bounded channel into a decoder-local FIFO, and only then writes the next encoded input to ffmpeg.
 
-The channel holds 16 frames and the reader uses blocking sends. Draining it before each write makes room for output already produced, but the reader can still block when a new output burst fills the handoff. The current implementation does not establish a maximum decoded-output burst per input write, so this ordering reduces the deadlock window rather than proving it absent. No decoded output is dropped by the handoff itself.
+The channel holds 16 frames and the reader uses blocking sends. Draining it before each write makes room for output already produced, but the reader can still block when a new output burst fills the handoff. The implementation has no measured or enforced maximum decoded-output burst per input write. The ordering narrows the deadlock window, and the handoff itself drops no decoded output.
 
 Under real-time backlog the decoder-local FIFO sheds older decoded frames and returns the freshest ready frame, so downstream labels stay close to the current stream position. Shedding happens after the lossless handoff, as an explicit freshness policy, not as a side effect of a full pipe.
 
 ### Decoder warm-up
 
-A live H.264 decoder commonly cannot emit a frame from its first input: it needs the SPS and PPS parameter sets and an IDR frame before it can produce output, and those often arrive across several access units. (A first access unit that already carries all three can produce output immediately; the pipeline may simply buffer until the decoder has what it needs.) During warm-up the parent must keep writing input while nothing is coming back, which is exactly the phase where a naive write-then-read loop stalls. The reader thread makes writes and reads concurrent, so warm-up completes without special-casing.
+A live H.264 decoder commonly cannot emit a frame from its first input: it needs the SPS and PPS parameter sets and an IDR frame before it can produce output, and those often arrive across several access units. (A first access unit that already carries all three can produce output immediately. The pipeline may simply buffer until the decoder has what it needs.) During warm-up the parent must keep writing input while nothing is coming back, which is exactly the phase where a naive write-then-read loop stalls. The reader thread makes writes and reads concurrent, so warm-up completes without special-casing.
 
 Warm-up also applies to memory: pooled frame buffers are grown to their working size during the first frames, and because recycled buffers keep their capacity, later resizes do not reallocate.
 

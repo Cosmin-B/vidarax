@@ -57,20 +57,48 @@ npm run build
 npm test
 ```
 
-Live tests need the matching local services: a VLM backend such as vLLM or SGLang for inference, `ffmpeg` and `ffprobe` on `PATH` for decode, and SpacetimeDB when running the module or the parity tests that depend on it.
+Live tests need the matching local services. Inference tests need a VLM backend
+such as vLLM or SGLang. Decode tests need `ffmpeg` and `ffprobe` on `PATH`.
+SpacetimeDB is required only for its module and mirror parity tests.
 
 Before shipping, run the [release checks](/docs/operations/#release-checks).
 
 ## Contributing basics
 
-Changes are reviewed before merge. Keep changes scoped, and include the command output or the failure reason for the checks you ran.
+Changes are reviewed before merge. Keep changes scoped. Include the command
+output or the failure reason for the checks you ran.
 
-Comments should explain invariants, constraints, or non-obvious decisions, not narrate line-by-line behavior. Performance claims in code or docs must come with the benchmark setup and input data that produced them.
+Comments should explain invariants, constraints, or non-obvious decisions.
+Line-by-line narration adds no useful context. Performance claims in code or
+docs must include the benchmark setup and input data that produced them.
 
 The project has an explicit concurrency and memory policy for hot paths:
 
-- Favor lock-free and wait-free structures on hot paths; if a lock is unavoidable, document why lock-free was rejected and what the contention model is.
+- Favor lock-free and wait-free structures on hot paths. If a lock is
+  unavoidable, document the contention model and why the lock stayed.
 - Prefer bounded FIFO, SPSC, and MPSC queues with explicit backpressure.
-- Avoid selected-global-allocator calls per frame after warmup in the core ingest and filter loops; reuse bounded buffers in throughput pipelines. Any new hot-path allocation needs explicit justification and measurement.
+- Avoid selected-global-allocator calls per frame after warmup in the core
+  ingest and filter loops. Reuse bounded buffers in throughput pipelines. Any
+  new hot-path allocation needs explicit justification and measurement.
 
 When weighing a change, the project's ordered checklist applies: avoid the work entirely, do it once, do it fewer times, approximate safely, use a lookup table or bounded queue, constrain the problem, delete dead code, and only then reach for vectorization. Back decisions with data.
+
+## Documentation site
+
+The documentation is an Astro/Starlight static build:
+
+```bash
+cd docs-site
+npm ci
+npm run build
+```
+
+The build writes `docs-site/dist`. The canonical site mounts that directory at
+`https://vidarax.cosminbararu.com/docs/` inside one Cloudflare Workers static
+asset deployment with the product landing page. The Cloudflare Worker serves
+documentation only. Vidarax API traffic, control-plane state, and media never
+pass through it.
+
+Deploy the combined asset tree from the website workspace. Deploying a
+standalone landing-page directory would remove `/docs/` from the same Worker
+asset set.

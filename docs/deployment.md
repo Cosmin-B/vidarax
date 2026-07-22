@@ -1,8 +1,8 @@
 # Deployment
 
-This document covers server configuration and the supported local deployment
-paths. Values below come from the current Rust source, mainly
-`crates/vidarax-api/src/config.rs`.
+Vidarax reads server configuration from environment variables and model backend
+configuration from either explicit URLs or `vidarax.toml`. The defaults below
+come from `crates/vidarax-api/src/config.rs`.
 
 ## Configuration
 
@@ -39,31 +39,38 @@ paths. Values below come from the current Rust source, mainly
 | `VIDARAX_STREAM_TTL_SECS` | `3600` | Idle TTL for active runs. Must be in `[60, 86400]`. |
 | `VIDARAX_ACTIVE_STREAM_LIMIT` | `5` | Max active runs per resolved principal. Clamped to `[1, 1024]`. |
 | `VIDARAX_MEDIA_MEMORY_BUDGET_BYTES` | `8589934592` | Process-wide live media reservation budget. Must be between 256 MiB and 1 TiB. Session admission reserves a conservative payload envelope before workers start. |
-| `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` | `64` | Process-wide live media OS-thread budget. Clamped to `[1, 4096]`. H.264/H.265 keyframe generations reserve 4 threads; clip generations reserve 5, including the ffmpeg stdout reader. |
+| `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` | `64` | Process-wide live media OS-thread budget. Clamped to `[1, 4096]`. H.264/H.265 keyframe generations reserve 4 threads. Clip generations reserve 5, including the ffmpeg stdout reader. |
 | `VIDARAX_WEBRTC_STUN_SERVERS` | `stun:stun.l.google.com:19302` | Comma-separated STUN server URIs. |
 | `VIDARAX_WEBRTC_TURN_URL` | unset | Optional TURN relay URL. |
 | `VIDARAX_WEBRTC_TURN_USERNAME` | unset | Optional TURN username. |
 | `VIDARAX_WEBRTC_TURN_CREDENTIAL` | unset | Optional TURN credential. |
+| `VIDARAX_WEBRTC_CROP` | unset | Optional `x,y,width,height` analysis crop as normalized fractions. |
 | `VIDARAX_WEBRTC_MAX_OUTPUT_TOKENS_PER_SECOND` | `128` | VLM output token rate cap per WebRTC session. |
 | `VIDARAX_WEBRTC_DECODE_WORKERS` | `1` | Loaded for compatibility, clamped to 1. One ordered stream uses one stateful decoder. |
 | `VIDARAX_WEBRTC_ANALYSIS_WORKERS` | `1` | Loaded for compatibility, clamped to 1. Analysis owns stream-order state. |
 | `VIDARAX_WEBRTC_VLM_WORKERS` | `1` | Loaded for compatibility, clamped to 1. VLM processing owns temporal state. |
 | `VIDARAX_WEBRTC_FIRST_PASS_MODEL` | `Qwen/Qwen3-VL-8B-Instruct` | Local first-pass VLM for WebRTC keyframes. Must be a supported model id. |
-| `VIDARAX_WEBRTC_SECOND_PASS_MODEL` | unset | Escalation model id. Set to a distinct supported id (e.g. a `gemini` backend's model) to enable tiering; unset or equal to the first pass keeps sessions local-only. |
-| `VIDARAX_WEBRTC_SECOND_PASS_THRESHOLD` | `0.7` | Escalate when first-pass confidence is below this. Clamped to `[0.0, 1.0]`; non-finite values fall back to the default. |
+| `VIDARAX_WEBRTC_SECOND_PASS_MODEL` | unset | Escalation model id. Set to a distinct supported id (e.g. a `gemini` backend's model) to enable tiering. Unset or equal to the first pass keeps sessions local-only. |
+| `VIDARAX_WEBRTC_SECOND_PASS_THRESHOLD` | `0.7` | Escalate when first-pass confidence is below this. Clamped to `[0.0, 1.0]`. Non-finite values fall back to the default. |
 | `VIDARAX_WEBRTC_SECOND_PASS_MAX_TOKENS` | `256` | Output token cap for the escalation pass. |
+| `VIDARAX_GATE_KEEPALIVE_EVERY_FRAMES` | `30` | Select a periodic frame after this many frames since the last committed selection. |
+| `VIDARAX_GATE_SCENE_CUT_HAMMING_THRESHOLD` | `18` | Perceptual-hash Hamming distance that selects a scene cut. |
+| `VIDARAX_GATE_LUMA_SHIFT_THRESHOLD` | `0.15` | Mean-luma change that marks an exposure shift. |
+| `VIDARAX_GATE_FLICKER_THRESHOLD` | `0.55` | Flicker score that marks a suspected artifact. |
+| `VIDARAX_GATE_GHOSTING_THRESHOLD` | `0.55` | Ghosting score that marks a suspected artifact. |
+| `VIDARAX_GATE_NOISE_VARIANCE_THRESHOLD` | `0.55` | Noise-variance score that marks a suspected artifact. |
 | `VIDARAX_NOVELTY_EMBEDDING_ADDR` | unset | Binary TCP embedding sidecar (`host:port` or `tcp://host:port`). Setting it enables live novelty. |
 | `VIDARAX_NOVELTY_MAX_REUSE_MS` | `2000` | Maximum capture-time gap from the last described frame. `0` disables reuse. |
 | `VIDARAX_NOVELTY_MAX_CUMULATIVE_DRIFT` | `0.50` | Refresh after reuse scores accumulate to this value. |
 | `VIDARAX_NOVELTY_SHADOW_SAMPLE_RATE` | `0.01` | Fraction of reuse decisions sampled through the VLM. |
 | `VIDARAX_NOVELTY_EMBEDDING_TIMEOUT_MS` | `2000` | Sidecar deadline. Failure runs the VLM. |
-| `VIDARAX_NOVELTY_REUSE_THRESHOLD` | `0.01` | Reuse at or below this embedding-distance score. Must be in `[0,1)`; treat the default as a conservative starting point and calibrate it on labelled deployment traffic. |
+| `VIDARAX_NOVELTY_REUSE_THRESHOLD` | `0.01` | Reuse at or below this embedding-distance score. Must be in `[0,1)`. Treat the default as a conservative starting point and calibrate it on labelled deployment traffic. |
 | `VIDARAX_ALLOW_REMOTE_HLS` | `false` | Allow remote HLS manifests. Keep disabled unless manifests are trusted. |
 | `VIDARAX_ALLOW_INSECURE_HTTP` | `false` | Allow `http://` media sources and redirects. |
 | `VIDARAX_ALLOW_UNENCRYPTED_RTSP` | `false` | Allow `rtsp://` camera sources. |
 | `VIDARAX_ALLOW_INSECURE_TLS` | `false` | Omit ffmpeg TLS verification arguments for supported live sources. |
 | `VIDARAX_TENANT_LABEL_MAPS_PATH` | unset | Optional JSON file for event and object label mapping by tenant metadata. |
-| `VIDARAX_SPACETIMEDB_URL` | unset | Adds a best-effort feedback and blocking-description mirror after local WAL commit. Feedback works without it; raw keyframes stay local. |
+| `VIDARAX_SPACETIMEDB_URL` | unset | Adds a best-effort feedback and blocking-description mirror after local WAL commit. Feedback works without it. Raw keyframes stay local. |
 | `VIDARAX_SPACETIMEDB_MODULE` | `vidarax` | SpacetimeDB database/module name. Only used when `VIDARAX_SPACETIMEDB_URL` is set. |
 | `VIDARAX_WEBHOOK_SECRET` | unset | Enables outbound webhooks when set to at least 32 bytes. It derives a distinct signing key per webhook and is never written to the timeline WAL or returned by the API. |
 | `VIDARAX_TRIGGER_LOCAL_OUTPUT_SOCKET` | unset | Absolute Unix datagram socket for metadata-only `notify local_output` trigger actions. Required when such a program is attached. |
@@ -72,7 +79,7 @@ paths. Values below come from the current Rust source, mainly
 
 For an OpenAI-compatible backend that serves a converted model id, set both
 `model` and `upstream_model` in its TOML entry. `model` is the curated Vidarax
-id exposed to clients; `upstream_model` is the backend-specific id sent on the
+id exposed to clients. `upstream_model` is the backend-specific id sent on the
 wire. This is required for mlx-vlm quantized conversions. `GET /v1/models`
 probes configured backends and reports readiness per curated model.
 
@@ -80,7 +87,7 @@ The `VIDARAX_STAGING_*` names are live-test fixtures, not server settings.
 WHIP events always commit locally. SpacetimeDB receives descriptions only.
 
 Webhook registration is disabled until `VIDARAX_WEBHOOK_SECRET` is configured.
-The creation response returns each derived verification key once; save it with
+The creation response returns each derived verification key once. Save it with
 that receiver. Rotate the root as an application credential and recreate hooks
 before restarting Vidarax. Webhook targets must
 use HTTPS and resolve only to public addresses. Vidarax pins the validated
@@ -115,15 +122,15 @@ cargo run --release -p vidarax-api
 The server creates `VIDARAX_DATA_DIR` if needed and stores the primary timeline
 at `timeline.wal`. Uploaded files are stored under a dedicated upload directory
 below the process temp directory. Shared local media paths are not enabled by
-default; set `VIDARAX_INGEST_FILE_ROOTS` to the directories operators trust.
+default. Set `VIDARAX_INGEST_FILE_ROOTS` to the directories operators trust.
 
 Keyframe JPEGs are stored at
 `keyframes/blobs/<sha-prefix>/<sha256>.jpg` through an atomic rename before the
 `keyframe_stored` event is appended. `image_ref` is relative to
-`VIDARAX_DATA_DIR`; the event also records media type, byte count, and SHA-256.
+`VIDARAX_DATA_DIR`. The event also records media type, byte count, and SHA-256.
 Identical JPEGs share a blob. Writes are flushed but not fsynced per keyframe.
 
-## Live semantic novelty and evidence
+## Live semantic novelty calibration
 
 Start the bundled SigLIP2 sidecar on the embedding accelerator:
 
@@ -143,13 +150,13 @@ The sidecar batches requests across streams. Any sidecar error runs the VLM.
 Reuse is limited by capture time and cumulative drift.
 
 The default 1% shadow sample checks reuse decisions without updating state or
-emitting events. `vidarax_pipeline_novelty_shadow_change_ratio` is a warning
-signal, not ground truth: description overlap can treat paraphrases as changes.
-Compare sampled and completed totals to spot provider failures.
+emitting events. Compare sampled and completed totals to find provider failures.
+Treat `vidarax_pipeline_novelty_shadow_change_ratio` as a warning because
+description overlap can classify paraphrases as changes.
 
 Activation is not calibration. Label at least 30 ordered JPEGs as `novel` or
 `redundant`. Include frozen content, slow drift, hard cuts, overlays, low-light
-frames, and repeated motion; a single natural sequence is not enough to expose
+frames, and repeated motion. A single natural sequence is not enough to expose
 false reuse. Measure the deployment's VLM p50, and run:
 
 ```bash
@@ -165,8 +172,7 @@ The final values are VLM p50 ms, maximum reuse ms, drift budget, minimum recall,
 and minimum speedup. The command fails if no threshold meets both floors. Set
 `VIDARAX_NOVELTY_REUSE_THRESHOLD` to the selected value, then confirm it with
 live shadow samples. A file-based `/reason` benchmark does not exercise the
-live semantic gate and must report novelty as not applicable rather than zero
-reuse.
+live semantic filter. Its report must mark novelty as not applicable.
 
 Provider and hardware results must remain separate. Create a TSV outside the
 repository with one configured deployment per row:
@@ -195,7 +201,7 @@ provider-latency histogram bounds, request counts, decoded-frame and gate
 selection counts, decode and gate mean latency, semantic-novelty counters when
 applicable, and errors for each row. The command fails on missing provider
 calls, excess errors, or low mean F1. Keep unavailable providers and
-accelerators as explicit gaps; do not infer their results from another row.
+accelerators as explicit gaps. Never infer their results from another row.
 
 `GET /v1/health` returns readiness for the running HTTP server. It does not
 check model backend availability.
@@ -205,7 +211,7 @@ generation reserves bounded RTP queue bytes, decoded-frame pool bytes, JPEG
 payload bytes, provider scratch space, a 64 MiB ffmpeg-process allowance, and
 its fixed worker count before `run_created` is appended. The reservation is
 released with the session. Watch the `vidarax_media_capacity_*` metrics when
-sizing the two media budget settings; a rejected reservation returns `503
+sizing the two media budget settings. A rejected reservation returns `503
 media process capacity exhausted` without creating a durable run.
 
 Provider admission is a separate process-wide scheduler. Urgent live
@@ -261,7 +267,7 @@ Coordinates are normalized to the decoded image. The region becomes the exact
 analysis crop for that pipeline generation. A WHIP attach may replace the
 device policy, but a separately supplied crop must match the selected region
 and clip mode cannot be enabled with restricted-zone activity detection.
-Policy changes take effect on a new generation; an active worker never reads
+Policy changes take effect on a new generation. An active worker never reads
 mutable process-wide policy state.
 
 The video decode backend is separate from the VLM backend. `cpu-ffmpeg` works
@@ -273,7 +279,7 @@ regardless of backend: it decodes to `framemd5` text output, which has no
 hardware-decode benefit. This backend requires an ffmpeg build with VideoToolbox
 support to accelerate the selective JPEG phase. ffmpeg may fall back to software
 decode when VideoToolbox recognizes the accelerator but cannot initialize it for
-the current input; the server records that fallback in logs.
+the current input. The server records that fallback in logs.
 
 ## Deployment dependencies
 
@@ -287,8 +293,8 @@ A useful deployment needs:
 - Network egress controls for untrusted remote media. Application-level SSRF
   checks are documented in [security.md](security.md).
 - Optional HTTP/3 TLS certificate and key when `VIDARAX_TRANSPORT=h3`. The
-  binary must be built with `--features h3-experimental`; otherwise the server
-  rejects H3 transport at startup.
+  binary must be built with `--features h3-experimental`. The server rejects H3
+  transport at startup when that feature is absent.
 - Optional SpacetimeDB as an additive feedback and description mirror. The
   local WAL and JPEG blobs remain the source of record.
 

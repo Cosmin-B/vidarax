@@ -3,14 +3,14 @@ title: Operations
 description: Deployment, observability, hardening, and release checks.
 ---
 
-This page covers what a deployment consists of, what the server exposes for observability, and the release-gate practice the project uses before shipping.
+A Vidarax deployment combines the API server, a reachable model backend, local durable storage, and the media tools selected for that host. The same server exports the signals needed to operate that pipeline under load.
 
 ## What a deployment needs
 
 - A VLM backend: an OpenAI-compatible endpoint (usually vLLM or SGLang) reachable at the configured base URL, or Gemini declared through the TOML backend file. Without a backend, inference routes fail and WHIP live sessions emit an explicit no-provider result.
 - `ffmpeg` and `ffprobe` on `PATH`, or paths set through `VIDARAX_FFMPEG_PATH` and `VIDARAX_FFPROBE_PATH`.
 - Network egress controls for untrusted remote media (see below).
-- Optionally, a TLS certificate and key when running the experimental HTTP/3 transport; the binary must be built with `--features h3-experimental`, otherwise the server rejects H3 transport at startup.
+- Optionally, a TLS certificate and key when running the experimental HTTP/3 transport. The binary must be built with `--features h3-experimental`, otherwise the server rejects H3 transport at startup.
 - Optionally, the SigLIP2 embedding sidecar: setting `VIDARAX_NOVELTY_EMBEDDING_ADDR` enables live semantic novelty. It uses raw binary JPEG and embedding payloads over TCP.
 - Optionally, SpacetimeDB: setting `VIDARAX_SPACETIMEDB_URL` adds a best-effort feedback and blocking-description mirror after local WAL commit. Feedback does not require it. Nonblocking events and keyframe blobs stay local.
 
@@ -26,7 +26,7 @@ The `deploy/` directory contains:
 | `certs/` | Development TLS certificate and key used by the experimental HTTP/3 transport defaults. |
 
 {% aside type="caution" title="Local compose boundaries" %}
-`docker-compose.local.yml` includes a local-only API key, authenticated metric scraping, ffmpeg in the runtime image, and persistent WAL storage. It still expects an inference service reachable from the API container; set the backend URL or edit `vidarax.toml` for that network. VictoriaLogs is present but no log shipper is configured, so structured logs remain on container stderr until you add one.
+`docker-compose.local.yml` includes a local-only API key, authenticated metric scraping, ffmpeg in the runtime image, and persistent WAL storage. It still expects an inference service reachable from the API container. Set the backend URL or edit `vidarax.toml` for that network. VictoriaLogs is present but no log shipper is configured, so structured logs remain on container stderr until you add one.
 {% /aside %}
 
 Check readiness with:
@@ -39,25 +39,36 @@ That endpoint covers the HTTP server. Query `GET /v1/models` to check live
 provider reachability and per-model readiness. For mlx-vlm, an
 `openai_compat` backend should set `model` to the curated Vidarax id and
 `upstream_model` to the quantized `mlx-community/...` conversion id.
-The backend rejects other curated model ids instead of silently sending them
-to the mapped conversion.
+The backend rejects other curated model ids before they reach the mapped
+conversion.
 
 ## Observability
 
-Four signals come out of the server:
+`GET /v1/metrics` serves Prometheus text. Authentication follows `VIDARAX_METRICS_REQUIRE_API_KEY`, which is enabled by default. The checked-in compose scraper sends its local development key.
 
-- Metrics. `GET /v1/metrics` serves Prometheus-format metrics covering runs, events, inference, novelty decisions, embedding latency, keyframe-blob durability, generation lifecycle, process media capacity, trigger assertions, SSE subscribers, notification lag, webhook attempts, retries, successful deliveries, and dead letters. Provider admission reports active token/byte reservations, deadline misses, budget rejections, and acquisitions by latency class. Restricted-zone and trigger activity have separate assertion, binary-write-failure, and bounded-queue-drop counters. Live WHIP traffic and recorded-file `ingest`, `analyze`, and `reason` work contribute to the shared decode and frame-filter series. Delivery metric names have fixed cardinality and no target URL or event-kind labels. `vidarax_pipeline_worker_faults_total{stage,reason}` uses fixed labels, generation shutdowns distinguish clean, faulted, and forced outcomes, and `vidarax_media_capacity_*` exposes reserved bytes, worker threads, limits, and rejections. Metrics require an API key by default (`VIDARAX_METRICS_REQUIRE_API_KEY`); the checked-in compose scraper sends its local development key.
-- Browser dashboards. The Pipeline Observability page derives an explicit healthy, faulted, saturated, or idle generation state from those backend metrics. Its Gate card exposes restricted-zone assertions and evidence pressure; its Delivery card exposes SSE subscribers, replay, stalls, webhook success, retries, and dead letters. It never fabricates telemetry when the scrape is unavailable. When the UI and API use different origins, include the exact UI origin in `VIDARAX_CORS_ALLOWED_ORIGINS`.
-- Logs. Tracing output goes to stdout in human-readable form and to stderr as structured JSON. The filter is `RUST_LOG` (default `info`). Shipping the stderr stream to a log store is left to the deployment; the compose stack runs VictoriaLogs but does not wire a shipper.
-- Traces. An OpenTelemetry layer bridges tracing spans to OTLP over gRPC when `VIDARAX_TRACES_ENDPOINT` is set; when unset, spans are dropped. The compose stack points this at VictoriaTraces.
+| Area | Metric families | Operational use |
+|---|---|---|
+| Pipeline generations | `vidarax_pipeline_generations_active`, `vidarax_pipeline_generation_shutdown_total`, `vidarax_pipeline_worker_faults_total`, `vidarax_pipeline_detached_workers_total` | Distinguish active work, clean shutdowns, stage faults, forced shutdowns, and workers that missed their join deadline. Stage and reason labels come from fixed sets. |
+| Media capacity | `vidarax_media_capacity_memory_*`, `vidarax_media_capacity_worker_*`, `vidarax_media_capacity_rejections_total` | Compare reserved bytes and worker threads with process limits. A rejected generation never starts. |
+| Inference admission | `vidarax_infer_admission_active`, `vidarax_infer_admission_waiting`, active token and byte reservations, deadline misses, budget rejections, and acquisitions by latency class | Find provider saturation before it turns into unbounded queueing. |
+| Frame pipeline | Decode, frame-filter, novelty, embedding, binary-store, restricted-zone, and trigger counters and latency histograms | Follow work from decoded frames through assertions and durable media references. Live and recorded paths contribute to the same decode and filter series. |
+| Delivery | `vidarax_sse_*` and `vidarax_webhook_*` | Observe subscribers, WAL replay, queue stalls, delivery lag, attempts, retries, successes, and dead letters. Labels never include a target URL or event kind. |
+
+The Pipeline Observability page reads those metrics without synthesizing missing values. It reports `faulted` when a worker fault occurred within the last 60 seconds or a detached worker exists. It reports `saturated` when inference is waiting, capacity is full, or a recent admission rejection occurred. An active generation with neither condition is `healthy`. No active generation is `idle`. The Per-frame filter card shows selection and zone activity. The Delivery card shows SSE and webhook pressure.
+
+When the UI and API use different origins, include the exact UI origin in `VIDARAX_CORS_ALLOWED_ORIGINS`.
+
+Tracing output goes to stdout in human-readable form and to stderr as structured JSON. `RUST_LOG` selects the filter and defaults to `info`. The compose stack runs VictoriaLogs but does not include a log shipper, so a production deployment must route stderr to its log store.
+
+An OpenTelemetry layer exports tracing spans over OTLP gRPC when `VIDARAX_TRACES_ENDPOINT` is set. The layer drops spans when the setting is absent. The compose stack points it at VictoriaTraces.
 
 ## Security and hardening
 
 Read `docs/security.md` in the repository before exposing a deployment to untrusted callers or untrusted media. The main knobs:
 
-- Keep `VIDARAX_REQUIRE_API_KEY=true` and issue separate API keys per isolated principal. Ownership of runs and uploaded files derives from the authenticated principal; `x-tenant-id` is metadata, not an authorization boundary.
+- Keep `VIDARAX_REQUIRE_API_KEY=true` and issue separate API keys per isolated principal. Ownership of runs and uploaded files derives from the authenticated principal. `x-tenant-id` is metadata, not an authorization boundary.
 - Set `VIDARAX_CORS_ALLOWED_ORIGINS` to exact browser origins. `*` is rejected when API keys are required.
-- Configure `VIDARAX_RATE_LIMIT_GLOBAL_RPS` and `VIDARAX_RATE_LIMIT_TENANT_RPS` for public endpoints; despite the historical name, the per-limit bucket key is the resolved principal.
+- Configure `VIDARAX_RATE_LIMIT_GLOBAL_RPS` and `VIDARAX_RATE_LIMIT_TENANT_RPS` for public endpoints. Despite the historical name, the per-limit bucket key is the resolved principal.
 - Terminate TLS at a proxy, or use the experimental HTTP/3 TLS settings.
 - Keep the insecure media toggles (`VIDARAX_ALLOW_INSECURE_HTTP`, `VIDARAX_ALLOW_UNENCRYPTED_RTSP`, `VIDARAX_ALLOW_REMOTE_HLS`, `VIDARAX_ALLOW_INSECURE_TLS`) disabled unless the source network is trusted.
 - Remote ingest applies application-level SSRF mitigations, but redirects or nested playlist resources that resolve to private addresses over an allowed scheme cannot be fully blocked in the application. Deployments that ingest untrusted sources need network-level egress controls: an egress proxy or resolver that enforces a public-IP policy on every connection.
@@ -79,4 +90,6 @@ Run the full sequence from the repository root:
 scripts/release_gates.sh
 ```
 
-The individual scripts can also be run alone. Beyond these checks, `scripts/` contains smoke and integration harnesses: `smoke_v1.sh` and `smoke_mp4_pipeline.sh` boot the server and exercise the API path, `e2e_integration_test.sh` runs an end-to-end pass over a generated test video (`generate_test_video.sh`), and `staging_provider_e2e.sh` runs the live provider integration test when the staging backend URLs are set. Throughput depends on hardware, models, and input, so the repository publishes no universal headline number; measure the provider and hardware combination you deploy.
+The individual scripts can also run alone. The `scripts/` directory contains smoke and integration harnesses. `smoke_v1.sh` and `smoke_mp4_pipeline.sh` boot the server and exercise the API path. `e2e_integration_test.sh` runs an end-to-end pass over a generated test video. `staging_provider_e2e.sh` runs the live provider integration test when staging backend URLs are set.
+
+Throughput depends on the hardware, model, and input. Measure the provider and hardware combination you plan to deploy.

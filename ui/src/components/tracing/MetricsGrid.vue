@@ -148,7 +148,7 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
       </div>
     </div>
 
-    <!-- Card 2: Gate Engine -->
+    <!-- Card 2: Per-frame filter -->
     <div class="card-skeuo-warm p-5 flex flex-col gap-4">
       <div class="flex items-center gap-2">
         <div class="w-7 h-7 rounded-lg flex items-center justify-center"
@@ -156,7 +156,7 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
           <AnimatedIcon :icon="SlidersHorizontal" :size="14" :stroke-width="1.75"
                         animation="glow-amber" class="text-[#f59e0b]" />
         </div>
-        <h4 class="text-[#94a3b8] text-xs font-medium uppercase tracking-wider">Gate Engine</h4>
+        <h4 class="text-[#94a3b8] text-xs font-medium uppercase tracking-wider">Per-frame filter</h4>
       </div>
 
       <!-- Primary metric -->
@@ -191,7 +191,7 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
           <span class="mono text-[#38bdf8] text-xs">{{ fmtInt(metrics.restrictedZoneAssertionsTotal) }}</span>
         </div>
         <div class="flex items-center justify-between">
-          <span class="text-[#475569] text-xs">Zone evidence failures</span>
+          <span class="text-[#475569] text-xs">Zone media write failures</span>
           <span class="mono text-xs" :class="metrics.restrictedZoneEvidenceFailuresTotal ? 'text-[#ef4444]' : 'text-[#2dd4bf]'">
             {{ fmtInt(metrics.restrictedZoneEvidenceFailuresTotal) }}
           </span>
@@ -228,26 +228,26 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
 
       <!-- Percentile rows (real histogram data) -->
       <div
-        v-if="metrics.histograms['Gate']"
+        v-if="metrics.histograms['Frame filter']"
         class="space-y-1.5 border-t border-[#2a2010] pt-3"
       >
         <div class="text-[#2d3748] text-[10px] uppercase tracking-wider mb-1">Latency percentiles</div>
         <div class="flex items-center justify-between">
           <span class="text-[#475569] text-[11px]">p50</span>
           <span class="mono text-[11px] text-[#f59e0b]">
-            {{ fmtPct(metrics.histograms['Gate'], 'p50') }}
+            {{ fmtPct(metrics.histograms['Frame filter'], 'p50') }}
           </span>
         </div>
         <div class="flex items-center justify-between">
           <span class="text-[#475569] text-[11px]">p95</span>
           <span class="mono text-[11px] text-[#f59e0b]">
-            {{ fmtPct(metrics.histograms['Gate'], 'p95') }}
+            {{ fmtPct(metrics.histograms['Frame filter'], 'p95') }}
           </span>
         </div>
         <div class="flex items-center justify-between">
           <span class="text-[#475569] text-[11px]">p99</span>
           <span class="mono text-[11px] text-[#f59e0b]">
-            {{ fmtPct(metrics.histograms['Gate'], 'p99') }}
+            {{ fmtPct(metrics.histograms['Frame filter'], 'p99') }}
           </span>
         </div>
       </div>

@@ -17,7 +17,7 @@ interface StageConfig {
 const STAGE_CONFIG: Record<string, StageConfig> = {
   WebRTC:      { icon: Radio },
   Decode:      { icon: Cpu },
-  Gate:        { icon: SlidersHorizontal },
+  'Frame filter': { icon: SlidersHorizontal },
   VLM:         { icon: Zap },
   'Keyframe store': { icon: Database },
 }

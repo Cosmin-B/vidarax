@@ -28,7 +28,7 @@ export default defineConfig({
         { label: 'Quickstart', slug: 'quickstart' },
         { label: 'Architecture', slug: 'architecture' },
         { label: 'Ingest', slug: 'ingest' },
-        { label: 'The gate', slug: 'gate' },
+        { label: 'Per-frame filter', slug: 'gate' },
         { label: 'API reference', slug: 'api' },
         { label: 'Events and SDK', slug: 'events' },
         { label: 'Policy rollouts', slug: 'policy-rollouts' },
@@ -41,7 +41,7 @@ export default defineConfig({
           items: [
             { label: 'Media plane', slug: 'internals/media-plane' },
             { label: 'Decode sidecar', slug: 'internals/decode-sidecar' },
-            { label: 'Gate internals', slug: 'internals/gate-internals' },
+            { label: 'Filter internals', slug: 'internals/gate-internals' },
             {
               label: 'State and cancellation',
               slug: 'internals/state-and-cancellation',

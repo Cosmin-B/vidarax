@@ -562,13 +562,13 @@ function toggle(section: SectionKey): void {
       </div>
     </div>
 
-    <!-- ── Gate Engine ─────────────────────────────────────────────────────── -->
+    <!-- ── Per-frame filter ────────────────────────────────────────────────── -->
     <div class="card-skeuo overflow-hidden">
       <button
         class="w-full flex items-center justify-between px-5 py-4 text-left"
         @click="toggle('gate')"
       >
-        <span class="text-[#e2e8f0] font-medium text-sm">Gate Engine</span>
+        <span class="text-[#e2e8f0] font-medium text-sm">Per-frame filter</span>
         <AnimatedIcon
           :icon="ChevronDown"
           :size="14"
@@ -582,7 +582,7 @@ function toggle(section: SectionKey): void {
       <div v-if="openSection === 'gate'"
            class="px-5 pb-5 pt-4 space-y-5 border-t border-[#1e2633]">
         <p class="text-[#475569] text-xs">
-          Gate thresholds and loop detection are configured server-side and cannot be changed from the browser.
+          Frame-selection thresholds and loop detection are configured server-side and cannot be changed from the browser.
         </p>
 
         <!-- Scene cut Hamming threshold -->

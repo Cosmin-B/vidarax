@@ -22,9 +22,9 @@ end
 ```
 
 Compile, validate, and replay through either the REST API, TypeScript SDK, or
-CLI. `POST /v1/triggers/compile` returns typed JSON bytecode;
+CLI. `POST /v1/triggers/compile` returns typed JSON bytecode.
 `POST /v1/triggers/validate` checks the version, stack, jumps, state, and action
-bounds; `POST /v1/triggers/evaluate` replays timestamped samples through the
+bounds. `POST /v1/triggers/evaluate` replays timestamped samples through the
 same state machine used by live capture.
 
 Replay samples keep scalar signals at the top level:
@@ -47,7 +47,7 @@ attach until their corresponding producers are connected. Replay supports all
 signals through explicit observations.
 
 An `emit loading_bay_entry` instruction commits the event as
-`trigger.loading_bay_entry`; trigger programs cannot impersonate run lifecycle
+`trigger.loading_bay_entry`. Trigger programs cannot impersonate run lifecycle
 events. `notify webhook` opts that assertion into the run's registered webhook
 deliveries. `notify local_output` sends a metadata-only Unix datagram to the
 absolute path in `VIDARAX_TRIGGER_LOCAL_OUTPUT_SOCKET`. It carries the stable

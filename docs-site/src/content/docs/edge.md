@@ -5,14 +5,14 @@ description: Signed binary model releases with shadow, canary, activation, and r
 
 The edge package runs the normal Vidarax API beside a local model server and a
 small signed-update controller. Model bytes never travel in JSON. A manifest
-references a binary artifact by URI, length, SHA-256, and monotonically
-increasing sequence and is signed with Ed25519; the device retains only the
-update public key.
+references a binary artifact by URI, length, SHA-256, and a monotonically
+increasing sequence. Ed25519 signs that manifest, and the device retains only
+the update public key.
 
 Use `vidarax edge enroll` once, then run `vidarax edge watch` from the supplied
 systemd service. A verified shadow candidate advances to canary only after its
 reported sample count, success rate, p95 latency, and RSS meet the signed
-acceptance bounds. A passing canary becomes the current local model; a failed
+acceptance bounds. A passing canary becomes the current local model. A failed
 candidate is discarded while the previous active release remains available.
 Network loss therefore stops updates, not perception.
 
@@ -38,8 +38,14 @@ so a polling device does not repeatedly download the same bad artifact.
 
 The update controller runs as a separate `vidarax-update` system user. The API
 service cannot write updater state or replace the enrolled trust root and hook.
-Artifact size and free-space checks run before download, and retention is
-bounded to the current, previous, and candidate releases.
+Artifact size and free-space checks run before download. Retention covers the
+current, previous, and candidate releases.
+
+This release supplies the device-side update loop. Enrollment is local and
+`vidarax edge watch` polls an operator-provided HTTPS manifest URL. Vidarax does
+not yet ship a hosted fleet inventory, remote enrollment service, cohort
+editor, or rollout dashboard. Those control-plane pieces can publish signed
+manifests to the existing device protocol without changing the media pipeline.
 
 The complete command sequence, manifest schema, and systemd files are in
 [`docs/edge-deployment.md`](https://github.com/Cosmin-B/vidarax/blob/main/docs/edge-deployment.md).

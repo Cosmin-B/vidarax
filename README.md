@@ -2,42 +2,40 @@
 
 Self-hosted video intelligence for live streams and recorded files.
 
-Vidarax decodes video, applies a deterministic per-frame filter, and sends selected
-frames to a configured vision-language model. Live capture can also use an
-embedding sidecar to reuse recent descriptions while a scene remains
-semantically stable. Events commit to a local write-ahead log; selected JPEGs
-are stored as content-addressed blobs and referenced by event metadata. For
-fixed cameras, a device-level restricted-zone policy can turn sustained motion
-in normalized image geometry into a durable assertion with binary evidence,
-without putting image bytes in JSON.
-Bounded trigger programs turn perception signals into namespaced events,
-webhooks, or metadata-only local outputs. A signed edge update loop advances
-models through shadow and canary checks while preserving the last active model
-through network loss or a failed candidate.
+Vidarax turns continuous video into actionable, replayable assertions. It
+decodes each stream, runs a deterministic per-frame filter, and spends model
+calls when visual or semantic change warrants them. Bounded trigger programs
+turn perception signals into namespaced events, signed webhooks, or
+metadata-only local outputs.
+
+Events commit to a local write-ahead log. Selected JPEGs live in a
+content-addressed binary store and event metadata carries their references.
+For fixed cameras, a restricted-zone policy can turn sustained motion inside a
+normalized image region into a durable assertion. A signed edge updater moves
+model releases through shadow and canary checks while the last active model
+keeps running through network loss or a rejected candidate.
 
 ## Architecture
 
 ```
- Sources                         vidarax                          Consumers
-┌──────────┐   ┌──────────────────────────────────────────┐   ┌──────────────┐
-│ MP4/File │──>│                                          │──>│ REST API     │
-│ WebRTC   │──>│ Decode ──> Frame Filter ──> VLM Tiering   │──>│ TypeScript   │
-│ RTSP/HLS │──>│              │                │          │──>│ SDK          │
-│ Upload   │──>│              v                v          │──>│ Vue 3 UI     │
-│          │   │        Markers +         Semantic       │   │ Prometheus   │
-│          │   │        Keyframes          Events        │   │ Optional     │
-│          │   │              └───────┬────────┘          │   │ SpacetimeDB  │
-│          │   │                      v                   │   │              │
-│          │   │                WAL event log             │   │              │
-└──────────┘   └──────────────────────────────────────────┘   └──────────────┘
+ Sources          Per-session generation          Durable state       Delivery
+┌──────────┐   ┌────────────────────────────────┐   ┌─────────────────┐   ┌─────────────┐
+│ MP4/File │──>│ Decode -> Frame filter -> VLM  │──>│ WAL event log   │──>│ REST / SSE  │
+│ WebRTC   │──>│              |                 │   │                 │   │ Webhooks    │
+│ RTSP/HLS │──>│          Trigger VM            │   │ Binary media    │   │ TypeScript  │
+│ Upload   │──>│              |                 │   │ sidecar         │   │ SDK / UI    │
+│          │   │        supervised generation     │   │                 │   │ Prometheus  │
+└──────────┘   └────────────────────────────────┘   └─────────────────┘   └─────────────┘
+
+ Signed release manifest -> edge updater -> shadow -> canary -> active model
 ```
 
 Each live session is admitted as one typed pipeline generation. The process
 reserves that generation's bounded memory and worker-thread envelope before it
 creates a durable run. A supervisor then owns every stage handle: if one
 stateful worker exits unexpectedly, Vidarax stops and joins the sibling stages,
-closes the peer, and reports the fixed stage and reason through metrics instead
-of restarting one worker underneath older temporal state. Live prompt and schema
+closes the peer, and reports the fixed stage and reason through metrics. It never
+restarts one worker underneath older temporal state. Live prompt and schema
 changes use a bounded, generation-tagged command and return only after the VLM
 worker acknowledges the new configuration.
 
@@ -45,7 +43,7 @@ Provider calls from all streams pass through one deadline-aware scheduler. It
 fair-queues principals and streams across urgent live, normal live, and offline
 classes while enforcing process-wide concurrency, output-token, and encoded
 media-byte reservations. Per-stream temporal order remains owned by that
-stream's single VLM worker; provider runtimes remain responsible for
+stream's single VLM worker. Provider runtimes remain responsible for
 token-level batching.
 
 ## Performance
@@ -57,8 +55,8 @@ and the scripts in `scripts/` cover the per-frame filter, provider transport, an
 end-to-end API path. The deterministic filter is the cheap per-frame stage. The
 optional semantic novelty filter reduces repeat model calls, while bounded tiering
 can escalate an uncertain first pass to a second model. Calibration and
-provider/hardware measurements are deployment-specific; see
-[deployment and evidence](docs/deployment.md#live-semantic-novelty-and-evidence).
+provider/hardware measurements are deployment-specific. See
+[deployment and calibration](docs/deployment.md#live-semantic-novelty-calibration).
 
 ## Quick start
 
@@ -102,7 +100,7 @@ for (const event of await v.getEvents(run.runId)) {
 ```
 
 For prompt-driven semantic analysis, create a run and call `reason()` with a
-`semantic_prompt` instead:
+`semantic_prompt`:
 
 ```typescript
 const { run_id } = await v.createRun()
@@ -126,7 +124,7 @@ The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via
 | `DELETE` | `/v1/runs/:id` | Delete a run |
 | `POST` | `/v1/runs/:id/ingest` | Ingest and decode a video source |
 | `POST` | `/v1/runs/:id/analyze` | Deterministic frame analysis |
-| `POST` | `/v1/runs/:id/reason` | Realtime semantic reasoning (tiered VLM) |
+| `POST` | `/v1/runs/:id/reason` | Real-time semantic analysis (tiered VLM) |
 | `POST` | `/v1/runs/:id/stop` | Stop a run |
 | `POST` | `/v1/runs/:id/keepalive` | Refresh active run TTL |
 | `GET` | `/v1/runs/:id/events` | List the current run-event snapshot |
@@ -178,7 +176,7 @@ The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via
 | `VIDARAX_INFERENCE_TOKEN_BUDGET` | `32768` | Aggregate output-token reservation across active provider calls |
 | `VIDARAX_INFERENCE_BYTE_BUDGET` | `268435456` | Aggregate encoded-media byte reservation across active provider calls |
 | `VIDARAX_STREAM_TTL_SECS` | `3600` | Run idle TTL |
-| `VIDARAX_WEBHOOK_SECRET` | — | Server-side root for per-webhook signing keys; 32 bytes minimum |
+| `VIDARAX_WEBHOOK_SECRET` | — | Server-side root for per-webhook signing keys. 32 bytes minimum |
 | `VIDARAX_TRIGGER_LOCAL_OUTPUT_SOCKET` | — | Absolute Unix datagram socket for metadata-only local trigger actions |
 | `VIDARAX_CONFIG` | `vidarax.toml` | Backend configuration and optional device-level restricted-zone policy |
 
@@ -212,8 +210,8 @@ pip install mlx-vlm
 mlx_vlm.server --model mlx-community/Qwen3-VL-4B-Instruct-4bit --port 8080
 ```
 
-Point a backend at it with `openai_kind = "mlx"` so its telemetry (`/v1/metrics`)
-and its side of the tiering split are labelled `mlx` instead of `vllm`:
+Point a backend at it with `openai_kind = "mlx"`. Its telemetry
+(`/v1/metrics`) and tiering role are then labelled `mlx`:
 
 ```toml
 [[backends]]
@@ -246,11 +244,11 @@ catalog reports only that curated id as available on this backend.
 | Backend | Rust, Axum, Hyper (HTTP/1.1 + H2, optional H3) |
 | Frame filter | Deterministic frame analysis on a single-threaded hot path |
 | Inference | vLLM and SGLang through OpenAI-compatible backends with fallback |
-| Decode | ffmpeg CPU, NVDEC, and Apple VideoToolbox; VideoToolbox may fall back to software decode inside ffmpeg when the input or host cannot initialise hardware |
-| Persistence | Local WAL plus content-addressed JPEG blobs; optional SpacetimeDB mirror for blocking WHIP description events |
+| Decode | ffmpeg CPU, NVDEC, and Apple VideoToolbox. VideoToolbox may fall back to software decode inside ffmpeg when the input or host cannot initialise hardware |
+| Persistence | Local WAL plus content-addressed JPEG blobs. Optional SpacetimeDB mirror for blocking WHIP description events |
 | Frontend | Vue 3, dark command-center UI |
 | Streaming | WebRTC via WHIP (RFC 9725) |
-| SDK | TypeScript (`vidarax` on npm) |
+| SDK | TypeScript workspace package (`vidarax`, pending its first npm release) |
 | Observability | OpenTelemetry, Prometheus metrics |
 
 ## Workspace layout

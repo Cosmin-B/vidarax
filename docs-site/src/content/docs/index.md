@@ -5,27 +5,24 @@ description: A self-hosted video intelligence engine that turns video streams in
 
 [← Vidarax](/)
 
-Vidarax is a self-hosted video intelligence engine. Video streams go in, structured semantic events come out.
+Vidarax turns continuous video into actionable, replayable assertions while spending expensive model calls only where meaning changes.
 
-It decodes live or file-based video, runs a deterministic per-frame filter (scene cuts, flicker, ghosting, exposure shifts, and loop detection), sends a selected subset through tiered vision-language models, and emits structured events. The server, storage, and event pipeline run on infrastructure you operate. Inference goes to a VLM backend you configure: a self-hosted OpenAI-compatible endpoint (vLLM or SGLang), or optionally Google's Gemini API. No SaaS dependency is required, but the Gemini integration exists for deployments that want it.
+It decodes live or file-based video, runs a deterministic per-frame filter, sends selected frames through tiered vision-language models, and emits structured events. The server, storage, and event pipeline run on infrastructure you operate. Inference goes to a self-hosted OpenAI-compatible endpoint such as vLLM or SGLang, or to Google's Gemini API through the backend configuration.
 
-The engine is a Rust workspace. Axum serves the HTTP API. Events commit to a local write-ahead log; selected keyframe JPEGs live in a content-addressed blob sidecar. An optional SpacetimeDB client mirrors blocking WHIP description events after the local commit. A TypeScript SDK, a Vue 3 UI, and Prometheus-format metrics sit on the consumer side.
+The engine is a Rust workspace with an Axum HTTP API. Events commit to a local write-ahead log. Selected JPEGs live in a content-addressed binary store and events carry their references. An optional SpacetimeDB client mirrors blocking WHIP descriptions after the local commit. Consumers can use the TypeScript SDK, the Vue 3 interface, cursor-based SSE, signed webhooks, or the REST API.
 
 ## Who it is for
 
 Vidarax is for teams that run their own inference and need machine-readable answers about what is happening in video:
 
-- Operators who point the server at an OpenAI-compatible VLM backend (vLLM or SGLang) they already run, or at Gemini through the TOML backend config.
-- Applications that analyze recorded files: upload or reference a video, receive a timeline of markers and semantic events.
-- Applications that watch live streams: WebRTC via WHIP, RTSP cameras, and HLS sources, with prompt changes acknowledged by the active pipeline generation while the session runs.
-- Consumers who want events as data: a REST API with sequence-numbered events, cross-run query and search, and a typed SDK.
+- Operators who already run an OpenAI-compatible VLM backend or want to call Gemini through the TOML backend configuration.
+- Applications that analyze recorded files and need a durable timeline of markers and semantic events.
+- Camera applications that ingest WebRTC through WHIP, RTSP, or HLS and need acknowledged configuration changes while a session runs.
+- Event consumers that need sequence cursors, WAL replay, filtering, signed delivery, cross-run search, and a typed SDK.
 
-## What it is not
+## Current operating boundary
 
-- It is not a hosted service. You deploy the server, the model backend, and the storage.
-- It does not ship or serve models. A deployment needs a configured inference backend, either an OpenAI-compatible endpoint or Gemini; without one, inference routes fail.
-- It is not a source-video archive. The WAL holds event metadata and selected keyframes are stored as JPEG blobs, but source video is not retained by the event store.
-- It is not an authorization layer for multi-tenant products on its own. Ownership derives from the authenticated API-key principal; the `x-tenant-id` header is metadata, not a security boundary.
+Vidarax is a self-hosted engine, so the operator supplies the server, model backend, and storage. The event store retains metadata and selected JPEGs, not the source stream. Run ownership derives from the authenticated API-key principal. `x-tenant-id` is descriptive metadata and must not be used as an authorization boundary.
 
 ## Where to go next
 

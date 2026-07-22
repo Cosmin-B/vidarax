@@ -408,7 +408,7 @@ function buildMetrics(
       percentiles: decodePct ?? undefined,
     },
     {
-      name: 'Gate',
+      name: 'Frame filter',
       itemsTotal: gateSelected,
       itemLabel: 'selected',
       latencyMs: gateLatency,
@@ -437,7 +437,7 @@ function buildMetrics(
 
   const histogramsOut: Record<string, HistogramPercentiles> = {}
   if (decodePct) histogramsOut['Decode'] = decodePct
-  if (gatePct) histogramsOut['Gate'] = gatePct
+  if (gatePct) histogramsOut['Frame filter'] = gatePct
   if (vlmPct) histogramsOut['VLM'] = vlmPct
   if (noveltyPct) histogramsOut['Novelty'] = noveltyPct
   if (keyframeBlobPct) histogramsOut['Keyframe store'] = keyframeBlobPct

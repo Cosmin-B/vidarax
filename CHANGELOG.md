@@ -15,6 +15,18 @@ release yet.
 - Process-wide media admission budgets, reserved before `run_created`, via
   `VIDARAX_MEDIA_MEMORY_BUDGET_BYTES` and
   `VIDARAX_MEDIA_WORKER_THREAD_BUDGET`.
+- A deadline-aware provider scheduler with fair queues across principals,
+  streams, and urgent live, live, and offline work.
+- Cursor-based SSE with WAL replay, stable CloudEvent IDs, bounded subscriber
+  queues, and SDK reconnect support.
+- Signed event webhooks with filters, retries, dead-letter state, and delivery
+  metrics.
+- A bounded trigger language exposed through the API, CLI, and TypeScript SDK,
+  with live WHIP execution and metadata-only local actions.
+- A content-addressed binary store for selected JPEGs. Timeline events carry
+  hashes and authenticated references, never JSON/base64 image payloads.
+- A signed edge update controller with enrollment, anti-replay sequence checks,
+  shadow and canary health checks, activation hooks, and rollback.
 - `vidarax_pipeline_detached_workers_total` metric counting worker threads
   left running past the join deadline of a forced shutdown.
 - CLI verbs `vidarax runs stop` and `vidarax runs keepalive`.
@@ -40,13 +52,13 @@ release yet.
 
 - The generation join deadline is derived from the VLM pass timeouts, the
   configured backend fallback count, the admission wait, and the novelty
-  embedding timeout instead of a flat 5 seconds, so teardown during an
-  in-flight call is not misreported as a forced shutdown.
+  embedding timeout. Teardown during an in-flight call is no longer measured
+  against a flat five-second deadline.
 - A forced shutdown keeps the session's media reservation, because detached
   worker threads still hold that memory until process exit.
-- REST run stop and delete now close a live WHIP session instead of only
-  recording the intent. Stop preserves the run's history, so the session
-  reclaim skips the tombstone for that one close.
+- REST run stop and delete now close a live WHIP session after recording the
+  intent. Stop preserves the run's history, so the session reclaimer skips the
+  tombstone for that close.
 - Deleted runs reject further event appends, so a worker that outlives its
   run cannot write past the tombstone.
 - The CLI default analyze model is `Qwen/Qwen3-VL-2B-Instruct`.
@@ -58,10 +70,10 @@ release yet.
   classification the TypeScript SDK uses.
 - SDK `whipUpdatePrompt` documents its 409 (generation closed or replaced)
   and 503 (acknowledgement timeout, command discarded, retry) outcomes.
-- Feedback endpoints return 503 with code `spacetimedb_not_configured` when
-  SpacetimeDB is not configured, instead of 500.
-- `GET /v1/files/{filename}` failures use the structured JSON error envelope
-  instead of plain-text bodies.
+- Feedback commits to the local WAL before returning success. A configured
+  SpacetimeDB service receives a best-effort mirror after the local commit.
+- `GET /v1/files/{filename}` failures now use the structured JSON error
+  envelope.
 - Inference uses a provider chain with priority order and fallback for
   OpenAI-compatible vLLM and SGLang backends.
 - Active stream limits apply per resolved principal, derived from the API key

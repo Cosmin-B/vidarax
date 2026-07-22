@@ -49,7 +49,7 @@ cd ui && npm install && npm run dev
 
 ## Analyze a file
 
-The TypeScript SDK wraps the whole flow. It lives in `packages/vidarax-sdk/` in the repository; build it and link it into your project:
+The TypeScript SDK wraps the whole flow. It lives in `packages/vidarax-sdk/` in the repository. Build it and link it into your project:
 
 ```bash
 cd packages/vidarax-sdk && npm install && npm run build && npm link
@@ -69,6 +69,31 @@ for (const event of await v.getEvents(run.runId)) {
 ```
 
 The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via `output_schema`, interactions, and snapshot reads of events and markers. See [Events and SDK](/docs/events/#the-typescript-sdk) for the method list.
+
+## Use the CLI
+
+The CLI covers run lifecycle, events, markers, search, file analysis, feedback,
+trigger compilation, edge updates, models, health, and diagnostics.
+
+```bash
+cargo build --release -p vidarax-cli
+target/release/vidarax doctor \
+  --url http://127.0.0.1:8080 \
+  --api-key dev-key
+
+target/release/vidarax analyze /srv/vidarax-media/demo.mp4
+target/release/vidarax runs list
+target/release/vidarax events <run_id>
+```
+
+Global connection values resolve in this order: command-line flags,
+`VIDARAX_API_URL` / `VIDARAX_API_KEY` / `VIDARAX_TENANT_ID`, the file selected
+by `VIDARAX_CLI_CONFIG`, then the default URL `http://127.0.0.1:8080`. Without
+`VIDARAX_CLI_CONFIG`, the CLI reads `~/.config/vidarax/config` when it exists.
+That file uses `KEY=VALUE` lines for `api_url`, `api_key`, and `tenant_id`.
+
+Run `vidarax config show` to inspect the resolved source of each value. Add
+`--json` for machine-readable command output.
 
 The same flow over plain HTTP: create a run and capture its ID, then run semantic reasoning against a source the server can read.
 
@@ -100,7 +125,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/runs/$RUN_ID/reason \
 
 ## Read events
 
-Every run writes sequence-numbered events to its timeline. This endpoint returns the current snapshot; use `GET /v1/runs/:id/events/stream` or the SDK's `subscribeEvents()` for replayable incremental delivery.
+Every run writes sequence-numbered events to its timeline. This endpoint returns the current snapshot. Use `GET /v1/runs/:id/events/stream` or the SDK's `subscribeEvents()` for replayable incremental delivery.
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/runs/$RUN_ID/events -H 'x-api-key: dev-key'

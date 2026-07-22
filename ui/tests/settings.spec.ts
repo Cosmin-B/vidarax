@@ -46,7 +46,7 @@ test.describe('Settings panel', () => {
     await expect(page.getByRole('button', { name: 'Connection', exact: true })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Models', exact: true })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Stream', exact: true })).toBeVisible()
-    await expect(page.getByRole('button', { name: 'Gate Engine', exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Per-frame filter', exact: true })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Advanced', exact: true })).toBeVisible()
   })
 
@@ -164,11 +164,11 @@ test.describe('Settings panel', () => {
     expect(newState).not.toBe(initialState)
   })
 
-  // ── Gate Engine section ──────────────────────────────────────────────────
+  // ── Per-frame filter section ─────────────────────────────────────────────
 
-  test('gate engine section: sliders are present', async ({ page }) => {
+  test('per-frame filter section: sliders are present', async ({ page }) => {
     await page.goto('/settings')
-    await page.getByRole('button', { name: /gate engine/i }).click()
+    await page.getByRole('button', { name: /per-frame filter/i }).click()
 
     // Hamming threshold
     await expect(page.getByRole('slider').nth(0)).toBeVisible()
@@ -265,7 +265,7 @@ test.describe('Settings panel', () => {
     await expect(page.getByTestId('token-rate-cap')).toBeDisabled()
     await expect(page.getByTestId('clip-mode-toggle')).toBeDisabled()
 
-    await page.getByRole('button', { name: /gate engine/i }).click()
+    await page.getByRole('button', { name: /per-frame filter/i }).click()
     await expect(page.getByTestId('scene-cut-hamming-threshold')).toBeDisabled()
     await expect(page.getByTestId('luma-shift-threshold')).toBeDisabled()
     await expect(page.getByTestId('loop-detection-toggle')).toBeDisabled()

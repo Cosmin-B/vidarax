@@ -3,7 +3,7 @@
 ## Supported live decode
 
 H.264 and H.265 use a long-lived ffmpeg sidecar on both CPU and GPU paths. The
-GPU path adds `-hwaccel auto`; the CPU path leaves acceleration unset. Both
+GPU path adds `-hwaccel auto`. The CPU path leaves acceleration unset. Both
 feeds raw Annex B H.264 into ffmpeg stdin and reads raw YUV420 frames from
 stdout. That raw pipe carries no output PTS or frame index, and inputs do not
 map 1:1 to output frames. Parameter sets, pre-sync input, undecodable
@@ -22,26 +22,24 @@ association that the raw ffmpeg pipe cannot provide. That path is an explicit
 native in-process exception: a libvpx crash is not contained by a child-process
 boundary.
 
-ffmpeg does not provide a live-usable raw VP8 demuxer for `-f vp8 -i pipe:0`.
-The available PTS-carrying container path is IVF, but IVF over a never-closed
-stdin pipe buffers many frames before producing output. That startup and
-steady-state lag is not acceptable for the real-time WebRTC pipeline.
+ffmpeg has no live-usable raw VP8 demuxer for `-f vp8 -i pipe:0`. Its
+PTS-carrying IVF path buffers many frames on a never-closed stdin pipe, which
+violates the latency target for WebRTC ingest.
 
 Without the `vp8` feature, VP8-negotiated sessions fail fast with a clear
 unsupported codec error. The client should offer H.264 or H.265 to the default
 build.
 
 The feature exists for deployments that accept the native in-process fault
-boundary. It is not selected silently as a fallback.
+boundary. Selection must be explicit.
 
 ## ffmpeg YUV reader behavior
 
 The ffmpeg YUV reader handoff is bounded and uses blocking sends. Each
 `decode()` call drains all currently-ready reader output before writing more
 encoded input to ffmpeg stdin. That ordering makes room for output already
-produced and narrows the coupled-pipe deadlock window, but it does not prove the
-window absent: the implementation does not yet establish a maximum decoded
-output burst per input write. After the write, the decoder returns the freshest
+produced and narrows the coupled-pipe deadlock window. The implementation has
+no measured or enforced maximum decoded-output burst per input write. After the write, the decoder returns the freshest
 pending decoded YUV frame. If several decoded frames were already waiting, the
 older decoded YUV frames are shed, their pooled Y/U/V buffers are recycled, and
 `vidarax_pipeline_frames_dropped_total` is incremented for the shed count.
@@ -71,4 +69,4 @@ The YUV output pool is sized per decode backend:
 The direct openh264 decoder remains in the core module for targeted use, but
 live backend selection does not choose it. This is deliberate process
 isolation: a native H.264 crash kills one ffmpeg child, after which the session
-supervisor faults and closes that generation instead of aborting the API.
+supervisor faults and closes that generation. The API process remains alive.

@@ -26,7 +26,7 @@ vidarax doctor
 vidarax analyze video.mp4
 
 # Analyze a source the server can reach directly (http(s), rtsp, hls, or a
-# server-local path) instead of uploading a file.
+# server-local path) and skip the upload step.
 vidarax analyze --source-uri rtsp://camera.local/stream
 
 # Stop a run without deleting its history. This also closes the run's live

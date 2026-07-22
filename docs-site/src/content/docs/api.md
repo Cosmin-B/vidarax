@@ -7,9 +7,9 @@ The API is served over HTTP/1.1 and HTTP/2, with optional HTTP/3 behind the `h3-
 
 ## Conventions
 
-- Auth. When API keys are enabled (the default), every route except `GET /v1/health` requires an `x-api-key` header; `GET /v1/metrics` has its own toggle (`VIDARAX_METRICS_REQUIRE_API_KEY`). Missing or invalid keys return 401 `unauthorized`.
+- Auth. When API keys are enabled (the default), every route except `GET /v1/health` requires an `x-api-key` header. `GET /v1/metrics` has its own toggle (`VIDARAX_METRICS_REQUIRE_API_KEY`). Missing or invalid keys return 401 `unauthorized`.
 - Ownership. Runs and uploaded files belong to the authenticated principal. A run owned by a different principal returns 404 `not_found`, indistinguishable from a missing run. `x-tenant-id` is metadata, not an authorization boundary.
-- Rate limits. The global limiter (when configured) applies to every request, including health checks; the per-principal limiter applies to authenticated routes. Both return 429 `rate_limited`.
+- Rate limits. The global limiter (when configured) applies to every request, including health checks. The per-principal limiter applies to authenticated routes. Both return 429 `rate_limited`.
 - Request IDs. Handler-generated JSON bodies usually carry a string `request_id` (format `req-` plus 16 hex digits). The health check, run list, upload response, interaction response, file serving, and WHIP routes are exceptions documented below.
 - Errors use the JSON envelope described [below](#error-envelope), except for the routes explicitly marked as returning raw bodies.
 
@@ -23,7 +23,7 @@ The API is served over HTTP/1.1 and HTTP/2, with optional HTTP/3 behind the `h3-
 | `DELETE` | `/v1/runs/:id` | Delete a run |
 | `POST` | `/v1/runs/:id/ingest` | Ingest and decode a video source |
 | `POST` | `/v1/runs/:id/analyze` | Deterministic frame analysis |
-| `POST` | `/v1/runs/:id/reason` | Realtime semantic reasoning (tiered VLM) |
+| `POST` | `/v1/runs/:id/reason` | Real-time semantic analysis (tiered VLM) |
 | `POST` | `/v1/runs/:id/stop` | Stop a run |
 | `POST` | `/v1/runs/:id/keepalive` | Refresh active run TTL |
 | `GET` | `/v1/runs/:id/events` | Read run events |
@@ -64,10 +64,10 @@ The API is served over HTTP/1.1 and HTTP/2, with optional HTTP/3 behind the `h3-
 
 | Route | Request | Success (200) | Failures | Side effects |
 |---|---|---|---|---|
-| `POST /v1/runs` | `{ mode?, model? }`. `mode` is one of `balanced`, `detailed`, `efficiency`, `custom` (default `balanced`); `model` must be in the supported model contract. | `{ run_id, request_id, status: "pending", mode, model }` | 409 active stream limit, 422 validation, 500 | Appends `run_created` |
+| `POST /v1/runs` | `{ mode?, model? }`. `mode` is one of `balanced`, `detailed`, `efficiency`, `custom` (default `balanced`). `model` must be in the supported model contract. | `{ run_id, request_id, status: "pending", mode, model }` | 409 active stream limit, 422 validation, 500 | Appends `run_created` |
 | `GET /v1/runs` | none | JSON array of `{ run_id, status, mode, model, source_uri, created_at, updated_at }`, caller-owned runs only, deleted runs excluded, ordered by creation time | 500 | none |
 | `GET /v1/runs/:id` | none | The same run summary object | 404, 422, 500 | none |
-| `DELETE /v1/runs/:id` | none | `{ request_id, run_id }`; repeat deletes stay 200 while the deletion record is retained | 404, 422, 500 | Appends `run_deleted` once per run via the single-winner claim |
+| `DELETE /v1/runs/:id` | none | `{ request_id, run_id }`. Repeat deletes stay 200 while the deletion record is retained | 404, 422, 500 | Appends `run_deleted` once per run via the single-winner claim |
 | `POST /v1/runs/:id/stop` | none | `{ request_id, run_id, status: "cancelled" }` | 404, 409 already terminal, 422, 500 | Appends `stop_requested` |
 | `POST /v1/runs/:id/keepalive` | none | `{ request_id, run_id, state: "processing" }` | 404, 409 terminal run, 422, 500 | Appends `keepalive_refreshed` |
 | `GET /v1/runs/:id/state` | none | `{ request_id, run_id, state }` (state derived by replaying events) | 404, 422, 500 | none |
@@ -76,23 +76,23 @@ The API is served over HTTP/1.1 and HTTP/2, with optional HTTP/3 behind the `h3-
 
 | Route | Request | Success (200) | Failures | Side effects |
 |---|---|---|---|---|
-| `POST /v1/runs/:id/ingest` | `{ source_uri, sampling_policy?, fixed_fps?, sample_fps?, max_frames?, stream_id? }`. `source_uri` is required and must resolve under an ingest root or the upload root. `sampling_policy` is `source_fps_adaptive` (default) or `fixed`; `fixed_fps` must be in [0.2, 120] and is required for `fixed`; `max_frames` is in [1, 500000], default 512. Unknown fields are rejected. | `{ request_id, run_id, status: "processing", decoded_frames, source_uri, sampling_policy, source_fps, sample_fps }` | 404, 409 terminal run, 422 (including source validation), 500 | Appends `ingest_received` and `frames_decoded` |
-| `POST /v1/runs/:id/analyze` | `{ model, mode?, stream_id?, sampling_policy?, fixed_fps?, frames?, window_size?, segment_ms?, trace_id? }`. Supply 1 to 4096 frames with normalized scores, or omit `frames` to reuse signals from the run's latest `frames_decoded` event. `window_size` is in [2, 256]; `segment_ms` is in [50, 60000]. | `{ request_id, run_id, generated, metadata[], markers[] }`. Metadata sourced from decoded video includes `coordinate_schema` and `coordinates`; caller-supplied signal arrays do not claim image provenance. | 404, 409 terminal run, 422, 500 | Appends one `marker_emitted` per marker, then `analysis_generated` |
-| `POST /v1/runs/:id/reason` | `{ source_uri, model, ... }` with `chunk_size` in [5, 500], `window_size` in [2, 256], `segment_ms >= 1`, `max_frames` in [1, 500000], `semantic_inference?`, `semantic_frames_per_chunk` in [1, 4], `semantic_frame_max_edge` in [64, 4096], `crop?: { x, y, width, height }` as normalized fractions, `semantic_timeout_ms` in [100, 120000], `semantic_prompt` up to 4096 bytes, `output_schema?`, `first_pass_model?`, `second_pass_model?`, `second_pass_threshold?`, `index_name?`, `temporal_chain?`, `visual_diff?`, `video_clip_mode?`, `video_clip_duration_s` in (0, 60], `vlm_concurrency?` clamped to [1, 64] | `{ request_id, run_id, generated, markers_emitted, decoded_frames, sample_fps, lag_p95_ms, lag_p99_ms, tokens, metadata[], markers[] }`; metadata carries the `vidarax.image.v1` source/crop/analysis transform. | 404, 409 terminal run, 422, 500 | Appends `semantic_chunk_inferred` and `semantic_chunk_generated` per chunk, `marker_emitted` per marker, `semantic_fallback_activated` when semantic inference was requested with no provider, and `run_completed` |
+| `POST /v1/runs/:id/ingest` | `{ source_uri, sampling_policy?, fixed_fps?, sample_fps?, max_frames?, stream_id? }`. `source_uri` is required and must resolve under an ingest root or the upload root. `sampling_policy` is `source_fps_adaptive` (default) or `fixed`. `fixed_fps` must be in [0.2, 120] and is required for `fixed`. `max_frames` is in [1, 500000], default 512. Unknown fields are rejected. | `{ request_id, run_id, status: "processing", decoded_frames, source_uri, sampling_policy, source_fps, sample_fps }` | 404, 409 terminal run, 422 (including source validation), 500 | Appends `ingest_received` and `frames_decoded` |
+| `POST /v1/runs/:id/analyze` | `{ model, mode?, stream_id?, sampling_policy?, fixed_fps?, frames?, window_size?, segment_ms?, trace_id? }`. Supply 1 to 4096 frames with normalized scores, or omit `frames` to reuse signals from the run's latest `frames_decoded` event. `window_size` is in [2, 256]. `segment_ms` is in [50, 60000]. | `{ request_id, run_id, generated, metadata[], markers[] }`. Metadata sourced from decoded video includes `coordinate_schema` and `coordinates`. Caller-supplied signal arrays do not claim image provenance. | 404, 409 terminal run, 422, 500 | Appends one `marker_emitted` per marker, then `analysis_generated` |
+| `POST /v1/runs/:id/reason` | `{ source_uri, model, ... }` with `chunk_size` in [5, 500], `window_size` in [2, 256], `segment_ms >= 1`, `max_frames` in [1, 500000], `semantic_inference?`, `semantic_frames_per_chunk` in [1, 4], `semantic_frame_max_edge` in [64, 4096], `crop?: { x, y, width, height }` as normalized fractions, `semantic_timeout_ms` in [100, 120000], `semantic_prompt` up to 4096 bytes, `output_schema?`, `first_pass_model?`, `second_pass_model?`, `second_pass_threshold?`, `index_name?`, `temporal_chain?`, `visual_diff?`, `video_clip_mode?`, `video_clip_duration_s` in (0, 60], `vlm_concurrency?` clamped to [1, 64] | `{ request_id, run_id, generated, markers_emitted, decoded_frames, sample_fps, lag_p95_ms, lag_p99_ms, tokens, metadata[], markers[] }`. Metadata carries the `vidarax.image.v1` source/crop/analysis transform. | 404, 409 terminal run, 422, 500 | Appends `semantic_chunk_inferred` and `semantic_chunk_generated` per chunk, `marker_emitted` per marker, `semantic_fallback_activated` when semantic inference was requested with no provider, and `run_completed` |
 
 ### Reading events and markers
 
 | Route | Request | Success (200) | Failures |
 |---|---|---|---|
 | `GET /v1/runs/:id/events` | `?index=<name>` optional payload filter | `{ request_id, run_id, events[] }` in sequence order | 404, 422, 500 |
-| `GET /v1/runs/:id/events/stream` | `?after=<seq>` and exact `?kind=<kind>` optional; `Last-Event-ID` takes precedence over `after` | `text/event-stream`; each event has `id: <seq>`, `event: <kind>`, and a CloudEvents-compatible JSON body | 404, 422, 500 |
+| `GET /v1/runs/:id/events/stream` | `?after=<seq>` and exact `?kind=<kind>` optional. `Last-Event-ID` takes precedence over `after` | `text/event-stream`. Each event has `id: <seq>`, `event: <kind>`, and a CloudEvents-compatible JSON body | 404, 422, 500 |
 | `GET /v1/runs/:id/markers` | `?status`, `?event_type`, `?from_frame`, `?to_frame` | `{ request_id, run_id, markers[] }` sorted by frame range | 404, 422, 500 |
 | `GET /v1/runs/:id/interactions` | `?index=<name>` optional | `{ run_id, count, interactions[] }` derived from semantic chunk events | 404, 422, 500 |
-| `POST /v1/query` | `{ run_id, kind?, from_seq? }`; `run_id` is required and ownership-checked | `{ request_id, query, matches[] }` | 404, 422, 500 |
-| `POST /v1/search` | `{ query, run_id?, limit? }`; query trimmed, 1 to 1024 bytes; limit in [1, 500], default 50 | `{ request_id, scanned, total_hits, hits[] }`; case-insensitive substring over payload `description` (fallback `summary`); scoped to owned runs when `run_id` is absent | 404, 422, 500 |
+| `POST /v1/query` | `{ run_id, kind?, from_seq? }`. `run_id` is required and ownership-checked | `{ request_id, query, matches[] }` | 404, 422, 500 |
+| `POST /v1/search` | `{ query, run_id?, limit? }`. Query trimmed, 1 to 1024 bytes. Limit in [1, 500], default 50 | `{ request_id, scanned, total_hits, hits[] }`. Case-insensitive substring over payload `description` (fallback `summary`). Scoped to owned runs when `run_id` is absent | 404, 422, 500 |
 
 SSE cursors are durable timeline sequence numbers. Reconnect with the last
-received `id` in `Last-Event-ID`; replay is strictly after that value. The
+received `id` in `Last-Event-ID`. Replay is strictly after that value. The
 server subscribes to its bounded notification ring before reading the WAL, and
 recovers notification lag from the WAL, so a slow consumer cannot block ingest
 or create an unbounded server queue. Delivery is at least once around reconnect:
@@ -102,12 +102,12 @@ deduplicate with the CloudEvent `id`, `<run_id>:<seq>`.
 
 | Route | Request | Success | Failures |
 |---|---|---|---|
-| `POST /v1/runs/:id/webhooks` | `{ url, event_kinds?: string[] }`; HTTPS public target, up to 32 exact kinds; an empty list means every non-bookkeeping event | 201 with `{ request_id, run_id, webhook_id, url, event_kinds, registered_seq, signing_secret }`; save the one-time secret | 404, 422, 500, 503 webhooks disabled or capacity unavailable |
+| `POST /v1/runs/:id/webhooks` | `{ url, event_kinds?: string[] }`. HTTPS public target, up to 32 exact kinds. An empty list means every non-bookkeeping event | 201 with `{ request_id, run_id, webhook_id, url, event_kinds, registered_seq, signing_secret }`. Save the one-time secret | 404, 422, 500, 503 webhooks disabled or capacity unavailable |
 | `GET /v1/runs/:id/webhooks` | none | `{ request_id, run_id, webhooks[] }`, including cursor, successful-delivery, dead-letter, and last-error state | 404, 500 |
 | `DELETE /v1/runs/:id/webhooks/:webhook_id` | none | `{ request_id, run_id, webhook_id, deleted: true }` | 404, 500 |
 
 Registrations and deletions are timeline events and survive restart. A bounded
-per-hook wake queue only signals work; each isolated worker reads its next batch
+per-hook wake queue only signals work. Each isolated worker reads its next batch
 from the WAL, retries failed requests three times, and records terminal state in
 `${VIDARAX_DATA_DIR}/webhook-delivery.wal`. A receiver may see a duplicate when
 the process stops after the receiver accepted a request but before the terminal
@@ -118,7 +118,7 @@ Requests use `Content-Type: application/cloudevents+json`,
 `x-vidarax-event-id: <run_id>:<seq>`, and
 `x-vidarax-signature: v1=<HMAC-SHA256(body)>`. The HMAC key is the hex-decoded
 `signing_secret` returned once when the hook is created. Binary media remains in the
-content-addressed sidecar; event bodies carry only its existing reference and
+content-addressed sidecar. Event bodies carry only its existing reference and
 hash. `VIDARAX_WEBHOOK_SECRET` must contain at least 32 bytes and acts only as a
 server-side derivation root. Each hook receives a distinct key, so one tenant's
 receiver cannot forge another hook's deliveries.
@@ -127,8 +127,8 @@ receiver cannot forge another hook's deliveries.
 
 | Route | Request | Success (200) | Failures | Side effects |
 |---|---|---|---|---|
-| `POST /v1/infer` | `{ model, prompt, run_id?, max_tokens?, temperature?, timeout_ms?, allow_fallback?, primary_provider?, output_schema? }`. Prompt 1 to 32768 bytes; `max_tokens` in [1, 4096]; `temperature` in [0, 2]; `timeout_ms` in [1, 120000]; `primary_provider` one of `vllm`, `sglang`, `gemini`, `mlx`. | `{ request_id, run_id, provider, model, fallback_used, output_text, finish_reason, inference_latency_ms, tokens }` | 422 invalid or over-budget request, 503 saturated/deadline missed, 500 no provider configured or sanitized provider failure | Appends `inference_completed` when `run_id` is set |
-| `POST /v1/infer/batch` | `{ requests[], max_parallel? }`; requests length in [1, 256]; `max_parallel` in [1, 64], default 8 | `{ request_id, processed, succeeded, failed, results[] }` with per-item `{ index, ok, result?, error? }` | 422, 500 | Same per-item event behavior as `/v1/infer` |
+| `POST /v1/infer` | `{ model, prompt, run_id?, max_tokens?, temperature?, timeout_ms?, allow_fallback?, primary_provider?, output_schema? }`. Prompt 1 to 32768 bytes. `max_tokens` in [1, 4096]. `temperature` in [0, 2]. `timeout_ms` in [1, 120000]. `primary_provider` one of `vllm`, `sglang`, `gemini`, `mlx`. | `{ request_id, run_id, provider, model, fallback_used, output_text, finish_reason, inference_latency_ms, tokens }` | 422 invalid or over-budget request, 503 saturated/deadline missed, 500 no provider configured or sanitized provider failure | Appends `inference_completed` when `run_id` is set |
+| `POST /v1/infer/batch` | `{ requests[], max_parallel? }`. Requests length in [1, 256]. `max_parallel` in [1, 64], default 8 | `{ request_id, processed, succeeded, failed, results[] }` with per-item `{ index, ok, result?, error? }` | 422, 500 | Same per-item event behavior as `/v1/infer` |
 | `GET /v1/models` | none | `{ request_id, models[] }` with `{ id, tier, availability, providers_available, fallback_candidates }` | 500 | none |
 
 ### Trigger programs
@@ -145,16 +145,19 @@ source format and current live-signal support.
 
 ### Feedback
 
-Feedback commits to the run's local WAL before the request succeeds. When SpacetimeDB is configured, the same entry is mirrored after the local commit; mirror failure is logged and does not make the durable local request fail.
+Feedback commits to the run's local WAL before the request succeeds. When SpacetimeDB is configured, the same entry is mirrored after the local commit. Mirror failure is logged and does not make the durable local request fail.
 
 | Route | Request | Success (200) | Failures |
 |---|---|---|---|
-| `POST /v1/runs/:id/feedback` | `{ rating, category, feedback? }`; rating in [0, 10], category non-empty | `{ request_id, run_id, feedback_id, status: "submitted", storage: "local_wal", mirrored_to_spacetimedb }` | 404, 422, 500 |
+| `POST /v1/runs/:id/feedback` | `{ rating, category, feedback? }`. Rating in [0, 10], category non-empty | `{ request_id, run_id, feedback_id, status: "submitted", storage: "local_wal", mirrored_to_spacetimedb }` | 404, 422, 500 |
 | `GET /v1/feedback` | none | `{ request_id, feedback[], storage: "local_wal" }`, filtered to caller-owned runs | 500 |
 
 ### Policy revisions and replay
 
-Policy control is event-sourced on each run's WAL. A revision is the sequence number of its immutable `policy_revision_created` event. `parent_revision` must name the latest revision, which makes stale editors fail instead of silently overwriting a newer policy.
+Policy control is event-sourced on each run's WAL. A revision is the sequence
+number of its immutable `policy_revision_created` event. `parent_revision` must
+name the latest revision. A stale editor receives 409 without overwriting the
+newer policy.
 
 ```json
 {
@@ -177,40 +180,85 @@ Policy control is event-sourced on each run's WAL. A revision is the sequence nu
 
 | Route | Request | Success (200) | Failures |
 |---|---|---|---|
-| `POST /v1/runs/:id/policies` | `{ parent_revision?, prompt?, output_schema?, parameters? }`; one of prompt or restricted-zone parameters is required | `{ request_id, run_id, policy }` with status `draft` | 404, 409 stale parent, 422, 500 |
+| `POST /v1/runs/:id/policies` | `{ parent_revision?, prompt?, output_schema?, parameters? }`. One of prompt or restricted-zone parameters is required | `{ request_id, run_id, policy }` with status `draft` | 404, 409 stale parent, 422, 500 |
 | `GET /v1/runs/:id/policies` | none | `{ request_id, run_id, policies[] }` | 404, 422, 500 |
 | `GET /v1/runs/:id/policies/:revision` | none | `{ request_id, run_id, policy }` | 404, 422, 500 |
-| `POST /v1/runs/:id/policies/:revision/activate` | `{ stage: "shadow" | "canary" | "active", expected_generation? }`; progression is draft → shadow → canary → active | `{ request_id, run_id, policy, application }` | 404, 409 invalid transition/stale generation, 422, 500, 503 acknowledgement timeout |
-| `POST /v1/runs/:id/policies/:revision/rollback` | `{ expected_generation? }`; target must have previously been active | `{ request_id, run_id, policy, application }` | 404, 409, 422, 500, 503 acknowledgement timeout |
+| `POST /v1/runs/:id/policies/:revision/activate` | `{ stage: "shadow" | "canary" | "active", expected_generation? }`. Progression is draft → shadow → canary → active | `{ request_id, run_id, policy, application }` | 404, 409 invalid transition/stale generation, 422, 500, 503 acknowledgement timeout |
+| `POST /v1/runs/:id/policies/:revision/rollback` | `{ expected_generation? }`. Target must have previously been active | `{ request_id, run_id, policy, application }` | 404, 409, 422, 500, 503 acknowledgement timeout |
 | `POST /v1/runs/:id/policies/:revision/replay` | `{ from_seq?, to_seq? }` | `{ request_id, run_id, evaluation_id, evaluation }` | 404, 422, 500 |
 
 On a live WHIP run, activation and rollback require `expected_generation`. Prompt/schema changes return success only after the existing generation-tagged worker command acknowledges them. Restricted-zone detector parameters are static-at-generation in this release: responses list `parameters.restricted_zone` in `deferred_fields` and set `effective_on_current_generation` to false until a new generation starts.
 
-Replay compares only persisted `restricted_zone_activity_entered` candidates with the revision's `enter_motion_score`. It reports accepted, rejected, and scoreless counts, plus the exact limitation that it cannot discover an event the original pipeline never emitted. It is evidence replay, not model retraining or missed-event measurement.
+Replay compares persisted `restricted_zone_activity_entered` candidates with
+the revision's `enter_motion_score`. It reports accepted, rejected, and
+scoreless counts. The input set contains only candidates emitted by the
+original pipeline, so this route cannot measure missed events or retrain a
+model.
 
 ### Files
 
 | Route | Request | Success | Failures | Notes |
 |---|---|---|---|---|
-| `POST /v1/upload` | multipart form with a `file` field; body capped at 200 MiB by the route's body limit | 200 `{ file_path }`, the server-side path to use as `source_uri` | 422 unsupported type or invalid media container, 500 | Filenames are sanitized and prefixed per principal; the content must validate as a media container, not a playlist |
-| `GET /v1/files/:filename` | bare filename only | 200 file bytes with a video content type and `Accept-Ranges: bytes` | 400 `bad_request`, 404 `not_found` | Errors use the structured JSON envelope. Uploads are only visible to the uploading principal; operator-configured roots are shared |
+| `POST /v1/upload` | multipart form with a `file` field. Body capped at 200 MiB by the route's body limit | 200 `{ file_path }`, the server-side path to use as `source_uri` | 422 unsupported type or invalid media container, 500 | Filenames are sanitized and prefixed per principal. The content must validate as a media container, not a playlist |
+| `GET /v1/files/:filename` | bare filename only | 200 file bytes with a video content type and `Accept-Ranges: bytes` | 400 `bad_request`, 404 `not_found` | Errors use the structured JSON envelope. Uploads are only visible to the uploading principal. Operator-configured roots are shared |
 
 ### Keyframe blobs
 
-`GET /v1/runs/:id/keyframes/:sha256` returns `image/jpeg` bytes for a hash referenced by a `keyframe_stored` event, the `evidence.image_sha256` field of a `restricted_zone_activity_entered` event, or a generation-tagged `trigger.*` event on that run. The caller must own the run; knowing a blob hash from another run is not enough to retrieve it. Responses use a private immutable cache policy and an ETag equal to the content hash. Invalid hashes return the JSON validation envelope, and missing references or files return the JSON not-found envelope. Image bytes are never placed in JSON or base64-encoded by this API.
+`GET /v1/runs/:id/keyframes/:sha256` returns `image/jpeg` bytes for a hash
+referenced by a `keyframe_stored` event. It also accepts hashes from the literal
+`evidence.image_sha256` field on `restricted_zone_activity_entered` and
+generation-tagged `trigger.*` events.
+
+The caller must own the run. A blob hash copied from another run grants no
+access. Responses use a private immutable cache policy and an ETag equal to the
+content hash. Invalid hashes return the JSON validation envelope. Missing
+references or files return the JSON not-found envelope. This API never places
+image bytes in JSON or base64.
 
 ### WebRTC (WHIP)
 
-Success and failure statuses for the four WHIP routes are covered in [WebRTC ingest](/docs/internals/webrtc-ingest/#endpoint-contract). Two things differ from the rest of the API: `POST /v1/stream/whip` answers with raw SDP (plus `Location` and `x-vidarax-run-id` headers) rather than JSON, and WHIP failures return bare status codes or plain-text bodies rather than the JSON envelope. `DELETE` terminates the WHIP resource and completes the run; it preserves the timeline and binary evidence. Deleting the Vidarax run is a separate API operation.
+Success and failure statuses for the four WHIP routes are covered in [WebRTC
+ingest](/docs/internals/webrtc-ingest/#endpoint-contract). `POST
+/v1/stream/whip` answers with raw SDP plus `Location` and `x-vidarax-run-id`
+headers. WHIP failures return bare status codes or plain-text bodies.
 
-The offer accepts an optional `x-attach-config` header (base64url-encoded JSON, no padding, size-capped) whose `prompt`, `max_output_tokens_per_second`, `clip_mode`, normalized `crop`, optional `restricted_zone`, and optional compiled `trigger_program` fields apply before workers start. Trigger programs and restricted-zone policy are mutually exclusive. The current live trigger path accepts motion, novelty, and confidence signals and one keyframe capture; unsupported detector/geometry or clip actions fail validation instead of being ignored. A deployment can instead define a default `[restricted_zone]` in `VIDARAX_CONFIG`, which is useful for fixed cameras and devices whose WHIP client cannot add custom headers. A stream-specific attach policy replaces that default. A restricted-zone policy contains `policy_id`, positive `policy_version`, `device_id`, normalized rectangular `region`, enter/exit motion thresholds, and consecutive-frame counts. Its region is the exact analysis crop; a separately supplied crop must match it, and restricted-zone activity cannot be combined with clip mode. Unknown attach fields are rejected. `PATCH /v1/stream/whip/:sess/prompt` accepts `{ prompt, output_schema? }`, where `output_schema` is a JSON Schema object, and returns the applied values only after the active generation's VLM worker acknowledges them. An unknown or foreign session returns 404 or 403, a closed generation returns 409, and a two-second acknowledgement timeout returns 503. A timed-out command is discarded rather than applied later. Token caps, crop, clip mode, restricted-zone policy, and trigger programs cannot be changed after start; changing one starts a new pipeline generation.
+`DELETE` terminates the WHIP resource and completes the run while preserving
+its timeline and retained media. Deleting the Vidarax run is a separate API
+operation.
+
+The offer accepts an optional `x-attach-config` header. It is size-capped,
+base64url-encoded JSON without padding. Its `prompt`,
+`max_output_tokens_per_second`, `clip_mode`, normalized `crop`, optional
+`restricted_zone`, and optional compiled `trigger_program` fields apply before
+workers start.
+
+Trigger programs and restricted-zone policy are mutually exclusive. The live
+trigger path accepts motion, novelty, and confidence signals plus one keyframe
+capture. Detector, geometry, or clip actions fail validation until their live
+producers are connected.
+
+A deployment may define a default `[restricted_zone]` in `VIDARAX_CONFIG` for
+fixed cameras and WHIP clients that cannot add custom headers. A stream attach
+policy replaces that default. The policy carries a `policy_id`, positive
+`policy_version`, `device_id`, normalized rectangular `region`, motion
+thresholds, and consecutive-frame counts. Its region becomes the analysis crop.
+A separately supplied crop must match it, and clip mode cannot run with
+restricted-zone activity. Unknown attach fields are rejected.
+
+`PATCH /v1/stream/whip/:sess/prompt` accepts `{ prompt, output_schema? }`, where
+`output_schema` is a JSON Schema object. The route returns the applied values
+after the active generation's VLM worker acknowledges them. An unknown session
+returns 404, another principal's session returns 403, and a closed generation
+returns 409. A two-second acknowledgement timeout returns 503. The worker drops
+a command whose requester has timed out. Token caps, crop, clip mode,
+restricted-zone policy, and trigger programs are fixed for the generation.
 
 ### Health and metrics
 
 | Route | Success (200) | Notes |
 |---|---|---|
 | `GET /v1/health` | `{ "status": "ok" }` | No API key required. Reports the HTTP server only, not model backend availability |
-| `GET /v1/metrics` | Prometheus text format | Requires an API key by default; returns 503 `metrics_unavailable` if metrics auth is enabled with no keys configured |
+| `GET /v1/metrics` | Prometheus text format | Requires an API key by default. Returns 503 `metrics_unavailable` if metrics auth is enabled with no keys configured |
 
 ## Error envelope
 
@@ -233,15 +281,14 @@ Handler errors share one JSON shape. The `request_id` is a string and lives insi
 |--------|------|------|
 | 400 | `validation_error` | CORS preflight without an `Origin` header. |
 | 400 | `bad_request` | File route filename with separators, traversal sequences, or an unsupported extension. |
-| 401 | `unauthorized` | Missing or invalid `x-api-key`; missing `x-tenant-id` when required. |
+| 401 | `unauthorized` | Missing or invalid `x-api-key`. Missing `x-tenant-id` when required. |
 | 403 | `cors_forbidden` | Preflight from an origin outside the allowlist. |
 | 404 | `not_found` | Unknown, deleted, or other-principal `run_id`. |
-| 409 | `conflict` | Action on a terminal run; active stream limit exceeded. |
-| 422 | `validation_error` | Field-level validation failure; `details` lists the fields. |
+| 409 | `conflict` | Action on a terminal run. Active stream limit exceeded. |
+| 422 | `validation_error` | Field-level validation failure. `details` lists the fields. |
 | 429 | `rate_limited` | Global or per-principal rate limit exceeded. |
-| 500 | `internal_error` | Internal failure; the message is sanitized and details are logged server-side. |
+| 500 | `internal_error` | Internal failure. The message is sanitized and details are logged server-side. |
 | 503 | `metrics_unavailable` | Metrics auth enabled with no API keys configured. |
-| 503 | `spacetimedb_not_configured` | Feedback routes without `VIDARAX_SPACETIMEDB_URL` set. |
 
 Not everything uses the envelope. WHIP routes return raw SDP on success and bare status codes or plain text on failure, and requests rejected before a handler runs (malformed JSON bodies, unknown routes, oversized uploads) get the framework's default plain responses.
 
@@ -260,11 +307,19 @@ Not everything uses the envelope. WHIP routes return raw SDP on success and bare
 | `VIDARAX_ACTIVE_STREAM_LIMIT` | `5` | Max active runs per resolved principal |
 | `VIDARAX_MEDIA_MEMORY_BUDGET_BYTES` | `8589934592` | Process-wide byte reservation for admitted live media generations |
 | `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` | `64` | Process-wide OS-thread reservation for admitted live media generations |
+| `VIDARAX_INFERENCE_GLOBAL_LIMIT` | `8` | Process-wide provider call limit |
+| `VIDARAX_INFERENCE_PER_PRINCIPAL_LIMIT` | `4` | Provider call limit for one authenticated principal |
+| `VIDARAX_INFERENCE_WAITER_LIMIT` | `128` | Maximum queued provider calls |
+| `VIDARAX_INFERENCE_WAIT_TIMEOUT_MS` | `5000` | Maximum admission wait before provider dispatch |
+| `VIDARAX_INFERENCE_TOKEN_BUDGET` | `32768` | Aggregate output-token reservation across active calls |
+| `VIDARAX_INFERENCE_BYTE_BUDGET` | `268435456` | Aggregate encoded-media reservation across active calls |
 | `VIDARAX_STREAM_TTL_SECS` | `3600` | Run idle TTL |
-| `VIDARAX_WEBHOOK_SECRET` | unset | Server-side derivation root for distinct HMAC-SHA256 webhook keys; at least 32 bytes, never persisted in the timeline |
-| `VIDARAX_NOVELTY_EMBEDDING_ADDR` | unset | Binary TCP embedding sidecar; setting it enables live semantic novelty |
-| `VIDARAX_NOVELTY_REUSE_THRESHOLD` | `0.01` | Conservative embedding-distance ceiling for description reuse; calibrate it on labelled deployment traffic |
+| `VIDARAX_WEBHOOK_SECRET` | unset | Server-side derivation root for distinct HMAC-SHA256 webhook keys. At least 32 bytes, never persisted in the timeline |
+| `VIDARAX_TRIGGER_LOCAL_OUTPUT_SOCKET` | unset | Absolute Unix datagram socket for metadata-only trigger actions |
+| `VIDARAX_WEBRTC_CROP` | unset | Default live crop as `x,y,width,height` fractions in `[0,1]` |
+| `VIDARAX_NOVELTY_EMBEDDING_ADDR` | unset | Binary TCP embedding sidecar. Setting it enables live semantic novelty |
+| `VIDARAX_NOVELTY_REUSE_THRESHOLD` | `0.01` | Conservative embedding-distance ceiling for description reuse. Calibrate it on labelled deployment traffic |
 
-When neither backend URL is set, the server reads a TOML config file (`VIDARAX_CONFIG`, default `vidarax.toml`) that declares backends in priority order; the parser supports `openai_compat` and `gemini` backend types, and string fields interpolate `${ENV_VAR}` references. When either explicit URL is set, the TOML file is not read.
+When neither backend URL is set, the server reads a TOML config file (`VIDARAX_CONFIG`, default `vidarax.toml`) that declares backends in priority order. The parser supports `openai_compat` and `gemini` backend types, and string fields interpolate `${ENV_VAR}` references. When either explicit URL is set, the TOML file is not read.
 
 The full configuration reference, including decode backend selection, CORS, rate limits, WebRTC and TURN settings, and SpacetimeDB, lives in `docs/deployment.md` in the repository. The hardening-relevant variables are summarized in [Operations](/docs/operations/#security-and-hardening).

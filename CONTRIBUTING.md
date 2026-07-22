@@ -43,7 +43,7 @@ npm test
 Live tests need the matching local services: a VLM backend such as vLLM or
 SGLang for inference, ffmpeg and ffprobe on `PATH` for decode, and SpacetimeDB
 when running the module or parity tests that depend on it. On Apple Silicon,
-mlx-vlm can serve the local inference model while VideoToolbox handles decode;
+mlx-vlm can serve the local inference model while VideoToolbox handles decode.
 these are separate backends and either can fall back independently.
 
 ## Review and style

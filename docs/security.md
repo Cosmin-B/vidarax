@@ -13,17 +13,13 @@ label-map selection derive from the authenticated principal.
 
 Tenant isolation requires `VIDARAX_REQUIRE_API_KEY=true` and distinct API keys
 issued per tenant. `VIDARAX_REQUIRE_TENANT_ID=true` only requires callers to
-include tenant metadata; it does not create isolation without authenticated API
+include tenant metadata. It does not create isolation without authenticated API
 keys, so the server rejects that configuration.
 
 Events and files created before ownership existed do not carry a
 `principal_key`. Those records are treated as the shared `public` namespace:
 visible in open mode, and not attributed to any authenticated API-key principal
 when API-key authentication is enabled.
-
-The earlier `api-key:<fnv1a64>` and `tenant:<id>` principal formats were
-introduced only within this same unreleased change set. They were never
-shipped, so there is no production data in those formats to migrate or trust.
 
 ## Outbound Webhooks
 
@@ -44,7 +40,7 @@ still restrict process egress to expected receiver networks as defense in
 depth.
 
 Webhook bodies are CloudEvents-compatible event metadata. Binary keyframes and
-clips are never embedded or base64-encoded; the existing content-addressed
+clips are never embedded or base64-encoded. The existing content-addressed
 sidecar reference remains in `data`. Receivers must fetch media through the
 authenticated blob route when needed.
 
@@ -104,7 +100,7 @@ Application-level mitigations already in place:
   domains, private/loopback/link-local/metadata IP literals, and hostnames that
   resolve to blocked IP ranges.
 - IPv4-mapped IPv6 addresses are unwrapped before blocked-range checks.
-- ffmpeg keeps the original hostname instead of rewriting to a resolved IP, so
+- ffmpeg keeps the original hostname and never rewrites it to a resolved IP, so
   TLS SNI, certificate identity, and HTTP Host routing remain intact for live
   stream paths.
 - Direct ffmpeg-handled `rtsps://` inputs pass `-tls_verify 1` and
@@ -114,7 +110,7 @@ Application-level mitigations already in place:
   their own peer certificates. Operators with self-signed/internal cameras can
   set `VIDARAX_ALLOW_INSECURE_TLS=true` to omit those ffmpeg TLS verification
   arguments for those sources.
-- ffmpeg protocol whitelists are scoped by source type; `file:`, plain
+- ffmpeg protocol whitelists are scoped by source type. `file:`, plain
   `http:`, and remote HLS are disabled by default.
 - downloadable HTTP(S) media is decoded only after validated local prefetch, so
   content-sniffed HLS manifests cannot make ffmpeg fetch segment, key, map, or

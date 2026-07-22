@@ -31,7 +31,7 @@ for (const event of await v.getEvents(run.runId)) {
 ```
 
 For prompt-driven semantic analysis, use `reason(id, opts)` with a
-`semantic_prompt` field instead of `analyze()`.
+`semantic_prompt` field. `analyze()` runs the deterministic frame-signal path.
 
 ## Constructor
 
@@ -53,7 +53,8 @@ const v = new Vidarax(baseUrl, options?)
 |---|---|
 | `analyze(source, opts?)` | High-level: ingest and analyze, then return a run handle. |
 | `createRun(opts)` / `listRuns()` | Create or list runs. |
-| `getRun(id)` / `deleteRun(id)` / `stopRun(id)` | Manage individual runs. |
+| `getRun(id)` / `deleteRun(id)` / `stopRun(id)` / `keepaliveRun(id)` | Manage individual runs. |
+| `getRunState(id)` | Read the state derived from the run timeline. |
 | `ingestRun(id, opts)` | Attach a source and decode frames. |
 | `analyzeRun(id, opts)` | Run analysis on ingested frames. |
 | `reason(id, opts)` | Realtime inference over a stream. |
@@ -63,15 +64,17 @@ const v = new Vidarax(baseUrl, options?)
 | `streamEvents(id)` / `streamMarkers(id)` | Async-iterate a one-time compatibility snapshot. |
 | `subscribeEvents(id, options?)` | Replay and follow events over SSE with `Last-Event-ID` reconnect. |
 | `createWebhook(id, request)` / `listWebhooks(id)` / `deleteWebhook(id, webhookId)` | Manage signed action hooks and inspect dead-letter state. Save the per-hook signing secret returned only at creation. |
+| `query(request)` / `search(query, opts?)` | Read timeline events by cursor or search stored VLM descriptions. |
 | `infer(opts)` / `inferBatch(items)` | Single or batch inference. |
 | `uploadFile(file, onProgress?)` | Upload a video file. |
 | `whipOffer(sdp, opts)` | WebRTC WHIP session (browser). |
 | `whipUpdatePrompt(id, request)` | Update the prompt and optional JSON Schema object. |
 | `submitFeedback(id, feedback)` / `listFeedback()` | Store and list durable operator feedback. |
-| `createPolicy(id, request)` / `listPolicies(id)` | Create and inspect immutable policy revisions. |
+| `createPolicy(id, request)` / `listPolicies(id)` / `getPolicy(id, revision)` | Create and inspect immutable policy revisions. |
 | `activatePolicy` / `rollbackPolicy` / `replayPolicy` | Exercise the staged policy control loop. |
 | `compileTrigger(source)` / `validateTrigger(program)` / `evaluateTrigger(program, samples)` | Compile and replay bounded trigger programs before live attachment. |
-| `listModels()` / `health()` | Models and health checks. |
+| `whipIce(id, candidate)` / `whipTerminate(id)` | Trickle ICE or end a live WHIP resource. |
+| `listModels()` / `health()` / `waitUntilHealthy(opts?)` | Models and health checks. |
 
 ## Trigger programs
 
@@ -97,7 +100,7 @@ const replay = await v.evaluateTrigger(compiled.program, [
 
 Pass `compiled.program` as `trigger_program` in `whipOffer`. Trigger event kinds
 are namespaced as `trigger.<event_type>`. Binary keyframes stay in the server's
-content-addressed store; timeline and webhook payloads carry references only.
+content-addressed store. Timeline and webhook payloads carry references only.
 
 ## Error handling
 

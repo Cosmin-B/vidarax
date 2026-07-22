@@ -1146,7 +1146,7 @@ function formatTime(ms: number): string {
           <div class="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
             <div>
               <h3 class="text-[#e2e8f0] font-medium text-sm">Policy control loop</h3>
-              <p class="mt-1 text-xs text-[#64748b]">Immutable revisions, evidence replay, staged promotion, and rollback.</p>
+              <p class="mt-1 text-xs text-[#64748b]">Immutable revisions, candidate replay, staged promotion, and rollback.</p>
             </div>
             <span class="badge badge-muted">Local WAL</span>
           </div>

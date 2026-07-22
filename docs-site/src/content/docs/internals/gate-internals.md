@@ -1,13 +1,13 @@
 ---
-title: Gate internals
-description: What the gate computes per frame, the branchless decision dispatch, the deferred commit protocol, and tiered escalation in run_tiered.
+title: Filter internals
+description: Per-frame signals, branchless decision dispatch, deferred commit, and tiered escalation.
 ---
 
-The gate is the deterministic filter that decides, per decoded frame, whether to spend a VLM call. It lives in `crates/vidarax-core/src/gate.rs`, with its input signals computed in `webrtc/signals.rs`, its windowed second pass in `pipeline.rs`, and the model escalation decision in `tiered_vlm.rs`. It guarantees determinism (same frames in, same decisions out, which is what the replay gate in [Allocation discipline](/docs/internals/allocation-discipline/) pins), zero heap allocation on the per-frame path, and exactly one decision per frame. This page is the code-level companion to [The gate](/docs/gate/).
+The deterministic filter decides whether each decoded frame justifies a VLM call. `crates/vidarax-core/src/gate.rs` owns the decision. `webrtc/signals.rs` computes its inputs, `pipeline.rs` adds windowed context, and `tiered_vlm.rs` decides model escalation. The same frames in the same order produce the same decisions. The replay checks in [Allocation discipline](/docs/internals/allocation-discipline/) pin that behavior. The per-frame decision path allocates no heap memory and emits exactly one decision per frame. This page is the code-level companion to [The per-frame filter](/docs/gate/).
 
 ## What is computed per frame
 
-Before the gate sees anything, `yuv_to_frame_signal` in `signals.rs` reduces a decoded YUV frame to a small `Copy` struct, `FrameSignal`:
+Before the filter sees anything, `yuv_to_frame_signal` in `signals.rs` reduces a decoded YUV frame to a small `Copy` struct named `FrameSignal`:
 
 | Field | Computation |
 |---|---|
@@ -18,7 +18,7 @@ Before the gate sees anything, `yuv_to_frame_signal` in `signals.rs` reduces a d
 | `ghosting_score: f32` | Hamming distance between this and the previous perceptual hash, divided by 64 (0.0 on the first frame) |
 | `frame_index`, `pts_ms` | Carried through from the stream |
 
-The frame must first clear `check_frame`, which verifies even non-zero dimensions and that each plane holds at least the samples the dimensions imply. Everything downstream indexes planes by dimension with no bounds guarding, so this check is the safety boundary; a frame that fails it is dropped before it can touch the previous-signal state and poison the temporal deltas.
+The frame must first clear `check_frame`, which verifies even non-zero dimensions and that each plane holds at least the samples implied by those dimensions. Everything downstream indexes planes by dimension with no bounds guard. A frame that fails the check is dropped before it can change the previous-signal state.
 
 ## The decision: branchless dispatch
 
@@ -56,7 +56,7 @@ Defaults live as constants at the top of `gate.rs`: `GATE_KEEPALIVE_EVERY_FRAMES
 
 ## The deferred commit protocol
 
-`process` reads state but never writes it. Advancing the reference frame is a separate call, `commit_keyframe`, which stores the kept frame's index, hash, and luma and sets `initialized`. The split exists because in the live path a "keep" decision is provisional until a JPEG actually exists: `GateStreamState::on_frame` in `workers.rs` runs the gate through `TwoPassPipeline::analyze_batch_defer_gate_commit`, and only if the decision is `KeepKeyframe` does it invoke the caller's `encode` closure; only if that closure returns non-empty bytes does it call `commit_gate_keyframe`.
+`process` reads state but never writes it. Advancing the reference frame is a separate call, `commit_keyframe`, which stores the kept frame's index, hash, and luma and sets `initialized`. A live "keep" decision stays provisional until a JPEG exists. `GateStreamState::on_frame` in `workers.rs` runs the filter through `TwoPassPipeline::analyze_batch_defer_gate_commit`. It invokes the caller's `encode` closure only for `KeepKeyframe` and calls `commit_gate_keyframe` only when that closure returns non-empty bytes.
 
 ```rust
 if meta.gate_event != GateEventType::KeepKeyframe {
@@ -66,13 +66,13 @@ let jpeg_bytes = encode().filter(|b| !b.is_empty())?;
 self.pipeline.commit_gate_keyframe(signal);
 ```
 
-Two properties fall out. A dropped frame never pays for JPEG encoding; the encoder runs at most once and only for kept frames, which in the live decode worker is the difference between encoding every decoded frame and encoding only what survives the gate. And a keep whose thumbnail failed does not become the reference frame, so the next good frame is compared against the last frame that actually produced output. A dedicated test (`keep_decision_does_not_advance_reference_until_committed`) pins the non-mutation contract.
+A dropped frame never pays for JPEG encoding. The encoder runs at most once and only for a selected frame. A selection whose thumbnail failed does not become the reference frame, so the next good frame is compared with the last frame that produced output. `keep_decision_does_not_advance_reference_until_committed` pins the non-mutation contract.
 
 ## The windowed second pass
 
 `TwoPassPipeline` (`pipeline.rs`) wraps the gate and adds context from a bounded sliding window of recent samples (`window_size` 16, ring-overwritten, no allocation after construction). For each frame, `window_metrics` derives `novelty_score` (mean normalized hash distance across the window) and `temporal_stability` (mean absolute luma drift across the window) in one fused pass, and `motion_score` is the normalized hash distance to the immediately previous frame. The three fuse into a confidence with fixed weights: `TWO_PASS_CONFIDENCE_NOVELTY_WEIGHT` 0.45, `TWO_PASS_CONFIDENCE_INSTABILITY_WEIGHT` 0.35, `TWO_PASS_CONFIDENCE_MOTION_WEIGHT` 0.20. Frames are also bucketed into fixed segments (`segment_ms` 250). The resulting `FrameMetadata` travels with the keyframe into `KeyframeWork` and is embedded in the VLM prompt as gate context (`trigger`, `confidence`, `novelty`, `motion`, `pts_ms`).
 
-Beside the gate, `LoopDetector` (`loop_detector.rs`) keeps a fixed ring of the 8 most recent perceptual hashes and fires when at least `repeat_trigger` of them sit within a Hamming threshold of the current hash. Entry into the looping state emits a single `loop_detected` event; while the state holds, kept keyframes carry `loop_active` and the VLM worker skips inference for them.
+`LoopDetector` in `loop_detector.rs` keeps a fixed ring of the eight most recent perceptual hashes. It fires when at least `repeat_trigger` entries sit within a Hamming threshold of the current hash. Entry into the looping state emits one `loop_detected` event. While the state holds, selected keyframes carry `loop_active` and the VLM worker skips inference for them.
 
 ## Escalation to the second-pass model
 
@@ -92,9 +92,9 @@ pub fn needs_second_pass(&self, first_pass_confidence: f32) -> bool {
 
 `run_tiered` walks the tiers in order:
 
-1. Rewrite the request's model to `first_pass_model` and call the provider. A provider error here is the caller's error; there is nothing to fall back to.
+1. Rewrite the request's model to `first_pass_model` and call the provider. A provider error here is the caller's error. There is nothing to fall back to.
 2. Parse confidence from the first pass's output text: `parse_confidence_from_output` looks for a `confidence` field in a JSON body and returns 0.5 when the output is not JSON or has no such field, so free-text output lands exactly at the "uncertain" midpoint and escalates only if the threshold is above 0.5.
-3. If `needs_second_pass` says so, rewrite the request to `second_pass_model` with `second_pass_max_tokens` and a second-pass timeout. The generic live-worker path uses `teacher_label_schema()` for that pass. Realtime semantic analysis supplies its built-in overlay schema as an explicit override so both passes retain the required `event_type`, `object_label`, `summary`, `description`, and `confidence` fields; a caller-supplied custom output schema keeps the existing teacher-label escalation behavior. On success, the second result wins, with the first pass's token usage and latency folded in so accounting spans the whole analysis. On failure, the first-pass result is returned and `used_second_pass` stays false: a broken teacher degrades quality, never availability.
+3. If `needs_second_pass` says so, rewrite the request to `second_pass_model` with `second_pass_max_tokens` and a second-pass timeout. The generic live-worker path uses `teacher_label_schema()` for that pass. Realtime semantic analysis supplies its built-in overlay schema as an explicit override so both passes retain the required `event_type`, `object_label`, `summary`, `description`, and `confidence` fields. A caller-supplied custom output schema keeps the existing teacher-label escalation behavior. On success, the second result wins, with the first pass's token usage and latency folded in so accounting spans the whole analysis. On failure, the first-pass result is returned and `used_second_pass` stays false: a broken teacher degrades quality, never availability.
 
 The caller in `workers.rs` records which tier answered in the event kind: `vlm` for a first-pass answer, `vlm_tiered` when the second pass ran (`clip_vlm` / `clip_vlm_tiered` on the clip path). Before tiering, live keyframe mode can ask the semantic novelty filter to reuse the last successful description.
 
@@ -103,5 +103,5 @@ The caller in `workers.rs` records which tier answered in the event kind: `vlm` 
 - The gate keys keepalive on frame index deltas, not wall time: `keepalive_every_frames` counts frames since the last commit, so a paused stream produces no keepalives.
 - Confidence from `parse_confidence_from_output` remains the model's self-report, not a calibrated probability. The parser clamps finite values to [0, 1] and maps missing or non-finite values to 0.5, but a model that consistently emits a high in-range score can still avoid escalation.
 - `GateStreamState::on_frame` emits `loop_detected` through `emit_event_nonblocking` before the gate decision, so the event reaches the sink even for frames the gate then drops.
-- The word-overlap check that gates `state_transition` events (`jaccard_word_overlap` in `workers.rs`, threshold `STATE_CHANGE_JACCARD_MAX` 0.5) compares word sets on the stack with FNV hashes; it only decides whether to emit an extra event, never whether to call the VLM.
-- Signal computation subsamples (stride 4 in the hash grid and the luma statistics); this is a deliberate approximation that preserves determinism because the stride is fixed.
+- The word-overlap check that gates `state_transition` events (`jaccard_word_overlap` in `workers.rs`, threshold `STATE_CHANGE_JACCARD_MAX` 0.5) compares word sets on the stack with FNV hashes. It only decides whether to emit an extra event, never whether to call the VLM.
+- Signal computation subsamples (stride 4 in the hash grid and the luma statistics). This is a deliberate approximation that preserves determinism because the stride is fixed.

@@ -3,7 +3,7 @@ title: Allocation discipline
 description: The counting allocator in the perf probe, pointer-identity tests for pool reuse, and executable release checks.
 ---
 
-The hot paths in Vidarax follow a stated policy: no selected-global-allocator calls per frame after warmup in the core ingest and filter loops, with reusable pools wherever buffers cross threads (see [Development](/docs/development/#contributing-basics)). The repository checks the policy three ways: a counting allocator in a probe binary, unit tests that assert pool reuse by pointer identity, and release scripts that turn the probe into a pass-or-fail check. Pointer-identity tests run in the ordinary workspace test suite; the release scripts do not run them.
+The hot paths in Vidarax follow a stated policy: no selected-global-allocator calls per frame after warmup in the core ingest and filter loops, with reusable pools wherever buffers cross threads (see [Development](/docs/development/#contributing-basics)). The repository checks the policy three ways: a counting allocator in a probe binary, unit tests that assert pool reuse by pointer identity, and release scripts that turn the probe into a pass-or-fail check. Pointer-identity tests run in the ordinary workspace test suite. The release scripts do not run them.
 
 ## The counting allocator
 
@@ -27,13 +27,13 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static GLOBAL: CountingAllocator = CountingAllocator;
 ```
 
-Every `alloc`, `alloc_zeroed`, and `realloc` routed through this Rust global allocator increments the counter and delegates to the system allocator; `dealloc` passes through uncounted. The value is an allocation-event count, not a live-bytes gauge. It does not observe stack storage, direct OS mappings, allocations inside foreign libraries that bypass Rust's selected allocator, or storage managed by a separate arena. The probe runs a timing pass and an allocation pass around `GateEngine::process`, then prints `allocations.total` and `allocations.per_frame`. The release script checks the integer total, so one allocation cannot disappear through decimal formatting.
+Every `alloc`, `alloc_zeroed`, and `realloc` routed through this Rust global allocator increments the counter and delegates to the system allocator. `dealloc` passes through uncounted. The value is an allocation-event count, not a live-bytes gauge. It does not observe stack storage, direct OS mappings, allocations inside foreign libraries that bypass Rust's selected allocator, or storage managed by a separate arena. The probe runs a timing pass and an allocation pass around `GateEngine::process`, then prints `allocations.total` and `allocations.per_frame`. The release script checks the integer total, so one allocation cannot disappear through decimal formatting.
 
 The design constraint worth knowing before modifying it: because the allocator is global, anything else the probe process does (logging, JSON formatting) also counts, so the measured region is kept to the bare gate loop with the counter snapshot taken immediately around it, and the workload constructs each `FrameSignal` on the stack.
 
 ## Pointer-identity tests
 
-Asserting "the pool was reused" by observing behavior is weak; the tests instead assert identity of the backing memory. The canonical one is in `crates/vidarax-core/src/webrtc/recycle.rs`:
+Asserting "the pool was reused" by observing behavior is weak. The tests instead assert identity of the backing memory. The canonical one is in `crates/vidarax-core/src/webrtc/recycle.rs`:
 
 ```rust
 let mut first = pool.acquire();
@@ -54,13 +54,13 @@ The same technique pins reuse at other layers:
 
 - `yuv_to_jpeg_emits_valid_jpeg_and_keeps_pool_buffer_reserved` in `webrtc/signals.rs` asserts that a JPEG buffer returned to the pool keeps its lazy capacity reservation, so the next frame's encode does not climb through doubling reallocations from zero.
 - `yuv_plane_pools_ensure_dims_rebuilds_on_resolution_change` in `webrtc/decode.rs` drains a plane pool's free-list and proves that a later acquire can only be pool-served after a deliberate rebuild, pinning the first-frame-then-grow policy.
-- In `crates/vidarax-api/src/state.rs`, `registry_keeps_same_map_snapshot_for_existing_run_event` asserts with `Arc::ptr_eq` that a non-structural run event updates per-run atomics in place without replacing the registry entry, and `publishing_append_reuses_unchanged_run_tail_arc` asserts that publishing a timeline snapshot shares untouched runs' tails by `Arc` instead of cloning them.
+- In `crates/vidarax-api/src/state.rs`, `registry_keeps_same_map_snapshot_for_existing_run_event` asserts with `Arc::ptr_eq` that a non-structural run event updates per-run atomics in place without replacing the registry entry. `publishing_append_reuses_unchanged_run_tail_arc` asserts that timeline publication shares untouched runs' tails through `Arc` and never clones them.
 
 The complementary sizing tests, such as the one deriving the 484-slot JPEG pool bound, are described in [Media plane](/docs/internals/media-plane/#pool-sizing-as-a-sum-over-in-flight-positions).
 
 ## The release-check scripts
 
-Three scripts under `scripts/` turn the probe and replay tests into release checks. Each check compares an observed value against a ceiling supplied by an environment variable, so thresholds can change without editing the scripts, and any breach exits non-zero. The pointer-identity tests above are not part of these scripts; they run with `cargo test --workspace`.
+Three scripts under `scripts/` turn the probe and replay tests into release checks. Each check compares an observed value against a ceiling supplied by an environment variable, so thresholds can change without editing the scripts, and any breach exits non-zero. The pointer-identity tests above are not part of these scripts. They run with `cargo test --workspace`.
 
 | Script | What it checks |
 |---|---|
@@ -72,8 +72,8 @@ The ceilings guard four different regressions: semantic drift in the filter (rep
 
 ## Edge cases and limits
 
-- The allocator counts selected-allocator events, not bytes or lifetimes; one huge allocation scores better than many small ones even if memory behavior worsens. Pool sizing tests and byte-capacity caps cover that axis separately.
+- The allocator counts selected-allocator events, not bytes or lifetimes. One huge allocation scores better than many small ones even if memory behavior worsens. Pool sizing tests and byte-capacity caps cover that axis separately.
 - The probe exercises the gate loop only. Allocation discipline in the decode, JPEG, and channel paths is enforced by the pointer-identity and pool-sizing tests, not by the probe.
-- `Vec::as_ptr().addr()` equality can in principle hold accidentally if an allocator reuses a freed address; the recycle test avoids that by keeping the pool slot occupied through the round trip, so the buffer is never returned to the system allocator at all.
-- The binary-size gates measure the uncompressed on-disk release binaries; they exist to catch accidental dependency growth, not to bound deployment artifacts, which may be stripped or compressed differently.
-- `perf_probe` must be built in release mode for either gate to mean anything; the scripts do this themselves (`cargo run --release --features perf-probe`), so run them through the scripts rather than invoking the binary ad hoc.
+- `Vec::as_ptr().addr()` equality can in principle hold accidentally if an allocator reuses a freed address. The recycle test avoids that by keeping the pool slot occupied through the round trip, so the buffer is never returned to the system allocator at all.
+- The binary-size gates measure the uncompressed on-disk release binaries. They exist to catch accidental dependency growth, not to bound deployment artifacts, which may be stripped or compressed differently.
+- `perf_probe` must be built in release mode for either check to be meaningful. The scripts run `cargo run --release --features perf-probe` with the required configuration.

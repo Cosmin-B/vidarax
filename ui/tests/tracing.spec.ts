@@ -139,7 +139,7 @@ test.describe('Tracing page', () => {
     await expect(pipelineSection).toBeVisible({ timeout: 10_000 })
 
     // Each of the 5 stages should appear in the pipeline diagram
-    for (const stageName of ['WebRTC', 'Decode', 'Gate', 'VLM', 'Keyframe store']) {
+    for (const stageName of ['WebRTC', 'Decode', 'Frame filter', 'VLM', 'Keyframe store']) {
       await expect(pipelineSection.getByText(stageName, { exact: true })).toBeVisible()
     }
   })
@@ -160,7 +160,7 @@ test.describe('Tracing page', () => {
     const metricsSection = page.getByRole('region', { name: 'Live pipeline metrics' })
     await expect(metricsSection).toBeVisible({ timeout: 10_000 })
 
-    for (const cardName of ['Decode', 'Gate Engine', 'VLM Inference', 'Keyframe sidecar', 'Delivery']) {
+    for (const cardName of ['Decode', 'Per-frame filter', 'VLM Inference', 'Keyframe sidecar', 'Delivery']) {
       await expect(metricsSection.getByRole('heading', { name: cardName })).toBeVisible()
     }
     await expect(metricsSection.getByText('Trigger queue drops', { exact: true })).toBeVisible()

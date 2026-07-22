@@ -32,7 +32,7 @@ problem from input to the subprocess boundary.
 
 Native crash containment wins over frame-exact labels for the default H.264
 path. Both CPU and GPU H.264 use the supervised ffmpeg child, and their labels
-remain best-effort. A broken sidecar faults the whole session generation; it is
+remain best-effort. A broken sidecar faults the whole session generation. It is
 not restarted underneath temporal workers.
 
 The optional `vp8` feature provides an in-process libvpx decoder and can retain
