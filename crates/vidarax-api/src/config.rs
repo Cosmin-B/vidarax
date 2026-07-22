@@ -50,7 +50,10 @@ pub fn load_backend_config(
                     priority: 2,
                 });
             }
-            Ok(vidarax_core::backends::VidaraxConfig { backends })
+            Ok(vidarax_core::backends::VidaraxConfig {
+                backends,
+                restricted_zone: None,
+            })
         }
     }
 }

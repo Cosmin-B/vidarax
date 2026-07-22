@@ -111,7 +111,6 @@ describe("durable event subscription", () => {
   });
 
   it("parses CloudEvents SSE and sends the durable cursor", async () => {
-  it("parses CloudEvents SSE and sends the durable cursor", async () => {
     const body = [
       "id: 6",
       "event: gate",

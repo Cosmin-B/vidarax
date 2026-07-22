@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Cpu, SlidersHorizontal, Zap, Database } from 'lucide-vue-next'
+import { Cpu, SlidersHorizontal, Zap, Database, Send } from 'lucide-vue-next'
 import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
 import type { MetricsData, HistogramPercentiles } from '@/composables/useMetrics'
 
@@ -62,7 +62,7 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
 </script>
 
 <template>
-  <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+  <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-4">
 
     <!-- Card 1: Decode Stats -->
     <div class="card-skeuo p-5 flex flex-col gap-4">
@@ -185,6 +185,22 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
         <div class="flex items-center justify-between">
           <span class="text-[#475569] text-xs">Loops detected</span>
           <span class="mono text-[#f59e0b] text-xs">{{ fmtInt(metrics.loopDetectedTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Zone assertions</span>
+          <span class="mono text-[#38bdf8] text-xs">{{ fmtInt(metrics.restrictedZoneAssertionsTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Zone evidence failures</span>
+          <span class="mono text-xs" :class="metrics.restrictedZoneEvidenceFailuresTotal ? 'text-[#ef4444]' : 'text-[#2dd4bf]'">
+            {{ fmtInt(metrics.restrictedZoneEvidenceFailuresTotal) }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Zone queue drops</span>
+          <span class="mono text-xs" :class="metrics.restrictedZoneQueueDroppedTotal ? 'text-[#f59e0b]' : 'text-[#2dd4bf]'">
+            {{ fmtInt(metrics.restrictedZoneQueueDroppedTotal) }}
+          </span>
         </div>
       </div>
 
@@ -403,6 +419,60 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
               boxShadow: '0 0 8px rgba(45,212,191,0.35)',
             }"
           />
+        </div>
+      </div>
+    </div>
+
+    <!-- Card 5: durable event delivery -->
+    <div class="card-skeuo p-5 flex flex-col gap-4">
+      <div class="flex items-center gap-2">
+        <div class="w-7 h-7 rounded-lg flex items-center justify-center"
+             style="background: rgba(56,189,248,0.08); border: 1px solid rgba(56,189,248,0.18);">
+          <AnimatedIcon :icon="Send" :size="14" :stroke-width="1.75" class="text-[#38bdf8]" />
+        </div>
+        <h4 class="text-[#94a3b8] text-xs font-medium uppercase tracking-wider">Delivery</h4>
+        <span class="badge badge-teal ml-auto text-[9px]">DURABLE</span>
+      </div>
+
+      <div>
+        <div class="text-[#475569] text-[10px] uppercase tracking-wider mb-1">Events sent</div>
+        <div class="mono text-3xl font-semibold text-[#38bdf8]">
+          {{ fmtInt(metrics.sseEventsTotal + metrics.webhookDeliveredTotal) }}
+        </div>
+      </div>
+
+      <div class="space-y-2 border-t border-[#1e2633] pt-3">
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">SSE subscribers</span>
+          <span class="mono text-[#38bdf8] text-xs">{{ fmtInt(metrics.sseSubscribersActive) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">WAL replays</span>
+          <span class="mono text-[#2dd4bf] text-xs">{{ fmtInt(metrics.sseReplayedEventsTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Queue stalls</span>
+          <span class="mono text-xs" :class="metrics.sseQueueStallsTotal ? 'text-[#f59e0b]' : 'text-[#2dd4bf]'">
+            {{ fmtInt(metrics.sseQueueStallsTotal) }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Active webhooks</span>
+          <span class="mono text-[#38bdf8] text-xs">{{ fmtInt(metrics.webhooksConfigured) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Webhook delivered</span>
+          <span class="mono text-[#2dd4bf] text-xs">{{ fmtInt(metrics.webhookDeliveredTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Retries</span>
+          <span class="mono text-[#f59e0b] text-xs">{{ fmtInt(metrics.webhookRetriesTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Dead letters</span>
+          <span class="mono text-xs" :class="metrics.webhookDeadLettersTotal ? 'text-[#ef4444]' : 'text-[#2dd4bf]'">
+            {{ fmtInt(metrics.webhookDeadLettersTotal) }}
+          </span>
         </div>
       </div>
     </div>

@@ -2550,10 +2550,10 @@ fn infer_execution_error_to_response(state: &AppState, err: InferExecutionError)
 #[cfg(test)]
 mod tests {
     use super::{
-        feedback_events_to_json_for_owned_runs, feedback_payload_error,
-        marker_to_emit_event_request, owned_run_ids_from_events, parse_provider,
-        run_command_with_timeout, validate_infer_request, AnalyzeMarker, InferRequest,
-        ProviderKind, MAX_FEEDBACK_CATEGORY_LEN, MAX_FEEDBACK_TEXT_LEN,
+        event_references_keyframe_blob, feedback_events_to_json_for_owned_runs,
+        feedback_payload_error, marker_to_emit_event_request, owned_run_ids_from_events,
+        parse_provider, run_command_with_timeout, validate_infer_request, AnalyzeMarker,
+        InferRequest, ProviderKind, MAX_FEEDBACK_CATEGORY_LEN, MAX_FEEDBACK_TEXT_LEN,
     };
     use crate::state::AppState;
     use axum::http::HeaderMap;
@@ -2777,6 +2777,26 @@ mod tests {
             !visible.contains(deleted_run),
             "deleted runs must not remain visible to search or feedback listing"
         );
+    }
+
+    #[test]
+    fn keyframe_authorization_accepts_only_supported_event_references() {
+        let sha = "a".repeat(64);
+        assert!(event_references_keyframe_blob(
+            "keyframe_stored",
+            &json!({ "image_sha256": sha }),
+            &"a".repeat(64),
+        ));
+        assert!(event_references_keyframe_blob(
+            "restricted_zone_activity_entered",
+            &json!({ "evidence": { "image_sha256": "B".repeat(64) } }),
+            &"b".repeat(64),
+        ));
+        assert!(!event_references_keyframe_blob(
+            "untrusted_event",
+            &json!({ "evidence": { "image_sha256": "c".repeat(64) } }),
+            &"c".repeat(64),
+        ));
     }
 
     #[test]
@@ -3165,7 +3185,7 @@ pub async fn serve_file(
     .into_response()
 }
 
-/// Return a raw JPEG referenced by a `keyframe_stored` event on an owned run.
+/// Return a raw JPEG referenced by a supported evidence event on an owned run.
 pub async fn serve_keyframe(
     State(state): State<AppState>,
     Path((run_id, sha256)): Path<(String, String)>,
@@ -3206,11 +3226,7 @@ pub async fn serve_keyframe(
         .into_response();
     }
     let referenced = events.iter().any(|event| {
-        event.kind == "keyframe_stored"
-            && parse_payload(&event.payload)
-                .get("image_sha256")
-                .and_then(Value::as_str)
-                .is_some_and(|value| value.eq_ignore_ascii_case(&sha256))
+        event_references_keyframe_blob(&event.kind, &parse_payload(&event.payload), &sha256)
     });
     if !referenced {
         return not_found_error(
@@ -3253,6 +3269,19 @@ pub async fn serve_keyframe(
         .header(header::ETAG, format!("\"{sha256}\""))
         .body(Body::from(data))
         .unwrap()
+}
+
+fn event_references_keyframe_blob(kind: &str, payload: &Value, sha256: &str) -> bool {
+    let referenced_sha = match kind {
+        "keyframe_stored" => payload.get("image_sha256"),
+        "restricted_zone_activity_entered" => payload
+            .get("evidence")
+            .and_then(|evidence| evidence.get("image_sha256")),
+        _ => None,
+    };
+    referenced_sha
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case(sha256))
 }
 
 pub async fn upload_file(

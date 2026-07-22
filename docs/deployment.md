@@ -219,6 +219,33 @@ When neither URL is set, the server reads `VIDARAX_CONFIG`, defaulting to
 `gemini` backends. String fields in that file support `${ENV_VAR}`
 interpolation.
 
+The same file may define one device-level restricted-zone policy. It applies
+to WHIP sessions that do not provide a stream-specific policy:
+
+```toml
+[restricted_zone]
+policy_id = "loading-dock-after-hours"
+policy_version = 3
+device_id = "camera-west-02"
+enter_motion_score = 0.12
+exit_motion_score = 0.04
+enter_after_frames = 2
+exit_after_frames = 4
+
+[restricted_zone.region]
+x = 0.10
+y = 0.20
+width = 0.70
+height = 0.60
+```
+
+Coordinates are normalized to the decoded image. The region becomes the exact
+analysis crop for that pipeline generation. A WHIP attach may replace the
+device policy, but a separately supplied crop must match the selected region
+and clip mode cannot be enabled with restricted-zone activity detection.
+Policy changes take effect on a new generation; an active worker never reads
+mutable process-wide policy state.
+
 The video decode backend is separate from the VLM backend. `cpu-ffmpeg` works
 with ffmpeg and ffprobe on `PATH`. `nvdec-cuda` uses ffmpeg with NVDEC for the
 JPEG phase. `mlx`, `apple`, `metal`, and `videotoolbox` are aliases for the

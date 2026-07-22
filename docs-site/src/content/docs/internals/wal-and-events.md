@@ -63,10 +63,11 @@ Handler-appended kinds, by string literal in `handlers.rs` (all through `append_
 | `semantic_chunk_generated` | A chunk's semantic result is recorded |
 | `semantic_fallback_activated` | The semantic path falls back (for example, no provider) |
 | `inference_completed` | `POST /v1/infer` completes |
-| `run_completed` | A run reaches its terminal success state |
+| `run_completed` | Analysis completes or a WHIP resource terminates gracefully |
+| `run_failed` | A live peer or its state channel ends unexpectedly |
 | `stop_requested` | `POST /v1/runs/{id}/stop` |
 | `keepalive_refreshed` | `POST /v1/runs/{id}/keepalive` |
-| `run_deleted` | `DELETE /v1/runs/{id}`, WHIP reclaim, or creation-failure tombstoning |
+| `run_deleted` | `DELETE /v1/runs/{id}` or creation-failure tombstoning |
 
 Concurrent semantic workers publish `semantic_chunk_inferred` as each chunk finishes, so WAL sequence captures completion order rather than `chunk_index` order. Consumers that reconstruct source order must sort by `chunk_index`.
 

@@ -1,9 +1,14 @@
 import { ref } from 'vue'
-import { api, type RawRunEvent } from '@/lib/api'
+import { api, followRunEvents, type RawRunEvent } from '@/lib/api'
 import { useEventsStore, type AgentEvent, type KeyframeEntry } from '@/stores/events'
 import { logger } from '@/lib/logger'
 
-const POLL_INTERVAL_MS = 1000
+const INITIAL_RECONNECT_MS = 250
+const MAX_RECONNECT_MS = 5000
+
+function objectField(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' ? value as Record<string, unknown> : {}
+}
 
 function mapEvent(raw: RawRunEvent, runId: string): AgentEvent | null {
   if (raw.kind === 'keyframe_stored') return null
@@ -16,14 +21,20 @@ function mapEvent(raw: RawRunEvent, runId: string): AgentEvent | null {
     'state_transition',
     'loop_detected',
   ])
-  if (raw.kind !== 'marker_emitted' && !workerKinds.has(raw.kind)) return null
+  const isRestrictedZone = raw.kind === 'restricted_zone_activity_entered'
+  if (raw.kind !== 'marker_emitted' && !workerKinds.has(raw.kind) && !isRestrictedZone) return null
 
+  const assertion = objectField(payload.assertion)
+  const trigger = objectField(assertion.trigger)
   const workerDescription = workerKinds.has(raw.kind)
-  const eventType = raw.kind === 'marker_emitted'
-    ? String(payload.event_type ?? 'context_observation')
-    : raw.kind === 'loop_detected'
-      ? 'loop_detected'
-      : 'vlm_description'
+  const eventType = isRestrictedZone
+    ? 'restricted_zone_activity'
+    : raw.kind === 'marker_emitted'
+      ? String(payload.event_type ?? 'context_observation')
+      : raw.kind === 'loop_detected'
+        ? 'loop_detected'
+        : 'vlm_description'
+  const zoneDescription = `Activity entered restricted zone ${String(assertion.policy_id ?? '')}`.trim()
 
   return {
     run_id: runId,
@@ -31,31 +42,56 @@ function mapEvent(raw: RawRunEvent, runId: string): AgentEvent | null {
     frame_index: Number(payload.frame_index ?? payload.start_frame ?? 0),
     pts_ms: Number(payload.pts_ms ?? payload.start_pts_ms ?? 0),
     event_type: eventType as AgentEvent['event_type'],
-    confidence: Number(payload.confidence ?? 0),
-    description: workerDescription
-      ? String(payload.description ?? '')
-      : String(payload.description ?? payload.summary ?? ''),
+    confidence: Number(payload.confidence ?? trigger.score ?? 0),
+    description: isRestrictedZone
+      ? zoneDescription
+      : workerDescription
+        ? String(payload.description ?? '')
+        : String(payload.description ?? payload.summary ?? ''),
     timestamp_ms: raw.pts_ms,
   }
 }
 
+function keyframeEvidence(raw: RawRunEvent): Record<string, unknown> | null {
+  if (raw.kind === 'keyframe_stored') return raw.payload
+  if (raw.kind === 'restricted_zone_activity_entered') return objectField(raw.payload.evidence)
+  return null
+}
+
 async function loadKeyframe(raw: RawRunEvent, runId: string): Promise<KeyframeEntry | null> {
-  if (raw.kind !== 'keyframe_stored') return null
-  const sha256 = raw.payload.image_sha256
+  const evidence = keyframeEvidence(raw)
+  if (!evidence) return null
+  const sha256 = evidence.image_sha256
   if (typeof sha256 !== 'string' || !/^[0-9a-fA-F]{64}$/.test(sha256)) return null
 
   const blob = await api.runs.keyframe(runId, sha256)
+  const assertion = objectField(raw.payload.assertion)
   return {
     id: raw.seq,
     run_id: runId,
     frame_index: Number(raw.payload.frame_index ?? 0),
     pts_ms: Number(raw.payload.pts_ms ?? 0),
-    event_type: String(raw.payload.event_type ?? ''),
-    description: String(raw.payload.description ?? ''),
+    event_type: String(raw.payload.event_type ?? raw.kind),
+    description: String(
+      raw.payload.description
+      ?? (raw.kind === 'restricted_zone_activity_entered'
+        ? `Activity entered restricted zone ${String(assertion.policy_id ?? '')}`.trim()
+        : ''),
+    ),
     image_sha256: sha256.toLowerCase(),
     image_url: URL.createObjectURL(blob),
     timestamp_ms: raw.pts_ms,
   }
+}
+
+function reconnectDelay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise(resolve => {
+    const timer = setTimeout(resolve, ms)
+    signal.addEventListener('abort', () => {
+      clearTimeout(timer)
+      resolve()
+    }, { once: true })
+  })
 }
 
 export function useEventStream() {
@@ -64,43 +100,64 @@ export function useEventStream() {
   const connectionError = ref<string | null>(null)
 
   let activeRunId: string | null = null
-  let pollTimer: ReturnType<typeof setInterval> | null = null
-  let pollInFlight = false
-  const seenSequences = new Set<number>()
+  let streamAbort: AbortController | null = null
+  let streamGeneration = 0
+  let lastSequence = 0
   const loadedKeyframes = new Set<string>()
 
-  async function poll(): Promise<void> {
-    if (!activeRunId || pollInFlight) return
-    pollInFlight = true
-    try {
-      const response = await api.runs.events(activeRunId)
-      for (const raw of response.events) {
-        if (seenSequences.has(raw.seq)) continue
-        const event = mapEvent(raw, activeRunId)
-        if (event) eventsStore.addEvent(event)
+  function processEvent(raw: RawRunEvent, runId: string): void {
+    if (raw.seq <= lastSequence) return
+    const event = mapEvent(raw, runId)
+    if (event) eventsStore.addEvent(event)
+    lastSequence = raw.seq
 
-        if (raw.kind === 'keyframe_stored') {
-          const sha = raw.payload.image_sha256
-          if (typeof sha === 'string' && !loadedKeyframes.has(sha)) {
-            const keyframe = await loadKeyframe(raw, activeRunId)
-            if (keyframe) {
-              eventsStore.addKeyframe(keyframe)
-              loadedKeyframes.add(keyframe.image_sha256)
-            }
-          }
-        }
-        seenSequences.add(raw.seq)
+    // Blob loading is independent of cursor progress. A slow or missing image
+    // must not stall the SSE reader and cause a server-side subscriber queue
+    // to fill; the assertion itself is already visible from the WAL event.
+    const evidence = keyframeEvidence(raw)
+    const sha = evidence?.image_sha256
+    if (typeof sha !== 'string' || !/^[0-9a-fA-F]{64}$/.test(sha)) return
+    const normalizedSha = sha.toLowerCase()
+    if (loadedKeyframes.has(normalizedSha)) return
+    loadedKeyframes.add(normalizedSha)
+
+    void loadKeyframe(raw, runId)
+      .then(keyframe => {
+        if (keyframe && activeRunId === runId) eventsStore.addKeyframe(keyframe)
+      })
+      .catch(error => {
+        loadedKeyframes.delete(normalizedSha)
+        logger.warn('[Timeline] Evidence load failed:', error)
+      })
+  }
+
+  async function follow(runId: string, generation: number, signal: AbortSignal): Promise<void> {
+    let reconnectMs = INITIAL_RECONNECT_MS
+    while (!signal.aborted && activeRunId === runId && streamGeneration === generation) {
+      try {
+        await followRunEvents(
+          runId,
+          lastSequence,
+          signal,
+          () => {
+            isConnected.value = true
+            connectionError.value = null
+            eventsStore.setConnectionStatus(true)
+            reconnectMs = INITIAL_RECONNECT_MS
+          },
+          raw => processEvent(raw, runId),
+        )
+        if (signal.aborted) return
+        throw new Error('Timeline stream closed')
+      } catch (error) {
+        if (signal.aborted) return
+        isConnected.value = false
+        connectionError.value = error instanceof Error ? error.message : 'Timeline stream failed'
+        eventsStore.setConnectionStatus(false, connectionError.value)
+        logger.warn('[Timeline] Stream reconnect:', connectionError.value)
       }
-      isConnected.value = true
-      connectionError.value = null
-      eventsStore.setConnectionStatus(true)
-    } catch (error) {
-      isConnected.value = false
-      connectionError.value = error instanceof Error ? error.message : 'Timeline polling failed'
-      eventsStore.setConnectionStatus(false, connectionError.value)
-      logger.warn('[Timeline] Poll failed:', connectionError.value)
-    } finally {
-      pollInFlight = false
+      await reconnectDelay(reconnectMs, signal)
+      reconnectMs = Math.min(reconnectMs * 2, MAX_RECONNECT_MS)
     }
   }
 
@@ -111,18 +168,21 @@ export function useEventStream() {
     }
     disconnect()
     activeRunId = runId
-    seenSequences.clear()
+    lastSequence = 0
     loadedKeyframes.clear()
     eventsStore.setActiveRunId(runId)
-    await poll()
-    pollTimer = setInterval(poll, POLL_INTERVAL_MS)
+    streamAbort = new AbortController()
+    const generation = ++streamGeneration
+    void follow(runId, generation, streamAbort.signal)
   }
 
   function disconnect(): void {
-    if (pollTimer) clearInterval(pollTimer)
-    pollTimer = null
+    streamGeneration++
+    streamAbort?.abort()
+    streamAbort = null
     activeRunId = null
     isConnected.value = false
+    eventsStore.setConnectionStatus(false)
   }
 
   return {

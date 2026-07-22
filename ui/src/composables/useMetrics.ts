@@ -53,6 +53,17 @@ export interface MetricsData {
   keyframeBlobsReusedTotal: number
   keyframeBlobFailuresTotal: number
   keyframeBlobBytesTotal: number
+  restrictedZoneAssertionsTotal: number
+  restrictedZoneEvidenceFailuresTotal: number
+  restrictedZoneQueueDroppedTotal: number
+  sseSubscribersActive: number
+  sseEventsTotal: number
+  sseReplayedEventsTotal: number
+  sseQueueStallsTotal: number
+  webhooksConfigured: number
+  webhookDeliveredTotal: number
+  webhookRetriesTotal: number
+  webhookDeadLettersTotal: number
   activeSessions: number
   activeGenerations: number
   generationsStartedTotal: number
@@ -428,6 +439,17 @@ function buildMetrics(
     keyframeBlobsReusedTotal: get('vidarax_pipeline_keyframe_blobs_reused_total'),
     keyframeBlobFailuresTotal: keyframeBlobFailures,
     keyframeBlobBytesTotal: get('vidarax_pipeline_keyframe_blob_bytes_total'),
+    restrictedZoneAssertionsTotal: get('vidarax_pipeline_restricted_zone_assertions_total'),
+    restrictedZoneEvidenceFailuresTotal: get('vidarax_pipeline_restricted_zone_evidence_failures_total'),
+    restrictedZoneQueueDroppedTotal: get('vidarax_pipeline_restricted_zone_queue_dropped_total'),
+    sseSubscribersActive: get('vidarax_sse_subscribers_active'),
+    sseEventsTotal: get('vidarax_sse_events_total'),
+    sseReplayedEventsTotal: get('vidarax_sse_replayed_events_total'),
+    sseQueueStallsTotal: get('vidarax_sse_output_queue_stalls_total'),
+    webhooksConfigured: get('vidarax_webhooks_configured'),
+    webhookDeliveredTotal: get('vidarax_webhook_delivered_total'),
+    webhookRetriesTotal: get('vidarax_webhook_retries_total'),
+    webhookDeadLettersTotal: get('vidarax_webhook_dead_letters_total'),
     activeSessions: sessions,
     activeGenerations,
     generationsStartedTotal: get('vidarax_pipeline_generations_started_total'),

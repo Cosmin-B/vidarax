@@ -589,7 +589,7 @@ impl From<&WebRtcConfig> for WorkerPoolConfig {
             loop_repeat_threshold: cfg.loop_repeat_threshold,
             max_output_tokens_per_second: cfg.max_output_tokens_per_second,
             crop: cfg.crop,
-            restricted_zone: None,
+            restricted_zone: cfg.restricted_zone.clone(),
         }
     }
 }
@@ -932,6 +932,7 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<Stage
                                 zone_tx.as_ref().map(|tx| tx.try_send(zone_work)),
                                 Some(Ok(true))
                             ) {
+                                metrics.inc_restricted_zone_queue_dropped();
                                 metrics.inc_keyframes_dropped();
                             }
                             continue 'rtp_frames;
@@ -1241,7 +1242,10 @@ fn spawn_zone_evidence_writer(
                 subject: zone.subject.as_ref(),
                 jpeg_data: &zone.work.jpeg_bytes,
             }) {
+                metrics.inc_restricted_zone_evidence_failure();
                 tracing::warn!(%err, "restricted-zone evidence commit failed");
+            } else {
+                metrics.inc_restricted_zone_assertion();
             }
 
             // Persistence only borrows the pooled JPEG. Move the same buffer on

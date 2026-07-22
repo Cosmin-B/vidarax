@@ -48,7 +48,10 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
 
     let wal_path = resolve_wal_path(&config).map_err(invalid_input)?;
     let backend_config = if let Some(backends) = backend_entries_from_explicit_urls(&config) {
-        vidarax_core::backends::VidaraxConfig { backends }
+        vidarax_core::backends::VidaraxConfig {
+            backends,
+            restricted_zone: None,
+        }
     } else {
         let config_path =
             std::env::var("VIDARAX_CONFIG").unwrap_or_else(|_| "vidarax.toml".to_string());
@@ -58,6 +61,7 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
     // inference call can try serially, so capture the count before the list
     // is consumed by provider construction.
     let inference_backend_count = backend_config.backends.len().max(1);
+    let default_restricted_zone = backend_config.restricted_zone.clone();
     let provider = if backend_config.backends.is_empty() {
         None
     } else {
@@ -80,7 +84,22 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
         )
     };
     let security_policy = security::SecurityPolicy::from_config(&config).map_err(invalid_input)?;
-    let webrtc_config = build_webrtc_config(&config);
+    let mut webrtc_config = build_webrtc_config(&config);
+    if let Some(policy) = default_restricted_zone {
+        let policy_crop = policy.crop();
+        if config
+            .webrtc_crop
+            .is_some_and(|configured| configured != policy_crop)
+        {
+            return Err(invalid_input(
+                "VIDARAX_WEBRTC_CROP must match restricted_zone.region when both are configured"
+                    .to_string(),
+            )
+            .into());
+        }
+        webrtc_config.crop = Some(policy_crop);
+        webrtc_config.restricted_zone = Some(Arc::new(policy));
+    }
     let capacity_worker_config = WorkerPoolConfig::from(&webrtc_config);
     let keyframe_capacity =
         MediaSessionResources::for_pipeline(&capacity_worker_config, VideoCodec::H264, false);

@@ -28,6 +28,7 @@ use crate::provider::{
     HttpTransport, InferenceProvider, ModelRoutingProvider, OpenAiCompatProvider, ProviderKind,
     ProviderRouter,
 };
+use crate::zone::RestrictedZonePolicy;
 
 // ── Config structs ────────────────────────────────────────────────────────────
 
@@ -36,6 +37,10 @@ use crate::provider::{
 pub struct VidaraxConfig {
     #[serde(default)]
     pub backends: Vec<BackendEntry>,
+    /// Optional device-level activity policy applied to every WHIP session.
+    /// A stream attach may replace it with another validated policy.
+    #[serde(default)]
+    pub restricted_zone: Option<RestrictedZonePolicy>,
 }
 
 /// A single backend entry from `[[backends]]`.
@@ -99,6 +104,14 @@ pub fn parse_config(toml_str: &str) -> Result<VidaraxConfig, String> {
         if let Some(s) = &entry.openai_kind {
             entry.openai_kind = Some(interpolate_env_vars(s));
         }
+    }
+
+    if let Some(policy) = &mut config.restricted_zone {
+        policy.policy_id = interpolate_env_vars(&policy.policy_id);
+        policy.device_id = interpolate_env_vars(&policy.device_id);
+        policy
+            .validate()
+            .map_err(|err| format!("invalid restricted_zone policy: {err}"))?;
     }
 
     Ok(config)
@@ -533,6 +546,60 @@ priority = 1
     fn parse_config_empty_backends() {
         let config = parse_config("").expect("empty toml is valid");
         assert!(config.backends.is_empty());
+        assert!(config.restricted_zone.is_none());
+    }
+
+    #[test]
+    fn parse_config_accepts_valid_device_restricted_zone() {
+        let config = parse_config(
+            r#"
+[restricted_zone]
+policy_id = "loading-bay"
+policy_version = 4
+device_id = "edge-17"
+enter_motion_score = 0.30
+exit_motion_score = 0.10
+enter_after_frames = 2
+exit_after_frames = 3
+
+[restricted_zone.region]
+x = 0.10
+y = 0.20
+width = 0.70
+height = 0.60
+"#,
+        )
+        .expect("valid policy");
+
+        let policy = config.restricted_zone.expect("restricted zone");
+        assert_eq!(policy.policy_id, "loading-bay");
+        assert_eq!(policy.policy_version, 4);
+        assert_eq!(policy.crop().width, 0.70);
+    }
+
+    #[test]
+    fn parse_config_rejects_invalid_device_restricted_zone() {
+        let err = parse_config(
+            r#"
+[restricted_zone]
+policy_id = "loading-bay"
+policy_version = 0
+device_id = "edge-17"
+enter_motion_score = 0.10
+exit_motion_score = 0.20
+enter_after_frames = 2
+exit_after_frames = 3
+
+[restricted_zone.region]
+x = 0.0
+y = 0.0
+width = 1.0
+height = 1.0
+"#,
+        )
+        .expect_err("invalid policy must fail startup parsing");
+
+        assert!(err.contains("invalid restricted_zone policy"));
     }
 
     #[test]

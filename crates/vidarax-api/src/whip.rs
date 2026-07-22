@@ -43,7 +43,8 @@ use vidarax_core::webrtc::clip::ClipConfig as CoreClipConfig;
 use vidarax_core::webrtc::resources::MediaSessionResources;
 use vidarax_core::webrtc::runtime::SessionCommand;
 use vidarax_core::webrtc::session::{
-    PeerConnectionState, WebRtcSession, WebRtcSetupError, RTP_FRAME_QUEUE_CAPACITY,
+    PeerConnectionState, SessionCloseDisposition, WebRtcSession, WebRtcSetupError,
+    RTP_FRAME_QUEUE_CAPACITY,
 };
 use vidarax_core::webrtc::workers::{
     spawn_pipeline, EventSink, PipelineWiring, WorkerPoolConfig, STREAM_FRAME_QUEUE_CAPACITY,
@@ -664,7 +665,9 @@ fn apply_attach_config(
         return Ok(None);
     };
 
-    if config.restricted_zone.is_some() && config.clip_mode.is_some() {
+    if (config.restricted_zone.is_some() || session.restricted_zone.is_some())
+        && config.clip_mode.is_some()
+    {
         return Err("restricted_zone and clip_mode cannot be enabled together".to_string());
     }
 
@@ -683,6 +686,15 @@ fn apply_attach_config(
         session.restricted_zone = Some(Arc::new(zone));
     } else if let Some(crop) = config.crop {
         crop.validate().map_err(|e| e.to_string())?;
+        if session
+            .restricted_zone
+            .as_ref()
+            .is_some_and(|policy| crop != policy.crop())
+        {
+            return Err(
+                "crop must exactly match the configured restricted_zone.region".to_string(),
+            );
+        }
         session.crop = Some(crop);
     }
 
@@ -772,11 +784,7 @@ pub async fn whip_terminate(
         .get_session(&sess_id)
         .map(|(principal, run_id, _)| (principal, run_id));
     let reclaimed_session = if live_session.is_none() {
-        state
-            .get_reclaimed_session(&sess_id)
-            .and_then(|(principal, run_id)| {
-                state.run_is_deleted(&run_id).then_some((principal, run_id))
-            })
+        state.get_reclaimed_session(&sess_id)
     } else {
         None
     };
@@ -794,12 +802,11 @@ pub async fn whip_terminate(
     match terminate_whip_session(&state, &sess_id, &run_id).await {
         Ok(()) => StatusCode::OK,
         Err(err) => {
-            // A committed tombstone satisfies the delete's contract even if
-            // the reclaim is owned elsewhere. The watcher finishes the
-            // session removal in that case.
-            if state.run_is_deleted(&run_id) {
+            // A committed terminal transition satisfies the termination even
+            // if a peer-state watcher owns the final in-memory removal.
+            if whip_run_is_terminal(&state, &run_id) {
                 tracing::info!(
-                    "WHIP terminate: tombstone committed, cleanup owned elsewhere sess={sess_id}: {err}"
+                    "WHIP terminate: terminal event committed, cleanup owned elsewhere sess={sess_id}: {err}"
                 );
                 return StatusCode::OK;
             }
@@ -828,20 +835,13 @@ async fn terminate_whip_session_transaction(
     sess_id: String,
     run_id: String,
 ) -> Result<(), String> {
-    // The tombstone, the delete marking, and the reclaim live in one
-    // cancellation-resistant task. A client can drop the request right after
-    // the tombstone commits, and cancelling there would leave a deleted run
-    // with a live session and pipeline still running.
-    //
-    // The delete guarantees its own tombstone, exactly like the REST delete
-    // handler, so a stop-claimed reclaim that skips its append cannot lose
-    // it. The append is idempotent, so a duplicate from the reclaim is
-    // impossible.
-    append_whip_run_deleted_once(&state, &run_id, &sess_id, "delete").await?;
     if let Some((_, _, session)) = state.get_session(&sess_id) {
-        session.mark_close_disposition_delete();
+        // RFC 9725 DELETE terminates the WHIP resource; it does not delete the
+        // Vidarax run or its durable evidence. The winning reclaimer commits
+        // run_completed before releasing the session.
+        session.mark_close_disposition_complete();
     }
-    reclaim_whip_session_transaction(state, sess_id, run_id, "delete".to_string()).await
+    reclaim_whip_session_transaction(state, sess_id, run_id, "whip_terminated".to_string()).await
 }
 
 fn should_reclaim_peer_state(state: PeerConnectionState) -> bool {
@@ -947,12 +947,22 @@ async fn reclaim_whip_session_transaction(
         }
     }
 
-    let preserve_history = session.close_preserves_history();
-    if !preserve_history {
-        if let Err(err) = append_whip_run_deleted_once(&state, &run_id, &sess_id, &reason).await {
-            session.release_reclaim_claim();
-            return Err(err);
+    let disposition = session.close_disposition();
+    let terminal_result = match disposition {
+        SessionCloseDisposition::Delete => {
+            append_whip_run_deleted_once(&state, &run_id, &sess_id, &reason).await
         }
+        SessionCloseDisposition::Stop => Ok(()),
+        SessionCloseDisposition::Complete => {
+            append_whip_terminal_once(&state, &run_id, &sess_id, "run_completed", &reason).await
+        }
+        SessionCloseDisposition::Fault => {
+            append_whip_terminal_once(&state, &run_id, &sess_id, "run_failed", &reason).await
+        }
+    };
+    if let Err(err) = terminal_result {
+        session.release_reclaim_claim();
+        return Err(err);
     }
 
     if let Some((_principal, _existing_run_id, session)) =
@@ -961,7 +971,8 @@ async fn reclaim_whip_session_transaction(
         state.pipeline_metrics().inc_sessions_removed();
         session.close();
         tracing::info!(
-            "WHIP session reclaimed sess_id={sess_id} reason={reason} preserve_history={preserve_history}"
+            ?disposition,
+            "WHIP session reclaimed sess_id={sess_id} reason={reason}"
         );
     }
 
@@ -1023,13 +1034,50 @@ async fn watcher_reclaim_terminal(state: &AppState, sess_id: &str, run_id: &str)
         return &*existing_run_id != run_id;
     }
 
-    if state.run_is_deleted(run_id) {
+    if whip_run_is_terminal(state, run_id) {
         return true;
     }
 
     state
         .get_reclaimed_session(sess_id)
         .is_some_and(|(_principal, reclaimed_run_id)| &*reclaimed_run_id == run_id)
+}
+
+fn whip_run_is_terminal(state: &AppState, run_id: &str) -> bool {
+    state
+        .run_runtime_snapshot(run_id, unix_time_ms())
+        .is_none_or(|snapshot| snapshot.state.is_terminal())
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+async fn append_whip_terminal_once(
+    state: &AppState,
+    run_id: &str,
+    sess_id: &str,
+    kind: &'static str,
+    reason: &str,
+) -> Result<(), String> {
+    if whip_run_is_terminal(state, run_id) {
+        return Ok(());
+    }
+    state
+        .append_run_event_async(
+            run_id,
+            kind,
+            serde_json::json!({
+                "source": "whip",
+                "session_id": sess_id,
+                "reason": reason,
+            }),
+        )
+        .await
+        .map(|_| ())
 }
 
 async fn append_whip_run_deleted_once(
@@ -1255,6 +1303,7 @@ mod tests {
     use http_body_util::BodyExt;
     use std::sync::Arc;
     use tower::ServiceExt;
+    use vidarax_contracts::lifecycle::StreamState;
 
     use crate::security::SecurityPolicy;
     use crate::state::AppState;
@@ -1665,7 +1714,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reclaim_on_disconnect_tombstones_run_and_releases_active_slot_once() {
+    async fn reclaim_on_disconnect_fails_run_and_preserves_history_once() {
         let state = AppState::with_wal_for_tests(std::env::temp_dir().join(format!(
             "vidarax-whip-disconnect-{}.wal",
             std::process::id()
@@ -1704,22 +1753,25 @@ mod tests {
             .expect("second reclaim must be idempotent");
 
         let events = state.read_run_events(&run_id).unwrap();
-        let deleted = events
+        let failed = events
             .iter()
-            .filter(|event| event.kind == "run_deleted")
+            .filter(|event| event.kind == "run_failed")
             .count();
-        assert_eq!(deleted, 1);
+        assert_eq!(failed, 1);
         assert_eq!(
             state.count_active_runs_for_principal(principal, now_ms()),
             0
         );
-        assert!(state.run_runtime_snapshot(&run_id, now_ms()).is_none());
+        assert_eq!(
+            state.run_runtime_snapshot(&run_id, now_ms()).unwrap().state,
+            StreamState::Failed
+        );
         assert!(state.get_session(sess_id).is_none());
     }
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_reclaim_cannot_commit_tombstone_and_leave_live_session() {
+    async fn cancelled_fault_reclaim_cannot_commit_terminal_event_and_leave_live_session() {
         let dir = std::env::temp_dir().join(format!(
             "vidarax-whip-reclaim-cancel-{}",
             std::process::id()
@@ -1766,7 +1818,9 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
-                if state.run_is_deleted(&run_id)
+                if state
+                    .run_runtime_snapshot(&run_id, now_ms())
+                    .is_some_and(|snapshot| snapshot.state == StreamState::Failed)
                     && state.session_count() == 0
                     && session.close_call_count_for_tests() == 1
                 {
@@ -1776,7 +1830,7 @@ mod tests {
             }
         })
         .await
-        .expect("blocked reclaim should commit, remove, and close the live session");
+        .expect("blocked reclaim should fail the run, remove, and close the live session");
 
         assert_eq!(state.session_count(), 0);
         assert!(state.get_session(sess_id).is_none());
@@ -1784,7 +1838,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_whip_terminate_still_deletes_run_and_removes_session() {
+    async fn cancelled_whip_terminate_still_completes_run_and_removes_session() {
         let state = AppState::with_wal_for_tests(std::env::temp_dir().join(format!(
             "vidarax-whip-termcancel-{}.wal",
             std::process::id()
@@ -1812,9 +1866,9 @@ mod tests {
             Arc::clone(&session),
         ));
 
-        // Cancel the terminate exactly while its tombstone append is in
+        // Cancel the terminate exactly while its terminal append is in
         // flight, like a client dropping the request. The spawned transaction
-        // must still finish: run deleted once, session removed.
+        // must still finish: run completed once, session removed.
         state.pause_timeline_appends_for_tests();
         let term_state = state.clone();
         let term_run_id = Arc::clone(&run_id);
@@ -1828,25 +1882,30 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if state.run_is_deleted(&run_id) && state.session_count() == 0 {
+                if state
+                    .run_runtime_snapshot(&run_id, now_ms())
+                    .is_some_and(|snapshot| snapshot.state == StreamState::Completed)
+                    && state.session_count() == 0
+                {
                     return;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("cancelled terminate must still delete the run and remove the session");
+        .expect("cancelled terminate must still complete the run and remove the session");
 
         let events = state.read_run_events(&run_id).unwrap();
-        let deleted = events
+        let completed = events
             .iter()
-            .filter(|event| event.kind == "run_deleted")
+            .filter(|event| event.kind == "run_completed")
             .count();
-        assert_eq!(deleted, 1);
+        assert_eq!(completed, 1);
+        assert!(events.iter().all(|event| event.kind != "run_deleted"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delete_overlapping_claimed_stop_reclaim_still_ends_deleted() {
+    async fn run_delete_overlapping_claimed_stop_reclaim_still_ends_deleted() {
         let state = AppState::with_wal_for_tests(
             std::env::temp_dir().join(format!("vidarax-whip-overlap-{}.wal", std::process::id())),
         );
@@ -1877,7 +1936,7 @@ mod tests {
         session.mark_close_disposition_stop();
         assert!(session.try_claim_reclaim());
 
-        // A WHIP delete lands in that window. Its endpoint appends the
+        // A run delete lands in that window. Its endpoint appends the
         // tombstone itself, so the delete contract holds no matter who wins
         // the session cleanup. The overlapping reclaim call must report a
         // retryable error, not false success.
@@ -1908,7 +1967,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn whip_delete_after_stop_mark_still_tombstones() {
+    async fn run_delete_disposition_after_stop_mark_still_tombstones() {
         let state = AppState::with_wal_for_tests(
             std::env::temp_dir().join(format!("vidarax-whip-wdel-{}.wal", std::process::id())),
         );
@@ -1935,10 +1994,9 @@ mod tests {
             Arc::clone(&session),
         ));
 
-        // A stop marks the session first, then a WHIP DELETE lands. The
-        // delete disposition overrides the stop mark, and the reclaim itself
-        // must append the tombstone because WHIP DELETE has no handler-side
-        // append of its own.
+        // A stop marks the session first, then a run deletion lands. The
+        // delete disposition overrides the stop mark, and the reclaimer
+        // appends the tombstone if the handler has not already done so.
         session.mark_close_disposition_stop();
         session.mark_close_disposition_delete();
         reclaim_whip_session(&state, sess_id, &run_id, "delete")
@@ -1952,7 +2010,7 @@ mod tests {
             .count();
         assert_eq!(
             deleted, 1,
-            "WHIP delete must tombstone despite the stop mark"
+            "run delete must tombstone despite the stop mark"
         );
         assert!(state.get_session(sess_id).is_none());
     }
@@ -2101,7 +2159,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reclaim_delete_after_watcher_reclaim_is_idempotent_success() {
+    async fn reclaim_after_watcher_failure_is_idempotent_success() {
         let state = AppState::with_wal_for_tests(std::env::temp_dir().join(format!(
             "vidarax-whip-watcher-wins-{}.wal",
             std::process::id()
@@ -2137,7 +2195,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| event.kind == "run_deleted")
+                .filter(|event| event.kind == "run_failed")
                 .count(),
             1
         );
@@ -2194,7 +2252,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_delete_and_watcher_reclaim_has_single_terminal_effect() {
+    async fn concurrent_reclaim_and_watcher_have_single_fault_effect() {
         let state = AppState::with_wal_for_tests(std::env::temp_dir().join(format!(
             "vidarax-whip-concurrent-reclaim-{}.wal",
             std::process::id()
@@ -2252,7 +2310,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| event.kind == "run_deleted")
+                .filter(|event| event.kind == "run_failed")
                 .count(),
             1
         );
@@ -2260,7 +2318,10 @@ mod tests {
             state.count_active_runs_for_principal(principal, now_ms()),
             0
         );
-        assert!(state.run_runtime_snapshot(&run_id, now_ms()).is_none());
+        assert_eq!(
+            state.run_runtime_snapshot(&run_id, now_ms()).unwrap().state,
+            StreamState::Failed
+        );
         assert!(state.get_session(sess_id).is_none());
         assert!(state
             .pipeline_metrics()
@@ -2312,7 +2373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reclaim_watcher_retries_transient_tombstone_append_failure_until_cleanup_succeeds() {
+    async fn reclaim_watcher_retries_transient_fault_append_failure_until_cleanup_succeeds() {
         let dir =
             std::env::temp_dir().join(format!("vidarax-whip-watch-retry-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2365,7 +2426,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| event.kind == "run_deleted")
+                .filter(|event| event.kind == "run_failed")
                 .count(),
             1
         );
@@ -2373,7 +2434,10 @@ mod tests {
             state.count_active_runs_for_principal(principal, now_ms()),
             0
         );
-        assert!(state.run_runtime_snapshot(&run_id, now_ms()).is_none());
+        assert_eq!(
+            state.run_runtime_snapshot(&run_id, now_ms()).unwrap().state,
+            StreamState::Failed
+        );
         assert!(state.get_session(sess_id).is_none());
     }
 

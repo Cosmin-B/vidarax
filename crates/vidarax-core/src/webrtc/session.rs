@@ -171,6 +171,9 @@ pub struct WebRtcConfig {
     /// analyzed. Session default; a per-attach crop on the stream request
     /// overrides it. `None` analyzes the whole frame.
     pub crop: Option<CropRegion>,
+    /// Optional device-level activity policy used when an attach request does
+    /// not replace it.
+    pub restricted_zone: Option<Arc<RestrictedZonePolicy>>,
 }
 
 /// Failure from [`WebRtcSession::new`].
@@ -213,8 +216,23 @@ impl Default for WebRtcConfig {
             loop_repeat_threshold: 3,
             vlm_tiering: TieredVlmConfig::default(),
             crop: None,
+            restricted_zone: None,
         }
     }
+}
+
+/// Durable outcome chosen for a live session when its peer is reclaimed.
+///
+/// The numeric order is intentional: an explicit run delete overrides every
+/// other outcome, and an explicit REST stop overrides a concurrent graceful
+/// WHIP resource termination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SessionCloseDisposition {
+    Fault = 0,
+    Complete = 1,
+    Stop = 2,
+    Delete = 3,
 }
 
 /// An active WebRTC peer connection managing a single inbound media stream.
@@ -226,10 +244,9 @@ impl Default for WebRtcConfig {
 /// connection closes when all handles are dropped.
 pub struct WebRtcSession {
     pc: PeerConnection,
-    /// Why this session is being closed, if a handler said so before the
-    /// close. 0 none, 1 stop (preserve history), 2 delete. Monotonic via
-    /// fetch_max so a delete always overrides a stop, and the winning
-    /// reclaimer reads it after it owns the removal.
+    /// Why this session is being closed. Monotonic ordering lets an explicit
+    /// stop or delete override a graceful transport close before the winning
+    /// reclaimer commits the terminal event.
     close_disposition: AtomicU8,
     /// Reclaim decision ownership. See try_claim_reclaim.
     reclaim_claimed: AtomicBool,
@@ -504,7 +521,7 @@ impl WebRtcSession {
                 control,
                 max_output_tokens_per_second: config.max_output_tokens_per_second,
                 crop: config.crop,
-                restricted_zone: None,
+                restricted_zone: config.restricted_zone.clone(),
                 codec,
                 rtp_nal_pool_slots: rtp_nal_pool_slots(config.decode_workers),
                 shutdown,
@@ -779,21 +796,33 @@ impl WebRtcSession {
         self.control.stopping_flag()
     }
 
+    /// Mark a normal WHIP resource termination as a completed run.
+    pub fn mark_close_disposition_complete(&self) {
+        self.close_disposition
+            .fetch_max(SessionCloseDisposition::Complete as u8, Ordering::AcqRel);
+    }
+
     /// Ask the reclaim of this session to keep the run's history (REST stop).
     pub fn mark_close_disposition_stop(&self) {
-        self.close_disposition.fetch_max(1, Ordering::AcqRel);
+        self.close_disposition
+            .fetch_max(SessionCloseDisposition::Stop as u8, Ordering::AcqRel);
     }
 
     /// Record that a delete requested this close. Overrides a stop mark, so a
     /// delete that lands after a stop still tombstones the run.
     pub fn mark_close_disposition_delete(&self) {
-        self.close_disposition.fetch_max(2, Ordering::AcqRel);
+        self.close_disposition
+            .fetch_max(SessionCloseDisposition::Delete as u8, Ordering::AcqRel);
     }
 
-    /// True only when a stop asked for history preservation and no delete
-    /// overrode it. Read by the reclaimer after it owns the reclaim claim.
-    pub fn close_preserves_history(&self) -> bool {
-        self.close_disposition.load(Ordering::Acquire) == 1
+    /// Read by the reclaimer only after it owns the reclaim claim.
+    pub fn close_disposition(&self) -> SessionCloseDisposition {
+        match self.close_disposition.load(Ordering::Acquire) {
+            1 => SessionCloseDisposition::Complete,
+            2 => SessionCloseDisposition::Stop,
+            3 => SessionCloseDisposition::Delete,
+            _ => SessionCloseDisposition::Fault,
+        }
     }
 
     /// Claim the right to decide this session's reclaim. Exactly one caller

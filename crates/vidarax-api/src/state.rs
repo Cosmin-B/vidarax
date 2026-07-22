@@ -54,9 +54,9 @@ type ReclaimedSessionEntry = (String, Arc<str>);
 type ReclaimedSessionMap = Arc<Mutex<ReclaimedSessions>>;
 type StreamReservations = Arc<DashMap<String, usize>>;
 
-/// WHIP DELETE remains idempotent for watcher-reclaimed sessions within this
-/// window. Older random session IDs are tombstones only; retaining them forever
-/// would make memory grow with all historical disconnects.
+/// WHIP termination remains idempotent for watcher-reclaimed sessions within
+/// this window. Retaining every historical session ID forever would make
+/// memory grow with all disconnects.
 const RECLAIMED_SESSION_TTL_MS: u64 = 10 * 60 * 1000;
 const RECLAIMED_SESSION_MAX_ENTRIES: usize = 1024;
 
@@ -312,8 +312,8 @@ pub struct AppStateInner {
     /// configured backend fallback count, admission wait, and novelty
     /// embedding timeout.
     media_join_deadline: std::time::Duration,
-    /// Recently reclaimed WHIP sessions, retained so DELETE remains idempotent
-    /// after a peer-state watcher has already removed the live session entry.
+    /// Recently reclaimed WHIP sessions, retained so termination remains
+    /// idempotent after a peer-state watcher removed the live session entry.
     reclaimed_sessions: ReclaimedSessionMap,
     /// WebRTC configuration (STUN/TURN servers, token rate limit).
     webrtc_config: WebRtcConfig,

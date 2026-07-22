@@ -6,7 +6,10 @@ Vidarax decodes video, applies a deterministic per-frame filter, and sends selec
 frames to a configured vision-language model. Live capture can also use an
 embedding sidecar to reuse recent descriptions while a scene remains
 semantically stable. Events commit to a local write-ahead log; selected JPEGs
-are stored as content-addressed blobs and referenced by event metadata.
+are stored as content-addressed blobs and referenced by event metadata. For
+fixed cameras, a device-level restricted-zone policy can turn sustained motion
+in normalized image geometry into a durable assertion with binary evidence,
+without putting image bytes in JSON.
 
 ## Architecture
 
@@ -160,6 +163,7 @@ The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via
 | `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` | `64` | Process-wide reservation budget for live pipeline OS threads |
 | `VIDARAX_STREAM_TTL_SECS` | `3600` | Run idle TTL |
 | `VIDARAX_WEBHOOK_SECRET` | — | Process signing secret for webhooks; 32 bytes minimum |
+| `VIDARAX_CONFIG` | `vidarax.toml` | Backend configuration and optional device-level restricted-zone policy |
 
 Full configuration reference in [docs/deployment.md](docs/deployment.md).
 

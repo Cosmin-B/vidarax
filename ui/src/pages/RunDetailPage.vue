@@ -570,6 +570,7 @@ const EVENT_COLORS: Record<string, string> = {
   exposure_shift:     '#a78bfa',
   flicker:            '#fb7185',
   keyframe:           '#22c55e',
+  restricted_zone_activity: '#38bdf8',
 }
 function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
 

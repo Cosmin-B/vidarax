@@ -9,6 +9,7 @@ export type EventType =
   | 'exposure_shift'
   | 'flicker'
   | 'keyframe'
+  | 'restricted_zone_activity'
 
 export interface AgentEvent {
   run_id: string

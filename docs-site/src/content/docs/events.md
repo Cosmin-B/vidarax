@@ -75,10 +75,11 @@ Run lifecycle and analysis kinds written by the API handlers, with the payload f
 | `semantic_chunk_generated` | A semantic result for a chunk was recorded. | `request_id`, `stream_id`, `chunk_index`, `chunk_frames`, `process_ms`, `source_span_ms`, `lag_ms`, `index_name`, token counts, `inference_latency_ms` |
 | `semantic_fallback_activated` | The semantic path fell back (for example, no provider). | `request_id`, `stream_id`, `reason` |
 | `inference_completed` | A direct inference request completed. | `request_id`, `provider`, `model`, `fallback_used`, `prompt_bytes`, `output_bytes` |
-| `run_completed` | The run reached a terminal state. | `request_id`, `stream_id`, `frames`, `markers`, `index_name` |
+| `run_completed` | The run reached a terminal success state, including graceful WHIP termination. | Analysis summary fields, or `source`, `session_id`, and `reason` for WHIP |
+| `run_failed` | A live session ended unexpectedly and its history remains available. | `source`, `session_id`, `reason` |
 | `stop_requested` | A graceful stop was requested. | `request_id` |
 | `keepalive_refreshed` | The run's idle TTL was refreshed. | `request_id` |
-| `run_deleted` | The run was soft-deleted. | `request_id` (WHIP reclaim and tombstone paths carry reclaim metadata instead) |
+| `run_deleted` | The run was explicitly soft-deleted. | `request_id` (creation-failure compensation carries tombstone metadata instead) |
 
 With concurrent semantic inference, `semantic_chunk_inferred` records are appended as chunks finish and can therefore arrive out of `chunk_index` order. Use the WAL sequence for observation order and `chunk_index` for source order.
 
