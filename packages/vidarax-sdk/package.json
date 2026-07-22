@@ -29,7 +29,7 @@
     "build:watch": "tsc --project tsconfig.json --watch",
     "typecheck": "tsc --project tsconfig.json --noEmit",
     "clean": "rm -rf dist tsconfig.tsbuildinfo",
-    "test": "vitest run",
+    "test": "vitest run tests/client.test.ts",
     "test:e2e": "vitest run tests/e2e.test.ts"
   },
   "devDependencies": {

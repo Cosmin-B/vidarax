@@ -16,6 +16,7 @@ use crate::policies::{
 };
 use crate::security::enforce_security;
 use crate::state::AppState;
+use crate::triggers::{compile_trigger, evaluate_trigger, validate_trigger};
 use crate::whip::{whip_ice, whip_offer, whip_terminate, whip_update_prompt};
 
 pub fn app_router(state: AppState) -> Router {
@@ -72,6 +73,9 @@ pub fn app_router(state: AppState) -> Router {
         .route("/v1/infer", post(infer))
         .route("/v1/infer/batch", post(infer_batch))
         .route("/v1/models", get(list_models))
+        .route("/v1/triggers/compile", post(compile_trigger))
+        .route("/v1/triggers/validate", post(validate_trigger))
+        .route("/v1/triggers/evaluate", post(evaluate_trigger))
         .route("/v1/health", get(health))
         .route("/v1/metrics", get(metrics))
         // WHIP WebRTC ingestion (RFC 9725)

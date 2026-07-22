@@ -56,10 +56,26 @@ export interface MetricsData {
   restrictedZoneAssertionsTotal: number
   restrictedZoneEvidenceFailuresTotal: number
   restrictedZoneQueueDroppedTotal: number
+  triggerAssertionsTotal: number
+  triggerBinaryWriteFailuresTotal: number
+  triggerQueueDroppedTotal: number
+  triggerMissingSignalTotal: number
+  triggerLocalOutputsTotal: number
+  triggerLocalOutputFailuresTotal: number
+  inferenceActiveTokens: number
+  inferenceTokenLimit: number
+  inferenceActiveBytes: number
+  inferenceByteLimit: number
+  inferenceDeadlineMissedTotal: number
+  inferenceBudgetRejectedTotal: number
+  inferenceUrgentAcquiredTotal: number
+  inferenceLiveAcquiredTotal: number
+  inferenceOfflineAcquiredTotal: number
   sseSubscribersActive: number
   sseEventsTotal: number
   sseReplayedEventsTotal: number
   sseQueueStallsTotal: number
+  sseCommitLatency: HistogramPercentiles | null
   webhooksConfigured: number
   webhookDeliveredTotal: number
   webhookRetriesTotal: number
@@ -290,6 +306,14 @@ function eventMirrorPercentilesMs(
   return toPercentiles(h)
 }
 
+function sseCommitPercentilesMs(
+  histograms: Map<string, RawHistogram>,
+): HistogramPercentiles | null {
+  const h = histograms.get('vidarax_sse_commit_to_send_latency_ms')
+  if (!h || h.totalCount === 0) return null
+  return toPercentiles(h)
+}
+
 function buildMetrics(
   map: Map<string, number>,
   histograms: Map<string, RawHistogram>,
@@ -304,6 +328,7 @@ function buildMetrics(
   const noveltyPct = noveltyPercentilesMs(histograms)
   const keyframeBlobPct = keyframeBlobPercentilesMs(histograms)
   const eventMirrorPct = eventMirrorPercentilesMs(histograms)
+  const sseCommitPct = sseCommitPercentilesMs(histograms)
 
   const decodeLatency = decodePct?.mean ?? 0
   const gateLatency = gatePct?.mean ?? 0
@@ -417,6 +442,7 @@ function buildMetrics(
   if (noveltyPct) histogramsOut['Novelty'] = noveltyPct
   if (keyframeBlobPct) histogramsOut['Keyframe store'] = keyframeBlobPct
   if (eventMirrorPct) histogramsOut['Event mirror'] = eventMirrorPct
+  if (sseCommitPct) histogramsOut['SSE delivery'] = sseCommitPct
 
   return {
     stages,
@@ -442,10 +468,26 @@ function buildMetrics(
     restrictedZoneAssertionsTotal: get('vidarax_pipeline_restricted_zone_assertions_total'),
     restrictedZoneEvidenceFailuresTotal: get('vidarax_pipeline_restricted_zone_evidence_failures_total'),
     restrictedZoneQueueDroppedTotal: get('vidarax_pipeline_restricted_zone_queue_dropped_total'),
+    triggerAssertionsTotal: get('vidarax_pipeline_trigger_assertions_total'),
+    triggerBinaryWriteFailuresTotal: get('vidarax_pipeline_trigger_binary_write_failures_total'),
+    triggerQueueDroppedTotal: get('vidarax_pipeline_trigger_queue_dropped_total'),
+    triggerMissingSignalTotal: get('vidarax_pipeline_trigger_missing_signal_total'),
+    triggerLocalOutputsTotal: get('vidarax_pipeline_trigger_local_outputs_total'),
+    triggerLocalOutputFailuresTotal: get('vidarax_pipeline_trigger_local_output_failures_total'),
+    inferenceActiveTokens: get('vidarax_infer_admission_active_tokens'),
+    inferenceTokenLimit: get('vidarax_infer_admission_token_limit'),
+    inferenceActiveBytes: get('vidarax_infer_admission_active_bytes'),
+    inferenceByteLimit: get('vidarax_infer_admission_byte_limit'),
+    inferenceDeadlineMissedTotal: get('vidarax_infer_admission_deadline_missed_total'),
+    inferenceBudgetRejectedTotal: get('vidarax_infer_admission_budget_rejections_total'),
+    inferenceUrgentAcquiredTotal: get('vidarax_infer_admission_urgent_live_acquired_total'),
+    inferenceLiveAcquiredTotal: get('vidarax_infer_admission_live_acquired_total'),
+    inferenceOfflineAcquiredTotal: get('vidarax_infer_admission_offline_acquired_total'),
     sseSubscribersActive: get('vidarax_sse_subscribers_active'),
     sseEventsTotal: get('vidarax_sse_events_total'),
     sseReplayedEventsTotal: get('vidarax_sse_replayed_events_total'),
     sseQueueStallsTotal: get('vidarax_sse_output_queue_stalls_total'),
+    sseCommitLatency: sseCommitPct,
     webhooksConfigured: get('vidarax_webhooks_configured'),
     webhookDeliveredTotal: get('vidarax_webhook_delivered_total'),
     webhookRetriesTotal: get('vidarax_webhook_retries_total'),

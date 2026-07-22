@@ -35,6 +35,7 @@ use axum::Json;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use vidarax_contracts::triggers::{CaptureKind, TriggerInstruction, TriggerSignal};
 use vidarax_core::provider::{
     InferenceObserver, InferenceProvider, InferenceRequest, InferenceResult, ProviderError,
     ProviderKind, TokenUsage,
@@ -341,6 +342,7 @@ async fn start_whip_session_transaction(
     admission_pool_config.max_output_tokens_per_second = session.max_output_tokens_per_second;
     admission_pool_config.crop = session.crop;
     admission_pool_config.restricted_zone = session.restricted_zone.clone();
+    admission_pool_config.trigger_program = session.trigger_program.clone();
     let media_resources = MediaSessionResources::for_pipeline(
         &admission_pool_config,
         session.codec,
@@ -373,6 +375,11 @@ async fn start_whip_session_transaction(
             "principal_key": principal,
             "session_id": sess_id,
             "source": "whip",
+            "trigger_program": session.trigger_program.as_ref().map(|program| serde_json::json!({
+                "program_id": program.program_id,
+                "version": program.version,
+                "isa_version": program.isa_version,
+            })),
         }),
     ) {
         tracing::error!("WHIP run_created append failed for {sess_id}: {err}");
@@ -475,6 +482,7 @@ async fn start_whip_session_transaction(
     // overridden by the attach request; it wins over the config default.
     let session_crop = session.crop;
     let restricted_zone_for_workers = session.restricted_zone.clone();
+    let trigger_program_for_workers = session.trigger_program.clone();
 
     // Capture everything needed by the spawn_blocking closure.
     let run_id_for_workers = Arc::clone(&run_id);
@@ -520,6 +528,7 @@ async fn start_whip_session_transaction(
         pool_config.max_output_tokens_per_second = max_output_tokens_per_second;
         pool_config.crop = session_crop;
         pool_config.restricted_zone = restricted_zone_for_workers;
+        pool_config.trigger_program = trigger_program_for_workers;
 
         match spawn_pipeline(
             &pool_config,
@@ -665,10 +674,20 @@ fn apply_attach_config(
         return Ok(None);
     };
 
-    if (config.restricted_zone.is_some() || session.restricted_zone.is_some())
+    if (config.restricted_zone.is_some()
+        || session.restricted_zone.is_some()
+        || config.trigger_program.is_some()
+        || session.trigger_program.is_some())
         && config.clip_mode.is_some()
     {
-        return Err("restricted_zone and clip_mode cannot be enabled together".to_string());
+        return Err(
+            "restricted_zone or trigger_program cannot be enabled with clip_mode".to_string(),
+        );
+    }
+    let zone_enabled = config.restricted_zone.is_some() || session.restricted_zone.is_some();
+    let trigger_enabled = config.trigger_program.is_some() || session.trigger_program.is_some();
+    if zone_enabled && trigger_enabled {
+        return Err("restricted_zone and trigger_program are mutually exclusive".to_string());
     }
 
     if let Some(zone) = config.restricted_zone {
@@ -698,6 +717,11 @@ fn apply_attach_config(
         session.crop = Some(crop);
     }
 
+    if let Some(program) = config.trigger_program {
+        validate_live_trigger_program(&program)?;
+        session.trigger_program = Some(Arc::new(program));
+    }
+
     if let Some(prompt) = config.prompt {
         session.set_initial_prompt(prompt);
     }
@@ -711,6 +735,67 @@ fn apply_attach_config(
     }
 
     Ok(None)
+}
+
+fn validate_live_trigger_program(
+    program: &vidarax_contracts::triggers::TriggerProgram,
+) -> Result<(), String> {
+    program.validate().map_err(|error| error.to_string())?;
+    let mut keyframe_captures = 0usize;
+    for instruction in &program.instructions {
+        match instruction {
+            TriggerInstruction::Load {
+                signal:
+                    TriggerSignal::MotionScore
+                    | TriggerSignal::NoveltyScore
+                    | TriggerSignal::Confidence,
+            } => {}
+            TriggerInstruction::Load { signal } => {
+                return Err(format!(
+                    "live frame path does not provide trigger signal {signal:?}; replay it through /v1/triggers/evaluate or attach a detector source"
+                ));
+            }
+            TriggerInstruction::Capture {
+                kind: CaptureKind::Keyframe,
+                ..
+            } => keyframe_captures += 1,
+            TriggerInstruction::Capture {
+                kind: CaptureKind::Clip,
+                ..
+            } => {
+                return Err(
+                    "live trigger clip capture requires the edge clip-ring capability; use keyframe capture on this runtime"
+                        .to_string(),
+                )
+            }
+            TriggerInstruction::Notify {
+                channel: vidarax_contracts::triggers::ActionChannel::LocalOutput,
+            } => {
+                #[cfg(not(unix))]
+                return Err("live trigger local output requires a Unix-domain datagram socket".to_string());
+                #[cfg(unix)]
+                {
+                    let path = std::env::var_os("VIDARAX_TRIGGER_LOCAL_OUTPUT_SOCKET")
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            "notify local_output requires VIDARAX_TRIGGER_LOCAL_OUTPUT_SOCKET"
+                                .to_string()
+                        })?;
+                    if !std::path::Path::new(&path).is_absolute() {
+                        return Err(
+                            "VIDARAX_TRIGGER_LOCAL_OUTPUT_SOCKET must be an absolute path"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if keyframe_captures != 1 {
+        return Err("live trigger program must contain exactly one keyframe capture".to_string());
+    }
+    Ok(())
 }
 
 /// `PATCH /v1/stream/whip/{sess_id}`
@@ -1304,6 +1389,7 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
     use vidarax_contracts::lifecycle::StreamState;
+    use vidarax_contracts::triggers::compile_trigger;
 
     use crate::security::SecurityPolicy;
     use crate::state::AppState;
@@ -1442,7 +1528,44 @@ mod tests {
         let err = apply_attach_config(&mut session, Some(config)).unwrap_err();
         assert_eq!(
             err,
-            "restricted_zone and clip_mode cannot be enabled together"
+            "restricted_zone or trigger_program cannot be enabled with clip_mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_rejects_trigger_when_session_has_default_zone() {
+        let raw = r#"{
+            "restricted_zone": {
+                "policy_id": "loading-bay-east",
+                "policy_version": 1,
+                "device_id": "camera-17",
+                "region": {"x": 0.25, "y": 0.2, "width": 0.5, "height": 0.6},
+                "enter_motion_score": 0.4,
+                "exit_motion_score": 0.15,
+                "enter_after_frames": 2,
+                "exit_after_frames": 3
+            }
+        }"#;
+        let zone: crate::models::AttachStreamRequest = serde_json::from_str(raw).unwrap();
+        let mut session = WebRtcSession::new_for_tests();
+        apply_attach_config(&mut session, Some(zone)).unwrap();
+        let trigger_program = compile_trigger(
+            "trigger motion-alert version 1\nwhen motion_score >= 0.5\nemit motion_alert\ncapture keyframe\nend\n",
+        )
+        .unwrap();
+        let config = crate::models::AttachStreamRequest {
+            prompt: None,
+            max_output_tokens_per_second: None,
+            clip_mode: None,
+            crop: None,
+            restricted_zone: None,
+            trigger_program: Some(trigger_program),
+        };
+
+        let error = apply_attach_config(&mut session, Some(config)).unwrap_err();
+        assert_eq!(
+            error,
+            "restricted_zone and trigger_program are mutually exclusive"
         );
     }
 

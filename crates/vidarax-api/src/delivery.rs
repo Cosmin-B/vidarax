@@ -27,7 +27,7 @@ use sha2::Sha256;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use vidarax_core::ingest::validate_public_https_url;
-use vidarax_core::timeline::{read_events_after, TimelineEvent};
+use vidarax_core::timeline::{read_events_after_from, TimelineEvent};
 
 use crate::handlers::load_run_snapshot;
 use crate::ids::validate_run_id;
@@ -50,6 +50,13 @@ const MAX_DELIVERY_ATTEMPTS: u32 = 3;
 const WEBHOOK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 const WEBHOOK_DELIVERY_LOG: &str = "webhook-delivery.wal";
 const LAST_EVENT_ID: &str = "last-event-id";
+const SSE_LATENCY_BUCKETS_MS: [u64; 8] = [10, 25, 50, 100, 250, 500, 1_000, u64::MAX];
+
+#[derive(Clone)]
+pub(crate) struct TimelineNotification {
+    pub(crate) event: TimelineEvent,
+    pub(crate) committed_at: Instant,
+}
 
 #[derive(Default)]
 pub(crate) struct DeliveryMetrics {
@@ -58,6 +65,9 @@ pub(crate) struct DeliveryMetrics {
     sse_replayed: AtomicU64,
     sse_notification_lag: AtomicU64,
     sse_output_stalls: AtomicU64,
+    sse_commit_latency_buckets: [AtomicU64; SSE_LATENCY_BUCKETS_MS.len()],
+    sse_commit_latency_sum_ms: AtomicU64,
+    sse_commit_latency_count: AtomicU64,
     webhook_configured: AtomicU64,
     webhook_attempts: AtomicU64,
     webhook_delivered: AtomicU64,
@@ -68,8 +78,21 @@ pub(crate) struct DeliveryMetrics {
 }
 
 impl DeliveryMetrics {
+    fn record_sse_commit_latency(&self, latency: Duration) {
+        let milliseconds = latency.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.sse_commit_latency_sum_ms
+            .fetch_add(milliseconds, Ordering::Relaxed);
+        self.sse_commit_latency_count
+            .fetch_add(1, Ordering::Relaxed);
+        for (index, upper_bound) in SSE_LATENCY_BUCKETS_MS.iter().enumerate() {
+            if milliseconds <= *upper_bound {
+                self.sse_commit_latency_buckets[index].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     pub(crate) fn render_prometheus(&self) -> String {
-        format!(
+        let mut output = format!(
             concat!(
                 "vidarax_sse_subscribers_active {}\n",
                 "vidarax_sse_events_total {}\n",
@@ -96,13 +119,30 @@ impl DeliveryMetrics {
             self.webhook_dead_letters.load(Ordering::Relaxed),
             self.webhook_wake_coalesced.load(Ordering::Relaxed),
             self.webhook_notification_lag.load(Ordering::Relaxed),
-        )
+        );
+        for (index, upper_bound) in SSE_LATENCY_BUCKETS_MS.iter().enumerate() {
+            let label = if *upper_bound == u64::MAX {
+                "+Inf".to_string()
+            } else {
+                upper_bound.to_string()
+            };
+            output.push_str(&format!(
+                "vidarax_sse_commit_to_send_latency_ms_bucket{{le=\"{label}\"}} {}\n",
+                self.sse_commit_latency_buckets[index].load(Ordering::Relaxed)
+            ));
+        }
+        output.push_str(&format!(
+            "vidarax_sse_commit_to_send_latency_ms_sum {}\nvidarax_sse_commit_to_send_latency_ms_count {}\n",
+            self.sse_commit_latency_sum_ms.load(Ordering::Relaxed),
+            self.sse_commit_latency_count.load(Ordering::Relaxed)
+        ));
+        output
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct DeliveryHub {
-    events: broadcast::Sender<TimelineEvent>,
+    events: broadcast::Sender<TimelineNotification>,
     commands: mpsc::Sender<WebhookCommand>,
     metrics: Arc<DeliveryMetrics>,
     webhooks_enabled: bool,
@@ -150,11 +190,11 @@ impl DeliveryHub {
         }
     }
 
-    pub(crate) fn event_sender(&self) -> broadcast::Sender<TimelineEvent> {
+    pub(crate) fn event_sender(&self) -> broadcast::Sender<TimelineNotification> {
         self.events.clone()
     }
 
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<TimelineEvent> {
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<TimelineNotification> {
         self.events.subscribe()
     }
 
@@ -162,7 +202,7 @@ impl DeliveryHub {
         &self.metrics
     }
 
-    async fn reserve(&self, config: WebhookConfig) -> Result<(), String> {
+    async fn reserve(&self, config: WebhookConfig) -> Result<String, String> {
         if !self.webhooks_enabled {
             return Err(
                 "webhook delivery requires VIDARAX_WEBHOOK_SECRET with at least 32 bytes"
@@ -286,20 +326,26 @@ pub(crate) async fn stream_events(
             metrics: Arc::clone(&metrics),
         };
         let mut cursor = cursor;
+        let mut needs_replay = true;
         loop {
-            match replay_to_sse(
-                &producer_state,
-                &run_id,
-                query.kind.as_deref(),
-                &mut cursor,
-                &tx,
-                &metrics,
-            )
-            .await
-            {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(()) => return,
+            if needs_replay {
+                loop {
+                    match replay_to_sse(
+                        &producer_state,
+                        &run_id,
+                        query.kind.as_deref(),
+                        &mut cursor,
+                        &tx,
+                        &metrics,
+                    )
+                    .await
+                    {
+                        Ok(true) => continue,
+                        Ok(false) => break,
+                        Err(()) => return,
+                    }
+                }
+                needs_replay = false;
             }
 
             let notification = tokio::select! {
@@ -307,7 +353,8 @@ pub(crate) async fn stream_events(
                 notification = notifications.recv() => notification,
             };
             match notification {
-                Ok(event) => {
+                Ok(notification) => {
+                    let event = notification.event;
                     if event.seq <= cursor {
                         continue;
                     }
@@ -317,15 +364,18 @@ pub(crate) async fn stream_events(
                             .kind
                             .as_ref()
                             .is_none_or(|wanted| event.kind == *wanted)
-                        && send_sse_event(&tx, &event, &metrics).await.is_err()
                     {
-                        return;
+                        if send_sse_event(&tx, &event, &metrics).await.is_err() {
+                            return;
+                        }
+                        metrics.record_sse_commit_latency(notification.committed_at.elapsed());
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     metrics
                         .sse_notification_lag
                         .fetch_add(skipped, Ordering::Relaxed);
+                    needs_replay = true;
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             }
@@ -504,9 +554,12 @@ pub(crate) async fn create_webhook(
         event_kinds: event_kinds.clone(),
         registered_seq: 0,
     };
-    if let Err(err) = state.delivery().reserve(config).await {
-        return service_unavailable(&state, "webhooks_unavailable", err).into_response();
-    }
+    let signing_secret = match state.delivery().reserve(config).await {
+        Ok(secret) => secret,
+        Err(err) => {
+            return service_unavailable(&state, "webhooks_unavailable", err).into_response()
+        }
+    };
     let event = match state
         .append_run_event_async(
             &run_id,
@@ -543,6 +596,7 @@ pub(crate) async fn create_webhook(
             "url": url,
             "event_kinds": event_kinds,
             "registered_seq": event.seq,
+            "signing_secret": signing_secret,
         })),
     )
         .into_response()
@@ -617,7 +671,7 @@ pub(crate) async fn delete_webhook(
 enum WebhookCommand {
     Reserve {
         config: WebhookConfig,
-        reply: oneshot::Sender<Result<(), String>>,
+        reply: oneshot::Sender<Result<String, String>>,
     },
     Activate {
         webhook_id: String,
@@ -645,7 +699,7 @@ async fn run_coordinator(
     delivery_log_path: PathBuf,
     configs: Vec<WebhookConfig>,
     secret: Option<String>,
-    mut events: broadcast::Receiver<TimelineEvent>,
+    mut events: broadcast::Receiver<TimelineNotification>,
     mut commands: mpsc::Receiver<WebhookCommand>,
     metrics: Arc<DeliveryMetrics>,
 ) {
@@ -662,12 +716,13 @@ async fn run_coordinator(
                 .get(&config.webhook_id)
                 .cloned()
                 .unwrap_or_default();
+            let hook_secret = derive_webhook_secret(secret.as_bytes(), &config);
             let entry = spawn_hook_worker(
                 config.clone(),
                 restored,
                 wal_path.clone(),
                 Arc::clone(delivery_log),
-                Arc::<[u8]>::from(secret.as_bytes()),
+                Arc::<[u8]>::from(hook_secret),
                 Arc::clone(&metrics),
             );
             hooks.insert(config.webhook_id.clone(), entry);
@@ -692,6 +747,10 @@ async fn run_coordinator(
                         } else if hooks.contains_key(&config.webhook_id) {
                             Err("webhook id collision".to_string())
                         } else {
+                            let hook_secret = derive_webhook_secret(
+                                secret.as_ref().expect("enabled webhooks require a secret").as_bytes(),
+                                &config,
+                            );
                             hooks.insert(config.webhook_id.clone(), HookEntry {
                                 config,
                                 wake: None,
@@ -699,7 +758,7 @@ async fn run_coordinator(
                                 status: Arc::new(Mutex::new(WorkerStatus::default())),
                             });
                             metrics.webhook_configured.store(hooks.len() as u64, Ordering::Relaxed);
-                            Ok(())
+                            Ok(hex_bytes(&hook_secret))
                         };
                         let _ = reply.send(result);
                     }
@@ -707,12 +766,16 @@ async fn run_coordinator(
                         let result = match hooks.get_mut(&webhook_id) {
                             Some(entry) if entry.wake.is_none() => {
                                 entry.config.registered_seq = registered_seq;
+                                let hook_secret = derive_webhook_secret(
+                                    secret.as_ref().expect("reservation required secret").as_bytes(),
+                                    &entry.config,
+                                );
                                 let activated = spawn_hook_worker(
                                     entry.config.clone(),
                                     WorkerStatus { last_terminal_seq: registered_seq, ..WorkerStatus::default() },
                                     wal_path.clone(),
                                     Arc::clone(delivery_log.as_ref().expect("reservation required delivery log")),
-                                    Arc::<[u8]>::from(secret.as_ref().expect("reservation required secret").as_bytes()),
+                                    Arc::<[u8]>::from(hook_secret),
                                     Arc::clone(&metrics),
                                 );
                                 *entry = activated;
@@ -743,7 +806,7 @@ async fn run_coordinator(
             }
             event = events.recv() => {
                 match event {
-                    Ok(event) => wake_run_hooks(&hooks, &event.run_id, &metrics),
+                    Ok(notification) => wake_run_hooks(&hooks, &notification.event.run_id, &metrics),
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         metrics.webhook_notification_lag.fetch_add(skipped, Ordering::Relaxed);
                         wake_all_hooks(&hooks, &metrics);
@@ -812,6 +875,7 @@ fn spawn_hook_worker(
     let worker_status = Arc::clone(&status);
     let worker_config = config.clone();
     tokio::spawn(async move {
+        let mut wal_offset = 0u64;
         loop {
             let failed = if let Err(err) = replay_hook(
                 &worker_config,
@@ -820,6 +884,7 @@ fn spawn_hook_worker(
                 &secret,
                 &worker_status,
                 &metrics,
+                &mut wal_offset,
             )
             .await
             {
@@ -860,6 +925,7 @@ async fn replay_hook(
     secret: &[u8],
     status: &Arc<Mutex<WorkerStatus>>,
     metrics: &DeliveryMetrics,
+    wal_offset: &mut u64,
 ) -> Result<(), String> {
     loop {
         let cursor = status
@@ -868,11 +934,14 @@ async fn replay_hook(
             .last_terminal_seq
             .max(config.registered_seq);
         let path = wal_path.to_path_buf();
-        let batch =
-            tokio::task::spawn_blocking(move || read_events_after(path, cursor, REPLAY_BATCH))
-                .await
-                .map_err(|err| format!("webhook WAL replay worker failed: {err}"))?
-                .map_err(|err| format!("webhook WAL replay failed: {err}"))?;
+        let offset = *wal_offset;
+        let (batch, next_offset) = tokio::task::spawn_blocking(move || {
+            read_events_after_from(path, cursor, REPLAY_BATCH, offset)
+        })
+        .await
+        .map_err(|err| format!("webhook WAL replay worker failed: {err}"))?
+        .map_err(|err| format!("webhook WAL replay failed: {err}"))?;
+        *wal_offset = next_offset;
         if batch.is_empty() {
             return Ok(());
         }
@@ -966,7 +1035,33 @@ fn webhook_matches(config: &WebhookConfig, event: &TimelineEvent) -> bool {
     if event.kind.starts_with("webhook_") {
         return false;
     }
+    if event.kind.starts_with("trigger.") {
+        let requested = serde_json::from_str::<Value>(&event.payload)
+            .ok()
+            .and_then(|payload| {
+                payload
+                    .pointer("/trigger/actions/webhook")
+                    .and_then(Value::as_bool)
+            })
+            .unwrap_or(false);
+        if !requested {
+            return false;
+        }
+    }
     config.event_kinds.is_empty() || config.event_kinds.iter().any(|kind| kind == &event.kind)
+}
+
+fn derive_webhook_secret(master: &[u8], config: &WebhookConfig) -> [u8; 32] {
+    let mut mac = Hmac::<Sha256>::new_from_slice(master)
+        .expect("HMAC accepts keys of every non-empty length");
+    mac.update(b"vidarax-webhook-v1\0");
+    mac.update(config.run_id.as_bytes());
+    mac.update(b"\0");
+    mac.update(config.webhook_id.as_bytes());
+    let bytes = mac.finalize().into_bytes();
+    let mut secret = [0u8; 32];
+    secret.copy_from_slice(&bytes);
+    secret
 }
 
 async fn deliver_webhook(
@@ -1249,6 +1344,30 @@ mod tests {
     }
 
     #[test]
+    fn trigger_event_requires_the_webhook_action() {
+        let config = WebhookConfig {
+            webhook_id: "wh_trigger".into(),
+            run_id: "run-a".into(),
+            url: "https://example.com/hook".into(),
+            event_kinds: Vec::new(),
+            registered_seq: 1,
+        };
+        let mut event = TimelineEvent {
+            seq: 2,
+            run_id: "run-a".into(),
+            stream_id: "camera-1".into(),
+            pts_ms: 33,
+            kind: "trigger.near_miss".into(),
+            payload: r#"{"trigger":{"actions":{"webhook":false}}}"#.into(),
+        };
+        assert!(!webhook_matches(&config, &event));
+        event.payload = r#"{"trigger":{"actions":{"webhook":true}}}"#.into();
+        assert!(webhook_matches(&config, &event));
+        event.payload = "{}".into();
+        assert!(!webhook_matches(&config, &event));
+    }
+
+    #[test]
     fn restores_registered_webhooks_and_applies_deletions() {
         let events = vec![
             TimelineEvent { seq: 1, run_id: "run-a".into(), stream_id: "s".into(), pts_ms: 0, kind: "webhook_registered".into(), payload: r#"{"webhook_id":"wh_a","url":"https://example.com/hook","event_kinds":["vlm"]}"#.into() },
@@ -1338,6 +1457,39 @@ mod tests {
         assert!(rx.try_recv().is_err());
         drop(state);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sse_commit_latency_exports_a_prometheus_histogram() {
+        let metrics = DeliveryMetrics::default();
+        metrics.record_sse_commit_latency(Duration::from_millis(42));
+        let rendered = metrics.render_prometheus();
+        assert!(rendered.contains("vidarax_sse_commit_to_send_latency_ms_bucket{le=\"50\"} 1"));
+        assert!(rendered.contains("vidarax_sse_commit_to_send_latency_ms_bucket{le=\"25\"} 0"));
+        assert!(rendered.contains("vidarax_sse_commit_to_send_latency_ms_sum 42"));
+        assert!(rendered.contains("vidarax_sse_commit_to_send_latency_ms_count 1"));
+    }
+
+    #[test]
+    fn webhook_signing_keys_are_isolated_per_hook() {
+        let first = WebhookConfig {
+            webhook_id: "wh-a".into(),
+            run_id: "run-a".into(),
+            url: "https://example.com/a".into(),
+            event_kinds: Vec::new(),
+            registered_seq: 1,
+        };
+        let mut second = first.clone();
+        second.webhook_id = "wh-b".into();
+        let root = b"a server-side derivation root with enough bytes";
+        assert_ne!(
+            derive_webhook_secret(root, &first),
+            derive_webhook_secret(root, &second)
+        );
+        assert_eq!(
+            derive_webhook_secret(root, &first),
+            derive_webhook_secret(root, &first)
+        );
     }
 
     #[tokio::test]

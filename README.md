@@ -10,6 +10,10 @@ are stored as content-addressed blobs and referenced by event metadata. For
 fixed cameras, a device-level restricted-zone policy can turn sustained motion
 in normalized image geometry into a durable assertion with binary evidence,
 without putting image bytes in JSON.
+Bounded trigger programs turn perception signals into namespaced events,
+webhooks, or metadata-only local outputs. A signed edge update loop advances
+models through shadow and canary checks while preserving the last active model
+through network loss or a failed candidate.
 
 ## Architecture
 
@@ -36,6 +40,13 @@ closes the peer, and reports the fixed stage and reason through metrics instead
 of restarting one worker underneath older temporal state. Live prompt and schema
 changes use a bounded, generation-tagged command and return only after the VLM
 worker acknowledges the new configuration.
+
+Provider calls from all streams pass through one deadline-aware scheduler. It
+fair-queues principals and streams across urgent live, normal live, and offline
+classes while enforcing process-wide concurrency, output-token, and encoded
+media-byte reservations. Per-stream temporal order remains owned by that
+stream's single VLM worker; provider runtimes remain responsible for
+token-level batching.
 
 ## Performance
 
@@ -132,6 +143,9 @@ The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via
 | `POST` | `/v1/runs/:id/policies/:revision/activate` | Promote through shadow, canary, and active |
 | `POST` | `/v1/runs/:id/policies/:revision/rollback` | Restore a previously active revision |
 | `POST` | `/v1/runs/:id/policies/:revision/replay` | Re-evaluate persisted restricted-zone candidates |
+| `POST` | `/v1/triggers/compile` | Compile bounded trigger source into the current ISA |
+| `POST` | `/v1/triggers/validate` | Validate a compiled trigger program |
+| `POST` | `/v1/triggers/evaluate` | Deterministically replay trigger samples |
 | `POST` | `/v1/query` | Query events across runs |
 | `POST` | `/v1/search` | Search VLM descriptions |
 | `POST` | `/v1/infer` | Single VLM inference |
@@ -161,11 +175,27 @@ The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via
 | `VIDARAX_ACTIVE_STREAM_LIMIT` | `5` | Max active runs per resolved principal |
 | `VIDARAX_MEDIA_MEMORY_BUDGET_BYTES` | `8589934592` | Process-wide reservation budget for live media payloads |
 | `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` | `64` | Process-wide reservation budget for live pipeline OS threads |
+| `VIDARAX_INFERENCE_TOKEN_BUDGET` | `32768` | Aggregate output-token reservation across active provider calls |
+| `VIDARAX_INFERENCE_BYTE_BUDGET` | `268435456` | Aggregate encoded-media byte reservation across active provider calls |
 | `VIDARAX_STREAM_TTL_SECS` | `3600` | Run idle TTL |
-| `VIDARAX_WEBHOOK_SECRET` | — | Process signing secret for webhooks; 32 bytes minimum |
+| `VIDARAX_WEBHOOK_SECRET` | — | Server-side root for per-webhook signing keys; 32 bytes minimum |
+| `VIDARAX_TRIGGER_LOCAL_OUTPUT_SOCKET` | — | Absolute Unix datagram socket for metadata-only local trigger actions |
 | `VIDARAX_CONFIG` | `vidarax.toml` | Backend configuration and optional device-level restricted-zone policy |
 
 Full configuration reference in [docs/deployment.md](docs/deployment.md).
+
+Trigger programs are bounded, forward-only bytecode. Compile and replay a
+source file before attaching the resulting program to a WHIP session:
+
+```bash
+vidarax triggers compile loading-bay.vxt --output loading-bay.json
+vidarax triggers validate loading-bay.json
+vidarax triggers evaluate loading-bay.json samples.json
+```
+
+The first edge package verifies signed binary model artifacts and advances a
+candidate through shadow and canary health checks without placing model bytes
+in JSON. See [edge deployment](docs/edge-deployment.md).
 
 ### Local first-pass VLM on Apple Silicon (mlx-vlm)
 

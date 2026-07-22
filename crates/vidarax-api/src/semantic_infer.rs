@@ -325,6 +325,7 @@ pub async fn run_semantic_dispatch(
     temporal_chain: bool,
     vlm_concurrency: usize,
     observer: Option<Arc<dyn InferenceObserver>>,
+    inference_dispatch: Option<Arc<tokio::sync::Semaphore>>,
     completion_tx: Option<tokio::sync::mpsc::Sender<(usize, ChunkSemanticResult)>>,
 ) -> (Vec<Option<ChunkSemanticResult>>, Vec<Instant>) {
     let num_chunks = chunk_preps.len();
@@ -371,6 +372,7 @@ pub async fn run_semantic_dispatch(
                 prev_jpeg_ref,
                 prep.chunk_video_clip.as_ref().map(Arc::clone),
                 observer.clone(),
+                inference_dispatch.clone(),
             )
             .await;
 
@@ -417,6 +419,7 @@ pub async fn run_semantic_dispatch(
                 tiered_config.clone(),
                 guided_json_str.as_ref().map(Arc::clone),
                 observer.clone(),
+                inference_dispatch.clone(),
             );
             task_chunks.insert(task_id, chunk_idx);
         }
@@ -462,6 +465,7 @@ pub async fn run_semantic_dispatch(
                     tiered_config.clone(),
                     guided_json_str.as_ref().map(Arc::clone),
                     observer.clone(),
+                    inference_dispatch.clone(),
                 );
                 task_chunks.insert(task_id, chunk_idx);
             }
@@ -482,6 +486,7 @@ fn spawn_semantic_task(
     tiered_config: TieredVlmConfig,
     guided_json_str: Option<Arc<str>>,
     observer: Option<Arc<dyn InferenceObserver>>,
+    inference_dispatch: Option<Arc<tokio::sync::Semaphore>>,
 ) -> (usize, TaskId) {
     let providers_c = providers;
     let prompt_c = semantic_prompt.to_string();
@@ -493,6 +498,7 @@ fn spawn_semantic_task(
     let tiered_config_c = tiered_config;
     let guided_json_c = guided_json_str;
     let observer_c = observer;
+    let inference_dispatch_c = inference_dispatch;
     let handle = join_set.spawn(async move {
         #[cfg(test)]
         if chunk_idx
@@ -516,6 +522,7 @@ fn spawn_semantic_task(
             None,
             chunk_video_clip_c,
             observer_c,
+            inference_dispatch_c,
         )
         .await;
         (chunk_idx, overlay, Instant::now())
@@ -589,6 +596,7 @@ pub async fn infer_chunk_semantics(
     prev_jpeg: Option<&[u8]>,
     video_clip: Option<Arc<[u8]>>,
     observer: Option<Arc<dyn InferenceObserver>>,
+    inference_dispatch: Option<Arc<tokio::sync::Semaphore>>,
 ) -> ChunkSemanticResult {
     if !semantic_available {
         return ChunkSemanticResult::default();
@@ -667,6 +675,12 @@ pub async fn infer_chunk_semantics(
         timeout_ms,
         allow_fallback: true,
         guided_json: request_guided_json,
+        scheduling: vidarax_core::provider::InferenceScheduling::new(
+            Arc::from(format!("offline:{frame_start_index}")),
+            vidarax_core::admission::LatencyClass::Offline,
+            timeout_ms.saturating_mul(2),
+            timeout_ms.min(1_000),
+        ),
     };
 
     // Capture the failing model's backend kind before the closure moves
@@ -675,10 +689,22 @@ pub async fn infer_chunk_semantics(
     // instead of the router's default kind.
     let first_pass_kind = provider.kind_for_model(tiered_config.first_pass_model.as_ref());
     let call_started = Instant::now();
+    let dispatch_permit = match inference_dispatch {
+        Some(dispatch) => match dispatch.try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                result.used_fallback = true;
+                result.error = Some("provider_saturated".to_string());
+                return result;
+            }
+        },
+        None => None,
+    };
     let provider_result = match tokio::task::spawn_blocking({
         let provider = Arc::clone(&provider);
         let observer_for_call = observer.clone();
         move || {
+            let _dispatch_permit = dispatch_permit;
             run_tiered_with_second_pass_schema(
                 provider.as_ref(),
                 &tiered_config,
@@ -707,6 +733,8 @@ pub async fn infer_chunk_semantics(
                 ProviderError::Transport(_) => "transport_error".to_string(),
                 ProviderError::InvalidResponse(_) => "invalid_response".to_string(),
                 ProviderError::Saturated { .. } => "provider_saturated".to_string(),
+                ProviderError::DeadlineMissed => "deadline_missed".to_string(),
+                ProviderError::RequestBudget => "request_budget_exceeded".to_string(),
             });
             return result;
         }
@@ -1097,6 +1125,7 @@ Ignore this trailing {not json}."#;
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -1130,6 +1159,7 @@ Ignore this trailing {not json}."#;
             false,
             false,
             2,
+            None,
             None,
             Some(completion_tx),
         );

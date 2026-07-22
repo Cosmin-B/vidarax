@@ -298,6 +298,7 @@ mod tests {
             timeout_ms: 1000,
             allow_fallback: true,
             guided_json: Some(Arc::clone(&schema)),
+            scheduling: Default::default(),
         };
 
         let output = run_tiered(&provider, &config, request, 1024, 1000, None).unwrap();
@@ -338,6 +339,7 @@ mod tests {
             timeout_ms: 1000,
             allow_fallback: true,
             guided_json: Some(Arc::clone(&schema)),
+            scheduling: Default::default(),
         };
 
         let output = run_tiered_with_second_pass_schema(
@@ -444,6 +446,7 @@ mod tests {
             timeout_ms: 1000,
             allow_fallback: true,
             guided_json: None,
+            scheduling: Default::default(),
         }
     }
 

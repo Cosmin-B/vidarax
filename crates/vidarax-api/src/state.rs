@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{broadcast, mpsc, oneshot, Notify};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore};
 
 use serde_json::Value;
 
@@ -30,7 +30,7 @@ use vidarax_core::timeline::{read_all_events, read_events_after, TimelineEvent, 
 use vidarax_core::webrtc::resources::MediaSessionResources;
 use vidarax_core::webrtc::session::WebRtcSession;
 
-use crate::delivery::{DeliveryHub, DeliveryMetrics};
+use crate::delivery::{DeliveryHub, DeliveryMetrics, TimelineNotification};
 use crate::ids::{parse_run_sequence, random_run_id};
 use crate::inference_metrics::InferenceMetrics;
 use crate::security::SecurityPolicy;
@@ -287,6 +287,9 @@ pub struct AppStateInner {
     // without borrowing from AppState.
     inference_metrics: Arc<InferenceMetrics>,
     inference_admission: Arc<InferenceAdmission>,
+    /// Bounds work admitted to Tokio's blocking executor before the
+    /// synchronous fair scheduler begins waiting.
+    inference_dispatch: Arc<Semaphore>,
     pipeline_metrics: Arc<PipelineMetrics>,
     novelty_config: LiveNoveltyConfig,
     run_registry: Arc<RunRegistry>,
@@ -375,6 +378,8 @@ impl AppStateConfig {
                 per_principal_in_flight: 4,
                 global_waiters: 128,
                 wait_timeout: std::time::Duration::from_secs(5),
+                max_in_flight_tokens: 1_000_000,
+                max_in_flight_bytes: 1024 * 1024 * 1024,
             },
             media_memory_budget_bytes: u64::MAX,
             media_worker_thread_budget: usize::MAX,
@@ -416,6 +421,11 @@ impl AppStateConfig {
                     InferenceAdmission::new(self.inference_admission_limits)
                         .expect("test admission limits are valid"),
                 ),
+                inference_dispatch: Arc::new(Semaphore::new(
+                    self.inference_admission_limits
+                        .global_in_flight
+                        .saturating_add(self.inference_admission_limits.global_waiters),
+                )),
                 pipeline_metrics: Arc::new(PipelineMetrics::new()),
                 novelty_config: LiveNoveltyConfig::default(),
                 run_registry,
@@ -532,6 +542,11 @@ impl AppState {
                     InferenceAdmission::new(inference_admission_limits)
                         .map_err(ToString::to_string)?,
                 ),
+                inference_dispatch: Arc::new(Semaphore::new(
+                    inference_admission_limits
+                        .global_in_flight
+                        .saturating_add(inference_admission_limits.global_waiters),
+                )),
                 pipeline_metrics: Arc::new(PipelineMetrics::new()),
                 novelty_config: novelty,
                 run_registry,
@@ -1236,7 +1251,7 @@ impl AppState {
         .map_err(|err| format!("timeline delivery read worker join failure: {err}"))?
     }
 
-    pub(crate) fn subscribe_timeline_events(&self) -> broadcast::Receiver<TimelineEvent> {
+    pub(crate) fn subscribe_timeline_events(&self) -> broadcast::Receiver<TimelineNotification> {
         self.delivery.subscribe()
     }
 
@@ -1308,6 +1323,16 @@ impl AppState {
 
     pub fn inference_admission(&self) -> &InferenceAdmission {
         &self.inference_admission
+    }
+
+    pub(crate) fn try_acquire_inference_dispatch(&self) -> Result<OwnedSemaphorePermit, String> {
+        Arc::clone(&self.inference_dispatch)
+            .try_acquire_owned()
+            .map_err(|_| "inference dispatch queue is full".to_string())
+    }
+
+    pub(crate) fn inference_dispatch(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.inference_dispatch)
     }
 
     /// Return the raw `Arc` for cases that need to move the metrics into
@@ -1616,7 +1641,7 @@ struct TimelineWriter {
     wal: WalWriter,
     registry: Arc<RunRegistry>,
     snapshot: Arc<ArcSwap<RingSnapshot>>,
-    delivery_events: broadcast::Sender<TimelineEvent>,
+    delivery_events: broadcast::Sender<TimelineNotification>,
     next_seq: u64,
     tails: HashMap<String, Arc<VecDeque<TimelineEvent>>>,
     tail_recency: HashMap<String, u64>,
@@ -1701,7 +1726,10 @@ impl TimelineWriter {
         // This notification is deliberately best effort. Every consumer owns
         // a durable sequence cursor and recovers a missed notification from the
         // WAL, so sending never waits for network delivery or subscriber space.
-        let _ = self.delivery_events.send(event.clone());
+        let _ = self.delivery_events.send(TimelineNotification {
+            event: event.clone(),
+            committed_at: std::time::Instant::now(),
+        });
         Ok(event)
     }
 
@@ -1725,7 +1753,7 @@ fn spawn_timeline_writer(
     wal: WalWriter,
     registry: Arc<RunRegistry>,
     snapshot: Arc<ArcSwap<RingSnapshot>>,
-    delivery_events: broadcast::Sender<TimelineEvent>,
+    delivery_events: broadcast::Sender<TimelineNotification>,
     next_seq: u64,
     tails: HashMap<String, Arc<VecDeque<TimelineEvent>>>,
     #[cfg(test)] test_control: Arc<TimelineWriterTestControl>,

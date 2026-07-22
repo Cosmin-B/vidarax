@@ -7,6 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use base64::Engine as _;
+use vidarax_contracts::triggers::{
+    ActionChannel, CaptureKind, TriggerInstruction, TriggerProgram, TriggerSample,
+};
 
 use crate::coordinates::FrameCoordinates;
 use crate::crop::{CropRegion, PixelCrop};
@@ -19,6 +22,7 @@ use crate::novelty::{LiveNoveltyConfig, LiveNoveltyGate, LiveNoveltyOutcome};
 use crate::pipeline::{TwoPassConfig, TwoPassPipeline};
 use crate::provider::{InferenceImage, InferenceObserver, InferenceProvider, InferenceRequest};
 use crate::tiered_vlm::{run_tiered, TieredVlmConfig};
+use crate::trigger::TriggerVm;
 use crate::webrtc::clip::{
     spawn_clip_accumulator, spawn_clip_vlm_workers, ClipConfig, ClipRateGate, ClipWork,
 };
@@ -53,6 +57,7 @@ pub const SINK_EVENT_QUEUE_CAPACITY: usize = 512;
 /// Zone transitions are rare and each item owns one pooled JPEG until the
 /// sidecar writer commits it. A small queue bounds both latency and memory.
 pub const ZONE_EVIDENCE_QUEUE_CAPACITY: usize = 8;
+pub const TRIGGER_BINARY_QUEUE_CAPACITY: usize = 8;
 pub const JPEG_POOL_SLOT_CEILING: usize = 512;
 const FFMPEG_READER_CONSTRUCTING_YUV_FRAMES: usize = 1;
 const FFMPEG_DECODER_PENDING_YUV_FRAMES: usize = FFMPEG_YUV_PENDING_POOL_ALLOWANCE;
@@ -169,6 +174,30 @@ pub trait EventSink: Send + Sync {
         &self,
         event: RestrictedZoneEvidenceEvent<'_>,
     ) -> Result<(), String>;
+
+    /// Persist a trigger assertion and its binary keyframe before publishing
+    /// metadata that references it.
+    fn store_trigger_sync(&self, event: TriggerAssertionEvent<'_>) -> Result<(), String> {
+        self.store_keyframe_sync(KeyframeEvent {
+            run_id: event.run_id,
+            frame_index: event.frame_index,
+            pts_ms: event.pts_ms,
+            coordinates: event.coordinates,
+            event_type: event.event_type,
+            description: "deterministic trigger assertion",
+            jpeg_data: event.jpeg_data,
+        })?;
+        self.emit_event_sync(
+            event.run_id,
+            event.session_id,
+            event.frame_index,
+            event.pts_ms,
+            event.coordinates,
+            event.event_type,
+            event.confidence,
+            "deterministic trigger assertion",
+        )
+    }
 }
 
 /// One keyframe and the provenance required to persist it correctly.
@@ -197,6 +226,24 @@ pub struct RestrictedZoneEvidenceEvent<'a> {
     /// `None` for the deterministic pHash-motion path. Only a structured
     /// detector or semantic result may populate this confirmation.
     pub subject: Option<&'a ConfirmedZoneSubject>,
+    pub jpeg_data: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TriggerAssertionEvent<'a> {
+    pub run_id: &'a str,
+    pub session_id: &'a str,
+    pub frame_index: u64,
+    pub pts_ms: u64,
+    pub coordinates: FrameCoordinates,
+    pub generation: PipelineGeneration,
+    pub program: &'a TriggerProgram,
+    pub event_type: &'a str,
+    pub confidence: f32,
+    pub motion_score: f32,
+    pub novelty_score: f32,
+    pub notify_webhook: bool,
+    pub notify_local_output: bool,
     pub jpeg_data: &'a [u8],
 }
 
@@ -346,6 +393,7 @@ struct LoopDetectedEvent {
 struct GateFrameOutcome {
     work: Option<KeyframeWork>,
     zone_entered: Option<ZoneActivityObservation>,
+    trigger_fired: Option<TriggerFire>,
 }
 
 struct ZoneEvidenceWork {
@@ -354,6 +402,19 @@ struct ZoneEvidenceWork {
     observation: ZoneActivityObservation,
     generation: PipelineGeneration,
     subject: Option<ConfirmedZoneSubject>,
+}
+
+struct TriggerAssertionWork {
+    work: KeyframeWork,
+    fire: TriggerFire,
+    generation: PipelineGeneration,
+}
+
+struct TriggerFire {
+    program: Arc<TriggerProgram>,
+    event_type: String,
+    notify_webhook: bool,
+    notify_local_output: bool,
 }
 
 /// Per-stream loop-detection and gate state, driven once per decoded frame.
@@ -368,6 +429,7 @@ struct GateStreamState {
     pipeline: TwoPassPipeline,
     loop_det: LoopDetector,
     zone: Option<RestrictedZoneState>,
+    trigger: Option<TriggerVm>,
     /// True while the loop detector considers the stream stuck; cleared when the
     /// detector no longer sees enough repeated hashes in its window.
     loop_active: bool,
@@ -379,6 +441,7 @@ impl GateStreamState {
         loop_hamming_threshold: u32,
         loop_repeat_threshold: usize,
         restricted_zone: Option<Arc<RestrictedZonePolicy>>,
+        trigger_program: Option<Arc<TriggerProgram>>,
     ) -> Self {
         Self {
             pipeline: TwoPassPipeline::new(TwoPassConfig::default(), gate_config),
@@ -386,6 +449,10 @@ impl GateStreamState {
             zone: restricted_zone.map(|policy| {
                 RestrictedZoneState::try_new(policy)
                     .expect("restricted-zone policy must be validated before worker startup")
+            }),
+            trigger: trigger_program.map(|program| {
+                TriggerVm::try_new(program)
+                    .expect("trigger program must be validated before worker startup")
             }),
             loop_active: false,
         }
@@ -460,6 +527,7 @@ impl GateStreamState {
             return GateFrameOutcome {
                 work: None,
                 zone_entered: None,
+                trigger_fired: None,
             };
         };
 
@@ -469,10 +537,83 @@ impl GateStreamState {
             })
         });
 
-        if meta.gate_event != GateEventType::KeepKeyframe && zone_entered.is_none() {
+        let trigger_fired = self.trigger.as_mut().and_then(|trigger| {
+            let sample = TriggerSample {
+                pts_ms,
+                motion_score: Some(meta.motion_score),
+                novelty_score: Some(meta.novelty_score),
+                confidence: Some(meta.confidence),
+                model_uncertainty: None,
+                teacher_disagreement: None,
+                observations: Vec::new(),
+            };
+            let evaluation = trigger.evaluate(&sample);
+            if evaluation.missing_signal {
+                ctx.metrics.inc_trigger_missing_signal();
+            }
+            if !evaluation.fired() {
+                return None;
+            }
+            let mut event_type = None;
+            let mut capture_keyframe = false;
+            let mut notify_webhook = false;
+            let mut notify_local_output = false;
+            for action in evaluation.actions(trigger.program()) {
+                match action {
+                    TriggerInstruction::Emit { event_type: value } => {
+                        event_type = Some(value.clone());
+                    }
+                    TriggerInstruction::Capture {
+                        kind: CaptureKind::Keyframe,
+                        ..
+                    } => capture_keyframe = true,
+                    TriggerInstruction::Notify {
+                        channel: ActionChannel::Webhook,
+                    } => notify_webhook = true,
+                    TriggerInstruction::Notify {
+                        channel: ActionChannel::LocalOutput,
+                    } => notify_local_output = true,
+                    TriggerInstruction::Capture {
+                        kind: CaptureKind::Clip,
+                        ..
+                    }
+                    | TriggerInstruction::Load { .. }
+                    | TriggerInstruction::Constant { .. }
+                    | TriggerInstruction::GreaterThan
+                    | TriggerInstruction::GreaterOrEqual
+                    | TriggerInstruction::LessThan
+                    | TriggerInstruction::LessOrEqual
+                    | TriggerInstruction::Equal
+                    | TriggerInstruction::And
+                    | TriggerInstruction::Or
+                    | TriggerInstruction::Not
+                    | TriggerInstruction::SustainFrames { .. }
+                    | TriggerInstruction::RisingEdge { .. }
+                    | TriggerInstruction::CooldownMs { .. }
+                    | TriggerInstruction::JumpIfFalse { .. }
+                    | TriggerInstruction::Halt => {}
+                }
+            }
+            debug_assert!(
+                capture_keyframe,
+                "live trigger validation requires keyframe capture"
+            );
+            event_type.map(|event_type| TriggerFire {
+                program: trigger.program_handle(),
+                event_type,
+                notify_webhook,
+                notify_local_output,
+            })
+        });
+
+        if meta.gate_event != GateEventType::KeepKeyframe
+            && zone_entered.is_none()
+            && trigger_fired.is_none()
+        {
             return GateFrameOutcome {
                 work: None,
                 zone_entered: None,
+                trigger_fired: None,
             };
         }
         if meta.gate_event == GateEventType::KeepKeyframe {
@@ -483,6 +624,7 @@ impl GateStreamState {
             return GateFrameOutcome {
                 work: None,
                 zone_entered: None,
+                trigger_fired: None,
             };
         };
         self.pipeline.commit_gate_keyframe(signal);
@@ -510,6 +652,7 @@ impl GateStreamState {
                 loop_active: self.loop_active,
             }),
             zone_entered,
+            trigger_fired,
         }
     }
 }
@@ -529,6 +672,7 @@ enum SinkState {
         gate: GateStreamState,
         vlm_tx: kanal::Sender<KeyframeWork>,
         zone_tx: Option<kanal::Sender<ZoneEvidenceWork>>,
+        trigger_tx: Option<kanal::Sender<TriggerAssertionWork>>,
         generation: PipelineGeneration,
         stdb: Arc<dyn EventSink>,
         run_id: Arc<str>,
@@ -573,6 +717,8 @@ pub struct WorkerPoolConfig {
     pub crop: Option<CropRegion>,
     /// Optional activity assertion fixed for this pipeline generation.
     pub restricted_zone: Option<Arc<RestrictedZonePolicy>>,
+    /// Optional generation-static deterministic trigger bytecode.
+    pub trigger_program: Option<Arc<TriggerProgram>>,
 }
 
 impl From<&WebRtcConfig> for WorkerPoolConfig {
@@ -590,6 +736,7 @@ impl From<&WebRtcConfig> for WorkerPoolConfig {
             max_output_tokens_per_second: cfg.max_output_tokens_per_second,
             crop: cfg.crop,
             restricted_zone: cfg.restricted_zone.clone(),
+            trigger_program: cfg.trigger_program.clone(),
         }
     }
 }
@@ -653,6 +800,8 @@ pub struct KeyframeSink {
     zone_tx: Option<kanal::Sender<ZoneEvidenceWork>>,
     pub generation: PipelineGeneration,
     pub restricted_zone: Option<Arc<RestrictedZonePolicy>>,
+    trigger_tx: Option<kanal::Sender<TriggerAssertionWork>>,
+    pub trigger_program: Option<Arc<TriggerProgram>>,
     /// Event sink for the loop-detected notice.
     pub stdb: Arc<dyn EventSink>,
     pub run_id: Arc<str>,
@@ -694,8 +843,10 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<Stage
             loop_repeat_threshold,
             vlm_tx,
             zone_tx,
+            trigger_tx,
             generation,
             restricted_zone,
+            trigger_program,
             stdb,
             run_id,
             session_id,
@@ -705,9 +856,11 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<Stage
                 loop_hamming_threshold,
                 loop_repeat_threshold,
                 restricted_zone,
+                trigger_program,
             ),
             vlm_tx,
             zone_tx,
+            trigger_tx,
             generation,
             stdb,
             run_id,
@@ -867,6 +1020,7 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<Stage
                         gate,
                         vlm_tx,
                         zone_tx,
+                        trigger_tx,
                         generation,
                         stdb,
                         run_id,
@@ -913,7 +1067,7 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<Stage
                             continue 'rtp_frames;
                         };
 
-                        // Zone activity takes the evidence-first route: the
+                        // Zone activity takes the binary-first route: the
                         // bounded writer commits the binary sidecar and WAL
                         // metadata, then forwards the same pooled JPEG to VLM.
                         // No payload copy or base64 transform occurs here.
@@ -933,6 +1087,24 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<Stage
                                 Some(Ok(true))
                             ) {
                                 metrics.inc_restricted_zone_queue_dropped();
+                                metrics.inc_keyframes_dropped();
+                            }
+                            continue 'rtp_frames;
+                        }
+
+                        if let Some(fire) = outcome.trigger_fired {
+                            let trigger_work = TriggerAssertionWork {
+                                work,
+                                fire,
+                                generation: *generation,
+                            };
+                            if !matches!(
+                                trigger_tx
+                                    .as_ref()
+                                    .map(|tx| tx.try_send(trigger_work)),
+                                Some(Ok(true))
+                            ) {
+                                metrics.inc_trigger_queue_dropped();
                                 metrics.inc_keyframes_dropped();
                             }
                             continue 'rtp_frames;
@@ -1049,6 +1221,7 @@ pub fn spawn_analysis_workers(params: AnalysisWorkerParams) -> std::io::Result<V
                     gate_config,
                     loop_hamming_threshold,
                     loop_repeat_threshold,
+                    None,
                     None,
                 );
 
@@ -1260,6 +1433,58 @@ fn spawn_zone_evidence_writer(
     Ok(StageHandle::new(PipelineStage::EventWriter, handle))
 }
 
+fn spawn_trigger_binary_writer(
+    trigger_rx: kanal::Receiver<TriggerAssertionWork>,
+    vlm_tx: kanal::Sender<KeyframeWork>,
+    sink: Arc<dyn EventSink>,
+    metrics: Arc<PipelineMetrics>,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<StageHandle> {
+    let handle = std::thread::Builder::new()
+        .name("vx-trigger-writer".to_string())
+        .spawn(move || loop {
+            if stopping.load(Ordering::Acquire) {
+                break;
+            }
+            let trigger = match trigger_rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                Ok(trigger) => trigger,
+                Err(kanal::ReceiveErrorTimeout::Timeout) => continue,
+                Err(
+                    kanal::ReceiveErrorTimeout::Closed | kanal::ReceiveErrorTimeout::SendClosed,
+                ) => break,
+            };
+
+            if let Err(err) = sink.store_trigger_sync(TriggerAssertionEvent {
+                run_id: &trigger.work.run_id,
+                session_id: &trigger.work.session_id,
+                frame_index: trigger.work.frame_index,
+                pts_ms: trigger.work.pts_ms,
+                coordinates: trigger.work.coordinates,
+                generation: trigger.generation,
+                program: &trigger.fire.program,
+                event_type: &trigger.fire.event_type,
+                confidence: trigger.work.confidence,
+                motion_score: trigger.work.motion_score,
+                novelty_score: trigger.work.novelty_score,
+                notify_webhook: trigger.fire.notify_webhook,
+                notify_local_output: trigger.fire.notify_local_output,
+                jpeg_data: &trigger.work.jpeg_bytes,
+            }) {
+                metrics.inc_trigger_binary_write_failure();
+                tracing::warn!(%err, "trigger evidence commit failed");
+            } else {
+                metrics.inc_trigger_assertion();
+            }
+
+            if matches!(vlm_tx.try_send(trigger.work), Ok(true)) {
+                metrics.inc_keyframes();
+            } else {
+                metrics.inc_keyframes_dropped();
+            }
+        })?;
+    Ok(StageHandle::new(PipelineStage::EventWriter, handle))
+}
+
 // ─── Pipeline assembly ────────────────────────────────────────────────────────
 
 /// Channels, sinks, and provider that wire one session's worker pipeline
@@ -1324,6 +1549,16 @@ where
             ));
         }
     }
+    if let Some(program) = &cfg.trigger_program {
+        if let Err(error) = program.validate() {
+            return Err(PipelineStartError::new(
+                PipelineStage::Decode,
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()),
+                None,
+                0,
+            ));
+        }
+    }
     let PipelineWiring {
         rtp_rx,
         stream_tx,
@@ -1349,13 +1584,17 @@ where
     } = wiring;
 
     let output_pool_slots = decode_output_pool_slots(cfg.gpu_available, codec);
-    let jpeg_pool_slots = jpeg_pool_slots(cfg.analysis_workers, cfg.vlm_workers).saturating_add(
-        if cfg.restricted_zone.is_some() {
+    let jpeg_pool_slots = jpeg_pool_slots(cfg.analysis_workers, cfg.vlm_workers)
+        .saturating_add(if cfg.restricted_zone.is_some() {
             ZONE_EVIDENCE_QUEUE_CAPACITY
         } else {
             0
-        },
-    );
+        })
+        .saturating_add(if cfg.trigger_program.is_some() {
+            TRIGGER_BINARY_QUEUE_CAPACITY
+        } else {
+            0
+        });
     let mut runtime = PipelineRuntime::new(generation, Arc::clone(&stopping));
 
     macro_rules! start_one {
@@ -1511,6 +1750,23 @@ where
         } else {
             None
         };
+        let trigger_tx = if cfg.trigger_program.is_some() {
+            let (trigger_tx, trigger_rx) =
+                kanal::bounded::<TriggerAssertionWork>(TRIGGER_BINARY_QUEUE_CAPACITY);
+            start_one!(
+                PipelineStage::EventWriter,
+                spawn_trigger_binary_writer(
+                    trigger_rx,
+                    vlm_tx.clone(),
+                    Arc::clone(&event_sink),
+                    Arc::clone(&metrics),
+                    Arc::clone(&stopping),
+                )
+            );
+            Some(trigger_tx)
+        } else {
+            None
+        };
         start_one!(
             PipelineStage::Decode,
             spawn_decode_workers(DecodeWorkerParams {
@@ -1527,8 +1783,10 @@ where
                     loop_repeat_threshold: cfg.loop_repeat_threshold,
                     vlm_tx,
                     zone_tx,
+                    trigger_tx,
                     generation,
                     restricted_zone: cfg.restricted_zone.clone(),
+                    trigger_program: cfg.trigger_program.clone(),
                     stdb: Arc::clone(&event_sink),
                     run_id,
                     session_id,
@@ -1931,6 +2189,15 @@ where
                             timeout_ms: crate::webrtc::runtime::KEYFRAME_FIRST_PASS_TIMEOUT_MS,
                             allow_fallback: true,
                             guided_json: guided_json.clone(),
+                            scheduling: crate::provider::InferenceScheduling::new(
+                                Arc::clone(&work.session_id),
+                                crate::admission::LatencyClass::UrgentLive,
+                                crate::webrtc::runtime::KEYFRAME_FIRST_PASS_TIMEOUT_MS
+                                    .saturating_add(
+                                        crate::webrtc::runtime::KEYFRAME_SECOND_PASS_TIMEOUT_MS,
+                                    ),
+                                500,
+                            ),
                         };
 
                         let tiered_call_start = std::time::Instant::now();
@@ -2646,7 +2913,7 @@ mod tests {
     fn observe_loop_returns_event_without_emitting_inline() {
         let sink = MockSink::new();
         let metrics = crate::metrics::PipelineMetrics::new();
-        let mut gate = GateStreamState::new(crate::gate::GateConfig::default(), 6, 3, None);
+        let mut gate = GateStreamState::new(crate::gate::GateConfig::default(), 6, 3, None, None);
 
         let mut event = None;
         for i in 0..8u64 {
@@ -2677,7 +2944,7 @@ mod tests {
         let stdb = sink as Arc<dyn EventSink>;
         let run_id: Arc<str> = "run-test".into();
         let session_id: Arc<str> = "sess-test".into();
-        let mut gate = GateStreamState::new(crate::gate::GateConfig::default(), 6, 3, None);
+        let mut gate = GateStreamState::new(crate::gate::GateConfig::default(), 6, 3, None, None);
         let ctx = KeyframeContext {
             run_id: &run_id,
             session_id: &session_id,
@@ -2736,6 +3003,7 @@ mod tests {
             6,
             3,
             Some(Arc::clone(&policy)),
+            None,
         );
         let ctx = KeyframeContext {
             run_id: &run_id,

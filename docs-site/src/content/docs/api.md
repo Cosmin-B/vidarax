@@ -40,6 +40,9 @@ The API is served over HTTP/1.1 and HTTP/2, with optional HTTP/3 behind the `h3-
 | `POST` | `/v1/runs/:id/policies/:revision/activate` | Promote a revision |
 | `POST` | `/v1/runs/:id/policies/:revision/rollback` | Restore an older active revision |
 | `POST` | `/v1/runs/:id/policies/:revision/replay` | Evaluate persisted candidates |
+| `POST` | `/v1/triggers/compile` | Compile bounded trigger source |
+| `POST` | `/v1/triggers/validate` | Validate a compiled trigger program |
+| `POST` | `/v1/triggers/evaluate` | Replay timestamped trigger samples |
 | `POST` | `/v1/query` | Query events across runs |
 | `POST` | `/v1/search` | Search VLM descriptions |
 | `POST` | `/v1/infer` | Single VLM inference |
@@ -99,7 +102,7 @@ deduplicate with the CloudEvent `id`, `<run_id>:<seq>`.
 
 | Route | Request | Success | Failures |
 |---|---|---|---|
-| `POST /v1/runs/:id/webhooks` | `{ url, event_kinds?: string[] }`; HTTPS public target, up to 32 exact kinds; an empty list means every non-bookkeeping event | 201 with `{ request_id, run_id, webhook_id, url, event_kinds, registered_seq }` | 404, 422, 500, 503 webhooks disabled or capacity unavailable |
+| `POST /v1/runs/:id/webhooks` | `{ url, event_kinds?: string[] }`; HTTPS public target, up to 32 exact kinds; an empty list means every non-bookkeeping event | 201 with `{ request_id, run_id, webhook_id, url, event_kinds, registered_seq, signing_secret }`; save the one-time secret | 404, 422, 500, 503 webhooks disabled or capacity unavailable |
 | `GET /v1/runs/:id/webhooks` | none | `{ request_id, run_id, webhooks[] }`, including cursor, successful-delivery, dead-letter, and last-error state | 404, 500 |
 | `DELETE /v1/runs/:id/webhooks/:webhook_id` | none | `{ request_id, run_id, webhook_id, deleted: true }` | 404, 500 |
 
@@ -113,18 +116,32 @@ bookkeeping events are never delivered recursively.
 
 Requests use `Content-Type: application/cloudevents+json`,
 `x-vidarax-event-id: <run_id>:<seq>`, and
-`x-vidarax-signature: v1=<HMAC-SHA256(body)>`. Binary media remains in the
+`x-vidarax-signature: v1=<HMAC-SHA256(body)>`. The HMAC key is the hex-decoded
+`signing_secret` returned once when the hook is created. Binary media remains in the
 content-addressed sidecar; event bodies carry only its existing reference and
-hash. `VIDARAX_WEBHOOK_SECRET` must contain at least 32 bytes and is one signing
-trust domain for the process.
+hash. `VIDARAX_WEBHOOK_SECRET` must contain at least 32 bytes and acts only as a
+server-side derivation root. Each hook receives a distinct key, so one tenant's
+receiver cannot forge another hook's deliveries.
 
 ### Inference
 
 | Route | Request | Success (200) | Failures | Side effects |
 |---|---|---|---|---|
-| `POST /v1/infer` | `{ model, prompt, run_id?, max_tokens?, temperature?, timeout_ms?, allow_fallback?, primary_provider?, output_schema? }`. Prompt 1 to 32768 bytes; `max_tokens` in [1, 4096]; `temperature` in [0, 2]; `timeout_ms` in [1, 120000]; `primary_provider` one of `vllm`, `sglang`, `gemini`, `mlx`. | `{ request_id, run_id, provider, model, fallback_used, output_text, finish_reason, inference_latency_ms, tokens }` | 422, 500 (including no provider configured; provider failures are sanitized) | Appends `inference_completed` when `run_id` is set |
+| `POST /v1/infer` | `{ model, prompt, run_id?, max_tokens?, temperature?, timeout_ms?, allow_fallback?, primary_provider?, output_schema? }`. Prompt 1 to 32768 bytes; `max_tokens` in [1, 4096]; `temperature` in [0, 2]; `timeout_ms` in [1, 120000]; `primary_provider` one of `vllm`, `sglang`, `gemini`, `mlx`. | `{ request_id, run_id, provider, model, fallback_used, output_text, finish_reason, inference_latency_ms, tokens }` | 422 invalid or over-budget request, 503 saturated/deadline missed, 500 no provider configured or sanitized provider failure | Appends `inference_completed` when `run_id` is set |
 | `POST /v1/infer/batch` | `{ requests[], max_parallel? }`; requests length in [1, 256]; `max_parallel` in [1, 64], default 8 | `{ request_id, processed, succeeded, failed, results[] }` with per-item `{ index, ok, result?, error? }` | 422, 500 | Same per-item event behavior as `/v1/infer` |
 | `GET /v1/models` | none | `{ request_id, models[] }` with `{ id, tier, availability, providers_available, fallback_candidates }` | 500 | none |
+
+### Trigger programs
+
+| Route | Request | Success (200) | Failures |
+|---|---|---|---|
+| `POST /v1/triggers/compile` | `{ source }`, at most 64 KiB | `{ request_id, program, instruction_count, state_slots }` | 422 |
+| `POST /v1/triggers/validate` | A compiled `TriggerProgram` | `{ request_id, valid, isa_version, program_id, program_version, instruction_count, state_slots }` | 422 |
+| `POST /v1/triggers/evaluate` | `{ program, samples }`, 1 to 10,000 timestamp-ordered samples | `{ request_id, program_id, program_version, results[] }` | 422 |
+
+The v1 program is bounded to 64 forward-only instructions, 16 stack values, 16
+state slots, and 8 actions. See [Trigger programs](/docs/triggers/) for the
+source format and current live-signal support.
 
 ### Feedback
 
@@ -180,13 +197,13 @@ Replay compares only persisted `restricted_zone_activity_entered` candidates wit
 
 ### Keyframe blobs
 
-`GET /v1/runs/:id/keyframes/:sha256` returns `image/jpeg` bytes for a hash referenced by a `keyframe_stored` event or the `evidence.image_sha256` field of a `restricted_zone_activity_entered` event on that run. The caller must own the run; knowing a blob hash from another run is not enough to retrieve it. Responses use a private immutable cache policy and an ETag equal to the content hash. Invalid hashes return the JSON validation envelope, and missing references or files return the JSON not-found envelope. Image bytes are never placed in JSON or base64-encoded by this API.
+`GET /v1/runs/:id/keyframes/:sha256` returns `image/jpeg` bytes for a hash referenced by a `keyframe_stored` event, the `evidence.image_sha256` field of a `restricted_zone_activity_entered` event, or a generation-tagged `trigger.*` event on that run. The caller must own the run; knowing a blob hash from another run is not enough to retrieve it. Responses use a private immutable cache policy and an ETag equal to the content hash. Invalid hashes return the JSON validation envelope, and missing references or files return the JSON not-found envelope. Image bytes are never placed in JSON or base64-encoded by this API.
 
 ### WebRTC (WHIP)
 
 Success and failure statuses for the four WHIP routes are covered in [WebRTC ingest](/docs/internals/webrtc-ingest/#endpoint-contract). Two things differ from the rest of the API: `POST /v1/stream/whip` answers with raw SDP (plus `Location` and `x-vidarax-run-id` headers) rather than JSON, and WHIP failures return bare status codes or plain-text bodies rather than the JSON envelope. `DELETE` terminates the WHIP resource and completes the run; it preserves the timeline and binary evidence. Deleting the Vidarax run is a separate API operation.
 
-The offer accepts an optional `x-attach-config` header (base64url-encoded JSON, no padding, size-capped) whose `prompt`, `max_output_tokens_per_second`, `clip_mode`, normalized `crop`, and optional `restricted_zone` fields apply before workers start. A deployment can instead define a default `[restricted_zone]` in `VIDARAX_CONFIG`, which is useful for fixed cameras and devices whose WHIP client cannot add custom headers. A stream-specific attach policy replaces that default. A restricted-zone policy contains `policy_id`, positive `policy_version`, `device_id`, normalized rectangular `region`, enter/exit motion thresholds, and consecutive-frame counts. Its region is the exact analysis crop; a separately supplied crop must match it, and restricted-zone activity cannot be combined with clip mode. Unknown attach fields are rejected. `PATCH /v1/stream/whip/:sess/prompt` accepts `{ prompt, output_schema? }`, where `output_schema` is a JSON Schema object, and returns the applied values only after the active generation's VLM worker acknowledges them. An unknown or foreign session returns 404 or 403, a closed generation returns 409, and a two-second acknowledgement timeout returns 503. A timed-out command is discarded rather than applied later. Token caps, crop, clip mode, and restricted-zone policy cannot be changed after start; changing the policy starts a new pipeline generation.
+The offer accepts an optional `x-attach-config` header (base64url-encoded JSON, no padding, size-capped) whose `prompt`, `max_output_tokens_per_second`, `clip_mode`, normalized `crop`, optional `restricted_zone`, and optional compiled `trigger_program` fields apply before workers start. Trigger programs and restricted-zone policy are mutually exclusive. The current live trigger path accepts motion, novelty, and confidence signals and one keyframe capture; unsupported detector/geometry or clip actions fail validation instead of being ignored. A deployment can instead define a default `[restricted_zone]` in `VIDARAX_CONFIG`, which is useful for fixed cameras and devices whose WHIP client cannot add custom headers. A stream-specific attach policy replaces that default. A restricted-zone policy contains `policy_id`, positive `policy_version`, `device_id`, normalized rectangular `region`, enter/exit motion thresholds, and consecutive-frame counts. Its region is the exact analysis crop; a separately supplied crop must match it, and restricted-zone activity cannot be combined with clip mode. Unknown attach fields are rejected. `PATCH /v1/stream/whip/:sess/prompt` accepts `{ prompt, output_schema? }`, where `output_schema` is a JSON Schema object, and returns the applied values only after the active generation's VLM worker acknowledges them. An unknown or foreign session returns 404 or 403, a closed generation returns 409, and a two-second acknowledgement timeout returns 503. A timed-out command is discarded rather than applied later. Token caps, crop, clip mode, restricted-zone policy, and trigger programs cannot be changed after start; changing one starts a new pipeline generation.
 
 ### Health and metrics
 
@@ -244,7 +261,7 @@ Not everything uses the envelope. WHIP routes return raw SDP on success and bare
 | `VIDARAX_MEDIA_MEMORY_BUDGET_BYTES` | `8589934592` | Process-wide byte reservation for admitted live media generations |
 | `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` | `64` | Process-wide OS-thread reservation for admitted live media generations |
 | `VIDARAX_STREAM_TTL_SECS` | `3600` | Run idle TTL |
-| `VIDARAX_WEBHOOK_SECRET` | unset | Enables HMAC-SHA256 webhooks; at least 32 bytes, never persisted in the timeline |
+| `VIDARAX_WEBHOOK_SECRET` | unset | Server-side derivation root for distinct HMAC-SHA256 webhook keys; at least 32 bytes, never persisted in the timeline |
 | `VIDARAX_NOVELTY_EMBEDDING_ADDR` | unset | Binary TCP embedding sidecar; setting it enables live semantic novelty |
 | `VIDARAX_NOVELTY_REUSE_THRESHOLD` | `0.01` | Conservative embedding-distance ceiling for description reuse; calibrate it on labelled deployment traffic |
 

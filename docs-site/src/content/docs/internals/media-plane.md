@@ -19,6 +19,7 @@ The complete per-session inventory, grouped by runtime and mode:
 | ffmpeg stdout reader (unnamed) | OS thread | both | `spawn_frame_reader` per sidecar decoder | Reads YUV planes from ffmpeg stdout into pooled buffers, blocking sends into the reader channel | Sidecar exit or receiver close; `Decoder::drop` kills the child and joins the reader |
 | `vx-vlm-{i}` | OS thread | keyframe only | `spawn_vlm_workers` | Semantic-novelty check, tiered VLM inference, dedup, temporal context | VLM work channel closes |
 | `vx-event-writer` | OS thread | keyframe only | `spawn_vlm_workers` | Drains `SinkEvent`s and calls the blocking `EventSink` methods so inference threads do not own storage writes | Sink event channel closes |
+| `vx-trigger-writer` | OS thread | keyframe trigger | `spawn_pipeline` | Stores the selected JPEG, commits the namespaced assertion, dispatches requested local output, then forwards the same buffer to semantic inference | Trigger queue closes |
 | `vx-analysis-{i}` | OS thread | clip only | `spawn_analysis_workers` | Loop detection, forwards accepted frames to the clip accumulator | Stream frame channel closes |
 | `vx-clip-acc` | OS thread | clip only | `spawn_clip_accumulator` | Batches sampled frames into `ClipWork` windows | Clip frame channel closes |
 | `vx-clip-vlm-{i}` | OS thread | clip only | `spawn_clip_vlm_workers` | Multi-image VLM inference over a clip window, calls the sink directly | Clip work channel closes |
@@ -55,6 +56,7 @@ All inter-stage channels are bounded `kanal` MPMC channels. Capacities are named
 | Clip frames | `CLIP_FRAME_QUEUE_CAPACITY` | 64 | analysis worker | clip accumulator | `try_send`; frame is dropped |
 | Clip work | `CLIP_WORK_QUEUE_CAPACITY` | 0 | clip accumulator | clip VLM worker | Rendezvous; accumulator blocks in `send` |
 | Sink events | `SINK_EVENT_QUEUE_CAPACITY` | 512 | VLM workers | `vx-event-writer` | Blocking `send`; inference thread waits |
+| Trigger binary writes | `TRIGGER_BINARY_QUEUE_CAPACITY` | 8 | decode worker | `vx-trigger-writer` | `try_send`; assertion is dropped and counted without blocking decode |
 
 Two behaviors are deliberate and worth internalizing before changing anything:
 
@@ -65,7 +67,7 @@ Two behaviors are deliberate and worth internalizing before changing anything:
 
 `spawn_pipeline` builds one of two topologies from `PipelineWiring`, selected by whether `clip_config` is set:
 
-- Keyframe mode (default). The gate runs inline inside the decode worker (`DecodeSink::Keyframe`), which JPEG-encodes only the frames the gate keeps and sends `KeyframeWork` straight to the VLM queue. There is no analysis stage; the `stream_tx`/`stream_rx` pair the caller allocated goes unused.
+- Keyframe mode (default). The per-frame filter and optional trigger VM run inline inside the decode worker (`DecodeSink::Keyframe`). A firing trigger can select a frame even when the ordinary filter would not. Its bounded writer stores the pooled JPEG and commits the assertion before forwarding that same buffer to the VLM queue. Ordinary selected frames go directly to the VLM queue. There is no analysis stage; the `stream_tx`/`stream_rx` pair the caller allocated goes unused.
 - Clip mode. The decode worker samples frames by PTS before encoding (`DecodeSink::Stream` with a `ClipRateGate`), the analysis worker runs loop detection, the accumulator builds windows of up to `MAX_CLIP_FRAMES_PER_REQUEST` (64) frames, and clip VLM workers make multi-image inference calls.
 
 ## The zero-capacity clip work queue

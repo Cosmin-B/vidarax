@@ -29,9 +29,10 @@ shipped, so there is no production data in those formats to migrate or trust.
 
 Webhook registration inherits run ownership: a principal can list, create, or
 delete hooks only for its own run. `VIDARAX_WEBHOOK_SECRET` is a process-level
-HMAC-SHA256 secret and must contain at least 32 bytes. It is held in memory,
-never persisted in the timeline, and never returned by an API response. Each
-request carries `x-vidarax-event-id: <run_id>:<seq>` and
+HMAC-SHA256 derivation root and must contain at least 32 bytes. It is held in
+memory and never persisted in the timeline. Each webhook receives a distinct
+derived key, returned only in its creation response. Each request carries
+`x-vidarax-event-id: <run_id>:<seq>` and
 `x-vidarax-signature: v1=<hex-hmac>` over the exact request body.
 
 Targets must be HTTPS URLs without credentials or fragments. Registration and

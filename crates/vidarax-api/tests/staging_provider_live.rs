@@ -36,6 +36,8 @@ async fn staging_live_provider_e2e_opt_in() {
         inference_per_principal_limit: 4,
         inference_waiter_limit: 128,
         inference_wait_timeout_ms: 5_000,
+        inference_token_budget: 32_768,
+        inference_byte_budget: 256 * 1024 * 1024,
         security_require_api_key: false,
         security_api_keys: vec![],
         security_require_tenant_id: false,

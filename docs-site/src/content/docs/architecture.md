@@ -29,6 +29,7 @@ The HTTP server is Axum over Hyper, on tokio, speaking HTTP/1.1 and HTTP/2 with 
 - Rate limiting, globally and per resolved principal.
 - Run lifecycle: create, list, stop, keepalive, delete, and reads of events, markers, and derived state.
 - The provider chain for inference backends: OpenAI-compatible vLLM and SGLang endpoints tried in priority order with fallback, or backends declared in a TOML config file.
+- One process-wide inference scheduler that fair-queues streams and principals, prioritizes urgent live work over ordinary live and offline work, rejects work that cannot fit its token/encoded-media budget, and stops waiting once a request can no longer meet its absolute deadline. Provider servers still own token-level batching.
 
 ## The media plane
 
@@ -57,6 +58,14 @@ The VLM worker, not an `ArcSwap`, owns the live prompt and output schema. `PATCH
 
 Before `run_created` is appended, process-wide admission reserves a conservative byte and worker-thread envelope for the negotiated generation. The calculation includes bounded RTP input, decoded and JPEG pools, decode and provider scratch space, and a 64 MiB allowance for an ffmpeg sidecar when used. `VIDARAX_MEDIA_MEMORY_BUDGET_BYTES` and `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` cap the sum across sessions. If either reservation cannot fit, creation returns 503 without leaving a durable run behind.
 
+Provider calls have a second process-wide budget for concurrency, queued callers,
+output tokens, and encoded media bytes. A request carries its stream identity,
+latency class, absolute deadline, and conservative service estimate. Live stream
+ordering remains owned by its single VLM worker; the scheduler creates
+parallelism across streams and tenants. A waiting caller has its own condition
+variable, so capacity release wakes the selected request instead of every
+blocked provider thread.
+
 H.264 and H.265 use an ffmpeg child process so a native decoder crash does not abort the API process. The supervisor owns the Rust stages and decoder teardown, but an OS thread cannot safely force-kill another OS thread; a wedged native child that defeats normal teardown remains an explicitly measured join-deadline fault rather than a claim of complete containment. See [Media plane](/docs/internals/media-plane/) and [Decode sidecar](/docs/internals/decode-sidecar/) for the detailed contracts.
 
 ## Event sinks
@@ -68,6 +77,18 @@ Worker threads report results through an `EventSink` trait rather than writing s
 - Frame and keyframe events carry `coordinate_schema: "vidarax.image.v1"` plus source dimensions, the requested normalized crop, the exact resolved pixel region, and the analyzed extent. The contract describes image coordinates, not camera extrinsics or a robot/world transform.
 - Operator feedback, policy revisions, deployments, rollbacks, and replay evaluations commit to the same local WAL as media events. Their current state is reconstructed from immutable events rather than a process-global mutable registry.
 - When `VIDARAX_SPACETIMEDB_URL` is set, successful blocking description events and feedback are mirrored after the WAL commit. Mirror failure is logged and does not roll back local durability. Nonblocking events and raw keyframes remain local.
+
+## Edge update loop
+
+The first edge package runs this same pipeline beside a local model server. An
+enrolled device pins an Ed25519 public key, a hardware cohort, and an activation
+hook. It streams a signed binary artifact to private local storage, verifies the
+declared length and SHA-256, evaluates shadow and canary health reports, and
+changes the current model only after the serving hook acknowledges that exact
+release. Each staged transition is journaled and acknowledged, and a failed
+candidate is removed only after the hook acknowledges rollback. Network loss
+stops updates rather than the active pipeline. See [Edge
+deployment](/docs/edge/).
 
 ## How state is persisted
 

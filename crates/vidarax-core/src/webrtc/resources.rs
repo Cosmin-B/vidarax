@@ -6,7 +6,7 @@ use crate::webrtc::signals::MAX_JPEG_BYTES_PER_FRAME;
 use crate::webrtc::workers::{
     decode_output_pool_slots, jpeg_pool_slots, per_stream_analysis_workers,
     per_stream_decode_workers, per_stream_vlm_workers, WorkerPoolConfig,
-    ZONE_EVIDENCE_QUEUE_CAPACITY,
+    TRIGGER_BINARY_QUEUE_CAPACITY, ZONE_EVIDENCE_QUEUE_CAPACITY,
 };
 
 /// Capacity-plan allowance for ffmpeg demux/codec/filter state outside the
@@ -38,7 +38,8 @@ impl MediaSessionResources {
         };
         let vlm_workers = per_stream_vlm_workers(cfg.vlm_workers);
         let event_writer_workers = usize::from(!clip_mode)
-            .saturating_add(usize::from(!clip_mode && cfg.restricted_zone.is_some()));
+            .saturating_add(usize::from(!clip_mode && cfg.restricted_zone.is_some()))
+            .saturating_add(usize::from(!clip_mode && cfg.trigger_program.is_some()));
         let clip_accumulator_workers = usize::from(clip_mode);
         let sidecar_reader_workers = usize::from(matches!(
             DecoderBackend::select(cfg.gpu_available, codec),
@@ -60,9 +61,15 @@ impl MediaSessionResources {
         } else {
             0
         };
+        let trigger_binary_slots = if !clip_mode && cfg.trigger_program.is_some() {
+            TRIGGER_BINARY_QUEUE_CAPACITY
+        } else {
+            0
+        };
         let jpeg_payload_bytes = (MAX_JPEG_BYTES_PER_FRAME as u64).saturating_mul(
             jpeg_pool_slots(cfg.analysis_workers, cfg.vlm_workers)
-                .saturating_add(zone_evidence_slots) as u64,
+                .saturating_add(zone_evidence_slots)
+                .saturating_add(trigger_binary_slots) as u64,
         );
         let rtp_queue_bytes = (MAX_RTP_ACCESS_UNIT_BYTES as u64)
             .saturating_mul((RTP_FRAME_QUEUE_CAPACITY + decode_workers + 1) as u64);

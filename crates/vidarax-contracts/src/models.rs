@@ -33,11 +33,8 @@ pub const REQUIRED_MODELS: &[&str] = &[
     "LiquidAI/LFM2.5-VL-1.6B",
 ];
 
-/// Gemini model IDs recognised by Vidarax. For now this is the single low-cost
-/// GA multimodal model gemini-3.1-flash-lite: no Pro tier is enabled (there is
-/// no GA gemini-3.1-pro upstream). This hardcoded set is the built-in default
-/// until the catalog is made configurable.
-pub const GEMINI_MODELS: &[&str] = &["gemini-3.1-flash-lite"];
+/// Low-cost Gemini multimodal models directly exercised by the provider path.
+pub const GEMINI_MODELS: &[&str] = &["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"];
 
 pub fn normalize_model_id(input: &str) -> Option<&'static str> {
     if input.len() > 64 {
@@ -61,12 +58,10 @@ pub fn normalize_model_id(input: &str) -> Option<&'static str> {
         "openbmb/minicpm-v-4_5" | "openbmb/minicpm-v-4.5" => Some("openbmb/MiniCPM-V-4_5"),
         "liquidai/lfm2-vl-450m" => Some("LiquidAI/LFM2-VL-450M"),
         "liquidai/lfm2.5-vl-1.6b" | "lfm2.5-vl-1.6b-q4_0.gguf" => Some("LiquidAI/LFM2.5-VL-1.6B"),
-        // Gemini cloud model. Short aliases and the retired -preview id all
-        // resolve to the one GA id in use.
-        "gemini-3.1-flash-lite"
-        | "gemini-3.1-flash-lite-preview"
-        | "gemini-flash-lite-latest"
-        | "gemini-flash-latest" => Some(GEMINI_MODELS[0]),
+        "gemini-3.5-flash-lite" | "gemini-flash-lite-latest" | "gemini-flash-latest" => {
+            Some(GEMINI_MODELS[0])
+        }
+        "gemini-3.1-flash-lite" | "gemini-3.1-flash-lite-preview" => Some(GEMINI_MODELS[1]),
         _ => None,
     }
 }

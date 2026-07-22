@@ -144,6 +144,17 @@ export type {
   PolicyReplayEvaluation,
   PolicyReplayResponse,
 
+  // Trigger ISA
+  TriggerSignal,
+  TriggerInstruction,
+  TriggerProgram,
+  TriggerObservation,
+  TriggerSample,
+  TriggerCompileResponse,
+  TriggerValidationResponse,
+  TriggerEvaluationResult,
+  TriggerEvaluationResponse,
+
   // WHIP
   AttachStreamRequest,
   WhipSession,

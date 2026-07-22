@@ -1,0 +1,23 @@
+[Unit]
+Description=Vidarax signed model update controller
+After=network-online.target vidarax-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vidarax-update
+Group=vidarax
+EnvironmentFile=/etc/vidarax/edge.env
+ExecStart=/usr/local/bin/vidarax edge watch --state-dir /var/lib/vidarax-edge --manifest-url ${VIDARAX_EDGE_MANIFEST_URL} --interval-secs 60
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+StateDirectory=vidarax-edge
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/vidarax-edge
+
+[Install]
+WantedBy=multi-user.target

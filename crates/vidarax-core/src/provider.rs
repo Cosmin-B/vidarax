@@ -7,7 +7,7 @@ use base64::Engine as _;
 use serde_json::Value;
 use vidarax_contracts::models::normalize_model_id;
 
-use crate::admission::{InferenceAdmission, LimitClass};
+use crate::admission::{AdmissionRequest, InferenceAdmission, LatencyClass, LimitClass};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -47,6 +47,69 @@ pub struct InferenceRequest {
     /// Optional JSON schema string for constrained decoding.
     /// Sent as `response_format.json_schema` for vLLM ≥0.15 compatibility.
     pub guided_json: Option<Arc<str>>,
+    pub scheduling: InferenceScheduling,
+}
+
+impl InferenceRequest {
+    /// Return the time still available to this logical request.
+    ///
+    /// Both the caller timeout and scheduler deadline bound every serial
+    /// provider attempt. Routers and providers call this again before a
+    /// fallback, upload, poll, or retry so those operations cannot each claim
+    /// the original timeout independently.
+    pub fn remaining_timeout_ms(&self) -> Result<u64, ProviderError> {
+        let remaining = self
+            .scheduling
+            .deadline_at
+            .saturating_duration_since(Instant::now());
+        let remaining_ms = remaining.as_millis().min(u128::from(u64::MAX)) as u64;
+        let timeout_ms = self.timeout_ms.min(remaining_ms);
+        if timeout_ms == 0 {
+            Err(ProviderError::DeadlineMissed)
+        } else {
+            Ok(timeout_ms)
+        }
+    }
+
+    fn with_remaining_timeout(&self) -> Result<Self, ProviderError> {
+        let mut request = self.clone();
+        request.timeout_ms = self.remaining_timeout_ms()?;
+        Ok(request)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct InferenceScheduling {
+    pub stream_id: Arc<str>,
+    pub class: LatencyClass,
+    pub deadline_ms: u64,
+    pub estimated_service_ms: u64,
+    pub deadline_at: Instant,
+}
+
+impl InferenceScheduling {
+    pub fn new(
+        stream_id: Arc<str>,
+        class: LatencyClass,
+        deadline_ms: u64,
+        estimated_service_ms: u64,
+    ) -> Self {
+        Self {
+            stream_id,
+            class,
+            deadline_ms,
+            estimated_service_ms,
+            deadline_at: Instant::now()
+                .checked_add(Duration::from_millis(deadline_ms))
+                .unwrap_or_else(Instant::now),
+        }
+    }
+}
+
+impl Default for InferenceScheduling {
+    fn default() -> Self {
+        Self::new(Arc::from("direct"), LatencyClass::Live, 30_000, 500)
+    }
 }
 
 /// Structured label emitted by the teacher VLM.
@@ -148,6 +211,8 @@ pub enum ProviderError {
         retry_after_ms: u64,
         blocked_by: LimitClass,
     },
+    DeadlineMissed,
+    RequestBudget,
 }
 
 impl ProviderError {
@@ -156,7 +221,10 @@ impl ProviderError {
             ProviderError::HttpStatus(code) => matches!(*code, 408 | 429 | 500..=599),
             ProviderError::Transport(_) => true,
             ProviderError::Saturated { .. } => true,
-            ProviderError::UnsupportedModel(_) | ProviderError::InvalidResponse(_) => false,
+            ProviderError::UnsupportedModel(_)
+            | ProviderError::InvalidResponse(_)
+            | ProviderError::DeadlineMissed
+            | ProviderError::RequestBudget => false,
         }
     }
 }
@@ -187,10 +255,42 @@ impl InferenceProvider for AdmittedProvider {
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
-        let _permit =
-            self.admission
-                .acquire(&self.principal)
-                .map_err(|error| ProviderError::Saturated {
+        let media_bytes = request
+            .input_images
+            .iter()
+            .map(|image| image.data_base64.len() as u64)
+            .chain(request.input_videos.iter().map(|video| {
+                video
+                    .raw_bytes
+                    .as_ref()
+                    .map_or(video.data_base64.len() as u64, |bytes| {
+                        (bytes.len() as u64).saturating_add(2) / 3 * 4 + 64
+                    })
+            }))
+            .fold(0_u64, u64::saturating_add);
+        let queue_budget = request
+            .scheduling
+            .deadline_at
+            .saturating_duration_since(Instant::now());
+        if queue_budget.is_zero() {
+            self.admission.record_deadline_missed();
+            return Err(ProviderError::DeadlineMissed);
+        }
+        let _permit = self
+            .admission
+            .acquire_scheduled(AdmissionRequest {
+                principal: &self.principal,
+                stream: &request.scheduling.stream_id,
+                class: request.scheduling.class,
+                deadline: queue_budget,
+                estimated_service: Duration::from_millis(request.scheduling.estimated_service_ms),
+                tokens: self.inner.reserved_output_tokens(request),
+                bytes: media_bytes,
+            })
+            .map_err(|error| match error {
+                crate::admission::AdmissionError::DeadlineMissed => ProviderError::DeadlineMissed,
+                crate::admission::AdmissionError::RequestBudget => ProviderError::RequestBudget,
+                error => ProviderError::Saturated {
                     retry_after_ms: self
                         .admission
                         .limits()
@@ -200,9 +300,18 @@ impl InferenceProvider for AdmittedProvider {
                     blocked_by: match error {
                         crate::admission::AdmissionError::Timeout { blocked_by } => blocked_by,
                         crate::admission::AdmissionError::WaiterLimit => LimitClass::Global,
+                        crate::admission::AdmissionError::DeadlineMissed
+                        | crate::admission::AdmissionError::RequestBudget => unreachable!(),
                     },
-                })?;
-        self.inner.infer(request)
+                },
+            })?;
+        let dispatched = request.with_remaining_timeout().map_err(|error| {
+            if error == ProviderError::DeadlineMissed {
+                self.admission.record_deadline_missed();
+            }
+            error
+        })?;
+        self.inner.infer(&dispatched)
     }
 
     fn kind_for_model(&self, model: &str) -> ProviderKind {
@@ -215,6 +324,10 @@ impl InferenceProvider for AdmittedProvider {
 
     fn configured_kinds_for_model(&self, model: &str) -> Vec<ProviderKind> {
         self.inner.configured_kinds_for_model(model)
+    }
+
+    fn reserved_output_tokens(&self, request: &InferenceRequest) -> u64 {
+        self.inner.reserved_output_tokens(request)
     }
 }
 
@@ -253,6 +366,13 @@ pub trait InferenceProvider: Send + Sync {
     /// Provider kinds configured to serve a public Vidarax model id.
     fn configured_kinds_for_model(&self, _model: &str) -> Vec<ProviderKind> {
         vec![self.kind()]
+    }
+
+    /// Maximum output-token capacity this logical call can consume while it
+    /// holds an admission permit. Providers that may retry with additional
+    /// output headroom must override this reservation.
+    fn reserved_output_tokens(&self, request: &InferenceRequest) -> u64 {
+        u64::from(request.max_tokens)
     }
 }
 
@@ -451,10 +571,16 @@ impl<P: InferenceProvider, F: InferenceProvider> ProviderRouter<P, F> {
     }
 
     pub fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
-        match self.primary.infer(request) {
+        self.infer_routed(request)
+    }
+
+    fn infer_routed(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+        let primary_request = request.with_remaining_timeout()?;
+        match self.primary.infer(&primary_request) {
             Ok(result) => Ok(result),
             Err(err) if request.allow_fallback && err.is_retryable() => {
-                let mut fallback_result = self.fallback.infer(request)?;
+                let fallback_request = request.with_remaining_timeout()?;
+                let mut fallback_result = self.fallback.infer(&fallback_request)?;
                 fallback_result.fallback_used = true;
                 Ok(fallback_result)
             }
@@ -470,17 +596,7 @@ impl<P: InferenceProvider, F: InferenceProvider> InferenceProvider for ProviderR
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
-        // Mirror inherent method logic — cannot call `self.infer()` here as that
-        // would recurse into this trait impl.
-        match self.primary.infer(request) {
-            Ok(result) => Ok(result),
-            Err(err) if request.allow_fallback && err.is_retryable() => {
-                let mut r = self.fallback.infer(request)?;
-                r.fallback_used = true;
-                Ok(r)
-            }
-            Err(err) => Err(err),
-        }
+        self.infer_routed(request)
     }
 
     fn available_kinds(&self) -> Vec<ProviderKind> {
@@ -501,6 +617,15 @@ impl<P: InferenceProvider, F: InferenceProvider> InferenceProvider for ProviderR
             }
         }
         kinds
+    }
+
+    fn reserved_output_tokens(&self, request: &InferenceRequest) -> u64 {
+        let primary = self.primary.reserved_output_tokens(request);
+        if request.allow_fallback {
+            primary.max(self.fallback.reserved_output_tokens(request))
+        } else {
+            primary
+        }
     }
 }
 
@@ -533,6 +658,10 @@ impl InferenceProvider for Arc<dyn InferenceProvider + Send + Sync> {
 
     fn configured_kinds_for_model(&self, model: &str) -> Vec<ProviderKind> {
         (**self).configured_kinds_for_model(model)
+    }
+
+    fn reserved_output_tokens(&self, request: &InferenceRequest) -> u64 {
+        (**self).reserved_output_tokens(request)
     }
 }
 
@@ -647,6 +776,13 @@ impl InferenceProvider for ModelRoutingProvider {
             .get(model)
             .unwrap_or(&self.default)
             .configured_kinds_for_model(model)
+    }
+
+    fn reserved_output_tokens(&self, request: &InferenceRequest) -> u64 {
+        self.routes
+            .get(request.model.as_ref())
+            .unwrap_or(&self.default)
+            .reserved_output_tokens(request)
     }
 }
 
@@ -846,10 +982,11 @@ fn parse_content_value(value: Value) -> Result<String, ProviderError> {
 mod tests {
     use super::{
         build_payload, infer_with_endpoints, AdmittedProvider, HttpTransport, InferenceImage,
-        InferenceProvider, InferenceRequest, InferenceResult, InferenceVideo, ModelRoutingProvider,
-        OpenAiCompatProvider, ProviderError, ProviderKind, ProviderRouter, TokenUsage, Transport,
+        InferenceProvider, InferenceRequest, InferenceResult, InferenceScheduling, InferenceVideo,
+        ModelRoutingProvider, OpenAiCompatProvider, ProviderError, ProviderKind, ProviderRouter,
+        TokenUsage, Transport,
     };
-    use crate::admission::{AdmissionLimits, InferenceAdmission, LimitClass};
+    use crate::admission::{AdmissionLimits, InferenceAdmission, LatencyClass, LimitClass};
     use serde_json::Value;
     use std::collections::HashMap;
     use std::io::{Read, Write};
@@ -859,7 +996,7 @@ mod tests {
         Arc, Mutex,
     };
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     struct MockTransport {
         calls: AtomicUsize,
@@ -905,6 +1042,7 @@ mod tests {
             timeout_ms: 500,
             allow_fallback: true,
             guided_json: None,
+            scheduling: Default::default(),
         }
     }
 
@@ -1222,6 +1360,7 @@ mod tests {
     struct RecordingModelProvider {
         kind: ProviderKind,
         seen_models: Mutex<Vec<String>>,
+        seen_timeouts: Mutex<Vec<u64>>,
     }
 
     impl RecordingModelProvider {
@@ -1229,6 +1368,7 @@ mod tests {
             Self {
                 kind,
                 seen_models: Mutex::new(Vec::new()),
+                seen_timeouts: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1243,6 +1383,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(request.model.to_string());
+            self.seen_timeouts.lock().unwrap().push(request.timeout_ms);
             Ok(InferenceResult {
                 provider: self.kind,
                 model: Arc::clone(&request.model),
@@ -1434,6 +1575,8 @@ mod tests {
                 per_principal_in_flight: 1,
                 global_waiters: 1,
                 wait_timeout: Duration::from_millis(5),
+                max_in_flight_tokens: 1_000_000,
+                max_in_flight_bytes: 1024 * 1024 * 1024,
             })
             .unwrap(),
         );
@@ -1452,5 +1595,77 @@ mod tests {
         drop(held);
         provider.infer(&request()).expect("capacity was released");
         assert_eq!(admission.snapshot().active, 0);
+    }
+
+    #[test]
+    fn admitted_provider_clamps_transport_timeout_to_absolute_deadline() {
+        let admission = Arc::new(
+            InferenceAdmission::new(AdmissionLimits {
+                global_in_flight: 1,
+                per_principal_in_flight: 1,
+                global_waiters: 1,
+                wait_timeout: Duration::from_secs(1),
+                max_in_flight_tokens: 1_000,
+                max_in_flight_bytes: 1_000,
+            })
+            .unwrap(),
+        );
+        let inner = Arc::new(RecordingModelProvider::new(ProviderKind::Vllm));
+        let provider = AdmittedProvider::new(
+            Arc::clone(&inner) as Arc<dyn InferenceProvider + Send + Sync>,
+            admission,
+            "tenant".into(),
+        );
+        let mut req = request();
+        req.timeout_ms = 5_000;
+        req.scheduling =
+            InferenceScheduling::new(Arc::from("camera-1"), LatencyClass::Live, 100, 1);
+
+        provider.infer(&req).unwrap();
+        let timeout = inner.seen_timeouts.lock().unwrap()[0];
+        assert!((1..=100).contains(&timeout));
+    }
+
+    #[test]
+    fn admitted_provider_rejects_expired_and_oversized_raw_video() {
+        let admission = Arc::new(
+            InferenceAdmission::new(AdmissionLimits {
+                global_in_flight: 1,
+                per_principal_in_flight: 1,
+                global_waiters: 1,
+                wait_timeout: Duration::from_secs(1),
+                max_in_flight_tokens: 1_000,
+                max_in_flight_bytes: 70,
+            })
+            .unwrap(),
+        );
+        let inner = Arc::new(RecordingModelProvider::new(ProviderKind::Vllm));
+        let provider = AdmittedProvider::new(
+            Arc::clone(&inner) as Arc<dyn InferenceProvider + Send + Sync>,
+            admission,
+            "tenant".into(),
+        );
+        let mut req = request();
+        req.input_videos.push(InferenceVideo {
+            media_type: "video/mp4",
+            raw_bytes: Some(Arc::from(&b"123456"[..])),
+            data_base64: String::new(),
+        });
+        req.scheduling =
+            InferenceScheduling::new(Arc::from("camera-1"), LatencyClass::Live, 100, 1);
+        assert!(matches!(
+            provider.infer(&req),
+            Err(ProviderError::RequestBudget)
+        ));
+
+        req.input_videos.clear();
+        req.scheduling.deadline_at = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        assert!(matches!(
+            provider.infer(&req),
+            Err(ProviderError::DeadlineMissed)
+        ));
+        assert!(inner.seen_models.lock().unwrap().is_empty());
     }
 }

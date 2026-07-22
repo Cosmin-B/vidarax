@@ -22,6 +22,42 @@ vidarax_pipeline_keyframe_blobs_written_total 2
 vidarax_pipeline_keyframe_blobs_reused_total 1
 vidarax_pipeline_keyframe_blob_failures_total 0
 vidarax_pipeline_keyframe_blob_bytes_total 4096
+vidarax_pipeline_restricted_zone_assertions_total 2
+vidarax_pipeline_restricted_zone_evidence_failures_total 0
+vidarax_pipeline_restricted_zone_queue_dropped_total 0
+vidarax_pipeline_trigger_assertions_total 3
+vidarax_pipeline_trigger_binary_write_failures_total 0
+vidarax_pipeline_trigger_queue_dropped_total 1
+vidarax_pipeline_trigger_missing_signal_total 0
+vidarax_pipeline_trigger_local_outputs_total 2
+vidarax_pipeline_trigger_local_output_failures_total 0
+vidarax_infer_admission_active_tokens 128
+vidarax_infer_admission_token_limit 4096
+vidarax_infer_admission_active_bytes 4096
+vidarax_infer_admission_byte_limit 134217728
+vidarax_infer_admission_deadline_missed_total 0
+vidarax_infer_admission_budget_rejections_total 0
+vidarax_infer_admission_urgent_live_acquired_total 2
+vidarax_infer_admission_live_acquired_total 1
+vidarax_infer_admission_offline_acquired_total 1
+vidarax_sse_subscribers_active 1
+vidarax_sse_events_total 5
+vidarax_sse_replayed_events_total 2
+vidarax_sse_output_queue_stalls_total 0
+vidarax_sse_commit_to_send_latency_ms_bucket{le="10"} 2
+vidarax_sse_commit_to_send_latency_ms_bucket{le="25"} 4
+vidarax_sse_commit_to_send_latency_ms_bucket{le="50"} 5
+vidarax_sse_commit_to_send_latency_ms_bucket{le="100"} 5
+vidarax_sse_commit_to_send_latency_ms_bucket{le="250"} 5
+vidarax_sse_commit_to_send_latency_ms_bucket{le="500"} 5
+vidarax_sse_commit_to_send_latency_ms_bucket{le="1000"} 5
+vidarax_sse_commit_to_send_latency_ms_bucket{le="+Inf"} 5
+vidarax_sse_commit_to_send_latency_ms_sum 72
+vidarax_sse_commit_to_send_latency_ms_count 5
+vidarax_webhooks_configured 1
+vidarax_webhook_delivered_total 3
+vidarax_webhook_retries_total 0
+vidarax_webhook_dead_letters_total 0
 vidarax_pipeline_sessions_created_total 1
 vidarax_pipeline_sessions_removed_total 0
 vidarax_pipeline_generations_active 1
@@ -118,16 +154,19 @@ test.describe('Tracing page', () => {
 
   // ── Metric cards ─────────────────────────────────────────────────────────────
 
-  test('Live Metrics section renders with 4 metric cards', async ({ page }) => {
+  test('Live Metrics section renders every operational metric card', async ({ page }) => {
     await page.goto('/tracing')
 
     const metricsSection = page.getByRole('region', { name: 'Live pipeline metrics' })
     await expect(metricsSection).toBeVisible({ timeout: 10_000 })
 
-    // All 4 card headings should be present
-    for (const cardName of ['Decode', 'Gate Engine', 'VLM Inference', 'Keyframe sidecar']) {
+    for (const cardName of ['Decode', 'Gate Engine', 'VLM Inference', 'Keyframe sidecar', 'Delivery']) {
       await expect(metricsSection.getByRole('heading', { name: cardName })).toBeVisible()
     }
+    await expect(metricsSection.getByText('Trigger queue drops', { exact: true })).toBeVisible()
+    await expect(metricsSection.getByText('Token reservations', { exact: true })).toBeVisible()
+    await expect(metricsSection.getByText('Local trigger outputs', { exact: true })).toBeVisible()
+    await expect(metricsSection.getByText('Commit → SSE p95', { exact: true })).toBeVisible()
   })
 
   test('Live Metrics section header is visible', async ({ page }) => {

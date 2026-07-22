@@ -91,6 +91,7 @@ const EVENT_COLORS: Record<string, string> = {
   vlm_description: '#22c55e', artifact_suspected: '#ef4444',
   exposure_shift: '#a78bfa', flicker: '#fb7185', keyframe: '#22c55e',
   restricted_zone_activity: '#38bdf8',
+  trigger_assertion: '#38bdf8',
 }
 function eventColor(type: string) { return EVENT_COLORS[type] ?? '#64748b' }
 </script>

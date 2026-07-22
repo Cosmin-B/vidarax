@@ -1800,6 +1800,7 @@ pub async fn reason_realtime_run(
         temporal_chain,
         vlm_concurrency,
         analyze_observer,
+        Some(state.inference_dispatch()),
         Some(semantic_event_tx),
     );
     let semantic_journal = async {
@@ -2411,6 +2412,12 @@ async fn validate_infer_request(
             guided_json: payload
                 .output_schema
                 .map(|schema| Arc::from(schema.to_string())),
+            scheduling: vidarax_core::provider::InferenceScheduling::new(
+                Arc::from("direct"),
+                vidarax_core::admission::LatencyClass::Live,
+                timeout_ms,
+                timeout_ms.saturating_sub(1).min(1_000),
+            ),
         },
         primary_provider,
         principal: state.security_policy().principal_key_from_headers(headers),
@@ -2433,22 +2440,21 @@ async fn execute_infer_request(
     state.pipeline_metrics().inc_vlm_inferences();
     let primary_provider_for_metrics = prepared.primary_provider;
     let request_for_provider = prepared.request.clone();
-    let result =
-        match tokio::task::spawn_blocking(move || provider.infer(&request_for_provider)).await {
-            Ok(result) => match result {
-                Ok(result) => result,
-                Err(err) => {
-                    state
-                        .pipeline_metrics()
-                        .vlm_latency_ms
-                        .record(started.elapsed().as_millis() as u64);
-                    state.inference_metrics().record_error(
-                        primary_provider_for_metrics,
-                        started.elapsed().as_millis() as u64,
-                    );
-                    return Err(map_provider_execution_error(err));
-                }
-            },
+    let dispatch_permit =
+        state
+            .try_acquire_inference_dispatch()
+            .map_err(|message| InferExecutionError {
+                code: "provider_saturated",
+                message,
+            })?;
+    let result = match tokio::task::spawn_blocking(move || {
+        let _dispatch_permit = dispatch_permit;
+        provider.infer(&request_for_provider)
+    })
+    .await
+    {
+        Ok(result) => match result {
+            Ok(result) => result,
             Err(err) => {
                 state
                     .pipeline_metrics()
@@ -2458,12 +2464,24 @@ async fn execute_infer_request(
                     primary_provider_for_metrics,
                     started.elapsed().as_millis() as u64,
                 );
-                return Err(InferExecutionError {
-                    code: "internal_error",
-                    message: format!("inference worker join failure: {err}"),
-                });
+                return Err(map_provider_execution_error(err));
             }
-        };
+        },
+        Err(err) => {
+            state
+                .pipeline_metrics()
+                .vlm_latency_ms
+                .record(started.elapsed().as_millis() as u64);
+            state.inference_metrics().record_error(
+                primary_provider_for_metrics,
+                started.elapsed().as_millis() as u64,
+            );
+            return Err(InferExecutionError {
+                code: "internal_error",
+                message: format!("inference worker join failure: {err}"),
+            });
+        }
+    };
     state.inference_metrics().record_success(
         result.provider,
         started.elapsed().as_millis() as u64,
@@ -2530,6 +2548,14 @@ fn map_provider_execution_error(err: ProviderError) -> InferExecutionError {
             code: "provider_saturated",
             message: "inference capacity is temporarily unavailable".to_string(),
         },
+        ProviderError::DeadlineMissed => InferExecutionError {
+            code: "deadline_missed",
+            message: "inference could not start before its deadline".to_string(),
+        },
+        ProviderError::RequestBudget => InferExecutionError {
+            code: "request_budget_exceeded",
+            message: "inference request exceeds the configured process budget".to_string(),
+        },
     }
 }
 
@@ -2541,8 +2567,18 @@ fn infer_execution_error_to_response(state: &AppState, err: InferExecutionError)
             vec![field_error("model", err.message)],
         );
     }
-    if err.code == "provider_saturated" {
+    if matches!(err.code, "provider_saturated" | "deadline_missed") {
         return service_unavailable(state, err.code, err.message);
+    }
+    if err.code == "request_budget_exceeded" {
+        return validation_error(
+            state,
+            err.message,
+            vec![field_error(
+                "request",
+                "reduce media bytes or max_tokens".to_string(),
+            )],
+        );
     }
     internal_error(state, err.message)
 }
@@ -2551,9 +2587,10 @@ fn infer_execution_error_to_response(state: &AppState, err: InferExecutionError)
 mod tests {
     use super::{
         event_references_keyframe_blob, feedback_events_to_json_for_owned_runs,
-        feedback_payload_error, marker_to_emit_event_request, owned_run_ids_from_events,
-        parse_provider, run_command_with_timeout, validate_infer_request, AnalyzeMarker,
-        InferRequest, ProviderKind, MAX_FEEDBACK_CATEGORY_LEN, MAX_FEEDBACK_TEXT_LEN,
+        feedback_payload_error, infer_execution_error_to_response, marker_to_emit_event_request,
+        owned_run_ids_from_events, parse_provider, run_command_with_timeout,
+        validate_infer_request, AnalyzeMarker, InferExecutionError, InferRequest, ProviderKind,
+        MAX_FEEDBACK_CATEGORY_LEN, MAX_FEEDBACK_TEXT_LEN,
     };
     use crate::state::AppState;
     use axum::http::HeaderMap;
@@ -2704,6 +2741,42 @@ mod tests {
         assert_eq!(value["properties"]["ok"]["type"].as_str(), Some("boolean"));
     }
 
+    #[tokio::test]
+    async fn direct_infer_keeps_short_deadlines_dispatchable() {
+        let state = test_state("short-infer-deadline");
+        let mut payload = infer_request(json!({"type": "object"}));
+        payload.timeout_ms = Some(1);
+        let prepared =
+            validate_infer_request(&state, &HeaderMap::new(), payload, "invalid infer payload")
+                .await
+                .unwrap();
+
+        assert_eq!(prepared.request.scheduling.deadline_ms, 1);
+        assert_eq!(prepared.request.scheduling.estimated_service_ms, 0);
+    }
+
+    #[test]
+    fn inference_capacity_errors_have_non_500_statuses() {
+        let state = test_state("infer-capacity-status");
+        let deadline = infer_execution_error_to_response(
+            &state,
+            InferExecutionError {
+                code: "deadline_missed",
+                message: "deadline missed".to_string(),
+            },
+        );
+        assert_eq!(deadline.0, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+
+        let budget = infer_execution_error_to_response(
+            &state,
+            InferExecutionError {
+                code: "request_budget_exceeded",
+                message: "budget exceeded".to_string(),
+            },
+        );
+        assert_eq!(budget.0, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
     #[test]
     fn feedback_list_filters_wal_events_to_owned_runs() {
         let events = vec![
@@ -2791,6 +2864,15 @@ mod tests {
             "restricted_zone_activity_entered",
             &json!({ "evidence": { "image_sha256": "B".repeat(64) } }),
             &"b".repeat(64),
+        ));
+        assert!(event_references_keyframe_blob(
+            "loading_bay_entry",
+            &json!({
+                "trigger": { "program_id": "loading-bay" },
+                "provenance": { "pipeline_generation": 7 },
+                "evidence": { "image_sha256": "C".repeat(64) }
+            }),
+            &"c".repeat(64),
         ));
         assert!(!event_references_keyframe_blob(
             "untrusted_event",
@@ -3277,6 +3359,21 @@ fn event_references_keyframe_blob(kind: &str, payload: &Value, sha256: &str) -> 
         "restricted_zone_activity_entered" => payload
             .get("evidence")
             .and_then(|evidence| evidence.get("image_sha256")),
+        _ if payload
+            .get("trigger")
+            .and_then(|trigger| trigger.get("program_id"))
+            .and_then(Value::as_str)
+            .is_some()
+            && payload
+                .get("provenance")
+                .and_then(|provenance| provenance.get("pipeline_generation"))
+                .and_then(Value::as_u64)
+                .is_some() =>
+        {
+            payload
+                .get("evidence")
+                .and_then(|evidence| evidence.get("image_sha256"))
+        }
         _ => None,
     };
     referenced_sha

@@ -58,7 +58,9 @@ For action hooks, configure `VIDARAX_WEBHOOK_SECRET` and register a target with
 filtered by exact event kinds. Failed attempts retry and then enter visible
 dead-letter state from `GET /v1/runs/{id}/webhooks`. Binary images and clips are
 not transformed into JSON/base64: `data` carries their sidecar reference, hash,
-media type, and byte count exactly as the timeline event does.
+media type, and byte count exactly as the timeline event does. Save the
+per-webhook `signing_secret` from the creation response; it is returned only
+once and must be hex-decoded before verifying the HMAC header.
 
 ## Event kinds and payloads
 

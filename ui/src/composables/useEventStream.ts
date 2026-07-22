@@ -22,13 +22,17 @@ function mapEvent(raw: RawRunEvent, runId: string): AgentEvent | null {
     'loop_detected',
   ])
   const isRestrictedZone = raw.kind === 'restricted_zone_activity_entered'
-  if (raw.kind !== 'marker_emitted' && !workerKinds.has(raw.kind) && !isRestrictedZone) return null
+  const rootTrigger = objectField(payload.trigger)
+  const isTriggerAssertion = typeof rootTrigger.program_id === 'string'
+  if (raw.kind !== 'marker_emitted' && !workerKinds.has(raw.kind) && !isRestrictedZone && !isTriggerAssertion) return null
 
   const assertion = objectField(payload.assertion)
   const trigger = objectField(assertion.trigger)
   const workerDescription = workerKinds.has(raw.kind)
   const eventType = isRestrictedZone
     ? 'restricted_zone_activity'
+    : isTriggerAssertion
+      ? 'trigger_assertion'
     : raw.kind === 'marker_emitted'
       ? String(payload.event_type ?? 'context_observation')
       : raw.kind === 'loop_detected'
@@ -45,6 +49,8 @@ function mapEvent(raw: RawRunEvent, runId: string): AgentEvent | null {
     confidence: Number(payload.confidence ?? trigger.score ?? 0),
     description: isRestrictedZone
       ? zoneDescription
+      : isTriggerAssertion
+        ? `Trigger ${String(rootTrigger.program_id)} emitted ${raw.kind}`
       : workerDescription
         ? String(payload.description ?? '')
         : String(payload.description ?? payload.summary ?? ''),
@@ -55,6 +61,7 @@ function mapEvent(raw: RawRunEvent, runId: string): AgentEvent | null {
 function keyframeEvidence(raw: RawRunEvent): Record<string, unknown> | null {
   if (raw.kind === 'keyframe_stored') return raw.payload
   if (raw.kind === 'restricted_zone_activity_entered') return objectField(raw.payload.evidence)
+  if (typeof objectField(raw.payload.trigger).program_id === 'string') return objectField(raw.payload.evidence)
   return null
 }
 
@@ -76,6 +83,8 @@ async function loadKeyframe(raw: RawRunEvent, runId: string): Promise<KeyframeEn
       raw.payload.description
       ?? (raw.kind === 'restricted_zone_activity_entered'
         ? `Activity entered restricted zone ${String(assertion.policy_id ?? '')}`.trim()
+        : typeof objectField(raw.payload.trigger).program_id === 'string'
+          ? `Trigger ${String(objectField(raw.payload.trigger).program_id)} emitted ${raw.kind}`
         : ''),
     ),
     image_sha256: sha256.toLowerCase(),

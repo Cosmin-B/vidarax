@@ -135,6 +135,18 @@ pub struct PipelineMetrics {
     restricted_zone_evidence_failures_total: AtomicU64,
     /// Restricted-zone assertions dropped at the bounded writer queue.
     restricted_zone_queue_dropped_total: AtomicU64,
+    /// Generic trigger assertions durably committed with keyframe evidence.
+    trigger_assertions_total: AtomicU64,
+    /// Trigger binary sidecar writes that failed before event commit.
+    trigger_binary_write_failures_total: AtomicU64,
+    /// Trigger assertions dropped at the bounded writer queue.
+    trigger_queue_dropped_total: AtomicU64,
+    /// Live trigger evaluations that referenced an unavailable signal.
+    trigger_missing_signal_total: AtomicU64,
+    /// Trigger metadata datagrams delivered to the configured local output.
+    trigger_local_outputs_total: AtomicU64,
+    /// Trigger local-output datagrams that could not be delivered.
+    trigger_local_output_failures_total: AtomicU64,
     /// VLM inference calls dispatched.
     vlm_inferences_total: AtomicU64,
     /// T2 candidates evaluated with a semantic embedding.
@@ -202,6 +214,12 @@ impl PipelineMetrics {
             restricted_zone_assertions_total: AtomicU64::new(0),
             restricted_zone_evidence_failures_total: AtomicU64::new(0),
             restricted_zone_queue_dropped_total: AtomicU64::new(0),
+            trigger_assertions_total: AtomicU64::new(0),
+            trigger_binary_write_failures_total: AtomicU64::new(0),
+            trigger_queue_dropped_total: AtomicU64::new(0),
+            trigger_missing_signal_total: AtomicU64::new(0),
+            trigger_local_outputs_total: AtomicU64::new(0),
+            trigger_local_output_failures_total: AtomicU64::new(0),
             vlm_inferences_total: AtomicU64::new(0),
             novelty_evaluated_total: AtomicU64::new(0),
             novelty_reused_total: AtomicU64::new(0),
@@ -369,6 +387,42 @@ impl PipelineMetrics {
     }
 
     #[inline]
+    pub fn inc_trigger_assertion(&self) {
+        self.trigger_assertions_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_trigger_binary_write_failure(&self) {
+        self.trigger_binary_write_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_trigger_queue_dropped(&self) {
+        self.trigger_queue_dropped_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_trigger_missing_signal(&self) {
+        self.trigger_missing_signal_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_trigger_local_output(&self) {
+        self.trigger_local_outputs_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_trigger_local_output_failure(&self) {
+        self.trigger_local_output_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
     pub fn inc_vlm_inferences(&self) {
         self.vlm_inferences_total.fetch_add(1, Ordering::Relaxed);
     }
@@ -528,6 +582,16 @@ impl PipelineMetrics {
         let restricted_zone_queue_dropped = self
             .restricted_zone_queue_dropped_total
             .load(Ordering::Relaxed);
+        let trigger_assertions = self.trigger_assertions_total.load(Ordering::Relaxed);
+        let trigger_binary_write_failures = self
+            .trigger_binary_write_failures_total
+            .load(Ordering::Relaxed);
+        let trigger_queue_dropped = self.trigger_queue_dropped_total.load(Ordering::Relaxed);
+        let trigger_missing_signal = self.trigger_missing_signal_total.load(Ordering::Relaxed);
+        let trigger_local_outputs = self.trigger_local_outputs_total.load(Ordering::Relaxed);
+        let trigger_local_output_failures = self
+            .trigger_local_output_failures_total
+            .load(Ordering::Relaxed);
         let vlm = self.vlm_inferences_total.load(Ordering::Relaxed);
         let novelty_evaluated = self.novelty_evaluated_total.load(Ordering::Relaxed);
         let novelty_reused = self.novelty_reused_total.load(Ordering::Relaxed);
@@ -586,6 +650,12 @@ impl PipelineMetrics {
              vidarax_pipeline_restricted_zone_assertions_total {restricted_zone_assertions}\n\
              vidarax_pipeline_restricted_zone_evidence_failures_total {restricted_zone_evidence_failures}\n\
              vidarax_pipeline_restricted_zone_queue_dropped_total {restricted_zone_queue_dropped}\n\
+             vidarax_pipeline_trigger_assertions_total {trigger_assertions}\n\
+             vidarax_pipeline_trigger_binary_write_failures_total {trigger_binary_write_failures}\n\
+             vidarax_pipeline_trigger_queue_dropped_total {trigger_queue_dropped}\n\
+             vidarax_pipeline_trigger_missing_signal_total {trigger_missing_signal}\n\
+             vidarax_pipeline_trigger_local_outputs_total {trigger_local_outputs}\n\
+             vidarax_pipeline_trigger_local_output_failures_total {trigger_local_output_failures}\n\
              vidarax_pipeline_vlm_inferences_total {vlm}\n\
              vidarax_pipeline_novelty_evaluated_total {novelty_evaluated}\n\
              vidarax_pipeline_novelty_reused_total {novelty_reused}\n\
@@ -695,6 +765,12 @@ mod tests {
         m.inc_restricted_zone_assertion();
         m.inc_restricted_zone_evidence_failure();
         m.inc_restricted_zone_queue_dropped();
+        m.inc_trigger_assertion();
+        m.inc_trigger_binary_write_failure();
+        m.inc_trigger_queue_dropped();
+        m.inc_trigger_missing_signal();
+        m.inc_trigger_local_output();
+        m.inc_trigger_local_output_failure();
 
         let text = m.render_prometheus();
         assert!(text.contains("vidarax_pipeline_rtp_frames_received_total 2"));
@@ -708,6 +784,12 @@ mod tests {
         assert!(text.contains("vidarax_pipeline_restricted_zone_assertions_total 1"));
         assert!(text.contains("vidarax_pipeline_restricted_zone_evidence_failures_total 1"));
         assert!(text.contains("vidarax_pipeline_restricted_zone_queue_dropped_total 1"));
+        assert!(text.contains("vidarax_pipeline_trigger_assertions_total 1"));
+        assert!(text.contains("vidarax_pipeline_trigger_binary_write_failures_total 1"));
+        assert!(text.contains("vidarax_pipeline_trigger_queue_dropped_total 1"));
+        assert!(text.contains("vidarax_pipeline_trigger_missing_signal_total 1"));
+        assert!(text.contains("vidarax_pipeline_trigger_local_outputs_total 1"));
+        assert!(text.contains("vidarax_pipeline_trigger_local_output_failures_total 1"));
     }
 
     #[test]

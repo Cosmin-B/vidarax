@@ -40,6 +40,7 @@ async fn main() {
         timeout_ms: 10_000,
         allow_fallback: true,
         guided_json: None,
+        scheduling: Default::default(),
     };
 
     let requests = 200usize;

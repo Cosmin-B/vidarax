@@ -40,6 +40,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
     Arc,
 };
+use vidarax_contracts::triggers::TriggerProgram;
 
 pub use rustrtc::peer_connection::PeerConnectionState;
 use rustrtc::{
@@ -174,6 +175,8 @@ pub struct WebRtcConfig {
     /// Optional device-level activity policy used when an attach request does
     /// not replace it.
     pub restricted_zone: Option<Arc<RestrictedZonePolicy>>,
+    /// Optional generation-static trigger bytecode supplied at attach time.
+    pub trigger_program: Option<Arc<TriggerProgram>>,
 }
 
 /// Failure from [`WebRtcSession::new`].
@@ -217,6 +220,7 @@ impl Default for WebRtcConfig {
             vlm_tiering: TieredVlmConfig::default(),
             crop: None,
             restricted_zone: None,
+            trigger_program: None,
         }
     }
 }
@@ -265,6 +269,8 @@ pub struct WebRtcSession {
     /// validates this before worker startup; replacing it requires a new
     /// generation so in-flight frames cannot cross policy versions.
     pub restricted_zone: Option<Arc<RestrictedZonePolicy>>,
+    /// Optional generation-static trigger bytecode supplied at attach time.
+    pub trigger_program: Option<Arc<TriggerProgram>>,
     /// Video codec negotiated from the SDP offer.
     pub codec: VideoCodec,
     rtp_nal_pool_slots: usize,
@@ -327,6 +333,7 @@ impl WebRtcSession {
                 max_output_tokens_per_second: 128,
                 crop: None,
                 restricted_zone: None,
+                trigger_program: None,
                 codec: VideoCodec::H264,
                 rtp_nal_pool_slots: rtp_nal_pool_slots(1),
                 shutdown,
@@ -522,6 +529,7 @@ impl WebRtcSession {
                 max_output_tokens_per_second: config.max_output_tokens_per_second,
                 crop: config.crop,
                 restricted_zone: config.restricted_zone.clone(),
+                trigger_program: config.trigger_program.clone(),
                 codec,
                 rtp_nal_pool_slots: rtp_nal_pool_slots(config.decode_workers),
                 shutdown,

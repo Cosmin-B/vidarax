@@ -4,6 +4,7 @@ pub mod errors;
 pub mod lifecycle;
 pub mod models;
 pub mod processing;
+pub mod triggers;
 
 #[cfg(test)]
 mod tests {
@@ -52,6 +53,14 @@ mod tests {
         for id in GEMINI_MODELS {
             assert_eq!(normalize_model_id(id), Some(*id));
         }
+        assert_eq!(
+            normalize_model_id("gemini-flash-lite-latest"),
+            Some("gemini-3.5-flash-lite")
+        );
+        assert_eq!(
+            normalize_model_id("gemini-3.1-flash-lite-preview"),
+            Some("gemini-3.1-flash-lite")
+        );
     }
 
     #[test]

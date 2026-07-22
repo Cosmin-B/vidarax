@@ -1,6 +1,6 @@
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Apply restrictive file permissions (owner read/write only) on Unix (C-4).
@@ -160,30 +160,54 @@ pub fn read_events_after(
     after_seq: u64,
     limit: usize,
 ) -> Result<Vec<TimelineEvent>, TimelineError> {
+    read_events_after_from(path, after_seq, limit, 0).map(|(events, _)| events)
+}
+
+/// Continue a WAL scan from a byte offset returned by an earlier call.
+///
+/// Long-lived delivery workers retain the offset so steady-state wakeups read
+/// only newly appended records. If the WAL was replaced or truncated, an
+/// out-of-range offset safely falls back to the beginning and the sequence
+/// cursor removes duplicates.
+pub fn read_events_after_from(
+    path: impl AsRef<Path>,
+    after_seq: u64,
+    limit: usize,
+    offset: u64,
+) -> Result<(Vec<TimelineEvent>, u64), TimelineError> {
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), offset));
     }
     let file = match OpenOptions::new().read(true).open(path.as_ref()) {
         Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), offset));
+        }
         Err(err) => return Err(TimelineError::Io(err)),
     };
-    let reader = BufReader::new(file);
+    let file_length = file.metadata()?.len();
+    let start = if offset <= file_length { offset } else { 0 };
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(start))?;
     let mut out = Vec::with_capacity(limit.min(256));
-    for line in reader.lines() {
-        let line = line?;
+    let mut line = String::new();
+    while reader.read_line(&mut line)? != 0 {
         let Some(event) = TimelineEvent::decode_line(&line) else {
+            line.clear();
             continue;
         };
         if event.seq <= after_seq {
+            line.clear();
             continue;
         }
         out.push(event);
         if out.len() == limit {
             break;
         }
+        line.clear();
     }
-    Ok(out)
+    let next_offset = reader.stream_position()?;
+    Ok((out, next_offset))
 }
 
 pub trait EventIndex {
@@ -281,8 +305,8 @@ fn restore(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_event, read_all_events, read_events_after, DualWriter, EventIndex, TimelineError,
-        TimelineEvent, WalWriter,
+        append_event, read_all_events, read_events_after, read_events_after_from, DualWriter,
+        EventIndex, TimelineError, TimelineEvent, WalWriter,
     };
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -384,6 +408,24 @@ mod tests {
         );
         assert!(read_events_after(&path, 8, 2).unwrap().is_empty());
         assert!(read_events_after(&path, 0, 0).unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cursor_read_continues_from_returned_byte_offset() {
+        let path = test_path("cursor-offset");
+        for seq in 1..=3 {
+            append_event(&path, &event(seq)).unwrap();
+        }
+        let (first, offset) = read_events_after_from(&path, 0, 3, 0).unwrap();
+        assert_eq!(first.len(), 3);
+        append_event(&path, &event(4)).unwrap();
+        let (next, next_offset) = read_events_after_from(&path, 3, 3, offset).unwrap();
+        assert_eq!(
+            next.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert!(next_offset > offset);
         let _ = std::fs::remove_file(path);
     }
 }

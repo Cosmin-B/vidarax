@@ -13,7 +13,9 @@ use std::sync::Arc;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use vidarax_core::coordinates::{FrameCoordinates, IMAGE_COORDINATE_SCHEMA};
-use vidarax_core::webrtc::workers::{EventSink, KeyframeEvent, RestrictedZoneEvidenceEvent};
+use vidarax_core::webrtc::workers::{
+    EventSink, KeyframeEvent, RestrictedZoneEvidenceEvent, TriggerAssertionEvent,
+};
 use vidarax_core::zone::{
     RESTRICTED_ZONE_ACTIVITY_EVENT, RESTRICTED_ZONE_COORDINATE_SPACE, RESTRICTED_ZONE_MOTION_MODEL,
 };
@@ -309,6 +311,131 @@ impl EventSink for WalEventSink {
             .append_run_event(event.run_id, RESTRICTED_ZONE_ACTIVITY_EVENT, payload)
             .map(|_| ())
     }
+
+    fn store_trigger_sync(&self, event: TriggerAssertionEvent<'_>) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let blob = match self.persist_keyframe_blob(event.jpeg_data) {
+            Ok(blob) => blob,
+            Err(err) => {
+                self.state.pipeline_metrics().inc_keyframe_blob_failure();
+                self.state
+                    .pipeline_metrics()
+                    .keyframe_blob_latency_ms
+                    .record(started.elapsed().as_millis() as u64);
+                return Err(err);
+            }
+        };
+        self.state
+            .pipeline_metrics()
+            .keyframe_blob_latency_ms
+            .record(started.elapsed().as_millis() as u64);
+        if blob.created {
+            self.state
+                .pipeline_metrics()
+                .record_keyframe_blob_written(blob.bytes as u64);
+        } else {
+            self.state.pipeline_metrics().inc_keyframe_blob_reused();
+        }
+        let payload = json!({
+            "session_id": event.session_id,
+            "frame_index": event.frame_index,
+            "pts_ms": event.pts_ms,
+            "coordinate_schema": IMAGE_COORDINATE_SCHEMA,
+            "coordinates": event.coordinates,
+            "confidence": event.confidence,
+            "event_type": event.event_type,
+            "trigger": {
+                "program_id": event.program.program_id,
+                "program_version": event.program.version,
+                "isa_version": event.program.isa_version,
+                "inputs": {
+                    "motion_score": event.motion_score,
+                    "novelty_score": event.novelty_score,
+                    "confidence": event.confidence,
+                },
+                "actions": {
+                    "event": true,
+                    "webhook": event.notify_webhook,
+                    "local_output": event.notify_local_output,
+                    "capture": "keyframe",
+                }
+            },
+            "provenance": {
+                "pipeline_generation": event.generation.get(),
+            },
+            "evidence": {
+                "image_ref": blob.image_ref,
+                "image_media_type": "image/jpeg",
+                "image_bytes": blob.bytes,
+                "image_sha256": blob.sha256,
+            },
+        });
+
+        let event_kind = format!("trigger.{}", event.event_type);
+        let committed = self
+            .state
+            .append_run_event(event.run_id, &event_kind, payload)?;
+        if event.notify_local_output {
+            match send_trigger_local_output(&committed, event.generation.get()) {
+                Ok(()) => self.state.pipeline_metrics().inc_trigger_local_output(),
+                Err(error) => {
+                    self.state
+                        .pipeline_metrics()
+                        .inc_trigger_local_output_failure();
+                    tracing::warn!(%error, "trigger local output delivery failed");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn send_trigger_local_output(
+    event: &vidarax_core::timeline::TimelineEvent,
+    generation: u64,
+) -> Result<(), String> {
+    let path = std::env::var_os("VIDARAX_TRIGGER_LOCAL_OUTPUT_SOCKET")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "VIDARAX_TRIGGER_LOCAL_OUTPUT_SOCKET is not configured".to_string())?;
+    send_trigger_local_output_to(std::path::Path::new(&path), event, generation)
+}
+
+#[cfg(unix)]
+fn send_trigger_local_output_to(
+    path: &std::path::Path,
+    event: &vidarax_core::timeline::TimelineEvent,
+    generation: u64,
+) -> Result<(), String> {
+    use std::os::unix::net::UnixDatagram;
+
+    let message = serde_json::to_vec(&json!({
+        "event_id": format!("{}:{}", event.run_id, event.seq),
+        "run_id": event.run_id,
+        "stream_id": event.stream_id,
+        "seq": event.seq,
+        "pts_ms": event.pts_ms,
+        "kind": event.kind,
+        "pipeline_generation": generation,
+    }))
+    .map_err(|error| format!("encode local trigger output: {error}"))?;
+    let socket = UnixDatagram::unbound()
+        .map_err(|error| format!("create local trigger output socket: {error}"))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|error| format!("configure local trigger output socket: {error}"))?;
+    socket
+        .send_to(&message, path)
+        .map(|_| ())
+        .map_err(|error| format!("send local trigger output: {error}"))
+}
+
+#[cfg(not(unix))]
+fn send_trigger_local_output(
+    _event: &vidarax_core::timeline::TimelineEvent,
+    _generation: u64,
+) -> Result<(), String> {
+    Err("local trigger output requires Unix-domain datagrams".to_string())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -318,9 +445,12 @@ mod tests {
     use super::WalEventSink;
     use crate::state::AppState;
     use std::sync::Arc;
+    use vidarax_contracts::triggers::compile_trigger;
     use vidarax_core::coordinates::{FrameCoordinates, NormalizedRect};
     use vidarax_core::webrtc::runtime::PipelineGeneration;
-    use vidarax_core::webrtc::workers::{EventSink, KeyframeEvent, RestrictedZoneEvidenceEvent};
+    use vidarax_core::webrtc::workers::{
+        EventSink, KeyframeEvent, RestrictedZoneEvidenceEvent, TriggerAssertionEvent,
+    };
     use vidarax_core::zone::{
         RestrictedZonePolicy, ZoneActivityObservation, ZoneActivityTransition,
         RESTRICTED_ZONE_ACTIVITY_EVENT,
@@ -528,6 +658,73 @@ mod tests {
         assert!(!events[0].payload.contains("zone-evidence"));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trigger_event_is_namespaced_away_from_run_lifecycle_kinds() {
+        let (state, path) = make_state();
+        let program = compile_trigger(
+            "trigger lifecycle-guard version 1\nwhen motion_score >= 0.1\nemit run_deleted\ncapture keyframe\nend",
+        )
+        .unwrap();
+        WalEventSink::new(state.clone())
+            .store_trigger_sync(TriggerAssertionEvent {
+                run_id: "run-trigger-namespace",
+                session_id: "sess-trigger",
+                frame_index: 1,
+                pts_ms: 33,
+                coordinates: FrameCoordinates::full_frame(640, 480),
+                generation: PipelineGeneration::new(4),
+                program: &program,
+                event_type: "run_deleted",
+                confidence: 0.9,
+                motion_score: 0.8,
+                novelty_score: 0.7,
+                notify_webhook: false,
+                notify_local_output: false,
+                jpeg_data: b"\xff\xd8trigger\xff\xd9",
+            })
+            .unwrap();
+        let events = state.read_run_events("run-trigger-namespace").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "trigger.run_deleted");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&events[0].payload).unwrap()["event_type"],
+            "run_deleted"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_output_is_metadata_only_and_stably_identified() {
+        use std::os::unix::net::UnixDatagram;
+
+        let socket_path = temp_wal().with_extension("sock");
+        let socket = UnixDatagram::bind(&socket_path).unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let event = vidarax_core::timeline::TimelineEvent {
+            seq: 7,
+            run_id: "run-trigger-local".into(),
+            stream_id: "camera-2".into(),
+            pts_ms: 99,
+            kind: "trigger.near_miss".into(),
+            payload: r#"{"evidence":{"image_ref":"keyframes/blobs/abc.jpg"}}"#.into(),
+        };
+
+        super::send_trigger_local_output_to(&socket_path, &event, PipelineGeneration::new(3).get())
+            .unwrap();
+        let mut buffer = [0u8; 2048];
+        let count = socket.recv(&mut buffer).unwrap();
+        let message: serde_json::Value = serde_json::from_slice(&buffer[..count]).unwrap();
+        assert_eq!(message["event_id"], "run-trigger-local:7");
+        assert_eq!(message["pipeline_generation"], 3);
+        assert_eq!(message["kind"], "trigger.near_miss");
+        assert!(message.get("payload").is_none());
+        assert!(!String::from_utf8_lossy(&buffer[..count]).contains("image_ref"));
+        let _ = std::fs::remove_file(socket_path);
     }
 
     #[test]

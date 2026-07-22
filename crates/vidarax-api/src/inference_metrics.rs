@@ -113,6 +113,62 @@ impl InferenceMetrics {
             "vidarax_infer_admission_wait_duration_us_count {}",
             snapshot.wait_duration_count
         );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_admission_active_tokens {}",
+            snapshot.active_tokens
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_admission_active_bytes {}",
+            snapshot.active_bytes
+        );
+        let limits = admission.limits();
+        let _ = writeln!(
+            out,
+            "vidarax_infer_admission_token_limit {}",
+            limits.max_in_flight_tokens
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_admission_byte_limit {}",
+            limits.max_in_flight_bytes
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_admission_deadline_missed_total {}",
+            snapshot.deadline_missed_total
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_admission_budget_rejections_total {}",
+            snapshot.budget_rejected_total
+        );
+        for (class, count) in [
+            ("urgent_live", snapshot.urgent_acquired_total),
+            ("live", snapshot.live_acquired_total),
+            ("offline", snapshot.offline_acquired_total),
+        ] {
+            let _ = writeln!(
+                out,
+                "vidarax_infer_admission_acquired_by_class_total{{class=\"{class}\"}} {count}"
+            );
+        }
+        let _ = writeln!(
+            out,
+            "vidarax_infer_admission_urgent_live_acquired_total {}",
+            snapshot.urgent_acquired_total
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_admission_live_acquired_total {}",
+            snapshot.live_acquired_total
+        );
+        let _ = writeln!(
+            out,
+            "vidarax_infer_admission_offline_acquired_total {}",
+            snapshot.offline_acquired_total
+        );
         out
     }
 
@@ -362,6 +418,8 @@ mod tests {
             per_principal_in_flight: 1,
             global_waiters: 2,
             wait_timeout: Duration::from_millis(5),
+            max_in_flight_tokens: 1_000_000,
+            max_in_flight_bytes: 1024 * 1024 * 1024,
         })
         .unwrap();
         let _permit = admission.acquire("secret-tenant-name").unwrap();

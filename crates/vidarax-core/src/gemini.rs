@@ -105,18 +105,31 @@ impl GeminiProvider {
         self.learned_thinking.store(Arc::new(next));
     }
 
+    fn request_model<'a>(&'a self, request: &'a InferenceRequest) -> &'a str {
+        if request.model.is_empty() {
+            &self.default_model
+        } else {
+            &request.model
+        }
+    }
+
     /// Build the `generateContent` request body as a JSON string.
+    #[cfg(test)]
     pub(crate) fn build_payload(
         &self,
         request: &InferenceRequest,
     ) -> Result<String, ProviderError> {
-        self.build_payload_with_max_tokens(request, request.max_tokens)
+        let model = self.request_model(request);
+        let deadline = request_deadline(request)?;
+        self.build_payload_with_max_tokens(request, request.max_tokens, model, deadline)
     }
 
     fn build_payload_with_max_tokens(
         &self,
         request: &InferenceRequest,
         max_tokens: u32,
+        model: &str,
+        deadline: Instant,
     ) -> Result<String, ProviderError> {
         // Media parts first (Gemini best practice), text prompt last.
         let mut parts: Vec<Value> = Vec::new();
@@ -134,7 +147,7 @@ impl GeminiProvider {
         // Videos — inline if small, File API if large
         for video in &request.input_videos {
             if video.raw_bytes.is_some() {
-                let uri = self.upload_file(video, request.timeout_ms)?;
+                let uri = self.upload_file(video, deadline)?;
                 parts.push(serde_json::json!({
                     "fileData": {
                         "mimeType": video.media_type,
@@ -149,7 +162,7 @@ impl GeminiProvider {
                     }
                 }));
             } else {
-                let uri = self.upload_file(video, request.timeout_ms)?;
+                let uri = self.upload_file(video, deadline)?;
                 parts.push(serde_json::json!({
                     "fileData": {
                         "mimeType": video.media_type,
@@ -162,10 +175,10 @@ impl GeminiProvider {
         // Text prompt always last
         parts.push(serde_json::json!({"text": &*request.prompt}));
 
-        let mut gen_config = serde_json::json!({
-            "maxOutputTokens": max_tokens,
-            "temperature": request.temperature
-        });
+        let mut gen_config = serde_json::json!({"maxOutputTokens": max_tokens});
+        if supports_sampling_parameters(model) {
+            gen_config["temperature"] = Value::from(request.temperature);
+        }
 
         if let Some(schema_str) = &request.guided_json {
             let schema: Value = serde_json::from_str(schema_str).map_err(|e| {
@@ -188,9 +201,8 @@ impl GeminiProvider {
     fn upload_file(
         &self,
         video: &InferenceVideo,
-        timeout_ms: u64,
+        deadline: Instant,
     ) -> Result<String, ProviderError> {
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
         let (upload_body, byte_count) = match &video.raw_bytes {
             Some(bytes) => (
                 reqwest::blocking::Body::sized(Cursor::new(Arc::clone(bytes)), bytes.len() as u64),
@@ -339,10 +351,10 @@ impl GeminiProvider {
     /// model's hidden reasoning does not starve the visible JSON.
     fn attempt(
         &self,
-        request: &InferenceRequest,
         model: &str,
         body: &str,
         start: Instant,
+        deadline: Instant,
     ) -> Result<InferenceResult, ProviderError> {
         let url = format!(
             "{}/v1beta/models/{}:generateContent?key={}",
@@ -353,7 +365,7 @@ impl GeminiProvider {
             .client
             .post(&url)
             .header("content-type", "application/json")
-            .timeout(Duration::from_millis(request.timeout_ms.max(1)))
+            .timeout(remaining_upload_time(deadline)?)
             .body(body.to_owned())
             .send()
             .map_err(|e| ProviderError::Transport(redact_url(e)))?;
@@ -441,11 +453,8 @@ impl InferenceProvider for GeminiProvider {
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
-        let model = if request.model.is_empty() {
-            &self.default_model
-        } else {
-            &*request.model
-        };
+        let model = self.request_model(request);
+        let deadline = request_deadline(request)?;
 
         // Empirical thinking support (no model-name matching): if this model was
         // previously seen to starve its output on hidden reasoning, pre-reserve
@@ -458,11 +467,11 @@ impl InferenceProvider for GeminiProvider {
             request.max_tokens
         };
         let body = if reserve {
-            self.build_payload_with_max_tokens(request, max_tokens)?
+            self.build_payload_with_max_tokens(request, max_tokens, model, deadline)?
         } else {
-            self.build_payload(request)?
+            self.build_payload_with_max_tokens(request, request.max_tokens, model, deadline)?
         };
-        let result = self.attempt(request, model, &body, started)?;
+        let result = self.attempt(model, &body, started, deadline)?;
 
         // First encounter with a thinking model: the response itself reports the
         // starvation (MAX_TOKENS + thoughtsTokenCount + empty text). Learn it and
@@ -475,7 +484,7 @@ impl InferenceProvider for GeminiProvider {
                 &body,
                 request.max_tokens.saturating_add(GEMINI_THINKING_HEADROOM),
             )?;
-            let mut retry = self.attempt(request, model, &retry_body, retry_started)?;
+            let mut retry = self.attempt(model, &retry_body, retry_started, deadline)?;
             // The starved first attempt was still billed (prompt + hidden
             // thinking tokens) and cost wall-clock time. Fold it into the
             // surfaced totals so token/latency accounting reflects the whole
@@ -508,6 +517,10 @@ impl InferenceProvider for GeminiProvider {
             Vec::new()
         }
     }
+
+    fn reserved_output_tokens(&self, request: &InferenceRequest) -> u64 {
+        u64::from(request.max_tokens.saturating_add(GEMINI_THINKING_HEADROOM))
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -525,7 +538,17 @@ fn remaining_upload_time(deadline: Instant) -> Result<Duration, ProviderError> {
     deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
-        .ok_or_else(|| ProviderError::Transport("Gemini file upload timed out".to_string()))
+        .ok_or(ProviderError::DeadlineMissed)
+}
+
+fn request_deadline(request: &InferenceRequest) -> Result<Instant, ProviderError> {
+    Instant::now()
+        .checked_add(Duration::from_millis(request.remaining_timeout_ms()?))
+        .ok_or(ProviderError::DeadlineMissed)
+}
+
+fn supports_sampling_parameters(model: &str) -> bool {
+    !model.starts_with("gemini-3.")
 }
 
 fn payload_with_max_output_tokens(body: &str, max_tokens: u32) -> Result<String, ProviderError> {
@@ -573,6 +596,7 @@ mod tests {
             timeout_ms: 5000,
             allow_fallback: false,
             guided_json: None,
+            scheduling: Default::default(),
         }
     }
 
@@ -648,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn payload_generation_config_passthrough() {
+    fn gemini_3_payload_omits_deprecated_sampling_parameters() {
         // build_payload is pure: it serializes the request verbatim and never
         // adds a thinkingConfig. Thinking support lives in infer()/attempt(),
         // which reserves output headroom empirically — not in the payload.
@@ -660,11 +684,22 @@ mod tests {
         let v: Value = serde_json::from_str(&body).unwrap();
         let cfg = &v["generationConfig"];
         assert_eq!(cfg["maxOutputTokens"].as_u64(), Some(256));
-        assert!((cfg["temperature"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+        assert!(cfg.get("temperature").is_none());
         assert!(
             cfg.get("thinkingConfig").is_none(),
             "build_payload must never emit a thinkingConfig"
         );
+    }
+
+    #[test]
+    fn pre_gemini_3_payload_keeps_temperature() {
+        let p =
+            GeminiProvider::new("test-key".to_string(), "gemini-2.5-flash".to_string()).unwrap();
+        let mut req = request();
+        req.temperature = 0.5;
+        let body = p.build_payload(&req).unwrap();
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert!((value["generationConfig"]["temperature"].as_f64().unwrap() - 0.5).abs() < 1e-6);
     }
 
     #[test]
@@ -918,13 +953,15 @@ mod tests {
 
     // ── Live integration tests (require GEMINI_API_KEY) ─────────────────────
 
+    const LIVE_GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
+
     #[test]
     #[ignore = "requires GEMINI_API_KEY env var"]
     fn live_text_only() {
         let key = std::env::var("GEMINI_API_KEY").unwrap();
-        let p = GeminiProvider::new(key, "gemini-3.1-flash-lite".to_string()).unwrap();
+        let p = GeminiProvider::new(key, LIVE_GEMINI_MODEL.to_string()).unwrap();
         let req = InferenceRequest {
-            model: std::sync::Arc::from("gemini-3.1-flash-lite"),
+            model: std::sync::Arc::from(LIVE_GEMINI_MODEL),
             prompt: std::sync::Arc::from("Say hello in exactly 3 words."),
             input_images: vec![],
             input_videos: vec![],
@@ -933,6 +970,7 @@ mod tests {
             timeout_ms: 30000,
             allow_fallback: false,
             guided_json: None,
+            scheduling: Default::default(),
         };
         let r = p.infer(&req).expect("text-only inference failed");
         assert_eq!(r.finish_reason.as_deref(), Some("stop"));
@@ -947,11 +985,11 @@ mod tests {
     #[ignore = "requires GEMINI_API_KEY env var + /tmp/test_frame.jpg"]
     fn live_image() {
         let key = std::env::var("GEMINI_API_KEY").unwrap();
-        let p = GeminiProvider::new(key, "gemini-3.1-flash-lite".to_string()).unwrap();
+        let p = GeminiProvider::new(key, LIVE_GEMINI_MODEL.to_string()).unwrap();
         let jpeg = std::fs::read("/tmp/test_frame.jpg").expect("need /tmp/test_frame.jpg");
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &jpeg);
         let req = InferenceRequest {
-            model: std::sync::Arc::from("gemini-3.1-flash-lite"),
+            model: std::sync::Arc::from(LIVE_GEMINI_MODEL),
             prompt: std::sync::Arc::from("What does this screenshot show? One sentence."),
             input_images: vec![crate::provider::InferenceImage {
                 media_type: "image/jpeg",
@@ -963,6 +1001,7 @@ mod tests {
             timeout_ms: 30000,
             allow_fallback: false,
             guided_json: None,
+            scheduling: Default::default(),
         };
         let r = p.infer(&req).expect("image inference failed");
         assert!(!r.output_text.is_empty());
@@ -971,25 +1010,25 @@ mod tests {
 
     #[test]
     #[ignore = "requires GEMINI_API_KEY env var + /tmp/test_clip.mp4"]
-    fn live_inline_video() {
+    fn live_raw_video() {
         let key = std::env::var("GEMINI_API_KEY").unwrap();
-        let p = GeminiProvider::new(key, "gemini-3.1-flash-lite".to_string()).unwrap();
+        let p = GeminiProvider::new(key, LIVE_GEMINI_MODEL.to_string()).unwrap();
         let mp4 = std::fs::read("/tmp/test_clip.mp4").expect("need /tmp/test_clip.mp4");
-        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &mp4);
         let req = InferenceRequest {
-            model: std::sync::Arc::from("gemini-3.1-flash-lite"),
+            model: std::sync::Arc::from(LIVE_GEMINI_MODEL),
             prompt: std::sync::Arc::from("Describe what happens in this video in one sentence."),
             input_images: vec![],
             input_videos: vec![crate::provider::InferenceVideo {
                 media_type: "video/mp4",
-                raw_bytes: None,
-                data_base64: b64,
+                raw_bytes: Some(Arc::from(mp4)),
+                data_base64: String::new(),
             }],
             max_tokens: 100,
             temperature: 0.0,
             timeout_ms: 30000,
             allow_fallback: false,
             guided_json: None,
+            scheduling: Default::default(),
         };
         let r = p.infer(&req).expect("video inference failed");
         assert!(!r.output_text.is_empty());
@@ -1000,12 +1039,12 @@ mod tests {
     #[ignore = "requires GEMINI_API_KEY env var + /tmp/test_frame.jpg"]
     fn live_structured_json() {
         let key = std::env::var("GEMINI_API_KEY").unwrap();
-        let p = GeminiProvider::new(key, "gemini-3.1-flash-lite".to_string()).unwrap();
+        let p = GeminiProvider::new(key, LIVE_GEMINI_MODEL.to_string()).unwrap();
         let jpeg = std::fs::read("/tmp/test_frame.jpg").expect("need /tmp/test_frame.jpg");
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &jpeg);
         let schema = r#"{"type":"object","properties":{"title":{"type":"string"},"has_button":{"type":"boolean"}},"required":["title","has_button"]}"#;
         let req = InferenceRequest {
-            model: std::sync::Arc::from("gemini-3.1-flash-lite"),
+            model: std::sync::Arc::from(LIVE_GEMINI_MODEL),
             prompt: std::sync::Arc::from(
                 "Extract the page title and whether there is a visible button.",
             ),
@@ -1019,6 +1058,7 @@ mod tests {
             timeout_ms: 30000,
             allow_fallback: false,
             guided_json: Some(std::sync::Arc::from(schema)),
+            scheduling: Default::default(),
         };
         let r = p.infer(&req).expect("structured json inference failed");
         let parsed: serde_json::Value =

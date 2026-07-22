@@ -32,6 +32,8 @@ export default defineConfig({
         { label: 'API reference', slug: 'api' },
         { label: 'Events and SDK', slug: 'events' },
         { label: 'Policy rollouts', slug: 'policy-rollouts' },
+        { label: 'Trigger programs', slug: 'triggers' },
+        { label: 'Edge deployment', slug: 'edge' },
         { label: 'Operations', slug: 'operations' },
         { label: 'Development', slug: 'development' },
         {

@@ -39,6 +39,7 @@ fn base_request() -> InferenceRequest {
         timeout_ms: 1_000,
         allow_fallback: false,
         guided_json: None,
+        scheduling: Default::default(),
     }
 }
 

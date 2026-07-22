@@ -100,7 +100,7 @@ curl -s -X POST http://127.0.0.1:8080/v1/runs/$RUN_ID/reason \
 
 ## Read events
 
-Every run writes sequence-numbered events to its timeline. This endpoint returns the current snapshot; poll `POST /v1/query` with `from_seq` when you need incremental updates.
+Every run writes sequence-numbered events to its timeline. This endpoint returns the current snapshot; use `GET /v1/runs/:id/events/stream` or the SDK's `subscribeEvents()` for replayable incremental delivery.
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/runs/$RUN_ID/events -H 'x-api-key: dev-key'

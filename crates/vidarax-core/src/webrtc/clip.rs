@@ -446,6 +446,14 @@ where
                         timeout_ms: crate::webrtc::runtime::CLIP_FIRST_PASS_TIMEOUT_MS,
                         allow_fallback: true,
                         guided_json: guided_json.clone(),
+                        scheduling: crate::provider::InferenceScheduling::new(
+                            Arc::clone(&work.session_id),
+                            crate::admission::LatencyClass::Live,
+                            crate::webrtc::runtime::CLIP_FIRST_PASS_TIMEOUT_MS.saturating_add(
+                                crate::webrtc::runtime::CLIP_SECOND_PASS_TIMEOUT_MS,
+                            ),
+                            1_000,
+                        ),
                     };
 
                     let clip_call_start = std::time::Instant::now();

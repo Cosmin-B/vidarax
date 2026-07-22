@@ -10,6 +10,7 @@ export type EventType =
   | 'flicker'
   | 'keyframe'
   | 'restricted_zone_activity'
+  | 'trigger_assertion'
 
 export interface AgentEvent {
   run_id: string

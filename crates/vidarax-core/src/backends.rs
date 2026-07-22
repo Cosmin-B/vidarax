@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 use serde::Deserialize;
+use vidarax_contracts::models::GEMINI_MODELS;
 
 use crate::gemini::GeminiProvider;
 use crate::provider::{
@@ -284,7 +285,7 @@ fn build_single_provider(
 fn build_gemini_provider(entry: &BackendEntry) -> Result<GeminiProvider, String> {
     // Note: env vars are already interpolated by parse_config().
     let api_key = entry.api_key.as_deref().unwrap_or("");
-    let model = entry.model.as_deref().unwrap_or("gemini-3.1-flash-lite");
+    let model = entry.model.as_deref().unwrap_or(GEMINI_MODELS[0]);
     if api_key.is_empty() || api_key.contains("${") {
         return Err(format!("backend '{}': gemini requires api_key", entry.name));
     }
@@ -329,7 +330,7 @@ fn select_model_route_entries(entries: &[BackendEntry]) -> Vec<&BackendEntry> {
     let mut claimed_models: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut selected = Vec::with_capacity(gemini_entries.len());
     for entry in gemini_entries {
-        let model = entry.model.as_deref().unwrap_or("gemini-3.1-flash-lite");
+        let model = entry.model.as_deref().unwrap_or(GEMINI_MODELS[0]);
         if claimed_models.insert(model) {
             selected.push(entry);
         } else {
@@ -360,7 +361,7 @@ fn build_model_routes(
         let model = entry
             .model
             .clone()
-            .unwrap_or_else(|| "gemini-3.1-flash-lite".to_string());
+            .unwrap_or_else(|| GEMINI_MODELS[0].to_string());
         let provider = build_gemini_provider(entry)?;
         routes.insert(model, Arc::new(provider));
     }
@@ -380,7 +381,7 @@ fn model_route_winners_for_tests(
             let model = entry
                 .model
                 .clone()
-                .unwrap_or_else(|| "gemini-3.1-flash-lite".to_string());
+                .unwrap_or_else(|| GEMINI_MODELS[0].to_string());
             (model, entry.name.clone())
         })
         .collect()
@@ -928,7 +929,7 @@ base_url = "${_VDX_TEST_URL}"
         }];
 
         let routes = build_model_routes(&entries).expect("route build");
-        assert!(routes.contains_key("gemini-3.1-flash-lite"));
+        assert!(routes.contains_key("gemini-3.5-flash-lite"));
     }
 
     #[test]

@@ -97,6 +97,8 @@ pub struct ServerConfig {
     pub inference_per_principal_limit: usize,
     pub inference_waiter_limit: usize,
     pub inference_wait_timeout_ms: u64,
+    pub inference_token_budget: u64,
+    pub inference_byte_budget: u64,
     pub security_require_api_key: bool,
     pub security_api_keys: Vec<String>,
     pub security_require_tenant_id: bool,
@@ -182,9 +184,17 @@ impl ServerConfig {
             );
         }
         let inference_waiter_limit =
-            parse_bounded_usize_env("VIDARAX_INFERENCE_WAITER_LIMIT", 128, 1, 65_536)?;
+            parse_bounded_usize_env("VIDARAX_INFERENCE_WAITER_LIMIT", 128, 1, 4_096)?;
         let inference_wait_timeout_ms =
             parse_bounded_u64_env("VIDARAX_INFERENCE_WAIT_TIMEOUT_MS", 5_000, 1, 120_000)?;
+        let inference_token_budget =
+            parse_bounded_u64_env("VIDARAX_INFERENCE_TOKEN_BUDGET", 32_768, 1, 100_000_000)?;
+        let inference_byte_budget = parse_bounded_u64_env(
+            "VIDARAX_INFERENCE_BYTE_BUDGET",
+            256 * 1024 * 1024,
+            1024,
+            1024 * 1024 * 1024 * 1024,
+        )?;
         let security_require_api_key = parse_bool_env("VIDARAX_REQUIRE_API_KEY", true)?;
         let security_api_keys = parse_csv_env("VIDARAX_API_KEYS");
         let security_require_tenant_id = parse_bool_env("VIDARAX_REQUIRE_TENANT_ID", false)?;
@@ -266,6 +276,8 @@ impl ServerConfig {
             inference_per_principal_limit,
             inference_waiter_limit,
             inference_wait_timeout_ms,
+            inference_token_budget,
+            inference_byte_budget,
             security_require_api_key,
             security_api_keys,
             security_require_tenant_id,
@@ -962,6 +974,8 @@ mod tests {
             inference_per_principal_limit: 4,
             inference_waiter_limit: 128,
             inference_wait_timeout_ms: 5_000,
+            inference_token_budget: 32_768,
+            inference_byte_budget: 256 * 1024 * 1024,
             security_require_api_key: false,
             security_api_keys: vec![],
             security_require_tenant_id: false,
@@ -1026,6 +1040,8 @@ mod tests {
             inference_per_principal_limit: 4,
             inference_waiter_limit: 128,
             inference_wait_timeout_ms: 5_000,
+            inference_token_budget: 32_768,
+            inference_byte_budget: 256 * 1024 * 1024,
             security_require_api_key: false,
             security_api_keys: vec![],
             security_require_tenant_id: false,
@@ -1300,6 +1316,8 @@ mod tests {
             inference_per_principal_limit: 4,
             inference_waiter_limit: 128,
             inference_wait_timeout_ms: 5_000,
+            inference_token_budget: 32_768,
+            inference_byte_budget: 256 * 1024 * 1024,
             security_require_api_key: false,
             security_api_keys: vec![],
             security_require_tenant_id: false,

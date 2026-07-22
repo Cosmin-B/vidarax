@@ -68,6 +68,11 @@ import type {
   RealtimeReasonResponse,
   ReplayPolicyRequest,
   RollbackPolicyRequest,
+  TriggerCompileResponse,
+  TriggerEvaluationResponse,
+  TriggerProgram,
+  TriggerSample,
+  TriggerValidationResponse,
   Run,
   SearchResponse,
   UploadResponse,
@@ -494,9 +499,8 @@ export class Vidarax {
   /**
    * Retrieve all timeline events for a run as a plain array.
    *
-   * For an async-iterable version of this same snapshot see `streamEvents()`
-   * (it fetches a one-time snapshot, not a live stream and not repeated
-   * polling; the server has no SSE endpoint).
+   * For a one-time async iterator use `streamEvents()`. For durable live
+   * delivery with replay and reconnect, use `subscribeEvents()`.
    */
   async getEvents(runId: string, index?: string): Promise<AgentEvent[]> {
     const params = new URLSearchParams();
@@ -511,9 +515,8 @@ export class Vidarax {
   /**
    * Retrieve all markers for a run with optional filtering.
    *
-   * For an async-iterable version of this same snapshot see `streamMarkers()`
-   * (it fetches a one-time snapshot, not a live stream and not repeated
-   * polling; the server has no SSE endpoint).
+   * `streamMarkers()` is the async-iterable form of this same snapshot.
+   * Markers do not have their own live subscription endpoint.
    */
   async getMarkers(runId: string, query: MarkerQuery = {}): Promise<Marker[]> {
     const params = new URLSearchParams();
@@ -744,20 +747,17 @@ export class Vidarax {
 
   // ─── Snapshot iterators ───────────────────────────────────────────────────
   //
-  // The server has no SSE / long-lived streaming route for events or markers
-  // — GET /v1/runs/{id}/events and GET /v1/runs/{id}/markers each return a
-  // full snapshot of current state. These two methods are async-iterable
-  // conveniences over that snapshot, not incremental push updates. Call them
-  // again (e.g. on a timer) to observe new events/markers as a run progresses.
+  // GET /events and GET /markers return snapshots. These methods are iterator
+  // conveniences over those snapshots. Use subscribeEvents() for replayable
+  // live event delivery; there is no marker-only live subscription.
 
   /**
    * Fetch the current timeline events for a run and yield them as an
    * async iterable, one call, one snapshot.
    *
    * This is NOT a live/incremental stream: it issues a single GET and yields
-   * whatever events exist at that moment, in sequence order. There is no
-   * server-side push endpoint (no SSE) for events. Poll by calling this
-   * again if you need to observe events emitted after the initial fetch.
+   * whatever events exist at that moment, in sequence order. Use
+   * `subscribeEvents()` to follow events emitted after the initial fetch.
    *
    * @example
    * for await (const event of v.streamEvents(runId)) {
@@ -1146,6 +1146,27 @@ export class Vidarax {
     );
   }
 
+  /** Compile bounded, forward-only trigger source using the server's current ISA. */
+  async compileTrigger(source: string): Promise<TriggerCompileResponse> {
+    return this.post<TriggerCompileResponse>("/v1/triggers/compile", { source });
+  }
+
+  /** Validate a compiled trigger program before attaching it to a stream. */
+  async validateTrigger(program: TriggerProgram): Promise<TriggerValidationResponse> {
+    return this.post<TriggerValidationResponse>("/v1/triggers/validate", program);
+  }
+
+  /** Deterministically replay samples through a trigger program. */
+  async evaluateTrigger(
+    program: TriggerProgram,
+    samples: TriggerSample[],
+  ): Promise<TriggerEvaluationResponse> {
+    return this.post<TriggerEvaluationResponse>("/v1/triggers/evaluate", {
+      program,
+      samples,
+    });
+  }
+
   // ─── Search ───────────────────────────────────────────────────────────────
 
   /**
@@ -1176,7 +1197,8 @@ export class Vidarax {
    * trickle-ICE and teardown.
    *
    * The optional `attachConfig` is sent as base64url-encoded JSON in the
-   * `x-attach-config` header for setting the initial prompt and clip mode.
+   * `x-attach-config` header for setting the initial prompt, clip mode, or
+   * generation-static trigger program.
    *
    * Per RFC 9725 the offer body is sent as `Content-Type: application/sdp`.
    *

@@ -105,6 +105,71 @@ describe("policy lifecycle", () => {
   });
 });
 
+describe("trigger programs", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("uses compile, validate, and evaluate endpoints with typed programs", async () => {
+    const program = {
+      isa_version: 1,
+      program_id: "loading-bay-entry",
+      version: 1,
+      instructions: [
+        { op: "load", signal: { kind: "motion_score" } },
+        { op: "constant", value: 0.4 },
+        { op: "greater_or_equal" },
+        { op: "emit", event_type: "loading_bay_entry" },
+        { op: "capture", kind: "keyframe", before_ms: 0, after_ms: 0 },
+        { op: "halt" },
+      ],
+    } as const;
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/compile")) {
+        return Response.json({
+          request_id: "req-compile",
+          instruction_count: program.instructions.length,
+          state_slots: 0,
+          program,
+        });
+      }
+      if (path.endsWith("/validate")) {
+        return Response.json({
+          request_id: "req-validate",
+          valid: true,
+          isa_version: 1,
+          program_id: program.program_id,
+          program_version: 1,
+          instruction_count: program.instructions.length,
+          state_slots: 0,
+        });
+      }
+      return Response.json({
+        request_id: "req-evaluate",
+        program_id: program.program_id,
+        program_version: 1,
+        results: [{ pts_ms: 0, fired: false, missing_signal: false, actions: [] }],
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new Vidarax("http://127.0.0.1:8080");
+
+    const compiled = await client.compileTrigger("trigger loading-bay-entry version 1");
+    await client.validateTrigger(compiled.program);
+    const evaluated = await client.evaluateTrigger(compiled.program, [
+      { pts_ms: 0, motion_score: 0.1 },
+    ]);
+
+    expect(evaluated.program_id).toBe("loading-bay-entry");
+    expect(fetchMock.mock.calls.map(([url]) => new URL(String(url)).pathname)).toEqual([
+      "/v1/triggers/compile",
+      "/v1/triggers/validate",
+      "/v1/triggers/evaluate",
+    ]);
+  });
+});
+
 describe("durable event subscription", () => {
   afterEach(() => {
     vi.unstubAllGlobals();

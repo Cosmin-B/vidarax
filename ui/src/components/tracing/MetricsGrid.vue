@@ -202,6 +202,28 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
             {{ fmtInt(metrics.restrictedZoneQueueDroppedTotal) }}
           </span>
         </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Trigger assertions</span>
+          <span class="mono text-[#38bdf8] text-xs">{{ fmtInt(metrics.triggerAssertionsTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Trigger write failures</span>
+          <span class="mono text-xs" :class="metrics.triggerBinaryWriteFailuresTotal ? 'text-[#ef4444]' : 'text-[#2dd4bf]'">
+            {{ fmtInt(metrics.triggerBinaryWriteFailuresTotal) }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Trigger queue drops</span>
+          <span class="mono text-xs" :class="metrics.triggerQueueDroppedTotal ? 'text-[#f59e0b]' : 'text-[#2dd4bf]'">
+            {{ fmtInt(metrics.triggerQueueDroppedTotal) }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Missing trigger signals</span>
+          <span class="mono text-xs" :class="metrics.triggerMissingSignalTotal ? 'text-[#f59e0b]' : 'text-[#2dd4bf]'">
+            {{ fmtInt(metrics.triggerMissingSignalTotal) }}
+          </span>
+        </div>
       </div>
 
       <!-- Percentile rows (real histogram data) -->
@@ -292,6 +314,26 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
           <span class="mono text-xs" :class="metrics.noveltyEmbeddingUnavailableTotal ? 'text-[#f59e0b]' : 'text-[#22c55e]'">
             {{ fmtInt(metrics.noveltyEmbeddingUnavailableTotal) }}
           </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Token reservations</span>
+          <span class="mono text-[#22c55e] text-xs">{{ fmtInt(metrics.inferenceActiveTokens) }} / {{ fmtInt(metrics.inferenceTokenLimit) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Media reservations</span>
+          <span class="mono text-[#22c55e] text-xs">{{ formatBytes(metrics.inferenceActiveBytes) }} / {{ formatBytes(metrics.inferenceByteLimit) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Deadline misses</span>
+          <span class="mono text-xs" :class="metrics.inferenceDeadlineMissedTotal ? 'text-[#f59e0b]' : 'text-[#22c55e]'">{{ fmtInt(metrics.inferenceDeadlineMissedTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Budget refusals</span>
+          <span class="mono text-xs" :class="metrics.inferenceBudgetRejectedTotal ? 'text-[#ef4444]' : 'text-[#22c55e]'">{{ fmtInt(metrics.inferenceBudgetRejectedTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Urgent / live / offline</span>
+          <span class="mono text-[#22c55e] text-xs">{{ fmtInt(metrics.inferenceUrgentAcquiredTotal) }} / {{ fmtInt(metrics.inferenceLiveAcquiredTotal) }} / {{ fmtInt(metrics.inferenceOfflineAcquiredTotal) }}</span>
         </div>
       </div>
 
@@ -457,6 +499,15 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
           </span>
         </div>
         <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Commit → SSE p95</span>
+          <span
+            class="mono text-xs"
+            :class="(metrics.sseCommitLatency?.p95 ?? 0) > 100 ? 'text-[#ef4444]' : 'text-[#2dd4bf]'"
+          >
+            {{ fmtPct(metrics.sseCommitLatency ?? undefined, 'p95') }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
           <span class="text-[#475569] text-xs">Active webhooks</span>
           <span class="mono text-[#38bdf8] text-xs">{{ fmtInt(metrics.webhooksConfigured) }}</span>
         </div>
@@ -472,6 +523,16 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
           <span class="text-[#475569] text-xs">Dead letters</span>
           <span class="mono text-xs" :class="metrics.webhookDeadLettersTotal ? 'text-[#ef4444]' : 'text-[#2dd4bf]'">
             {{ fmtInt(metrics.webhookDeadLettersTotal) }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Local trigger outputs</span>
+          <span class="mono text-[#2dd4bf] text-xs">{{ fmtInt(metrics.triggerLocalOutputsTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Local output failures</span>
+          <span class="mono text-xs" :class="metrics.triggerLocalOutputFailuresTotal ? 'text-[#ef4444]' : 'text-[#2dd4bf]'">
+            {{ fmtInt(metrics.triggerLocalOutputFailuresTotal) }}
           </span>
         </div>
       </div>

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use vidarax_contracts::triggers::TriggerProgram;
 use vidarax_core::crop::CropRegion;
 use vidarax_core::zone::RestrictedZonePolicy;
 
@@ -502,6 +503,9 @@ pub struct AttachStreamRequest {
     /// policy is fixed for the pipeline generation and its region becomes the
     /// exact analysis crop. Subject identity requires a separate confirmation.
     pub restricted_zone: Option<RestrictedZonePolicy>,
+    /// Generation-static deterministic trigger bytecode. Compile human source
+    /// through `/v1/triggers/compile` before attaching it.
+    pub trigger_program: Option<TriggerProgram>,
 }
 
 #[cfg(test)]

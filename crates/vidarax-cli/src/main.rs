@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod edge;
+
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -112,6 +114,12 @@ enum Commands {
     /// Submit and list feedback.
     #[command(subcommand)]
     Feedback(FeedbackCommands),
+    /// Compile, validate, and replay deterministic trigger programs.
+    #[command(subcommand)]
+    Triggers(TriggerCommands),
+    /// Enroll an edge node and apply signed model releases.
+    #[command(subcommand)]
+    Edge(edge::EdgeCommands),
     /// List model availability.
     Models,
     /// Check API health.
@@ -394,6 +402,21 @@ enum FeedbackCommands {
     List,
 }
 
+#[derive(Subcommand, Debug)]
+enum TriggerCommands {
+    /// Compile a .vxt source file through the server's current ISA.
+    Compile {
+        source: PathBuf,
+        /// Write the compiled program JSON to this path.
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
+    /// Validate a compiled trigger program JSON file.
+    Validate { program: PathBuf },
+    /// Replay a trigger program over a JSON array of samples.
+    Evaluate { program: PathBuf, samples: PathBuf },
+}
+
 #[derive(Args, Debug)]
 struct FeedbackSubmitArgs {
     /// Run ID.
@@ -443,6 +466,8 @@ async fn dispatch(
             FeedbackCommands::Submit(args) => cmd_feedback_submit(config, output, &args).await,
             FeedbackCommands::List => cmd_feedback_list(config, output).await,
         },
+        Commands::Triggers(command) => cmd_triggers(config, output, command).await,
+        Commands::Edge(command) => edge::run(command, output.json).await,
         Commands::Models => cmd_models(config, output).await,
         Commands::Health => cmd_health(config, output).await,
         Commands::Doctor => cmd_doctor(config, output).await,
@@ -450,6 +475,110 @@ async fn dispatch(
         Commands::States => cmd_states(output),
         Commands::RunCreate(args) => cmd_run_create(config, output, &args).await,
     }
+}
+
+async fn cmd_triggers(
+    config: RuntimeConfig,
+    output: OutputMode,
+    command: TriggerCommands,
+) -> Result<(), String> {
+    let client = ApiClient::new(config.api_opts())?;
+    match command {
+        TriggerCommands::Compile {
+            source,
+            output: destination,
+        } => {
+            let source_text = fs::read_to_string(&source)
+                .map_err(|error| format!("failed to read {}: {error}", source.display()))?;
+            let response = client
+                .post_json("/v1/triggers/compile", &json!({"source": source_text}))
+                .await?;
+            if let Some(destination) = destination {
+                let program = response
+                    .get("program")
+                    .ok_or_else(|| "compile response did not contain program".to_string())?;
+                let encoded = serde_json::to_vec_pretty(program)
+                    .map_err(|error| format!("failed to encode trigger program: {error}"))?;
+                fs::write(&destination, encoded).map_err(|error| {
+                    format!("failed to write {}: {error}", destination.display())
+                })?;
+                if !output.json {
+                    println!("compiled {} -> {}", source.display(), destination.display());
+                    return Ok(());
+                }
+            }
+            if output.json {
+                print_json(&response)
+            } else {
+                println!(
+                    "{} v{}: {} instructions, {} state slots",
+                    string_field(&response["program"], "program_id").unwrap_or("trigger"),
+                    u64_field(&response["program"], "version").unwrap_or(0),
+                    u64_field(&response, "instruction_count").unwrap_or(0),
+                    u64_field(&response, "state_slots").unwrap_or(0),
+                );
+                Ok(())
+            }
+        }
+        TriggerCommands::Validate { program } => {
+            let program = read_json_file(&program, "trigger program")?;
+            let response = client.post_json("/v1/triggers/validate", &program).await?;
+            if output.json {
+                print_json(&response)
+            } else {
+                println!(
+                    "valid: {} v{} (ISA {}, {} instructions)",
+                    string_field(&response, "program_id").unwrap_or("trigger"),
+                    u64_field(&response, "program_version").unwrap_or(0),
+                    u64_field(&response, "isa_version").unwrap_or(0),
+                    u64_field(&response, "instruction_count").unwrap_or(0),
+                );
+                Ok(())
+            }
+        }
+        TriggerCommands::Evaluate { program, samples } => {
+            let program = read_json_file(&program, "trigger program")?;
+            let samples = read_json_file(&samples, "trigger samples")?;
+            if !samples.is_array() {
+                return Err("trigger samples file must contain a JSON array".to_string());
+            }
+            let response = client
+                .post_json(
+                    "/v1/triggers/evaluate",
+                    &json!({"program": program, "samples": samples}),
+                )
+                .await?;
+            if output.json {
+                print_json(&response)
+            } else {
+                let results = response["results"]
+                    .as_array()
+                    .map_or(&[][..], Vec::as_slice);
+                let fired = results
+                    .iter()
+                    .filter(|result| result["fired"].as_bool() == Some(true))
+                    .count();
+                let missing = results
+                    .iter()
+                    .filter(|result| result["missing_signal"].as_bool() == Some(true))
+                    .count();
+                println!(
+                    "replayed {} samples: {} fired, {} missing-signal samples",
+                    results.len(),
+                    fired,
+                    missing
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+fn read_json_file(path: &Path, label: &str) -> Result<Value, String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("failed to read {label} {}: {error}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid {label} JSON {}: {error}", path.display()))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

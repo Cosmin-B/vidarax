@@ -150,6 +150,8 @@ export interface CreateWebhookResponse {
   url: string;
   event_kinds: string[];
   registered_seq: number;
+  /** Per-webhook HMAC key, returned only when the webhook is created. */
+  signing_secret: string;
 }
 
 export interface WebhookListResponse {
@@ -777,12 +779,90 @@ export interface PolicyReplayResponse {
 
 // ─── WHIP ─────────────────────────────────────────────────────────────────────
 
+export type TriggerSignal =
+  | { kind: "motion_score" }
+  | { kind: "novelty_score" }
+  | { kind: "confidence" }
+  | { kind: "object_count"; label: string; zone?: string }
+  | { kind: "minimum_distance_mm"; left: string; right: string }
+  | { kind: "time_to_collision_ms"; left: string; right: string }
+  | { kind: "dwell_ms"; label: string; zone: string }
+  | { kind: "model_uncertainty" }
+  | { kind: "teacher_disagreement" };
+
+export type TriggerInstruction =
+  | { op: "load"; signal: TriggerSignal }
+  | { op: "constant"; value: number }
+  | { op: "greater_than" | "greater_or_equal" | "less_than" | "less_or_equal" | "equal" | "and" | "or" | "not" | "halt" }
+  | { op: "sustain_frames"; slot: number; frames: number }
+  | { op: "rising_edge"; slot: number }
+  | { op: "cooldown_ms"; slot: number; duration_ms: number }
+  | { op: "jump_if_false"; target: number }
+  | { op: "emit"; event_type: string }
+  | { op: "capture"; kind: "keyframe" | "clip"; before_ms: number; after_ms: number }
+  | { op: "notify"; channel: "webhook" | "local_output" };
+
+export interface TriggerProgram {
+  isa_version: number;
+  program_id: string;
+  version: number;
+  instructions: TriggerInstruction[];
+}
+
+export interface TriggerObservation {
+  signal: TriggerSignal;
+  value: number;
+}
+
+export interface TriggerSample {
+  pts_ms: number;
+  motion_score?: number;
+  novelty_score?: number;
+  confidence?: number;
+  model_uncertainty?: number;
+  teacher_disagreement?: number;
+  observations?: TriggerObservation[];
+}
+
+export interface TriggerCompileResponse {
+  request_id: string;
+  instruction_count: number;
+  state_slots: number;
+  program: TriggerProgram;
+}
+
+export interface TriggerValidationResponse {
+  request_id: string;
+  valid: true;
+  isa_version: number;
+  program_id: string;
+  program_version: number;
+  instruction_count: number;
+  state_slots: number;
+}
+
+export interface TriggerEvaluationResult {
+  pts_ms: number;
+  fired: boolean;
+  missing_signal: boolean;
+  actions: TriggerInstruction[];
+}
+
+export interface TriggerEvaluationResponse {
+  request_id: string;
+  program_id: string;
+  program_version: number;
+  results: TriggerEvaluationResult[];
+}
+
 /** Configuration sent when attaching a WHIP stream session. */
 export interface AttachStreamRequest {
   prompt?: string;
   max_output_tokens_per_second?: number;
   clip_mode?: ClipConfig;
   crop?: CropRegion;
+  restricted_zone?: RestrictedZonePolicyParameters;
+  trigger_program?: TriggerProgram;
 }
 
 /** Request body for PATCH /v1/stream/whip/{session}/prompt. */

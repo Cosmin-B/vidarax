@@ -21,6 +21,7 @@ pub mod pipeline;
 pub mod provider;
 pub mod tiered_vlm;
 pub mod timeline;
+pub mod trigger;
 pub mod webrtc;
 pub mod zone;
 

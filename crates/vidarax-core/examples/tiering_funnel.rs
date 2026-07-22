@@ -196,6 +196,7 @@ fn base_request(prompt: &str) -> InferenceRequest {
         timeout_ms: 10_000,
         allow_fallback: false,
         guided_json: None,
+        scheduling: Default::default(),
     }
 }
 

@@ -1,0 +1,22 @@
+[Unit]
+Description=Vidarax edge video pipeline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vidarax
+Group=vidarax
+EnvironmentFile=/etc/vidarax/edge.env
+ExecStart=/usr/local/bin/vidarax-api
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RuntimeDirectory=vidarax
+ReadWritePaths=/var/lib/vidarax /run/vidarax
+
+[Install]
+WantedBy=multi-user.target

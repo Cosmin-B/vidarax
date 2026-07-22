@@ -18,6 +18,12 @@ paths. Values below come from the current Rust source, mainly
 | `VIDARAX_CONFIG` | `vidarax.toml` | Backend TOML path, used when explicit backend URLs are not set. |
 | `VIDARAX_VLLM_BASE_URL` | unset | vLLM OpenAI-compatible base URL. When set, it is used as priority 1. |
 | `VIDARAX_SGLANG_BASE_URL` | unset | SGLang OpenAI-compatible base URL. When set, it is used as priority 2. |
+| `VIDARAX_INFERENCE_GLOBAL_LIMIT` | `8` | Maximum concurrent provider calls across the process. |
+| `VIDARAX_INFERENCE_PER_PRINCIPAL_LIMIT` | `4` | Maximum concurrent provider calls for one authenticated principal. |
+| `VIDARAX_INFERENCE_WAITER_LIMIT` | `128` | Maximum queued provider calls. |
+| `VIDARAX_INFERENCE_WAIT_TIMEOUT_MS` | `5000` | Maximum admission wait before provider dispatch. |
+| `VIDARAX_INFERENCE_TOKEN_BUDGET` | `32768` | Aggregate output-token reservation across active calls. |
+| `VIDARAX_INFERENCE_BYTE_BUDGET` | `268435456` | Aggregate encoded image/video bytes reserved by active calls. |
 | `VIDARAX_DECODE_BACKEND` | `auto` | Video decode backend. Accepts `cpu`, `ffmpeg`, `cpu-ffmpeg`, `nvdec`, `cuda`, `nvdec-cuda`, `gpu`, `mlx`, `apple`, `metal`, or `videotoolbox`. |
 | `VIDARAX_FFMPEG_PATH` | `ffmpeg` | ffmpeg binary path. |
 | `VIDARAX_FFPROBE_PATH` | `ffprobe` | ffprobe binary path. |
@@ -59,7 +65,8 @@ paths. Values below come from the current Rust source, mainly
 | `VIDARAX_TENANT_LABEL_MAPS_PATH` | unset | Optional JSON file for event and object label mapping by tenant metadata. |
 | `VIDARAX_SPACETIMEDB_URL` | unset | Adds a best-effort feedback and blocking-description mirror after local WAL commit. Feedback works without it; raw keyframes stay local. |
 | `VIDARAX_SPACETIMEDB_MODULE` | `vidarax` | SpacetimeDB database/module name. Only used when `VIDARAX_SPACETIMEDB_URL` is set. |
-| `VIDARAX_WEBHOOK_SECRET` | unset | Enables outbound webhooks when set to at least 32 bytes. The value signs every delivery in this process and is never written to the timeline WAL or returned by the API. |
+| `VIDARAX_WEBHOOK_SECRET` | unset | Enables outbound webhooks when set to at least 32 bytes. It derives a distinct signing key per webhook and is never written to the timeline WAL or returned by the API. |
+| `VIDARAX_TRIGGER_LOCAL_OUTPUT_SOCKET` | unset | Absolute Unix datagram socket for metadata-only `notify local_output` trigger actions. Required when such a program is attached. |
 | `RUST_LOG` | `info` | Tracing filter used by `tracing_subscriber`. |
 | `VIDARAX_TRACES_ENDPOINT` | unset | Optional OTLP gRPC endpoint for trace export. |
 
@@ -73,8 +80,9 @@ The `VIDARAX_STAGING_*` names are live-test fixtures, not server settings.
 WHIP events always commit locally. SpacetimeDB receives descriptions only.
 
 Webhook registration is disabled until `VIDARAX_WEBHOOK_SECRET` is configured.
-One secret defines one deployment trust domain; rotate it as an application
-credential and update receivers before restarting Vidarax. Webhook targets must
+The creation response returns each derived verification key once; save it with
+that receiver. Rotate the root as an application credential and recreate hooks
+before restarting Vidarax. Webhook targets must
 use HTTPS and resolve only to public addresses. Vidarax pins the validated
 addresses for each attempt, disables proxies and redirects, and applies a
 three-second total attempt deadline.
@@ -199,6 +207,16 @@ its fixed worker count before `run_created` is appended. The reservation is
 released with the session. Watch the `vidarax_media_capacity_*` metrics when
 sizing the two media budget settings; a rejected reservation returns `503
 media process capacity exhausted` without creating a durable run.
+
+Provider admission is a separate process-wide scheduler. Urgent live
+keyframes, normal live clips/direct calls, and offline timeline work have fixed
+latency classes. Selection preserves each stream's own ordered worker, rotates
+away from the last principal and stream when peers are waiting, and ages older
+classes so offline work cannot starve. Dispatch is refused when its remaining
+deadline cannot cover the estimated provider service time, or when its token or
+encoded-media reservation cannot fit. The corresponding active reservations,
+deadline misses, budget rejections, and acquisitions by class are exported at
+`GET /v1/metrics`.
 
 ## Backend configuration
 

@@ -62,7 +62,7 @@ const v = new Vidarax(baseUrl, options?)
 | `getKeyframe(id, sha256)` | Fetch a run-owned keyframe as a raw JPEG `Blob`. |
 | `streamEvents(id)` / `streamMarkers(id)` | Async-iterate a one-time compatibility snapshot. |
 | `subscribeEvents(id, options?)` | Replay and follow events over SSE with `Last-Event-ID` reconnect. |
-| `createWebhook(id, request)` / `listWebhooks(id)` / `deleteWebhook(id, webhookId)` | Manage signed action hooks and inspect dead-letter state. |
+| `createWebhook(id, request)` / `listWebhooks(id)` / `deleteWebhook(id, webhookId)` | Manage signed action hooks and inspect dead-letter state. Save the per-hook signing secret returned only at creation. |
 | `infer(opts)` / `inferBatch(items)` | Single or batch inference. |
 | `uploadFile(file, onProgress?)` | Upload a video file. |
 | `whipOffer(sdp, opts)` | WebRTC WHIP session (browser). |
@@ -70,7 +70,34 @@ const v = new Vidarax(baseUrl, options?)
 | `submitFeedback(id, feedback)` / `listFeedback()` | Store and list durable operator feedback. |
 | `createPolicy(id, request)` / `listPolicies(id)` | Create and inspect immutable policy revisions. |
 | `activatePolicy` / `rollbackPolicy` / `replayPolicy` | Exercise the staged policy control loop. |
+| `compileTrigger(source)` / `validateTrigger(program)` / `evaluateTrigger(program, samples)` | Compile and replay bounded trigger programs before live attachment. |
 | `listModels()` / `health()` | Models and health checks. |
+
+## Trigger programs
+
+```typescript
+const compiled = await v.compileTrigger(`
+trigger loading-bay-entry version 1
+when motion_score >= 0.40 for 2 frames
+edge rising
+cooldown 5000ms
+emit loading_bay_entry
+capture keyframe
+notify webhook
+end
+`)
+
+await v.validateTrigger(compiled.program)
+const replay = await v.evaluateTrigger(compiled.program, [
+  { pts_ms: 0, motion_score: 0.1 },
+  { pts_ms: 33, motion_score: 0.6 },
+  { pts_ms: 66, motion_score: 0.7 },
+])
+```
+
+Pass `compiled.program` as `trigger_program` in `whipOffer`. Trigger event kinds
+are namespaced as `trigger.<event_type>`. Binary keyframes stay in the server's
+content-addressed store; timeline and webhook payloads carry references only.
 
 ## Error handling
 
