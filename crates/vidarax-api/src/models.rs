@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use vidarax_core::crop::CropRegion;
+use vidarax_core::zone::RestrictedZonePolicy;
 
 // ─── Clip mode ────────────────────────────────────────────────────────────────
 
@@ -497,6 +498,10 @@ pub struct AttachStreamRequest {
     /// live client can point analysis at part of its screen. Absent keeps the
     /// server default.
     pub crop: Option<CropRegion>,
+    /// Deterministic activity assertion for one normalized image zone. The
+    /// policy is fixed for the pipeline generation and its region becomes the
+    /// exact analysis crop. Subject identity requires a separate confirmation.
+    pub restricted_zone: Option<RestrictedZonePolicy>,
 }
 
 #[cfg(test)]

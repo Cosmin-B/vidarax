@@ -82,6 +82,12 @@ The outer payload remains add-only and has no schema negotiation. Spatial metada
 
 The value is carried as fixed-size frame metadata. It does not own image bytes or allocate when copied between stages. This is image-space provenance, not a camera-extrinsics or robot-world transform; embodied consumers must attach those calibration transforms downstream.
 
+## Restricted-zone activity
+
+A live session configured with `restricted_zone` may emit `restricted_zone_activity_entered`. The deterministic assertion means that perceptual-hash motion persisted inside the configured normalized image rectangle for the policy's required number of frames. It does not identify a person, vehicle, or other subject. `assertion.subject` is `null` on this path and may only be populated by a separate structured detector or semantic confirmation.
+
+The payload records the policy ID and version, normalized zone and trigger measurement, caller-supplied device ID, fixed motion-model identifier, pipeline generation, and the complete `vidarax.image.v1` crop transform. Its `evidence.image_ref` points to a JPEG in the content-addressed binary sidecar; the event contains the hash, media type, and byte count, never image bytes or base64. The policy is immutable for one pipeline generation so replay never mixes frames from one version with an assertion from another.
+
 ## Markers
 
 Markers are frame-range annotations derived from the analysis pass, exposed as their own timeline at `GET /v1/runs/{id}/markers` with `status`, `event_type`, `from_frame`, and `to_frame` filters. They are not raw gate decisions; the server derives them in two steps:

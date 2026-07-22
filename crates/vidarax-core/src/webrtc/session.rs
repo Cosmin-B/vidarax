@@ -60,6 +60,7 @@ use crate::webrtc::recycle::{RecycledBytes, VecPool};
 use crate::webrtc::runtime::{
     PipelineGeneration, SessionCommand, SessionControl, SessionControlError,
 };
+use crate::zone::RestrictedZonePolicy;
 
 /// Annex B start code prepended to every H.264 or H.265 NAL unit.
 ///
@@ -243,6 +244,10 @@ pub struct WebRtcSession {
     /// from the server default and can be overridden per attach. `None` analyzes
     /// the whole frame.
     pub crop: Option<CropRegion>,
+    /// Optional generation-static restricted-zone activity policy. The API
+    /// validates this before worker startup; replacing it requires a new
+    /// generation so in-flight frames cannot cross policy versions.
+    pub restricted_zone: Option<Arc<RestrictedZonePolicy>>,
     /// Video codec negotiated from the SDP offer.
     pub codec: VideoCodec,
     rtp_nal_pool_slots: usize,
@@ -304,6 +309,7 @@ impl WebRtcSession {
                 control,
                 max_output_tokens_per_second: 128,
                 crop: None,
+                restricted_zone: None,
                 codec: VideoCodec::H264,
                 rtp_nal_pool_slots: rtp_nal_pool_slots(1),
                 shutdown,
@@ -498,6 +504,7 @@ impl WebRtcSession {
                 control,
                 max_output_tokens_per_second: config.max_output_tokens_per_second,
                 crop: config.crop,
+                restricted_zone: None,
                 codec,
                 rtp_nal_pool_slots: rtp_nal_pool_slots(config.decode_workers),
                 shutdown,

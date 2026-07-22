@@ -22,6 +22,7 @@ pub mod provider;
 pub mod tiered_vlm;
 pub mod timeline;
 pub mod webrtc;
+pub mod zone;
 
 #[cfg(test)]
 pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

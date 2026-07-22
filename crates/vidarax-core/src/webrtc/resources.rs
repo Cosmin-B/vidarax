@@ -6,6 +6,7 @@ use crate::webrtc::signals::MAX_JPEG_BYTES_PER_FRAME;
 use crate::webrtc::workers::{
     decode_output_pool_slots, jpeg_pool_slots, per_stream_analysis_workers,
     per_stream_decode_workers, per_stream_vlm_workers, WorkerPoolConfig,
+    ZONE_EVIDENCE_QUEUE_CAPACITY,
 };
 
 /// Capacity-plan allowance for ffmpeg demux/codec/filter state outside the
@@ -36,7 +37,8 @@ impl MediaSessionResources {
             0
         };
         let vlm_workers = per_stream_vlm_workers(cfg.vlm_workers);
-        let event_writer_workers = usize::from(!clip_mode);
+        let event_writer_workers = usize::from(!clip_mode)
+            .saturating_add(usize::from(!clip_mode && cfg.restricted_zone.is_some()));
         let clip_accumulator_workers = usize::from(clip_mode);
         let sidecar_reader_workers = usize::from(matches!(
             DecoderBackend::select(cfg.gpu_available, codec),
@@ -53,8 +55,15 @@ impl MediaSessionResources {
         let yuv_frame_bytes = pixels.saturating_mul(3).saturating_div(2);
         let decoded_frame_bytes = yuv_frame_bytes
             .saturating_mul(decode_output_pool_slots(cfg.gpu_available, codec) as u64);
-        let jpeg_payload_bytes = (MAX_JPEG_BYTES_PER_FRAME as u64)
-            .saturating_mul(jpeg_pool_slots(cfg.analysis_workers, cfg.vlm_workers) as u64);
+        let zone_evidence_slots = if !clip_mode && cfg.restricted_zone.is_some() {
+            ZONE_EVIDENCE_QUEUE_CAPACITY
+        } else {
+            0
+        };
+        let jpeg_payload_bytes = (MAX_JPEG_BYTES_PER_FRAME as u64).saturating_mul(
+            jpeg_pool_slots(cfg.analysis_workers, cfg.vlm_workers)
+                .saturating_add(zone_evidence_slots) as u64,
+        );
         let rtp_queue_bytes = (MAX_RTP_ACCESS_UNIT_BYTES as u64)
             .saturating_mul((RTP_FRAME_QUEUE_CAPACITY + decode_workers + 1) as u64);
         // One YCbCr interleave scratch per decoder and one base64 request
@@ -97,6 +106,8 @@ mod tests {
     use crate::webrtc::decode::VideoCodec;
     use crate::webrtc::session::WebRtcConfig;
     use crate::webrtc::workers::WorkerPoolConfig;
+    use crate::{coordinates::NormalizedRect, zone::RestrictedZonePolicy};
+    use std::sync::Arc;
 
     #[test]
     fn default_session_plan_is_finite_and_clip_has_one_more_worker() {
@@ -107,5 +118,35 @@ mod tests {
         assert_eq!(clip.worker_threads, 5);
         assert!(keyframe.reserved_bytes > keyframe.rtp_queue_bytes);
         assert!(keyframe.reserved_bytes < u64::MAX);
+    }
+
+    #[test]
+    fn restricted_zone_reserves_its_writer_and_bounded_evidence_payloads() {
+        let mut cfg = WorkerPoolConfig::from(&WebRtcConfig::default());
+        let base = MediaSessionResources::for_pipeline(&cfg, VideoCodec::H264, false);
+        cfg.restricted_zone = Some(Arc::new(RestrictedZonePolicy {
+            policy_id: "zone-east".to_string(),
+            policy_version: 1,
+            device_id: "camera-17".to_string(),
+            region: NormalizedRect {
+                x: 0.25,
+                y: 0.25,
+                width: 0.50,
+                height: 0.50,
+            },
+            enter_motion_score: 0.4,
+            exit_motion_score: 0.1,
+            enter_after_frames: 2,
+            exit_after_frames: 2,
+        }));
+
+        let zone = MediaSessionResources::for_pipeline(&cfg, VideoCodec::H264, false);
+
+        assert_eq!(zone.worker_threads, base.worker_threads + 1);
+        assert_eq!(
+            zone.jpeg_payload_bytes - base.jpeg_payload_bytes,
+            crate::webrtc::signals::MAX_JPEG_BYTES_PER_FRAME as u64
+                * crate::webrtc::workers::ZONE_EVIDENCE_QUEUE_CAPACITY as u64
+        );
     }
 }

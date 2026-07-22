@@ -339,6 +339,7 @@ async fn start_whip_session_transaction(
     let mut admission_pool_config = WorkerPoolConfig::from(state.webrtc_config());
     admission_pool_config.max_output_tokens_per_second = session.max_output_tokens_per_second;
     admission_pool_config.crop = session.crop;
+    admission_pool_config.restricted_zone = session.restricted_zone.clone();
     let media_resources = MediaSessionResources::for_pipeline(
         &admission_pool_config,
         session.codec,
@@ -472,6 +473,7 @@ async fn start_whip_session_transaction(
     // The session's crop starts from the server default and may have been
     // overridden by the attach request; it wins over the config default.
     let session_crop = session.crop;
+    let restricted_zone_for_workers = session.restricted_zone.clone();
 
     // Capture everything needed by the spawn_blocking closure.
     let run_id_for_workers = Arc::clone(&run_id);
@@ -516,6 +518,7 @@ async fn start_whip_session_transaction(
         let mut pool_config = WorkerPoolConfig::from(&webrtc_config_for_workers);
         pool_config.max_output_tokens_per_second = max_output_tokens_per_second;
         pool_config.crop = session_crop;
+        pool_config.restricted_zone = restricted_zone_for_workers;
 
         match spawn_pipeline(
             &pool_config,
@@ -661,15 +664,33 @@ fn apply_attach_config(
         return Ok(None);
     };
 
+    if config.restricted_zone.is_some() && config.clip_mode.is_some() {
+        return Err("restricted_zone and clip_mode cannot be enabled together".to_string());
+    }
+
+    if let Some(zone) = config.restricted_zone {
+        zone.validate().map_err(str::to_string)?;
+        let zone_crop = zone.crop();
+        if let Some(crop) = config.crop {
+            crop.validate().map_err(|e| e.to_string())?;
+            if crop != zone_crop {
+                return Err(
+                    "crop must exactly match restricted_zone.region when both are set".to_string(),
+                );
+            }
+        }
+        session.crop = Some(zone_crop);
+        session.restricted_zone = Some(Arc::new(zone));
+    } else if let Some(crop) = config.crop {
+        crop.validate().map_err(|e| e.to_string())?;
+        session.crop = Some(crop);
+    }
+
     if let Some(prompt) = config.prompt {
         session.set_initial_prompt(prompt);
     }
     if let Some(max) = config.max_output_tokens_per_second {
         session.max_output_tokens_per_second = max;
-    }
-    if let Some(crop) = config.crop {
-        crop.validate().map_err(|e| e.to_string())?;
-        session.crop = Some(crop);
     }
     if let Some(clip) = config.clip_mode {
         let clip = clip.into_core();
@@ -1321,6 +1342,59 @@ mod tests {
 
         assert!(clip.is_none());
         assert_eq!(session.initial_prompt().as_ref(), prompt);
+    }
+
+    #[tokio::test]
+    async fn restricted_zone_attach_becomes_generation_static_analysis_crop() {
+        let raw = r#"{
+            "restricted_zone": {
+                "policy_id": "loading-bay-east",
+                "policy_version": 4,
+                "device_id": "camera-17",
+                "region": {"x": 0.25, "y": 0.2, "width": 0.5, "height": 0.6},
+                "enter_motion_score": 0.4,
+                "exit_motion_score": 0.15,
+                "enter_after_frames": 2,
+                "exit_after_frames": 3
+            }
+        }"#;
+        let config: crate::models::AttachStreamRequest = serde_json::from_str(raw).unwrap();
+        let mut session = WebRtcSession::new_for_tests();
+
+        let clip = apply_attach_config(&mut session, Some(config)).unwrap();
+
+        assert!(clip.is_none());
+        let zone = session
+            .restricted_zone
+            .as_ref()
+            .expect("zone should be fixed");
+        assert_eq!(zone.policy_id, "loading-bay-east");
+        assert_eq!(session.crop, Some(zone.crop()));
+    }
+
+    #[tokio::test]
+    async fn restricted_zone_rejects_conflicting_media_modes() {
+        let raw = r#"{
+            "clip_mode": {"target_fps": 6, "clip_length_seconds": 0.5, "delay_seconds": 0.25},
+            "restricted_zone": {
+                "policy_id": "loading-bay-east",
+                "policy_version": 1,
+                "device_id": "camera-17",
+                "region": {"x": 0.25, "y": 0.2, "width": 0.5, "height": 0.6},
+                "enter_motion_score": 0.4,
+                "exit_motion_score": 0.15,
+                "enter_after_frames": 2,
+                "exit_after_frames": 3
+            }
+        }"#;
+        let config: crate::models::AttachStreamRequest = serde_json::from_str(raw).unwrap();
+        let mut session = WebRtcSession::new_for_tests();
+
+        let err = apply_attach_config(&mut session, Some(config)).unwrap_err();
+        assert_eq!(
+            err,
+            "restricted_zone and clip_mode cannot be enabled together"
+        );
     }
 
     #[test]

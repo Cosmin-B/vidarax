@@ -35,6 +35,10 @@ use crate::webrtc::session::{RtpFrame, WebRtcConfig};
 use crate::webrtc::signals::{
     check_frame, crop_yuv, yuv_to_frame_signal_unchecked, yuv_to_jpeg_unchecked, CropPool,
 };
+use crate::zone::{
+    ConfirmedZoneSubject, RestrictedZonePolicy, RestrictedZoneState, ZoneActivityObservation,
+    ZoneActivityTransition,
+};
 
 pub const STREAM_FRAME_QUEUE_CAPACITY: usize = 64;
 pub const VLM_WORK_QUEUE_CAPACITY: usize = 32;
@@ -46,6 +50,9 @@ pub const CLIP_FRAME_QUEUE_CAPACITY: usize = STREAM_FRAME_QUEUE_CAPACITY;
 ///   active/blocked clip work.
 pub const CLIP_WORK_QUEUE_CAPACITY: usize = 0;
 pub const SINK_EVENT_QUEUE_CAPACITY: usize = 512;
+/// Zone transitions are rare and each item owns one pooled JPEG until the
+/// sidecar writer commits it. A small queue bounds both latency and memory.
+pub const ZONE_EVIDENCE_QUEUE_CAPACITY: usize = 8;
 pub const JPEG_POOL_SLOT_CEILING: usize = 512;
 const FFMPEG_READER_CONSTRUCTING_YUV_FRAMES: usize = 1;
 const FFMPEG_DECODER_PENDING_YUV_FRAMES: usize = FFMPEG_YUV_PENDING_POOL_ALLOWANCE;
@@ -155,6 +162,13 @@ pub trait EventSink: Send + Sync {
 
     /// Persist a keyframe with its JPEG thumbnail (blocking).
     fn store_keyframe_sync(&self, event: KeyframeEvent<'_>) -> Result<(), String>;
+
+    /// Persist a restricted-zone assertion and its JPEG evidence (blocking).
+    /// Implementations must write binary evidence before committing metadata.
+    fn store_restricted_zone_sync(
+        &self,
+        event: RestrictedZoneEvidenceEvent<'_>,
+    ) -> Result<(), String>;
 }
 
 /// One keyframe and the provenance required to persist it correctly.
@@ -166,6 +180,23 @@ pub struct KeyframeEvent<'a> {
     pub coordinates: FrameCoordinates,
     pub event_type: &'a str,
     pub description: &'a str,
+    pub jpeg_data: &'a [u8],
+}
+
+/// One deterministic zone transition and the provenance required to replay it.
+#[derive(Debug, Clone, Copy)]
+pub struct RestrictedZoneEvidenceEvent<'a> {
+    pub run_id: &'a str,
+    pub session_id: &'a str,
+    pub frame_index: u64,
+    pub pts_ms: u64,
+    pub coordinates: FrameCoordinates,
+    pub generation: PipelineGeneration,
+    pub policy: &'a RestrictedZonePolicy,
+    pub observation: ZoneActivityObservation,
+    /// `None` for the deterministic pHash-motion path. Only a structured
+    /// detector or semantic result may populate this confirmation.
+    pub subject: Option<&'a ConfirmedZoneSubject>,
     pub jpeg_data: &'a [u8],
 }
 
@@ -312,6 +343,19 @@ struct LoopDetectedEvent {
     description: &'static str,
 }
 
+struct GateFrameOutcome {
+    work: Option<KeyframeWork>,
+    zone_entered: Option<ZoneActivityObservation>,
+}
+
+struct ZoneEvidenceWork {
+    work: KeyframeWork,
+    policy: Arc<RestrictedZonePolicy>,
+    observation: ZoneActivityObservation,
+    generation: PipelineGeneration,
+    subject: Option<ConfirmedZoneSubject>,
+}
+
 /// Per-stream loop-detection and gate state, driven once per decoded frame.
 ///
 /// Owns the two-pass gate and the loop detector for one ordered stream. The
@@ -323,6 +367,7 @@ struct LoopDetectedEvent {
 struct GateStreamState {
     pipeline: TwoPassPipeline,
     loop_det: LoopDetector,
+    zone: Option<RestrictedZoneState>,
     /// True while the loop detector considers the stream stuck; cleared when the
     /// detector no longer sees enough repeated hashes in its window.
     loop_active: bool,
@@ -333,12 +378,21 @@ impl GateStreamState {
         gate_config: GateConfig,
         loop_hamming_threshold: u32,
         loop_repeat_threshold: usize,
+        restricted_zone: Option<Arc<RestrictedZonePolicy>>,
     ) -> Self {
         Self {
             pipeline: TwoPassPipeline::new(TwoPassConfig::default(), gate_config),
             loop_det: LoopDetector::new(loop_hamming_threshold, loop_repeat_threshold),
+            zone: restricted_zone.map(|policy| {
+                RestrictedZoneState::try_new(policy)
+                    .expect("restricted-zone policy must be validated before worker startup")
+            }),
             loop_active: false,
         }
+    }
+
+    fn zone_policy_handle(&self) -> Option<Arc<RestrictedZonePolicy>> {
+        self.zone.as_ref().map(RestrictedZoneState::policy_handle)
     }
 
     /// Feed one frame's perceptual hash to the loop detector, returning the
@@ -382,7 +436,7 @@ impl GateStreamState {
         coordinates: FrameCoordinates,
         ctx: &KeyframeContext<'_>,
         encode: impl FnOnce() -> Option<RecycledBytes>,
-    ) -> Option<KeyframeWork> {
+    ) -> GateFrameOutcome {
         if let Some(event) = self.observe_loop(&signal, pts_ms, ctx.metrics) {
             let _ = ctx.stdb.emit_event_nonblocking(
                 ctx.run_id,
@@ -402,35 +456,61 @@ impl GateStreamState {
             .gate_latency_us
             .record(gate_start.elapsed().as_micros() as u64);
         ctx.metrics.inc_gate_frame_analyzed();
-        let meta = *metas.first()?;
+        let Some(meta) = metas.first().copied() else {
+            return GateFrameOutcome {
+                work: None,
+                zone_entered: None,
+            };
+        };
 
-        if meta.gate_event != GateEventType::KeepKeyframe {
-            return None;
+        let zone_entered = self.zone.as_mut().and_then(|zone| {
+            zone.observe(meta.motion_score).and_then(|observation| {
+                (observation.transition == ZoneActivityTransition::Entered).then_some(observation)
+            })
+        });
+
+        if meta.gate_event != GateEventType::KeepKeyframe && zone_entered.is_none() {
+            return GateFrameOutcome {
+                work: None,
+                zone_entered: None,
+            };
         }
-        ctx.metrics.inc_gate_keyframe_selected();
+        if meta.gate_event == GateEventType::KeepKeyframe {
+            ctx.metrics.inc_gate_keyframe_selected();
+        }
 
-        let jpeg_bytes = encode().filter(|b| !b.is_empty())?;
+        let Some(jpeg_bytes) = encode().filter(|b| !b.is_empty()) else {
+            return GateFrameOutcome {
+                work: None,
+                zone_entered: None,
+            };
+        };
         self.pipeline.commit_gate_keyframe(signal);
 
         let event_type: &'static str = if meta.scene_cut {
             "scene_cut"
+        } else if zone_entered.is_some() && meta.gate_event != GateEventType::KeepKeyframe {
+            "restricted_zone_activity"
         } else {
             "periodic_keepalive"
         };
 
-        Some(KeyframeWork {
-            run_id: Arc::clone(ctx.run_id),
-            session_id: Arc::clone(ctx.session_id),
-            frame_index: signal.frame_index,
-            pts_ms,
-            coordinates,
-            event_type,
-            confidence: meta.confidence,
-            novelty_score: meta.novelty_score,
-            motion_score: meta.motion_score,
-            jpeg_bytes,
-            loop_active: self.loop_active,
-        })
+        GateFrameOutcome {
+            work: Some(KeyframeWork {
+                run_id: Arc::clone(ctx.run_id),
+                session_id: Arc::clone(ctx.session_id),
+                frame_index: signal.frame_index,
+                pts_ms,
+                coordinates,
+                event_type,
+                confidence: meta.confidence,
+                novelty_score: meta.novelty_score,
+                motion_score: meta.motion_score,
+                jpeg_bytes,
+                loop_active: self.loop_active,
+            }),
+            zone_entered,
+        }
     }
 }
 
@@ -448,6 +528,8 @@ enum SinkState {
     Keyframe {
         gate: GateStreamState,
         vlm_tx: kanal::Sender<KeyframeWork>,
+        zone_tx: Option<kanal::Sender<ZoneEvidenceWork>>,
+        generation: PipelineGeneration,
         stdb: Arc<dyn EventSink>,
         run_id: Arc<str>,
         session_id: Arc<str>,
@@ -489,6 +571,8 @@ pub struct WorkerPoolConfig {
     /// Optional region of interest cropped from each decoded frame before the
     /// gate and JPEG encoder run. `None` analyzes the whole frame.
     pub crop: Option<CropRegion>,
+    /// Optional activity assertion fixed for this pipeline generation.
+    pub restricted_zone: Option<Arc<RestrictedZonePolicy>>,
 }
 
 impl From<&WebRtcConfig> for WorkerPoolConfig {
@@ -505,6 +589,7 @@ impl From<&WebRtcConfig> for WorkerPoolConfig {
             loop_repeat_threshold: cfg.loop_repeat_threshold,
             max_output_tokens_per_second: cfg.max_output_tokens_per_second,
             crop: cfg.crop,
+            restricted_zone: None,
         }
     }
 }
@@ -564,6 +649,10 @@ pub struct KeyframeSink {
     pub loop_repeat_threshold: usize,
     /// Kept keyframes out to the VLM queue.
     pub vlm_tx: kanal::Sender<KeyframeWork>,
+    /// Activity evidence handoff; bounded and nonblocking on the decode path.
+    zone_tx: Option<kanal::Sender<ZoneEvidenceWork>>,
+    pub generation: PipelineGeneration,
+    pub restricted_zone: Option<Arc<RestrictedZonePolicy>>,
     /// Event sink for the loop-detected notice.
     pub stdb: Arc<dyn EventSink>,
     pub run_id: Arc<str>,
@@ -604,12 +693,22 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<Stage
             loop_hamming_threshold,
             loop_repeat_threshold,
             vlm_tx,
+            zone_tx,
+            generation,
+            restricted_zone,
             stdb,
             run_id,
             session_id,
         }) => SinkState::Keyframe {
-            gate: GateStreamState::new(gate_config, loop_hamming_threshold, loop_repeat_threshold),
+            gate: GateStreamState::new(
+                gate_config,
+                loop_hamming_threshold,
+                loop_repeat_threshold,
+                restricted_zone,
+            ),
             vlm_tx,
+            zone_tx,
+            generation,
             stdb,
             run_id,
             session_id,
@@ -767,6 +866,8 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<Stage
                     SinkState::Keyframe {
                         gate,
                         vlm_tx,
+                        zone_tx,
+                        generation,
                         stdb,
                         run_id,
                         session_id,
@@ -795,7 +896,7 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<Stage
                         };
                         // The encoder only runs if the gate keeps the frame. A
                         // rejected thumbnail costs this one frame, not the stream.
-                        let work = gate.on_frame(signal, pts_ms, coordinates, &ctx, || {
+                        let outcome = gate.on_frame(signal, pts_ms, coordinates, &ctx, || {
                             match yuv_to_jpeg_unchecked(&yuv, 75, &mut ycbcr_scratch, &jpeg_pool) {
                                 Ok(bytes) => Some(bytes),
                                 Err(err) => {
@@ -808,9 +909,33 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<Stage
                                 }
                             }
                         });
-                        let Some(work) = work else {
+                        let Some(work) = outcome.work else {
                             continue 'rtp_frames;
                         };
+
+                        // Zone activity takes the evidence-first route: the
+                        // bounded writer commits the binary sidecar and WAL
+                        // metadata, then forwards the same pooled JPEG to VLM.
+                        // No payload copy or base64 transform occurs here.
+                        if let Some(observation) = outcome.zone_entered {
+                            let Some(policy) = gate.zone_policy_handle() else {
+                                continue 'rtp_frames;
+                            };
+                            let zone_work = ZoneEvidenceWork {
+                                work,
+                                policy,
+                                observation,
+                                generation: *generation,
+                                subject: None,
+                            };
+                            if !matches!(
+                                zone_tx.as_ref().map(|tx| tx.try_send(zone_work)),
+                                Some(Ok(true))
+                            ) {
+                                metrics.inc_keyframes_dropped();
+                            }
+                            continue 'rtp_frames;
+                        }
 
                         // Non-blocking: drop if the VLM queue is full rather than
                         // stall the decode loop for the whole stream.
@@ -923,6 +1048,7 @@ pub fn spawn_analysis_workers(params: AnalysisWorkerParams) -> std::io::Result<V
                     gate_config,
                     loop_hamming_threshold,
                     loop_repeat_threshold,
+                    None,
                 );
 
                 loop {
@@ -1082,6 +1208,54 @@ enum SinkEvent {
     },
 }
 
+fn spawn_zone_evidence_writer(
+    zone_rx: kanal::Receiver<ZoneEvidenceWork>,
+    vlm_tx: kanal::Sender<KeyframeWork>,
+    sink: Arc<dyn EventSink>,
+    metrics: Arc<PipelineMetrics>,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<StageHandle> {
+    let handle = std::thread::Builder::new()
+        .name("vx-zone-writer".to_string())
+        .spawn(move || loop {
+            if stopping.load(Ordering::Acquire) {
+                break;
+            }
+            let zone = match zone_rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                Ok(zone) => zone,
+                Err(kanal::ReceiveErrorTimeout::Timeout) => continue,
+                Err(
+                    kanal::ReceiveErrorTimeout::Closed | kanal::ReceiveErrorTimeout::SendClosed,
+                ) => break,
+            };
+
+            if let Err(err) = sink.store_restricted_zone_sync(RestrictedZoneEvidenceEvent {
+                run_id: &zone.work.run_id,
+                session_id: &zone.work.session_id,
+                frame_index: zone.work.frame_index,
+                pts_ms: zone.work.pts_ms,
+                coordinates: zone.work.coordinates,
+                generation: zone.generation,
+                policy: &zone.policy,
+                observation: zone.observation,
+                subject: zone.subject.as_ref(),
+                jpeg_data: &zone.work.jpeg_bytes,
+            }) {
+                tracing::warn!(%err, "restricted-zone evidence commit failed");
+            }
+
+            // Persistence only borrows the pooled JPEG. Move the same buffer on
+            // to optional semantic inference without a byte copy. A saturated
+            // VLM queue cannot erase the already-durable local assertion.
+            if matches!(vlm_tx.try_send(zone.work), Ok(true)) {
+                metrics.inc_keyframes();
+            } else {
+                metrics.inc_keyframes_dropped();
+            }
+        })?;
+    Ok(StageHandle::new(PipelineStage::EventWriter, handle))
+}
+
 // ─── Pipeline assembly ────────────────────────────────────────────────────────
 
 /// Channels, sinks, and provider that wire one session's worker pipeline
@@ -1136,6 +1310,16 @@ pub fn spawn_pipeline<I>(
 where
     I: InferenceProvider + 'static,
 {
+    if let Some(policy) = &cfg.restricted_zone {
+        if let Err(message) = policy.validate() {
+            return Err(PipelineStartError::new(
+                PipelineStage::Decode,
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, message),
+                None,
+                0,
+            ));
+        }
+    }
     let PipelineWiring {
         rtp_rx,
         stream_tx,
@@ -1161,7 +1345,13 @@ where
     } = wiring;
 
     let output_pool_slots = decode_output_pool_slots(cfg.gpu_available, codec);
-    let jpeg_pool_slots = jpeg_pool_slots(cfg.analysis_workers, cfg.vlm_workers);
+    let jpeg_pool_slots = jpeg_pool_slots(cfg.analysis_workers, cfg.vlm_workers).saturating_add(
+        if cfg.restricted_zone.is_some() {
+            ZONE_EVIDENCE_QUEUE_CAPACITY
+        } else {
+            0
+        },
+    );
     let mut runtime = PipelineRuntime::new(generation, Arc::clone(&stopping));
 
     macro_rules! start_one {
@@ -1300,6 +1490,23 @@ where
         // encoded only for the frames it keeps and handed straight to the VLM
         // workers. There is no separate analysis stage, and the `stream_tx` /
         // `stream_rx` channel the caller allocated goes unused here.
+        let zone_tx = if cfg.restricted_zone.is_some() {
+            let (zone_tx, zone_rx) =
+                kanal::bounded::<ZoneEvidenceWork>(ZONE_EVIDENCE_QUEUE_CAPACITY);
+            start_one!(
+                PipelineStage::EventWriter,
+                spawn_zone_evidence_writer(
+                    zone_rx,
+                    vlm_tx.clone(),
+                    Arc::clone(&event_sink),
+                    Arc::clone(&metrics),
+                    Arc::clone(&stopping),
+                )
+            );
+            Some(zone_tx)
+        } else {
+            None
+        };
         start_one!(
             PipelineStage::Decode,
             spawn_decode_workers(DecodeWorkerParams {
@@ -1315,6 +1522,9 @@ where
                     loop_hamming_threshold: cfg.loop_hamming_threshold,
                     loop_repeat_threshold: cfg.loop_repeat_threshold,
                     vlm_tx,
+                    zone_tx,
+                    generation,
+                    restricted_zone: cfg.restricted_zone.clone(),
                     stdb: Arc::clone(&event_sink),
                     run_id,
                     session_id,
@@ -2017,12 +2227,12 @@ mod tests {
         advance_temporal_context, build_clip_stream_frame_from_yuv, build_stream_frame_from_yuv,
         decode_output_pool_slots, hash_word, jaccard_word_overlap, jpeg_pool_slots,
         prune_stale_token_budget_entries, token_budget_entry, DecoderBackend, EventSink,
-        GateStreamState, KeyframeContext, KeyframeEvent, KeyframeWork, StreamFrame,
-        CLIP_FRAME_QUEUE_CAPACITY, CLIP_WORK_QUEUE_CAPACITY, FFMPEG_YUV_READER_QUEUE_CAPACITY,
-        JPEG_POOL_SLOT_CEILING, JPEG_SINK_EVENT_POOL_ALLOWANCE, SINK_EVENT_QUEUE_CAPACITY,
-        STREAM_FRAME_QUEUE_CAPACITY, VLM_WORK_QUEUE_CAPACITY,
+        GateStreamState, KeyframeContext, KeyframeEvent, KeyframeWork, RestrictedZoneEvidenceEvent,
+        StreamFrame, CLIP_FRAME_QUEUE_CAPACITY, CLIP_WORK_QUEUE_CAPACITY,
+        FFMPEG_YUV_READER_QUEUE_CAPACITY, JPEG_POOL_SLOT_CEILING, JPEG_SINK_EVENT_POOL_ALLOWANCE,
+        SINK_EVENT_QUEUE_CAPACITY, STREAM_FRAME_QUEUE_CAPACITY, VLM_WORK_QUEUE_CAPACITY,
     };
-    use crate::coordinates::FrameCoordinates;
+    use crate::coordinates::{FrameCoordinates, NormalizedRect};
     use crate::gate::FrameSignal;
     use crate::webrtc::clip::ClipRateGate;
     use crate::webrtc::clip::MAX_CLIP_FRAMES_PER_REQUEST;
@@ -2032,6 +2242,7 @@ mod tests {
         VideoCodec, YuvFrame, FFMPEG_YUV_PENDING_POOL_ALLOWANCE, FFMPEG_YUV_READER_POOL_MIN_SLOTS,
     };
     use crate::webrtc::recycle::VecPool;
+    use crate::zone::RestrictedZonePolicy;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -2071,6 +2282,17 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(event.event_type.to_string());
+            Ok(())
+        }
+
+        fn store_restricted_zone_sync(
+            &self,
+            _event: RestrictedZoneEvidenceEvent<'_>,
+        ) -> Result<(), String> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(crate::zone::RESTRICTED_ZONE_ACTIVITY_EVENT.to_string());
             Ok(())
         }
     }
@@ -2420,7 +2642,7 @@ mod tests {
     fn observe_loop_returns_event_without_emitting_inline() {
         let sink = MockSink::new();
         let metrics = crate::metrics::PipelineMetrics::new();
-        let mut gate = GateStreamState::new(crate::gate::GateConfig::default(), 6, 3);
+        let mut gate = GateStreamState::new(crate::gate::GateConfig::default(), 6, 3, None);
 
         let mut event = None;
         for i in 0..8u64 {
@@ -2451,7 +2673,7 @@ mod tests {
         let stdb = sink as Arc<dyn EventSink>;
         let run_id: Arc<str> = "run-test".into();
         let session_id: Arc<str> = "sess-test".into();
-        let mut gate = GateStreamState::new(crate::gate::GateConfig::default(), 6, 3);
+        let mut gate = GateStreamState::new(crate::gate::GateConfig::default(), 6, 3, None);
         let ctx = KeyframeContext {
             run_id: &run_id,
             session_id: &session_id,
@@ -2467,6 +2689,7 @@ mod tests {
                 &ctx,
                 || None,
             )
+            .work
             .is_none());
 
         let second = gate
@@ -2477,8 +2700,75 @@ mod tests {
                 &ctx,
                 || Some([0xff_u8, 0xd8, 0xff, 0xd9].into()),
             )
+            .work
             .expect("uncommitted failed keep should not suppress the next keep");
         assert_eq!(second.frame_index, 1);
+    }
+
+    #[test]
+    fn restricted_zone_entry_is_deterministic_and_carries_the_same_jpeg_work() {
+        let sink = MockSink::new();
+        let metrics = crate::metrics::PipelineMetrics::new();
+        let stdb = sink as Arc<dyn EventSink>;
+        let run_id: Arc<str> = "run-zone".into();
+        let session_id: Arc<str> = "sess-zone".into();
+        let policy = Arc::new(RestrictedZonePolicy {
+            policy_id: "zone-east".to_string(),
+            policy_version: 2,
+            device_id: "camera-17".to_string(),
+            region: NormalizedRect {
+                x: 0.25,
+                y: 0.25,
+                width: 0.50,
+                height: 0.50,
+            },
+            enter_motion_score: 0.40,
+            exit_motion_score: 0.10,
+            enter_after_frames: 2,
+            exit_after_frames: 2,
+        });
+        let mut gate = GateStreamState::new(
+            crate::gate::GateConfig::default(),
+            6,
+            3,
+            Some(Arc::clone(&policy)),
+        );
+        let ctx = KeyframeContext {
+            run_id: &run_id,
+            session_id: &session_id,
+            stdb: &stdb,
+            metrics: &metrics,
+        };
+        let coordinates = FrameCoordinates::resolve(640, 480, Some(policy.crop())).unwrap();
+        let make_signal = |frame_index, perceptual_hash| FrameSignal {
+            frame_index,
+            pts_ms: frame_index * 33,
+            perceptual_hash,
+            luma_mean: 0.4,
+            flicker_score: 0.0,
+            ghosting_score: 0.0,
+            noise_variance_score: 0.0,
+        };
+        let encode = || Some([0xff_u8, 0xd8, 0xff, 0xd9].into());
+
+        let initial = gate.on_frame(make_signal(0, 0), 0, coordinates, &ctx, encode);
+        assert!(initial.work.is_some());
+        assert!(initial.zone_entered.is_none());
+        let first_motion = gate.on_frame(make_signal(1, u64::MAX), 33, coordinates, &ctx, encode);
+        assert!(first_motion.zone_entered.is_none());
+        let entered = gate.on_frame(make_signal(2, 0), 66, coordinates, &ctx, encode);
+
+        let observation = entered
+            .zone_entered
+            .expect("second high-motion frame enters");
+        assert_eq!(observation.motion_score, 1.0);
+        assert_eq!(observation.consecutive_frames, 2);
+        let work = entered
+            .work
+            .expect("zone entry always retains evidence work");
+        assert_eq!(&work.jpeg_bytes[..], &[0xff, 0xd8, 0xff, 0xd9]);
+        assert_eq!(work.coordinates.requested_region, policy.region);
+        assert_eq!(gate.zone_policy_handle().unwrap().policy_version, 2);
     }
 
     #[test]

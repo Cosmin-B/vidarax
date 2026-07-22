@@ -13,7 +13,10 @@ use std::sync::Arc;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use vidarax_core::coordinates::{FrameCoordinates, IMAGE_COORDINATE_SCHEMA};
-use vidarax_core::webrtc::workers::{EventSink, KeyframeEvent};
+use vidarax_core::webrtc::workers::{EventSink, KeyframeEvent, RestrictedZoneEvidenceEvent};
+use vidarax_core::zone::{
+    RESTRICTED_ZONE_ACTIVITY_EVENT, RESTRICTED_ZONE_COORDINATE_SPACE, RESTRICTED_ZONE_MOTION_MODEL,
+};
 
 use crate::spacetime_client::{EmitEventArgs, SpacetimeClient};
 use crate::state::AppState;
@@ -238,6 +241,74 @@ impl EventSink for WalEventSink {
             .append_run_event(event.run_id, "keyframe_stored", payload)
             .map(|_| ())
     }
+
+    /// Write binary evidence before publishing the assertion that references
+    /// it. The WAL never contains image bytes or a base64 representation.
+    fn store_restricted_zone_sync(
+        &self,
+        event: RestrictedZoneEvidenceEvent<'_>,
+    ) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        let blob = match self.persist_keyframe_blob(event.jpeg_data) {
+            Ok(blob) => blob,
+            Err(err) => {
+                self.state.pipeline_metrics().inc_keyframe_blob_failure();
+                self.state
+                    .pipeline_metrics()
+                    .keyframe_blob_latency_ms
+                    .record(started.elapsed().as_millis() as u64);
+                return Err(err);
+            }
+        };
+        self.state
+            .pipeline_metrics()
+            .keyframe_blob_latency_ms
+            .record(started.elapsed().as_millis() as u64);
+        if blob.created {
+            self.state
+                .pipeline_metrics()
+                .record_keyframe_blob_written(blob.bytes as u64);
+        } else {
+            self.state.pipeline_metrics().inc_keyframe_blob_reused();
+        }
+        let payload = json!({
+            "session_id": event.session_id,
+            "frame_index": event.frame_index,
+            "pts_ms": event.pts_ms,
+            "coordinate_schema": IMAGE_COORDINATE_SCHEMA,
+            "coordinates": event.coordinates,
+            "confidence": event.observation.motion_score,
+            "assertion": {
+                "policy_id": event.policy.policy_id,
+                "policy_version": event.policy.policy_version,
+                "status": "active",
+                "coordinate_space": RESTRICTED_ZONE_COORDINATE_SPACE,
+                "zone": event.policy.region,
+                "trigger": {
+                    "kind": "perceptual_hash_motion",
+                    "score": event.observation.motion_score,
+                    "threshold": event.observation.threshold,
+                    "consecutive_frames": event.observation.consecutive_frames,
+                },
+                "subject": event.subject,
+            },
+            "provenance": {
+                "device_id": event.policy.device_id,
+                "model_id": RESTRICTED_ZONE_MOTION_MODEL,
+                "pipeline_generation": event.generation.get(),
+            },
+            "evidence": {
+                "image_ref": blob.image_ref,
+                "image_media_type": "image/jpeg",
+                "image_bytes": blob.bytes,
+                "image_sha256": blob.sha256,
+            },
+        });
+
+        self.state
+            .append_run_event(event.run_id, RESTRICTED_ZONE_ACTIVITY_EVENT, payload)
+            .map(|_| ())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -247,8 +318,13 @@ mod tests {
     use super::WalEventSink;
     use crate::state::AppState;
     use std::sync::Arc;
-    use vidarax_core::coordinates::FrameCoordinates;
-    use vidarax_core::webrtc::workers::{EventSink, KeyframeEvent};
+    use vidarax_core::coordinates::{FrameCoordinates, NormalizedRect};
+    use vidarax_core::webrtc::runtime::PipelineGeneration;
+    use vidarax_core::webrtc::workers::{EventSink, KeyframeEvent, RestrictedZoneEvidenceEvent};
+    use vidarax_core::zone::{
+        RestrictedZonePolicy, ZoneActivityObservation, ZoneActivityTransition,
+        RESTRICTED_ZONE_ACTIVITY_EVENT,
+    };
 
     fn temp_wal() -> std::path::PathBuf {
         // A per-call unique path. A bare nanosecond timestamp collided when two
@@ -387,6 +463,69 @@ mod tests {
             serde_json::from_str(&ev.payload).expect("keyframe payload should be valid JSON");
         assert_eq!(payload["coordinates"]["source_extent"]["width"], 1920);
         assert_eq!(payload["coordinates"]["source_extent"]["height"], 1080);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn restricted_zone_event_has_provenance_and_binary_sidecar_reference() {
+        let (state, path) = make_state();
+        let run_id = "run-zone0000000000";
+        let policy = RestrictedZonePolicy {
+            policy_id: "loading-bay-east".to_string(),
+            policy_version: 4,
+            device_id: "camera-17".to_string(),
+            region: NormalizedRect {
+                x: 0.25,
+                y: 0.20,
+                width: 0.50,
+                height: 0.60,
+            },
+            enter_motion_score: 0.40,
+            exit_motion_score: 0.15,
+            enter_after_frames: 2,
+            exit_after_frames: 3,
+        };
+        let coordinates = FrameCoordinates::resolve(1920, 1080, Some(policy.crop())).unwrap();
+
+        let sink = WalEventSink::new(state.clone());
+        sink.store_restricted_zone_sync(RestrictedZoneEvidenceEvent {
+            run_id,
+            session_id: "sess-zone",
+            frame_index: 11,
+            pts_ms: 363,
+            coordinates,
+            generation: PipelineGeneration::new(9),
+            policy: &policy,
+            observation: ZoneActivityObservation {
+                transition: ZoneActivityTransition::Entered,
+                motion_score: 0.58,
+                threshold: 0.40,
+                consecutive_frames: 2,
+            },
+            subject: None,
+            jpeg_data: b"\xff\xd8zone-evidence\xff\xd9",
+        })
+        .expect("zone evidence should commit");
+
+        let events = state.read_run_events(run_id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, RESTRICTED_ZONE_ACTIVITY_EVENT);
+        let payload: serde_json::Value = serde_json::from_str(&events[0].payload).unwrap();
+        assert_eq!(payload["assertion"]["policy_id"], "loading-bay-east");
+        assert_eq!(payload["assertion"]["subject"], serde_json::Value::Null);
+        assert_eq!(payload["provenance"]["device_id"], "camera-17");
+        assert_eq!(payload["provenance"]["pipeline_generation"], 9);
+        assert_eq!(payload["provenance"]["model_id"], "vidarax.motion-phash.v1");
+        assert_eq!(payload["assertion"]["coordinate_space"], "normalized_image");
+        assert_eq!(payload["coordinates"]["resolved_region"]["x"], 480);
+        assert!(payload["evidence"]["image_ref"]
+            .as_str()
+            .unwrap()
+            .starts_with("keyframes/blobs/"));
+        assert!(payload.get("image_data").is_none());
+        assert!(payload.get("data_base64").is_none());
+        assert!(!events[0].payload.contains("zone-evidence"));
 
         let _ = std::fs::remove_file(path);
     }
