@@ -4,6 +4,7 @@ use axum::routing::{get, patch, post};
 use axum::Router;
 use tower_http::compression::CompressionLayer;
 
+use crate::delivery::{create_webhook, delete_webhook, list_webhooks, stream_events};
 use crate::handlers::{
     analyze_run, create_run, delete_run, get_events, get_interactions, get_markers, get_run,
     get_state, health, infer, infer_batch, ingest_run, keepalive_run, list_feedback, list_models,
@@ -35,6 +36,15 @@ pub fn app_router(state: AppState) -> Router {
         .route("/v1/runs/{run_id}/stop", post(stop_run))
         .route("/v1/runs/{run_id}/keepalive", post(keepalive_run))
         .route("/v1/runs/{run_id}/events", get(get_events))
+        .route("/v1/runs/{run_id}/events/stream", get(stream_events))
+        .route(
+            "/v1/runs/{run_id}/webhooks",
+            get(list_webhooks).post(create_webhook),
+        )
+        .route(
+            "/v1/runs/{run_id}/webhooks/{webhook_id}",
+            axum::routing::delete(delete_webhook),
+        )
         .route("/v1/runs/{run_id}/markers", get(get_markers))
         .route("/v1/runs/{run_id}/state", get(get_state))
         .route("/v1/runs/{run_id}/interactions", get(get_interactions))

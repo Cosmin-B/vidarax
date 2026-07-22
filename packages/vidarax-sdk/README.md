@@ -60,7 +60,9 @@ const v = new Vidarax(baseUrl, options?)
 | `getEvents(id, index?)` / `getMarkers(id, query?)` | Fetch one snapshot of events or markers. |
 | `getInteractions(id, index?)` | Fetch guided semantic interactions. |
 | `getKeyframe(id, sha256)` | Fetch a run-owned keyframe as a raw JPEG `Blob`. |
-| `streamEvents(id)` / `streamMarkers(id)` | Async-iterate a one-time snapshot of results (not a live stream; the server has no SSE endpoint). |
+| `streamEvents(id)` / `streamMarkers(id)` | Async-iterate a one-time compatibility snapshot. |
+| `subscribeEvents(id, options?)` | Replay and follow events over SSE with `Last-Event-ID` reconnect. |
+| `createWebhook(id, request)` / `listWebhooks(id)` / `deleteWebhook(id, webhookId)` | Manage signed action hooks and inspect dead-letter state. |
 | `infer(opts)` / `inferBatch(items)` | Single or batch inference. |
 | `uploadFile(file, onProgress?)` | Upload a video file. |
 | `whipOffer(sdp, opts)` | WebRTC WHIP session (browser). |

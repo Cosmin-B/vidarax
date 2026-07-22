@@ -32,6 +32,9 @@ import type {
   AttachStreamRequest,
   CreateRunRequest,
   CreateRunResponse,
+  CreateWebhookRequest,
+  CreateWebhookResponse,
+  EventSubscriptionOptions,
   EventsResponse,
   FeedbackItem,
   FeedbackListResponse,
@@ -72,6 +75,8 @@ import type {
   WhipSession,
   WhipPromptUpdateRequest,
   WhipPromptUpdateResponse,
+  Webhook,
+  WebhookListResponse,
 } from "./types.js";
 
 // Default model used when a caller does not specify one. Must be a model id
@@ -83,6 +88,52 @@ const DEFAULT_MODEL = "Qwen/Qwen3-VL-2B-Instruct";
 /** Sleep for `ms` milliseconds. */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+interface ParsedSseEvent {
+  id: string;
+  event: string;
+  data: string;
+}
+
+const MAX_SSE_EVENT_BYTES = 4 * 1024 * 1024;
+
+/** Decode SSE framing without relying on EventSource, which cannot set API-key headers. */
+async function* decodeSse(body: ReadableStream<Uint8Array>): AsyncGenerator<ParsedSseEvent> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, "\n");
+      if (buffer.length > MAX_SSE_EVENT_BYTES) {
+        throw new ParseError("SSE event exceeded the 4 MiB SDK limit", buffer.slice(0, 256));
+      }
+      let boundary: number;
+      while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        let id = "";
+        let event = "message";
+        const data: string[] = [];
+        for (const line of block.split("\n")) {
+          if (line.startsWith(":")) continue;
+          const separator = line.indexOf(":");
+          const field = separator >= 0 ? line.slice(0, separator) : line;
+          const raw = separator >= 0 ? line.slice(separator + 1) : "";
+          const value = raw.startsWith(" ") ? raw.slice(1) : raw;
+          if (field === "id") id = value;
+          else if (field === "event") event = value;
+          else if (field === "data") data.push(value);
+        }
+        if (data.length > 0) yield { id, event, data: data.join("\n") };
+      }
+      if (done) break;
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
 }
 
 /** Clamp a number between min and max. */
@@ -718,6 +769,114 @@ export class Vidarax {
     for (const event of events) {
       yield event;
     }
+  }
+
+  /**
+   * Replay and follow a run's events over the durable SSE endpoint.
+   *
+   * The SDK sends API-key headers with `fetch`, tracks the SSE sequence ID,
+   * and reconnects with `Last-Event-ID`. Successful deliveries can repeat
+   * around disconnects, so callers should deduplicate by `seq` when applying
+   * non-idempotent effects. Abort the supplied signal to stop reconnecting.
+   */
+  async *subscribeEvents(
+    runId: string,
+    options: EventSubscriptionOptions = {},
+  ): AsyncGenerator<AgentEvent> {
+    let cursor = options.after ?? 0;
+    const reconnect = options.reconnect ?? true;
+    const reconnectDelayMs = options.reconnectDelayMs ?? 500;
+    const params = new URLSearchParams();
+    if (options.after !== undefined) params.set("after", String(options.after));
+    if (options.kind !== undefined) params.set("kind", options.kind);
+    const query = params.toString();
+    const path = `/v1/runs/${encodeURIComponent(runId)}/events/stream${query ? `?${query}` : ""}`;
+
+    do {
+      if (options.signal?.aborted) return;
+      const headers = this.headers({ Accept: "text/event-stream" });
+      delete headers["Content-Type"];
+      if (cursor > 0) headers["Last-Event-ID"] = String(cursor);
+      let response: Response;
+      try {
+        const init: RequestInit = { headers };
+        if (options.signal !== undefined) init.signal = options.signal;
+        response = await fetch(`${this.baseUrl}${path}`, init);
+      } catch (err) {
+        if (options.signal?.aborted) return;
+        if (!reconnect) throw new NetworkError(`Event subscription failed: ${String(err)}`, err);
+        await sleep(reconnectDelayMs);
+        continue;
+      }
+      if (!response.ok) {
+        let apiError: ApiErrorBody | null = null;
+        try {
+          apiError = ((await response.json()) as { error?: ApiErrorBody }).error ?? null;
+        } catch {
+          // Keep the transport-level error when the route returned plain text.
+        }
+        throw new HttpError(
+          response.status,
+          apiError?.message ?? `HTTP ${response.status} on GET ${path}`,
+          apiError,
+        );
+      }
+      if (response.body === null) {
+        throw new ParseError("Event subscription response had no body", "");
+      }
+      for await (const message of decodeSse(response.body)) {
+        const sequence = Number(message.id);
+        if (!Number.isSafeInteger(sequence) || sequence <= cursor) continue;
+        let envelope: {
+          sequence?: number;
+          pts_ms?: number;
+          data?: Record<string, unknown>;
+        };
+        try {
+          envelope = JSON.parse(message.data) as typeof envelope;
+        } catch (err) {
+          throw new ParseError(`Failed to parse SSE event: ${String(err)}`, message.data);
+        }
+        if (envelope.sequence !== sequence || typeof envelope.pts_ms !== "number") {
+          throw new ParseError("SSE event identity did not match its envelope", message.data);
+        }
+        cursor = sequence;
+        yield {
+          seq: sequence,
+          pts_ms: envelope.pts_ms,
+          kind: message.event,
+          payload: envelope.data ?? {},
+        };
+      }
+      if (!reconnect || options.signal?.aborted) return;
+      await sleep(reconnectDelayMs);
+    } while (true);
+  }
+
+  /** Register a signed, filtered action webhook for a run. */
+  async createWebhook(
+    runId: string,
+    request: CreateWebhookRequest,
+  ): Promise<CreateWebhookResponse> {
+    return this.post<CreateWebhookResponse>(
+      `/v1/runs/${encodeURIComponent(runId)}/webhooks`,
+      request,
+    );
+  }
+
+  /** List webhook configuration and durable delivery/dead-letter state. */
+  async listWebhooks(runId: string): Promise<Webhook[]> {
+    const response = await this.get<WebhookListResponse>(
+      `/v1/runs/${encodeURIComponent(runId)}/webhooks`,
+    );
+    return response.webhooks;
+  }
+
+  /** Remove a run webhook. */
+  async deleteWebhook(runId: string, webhookId: string): Promise<void> {
+    await this.delete(
+      `/v1/runs/${encodeURIComponent(runId)}/webhooks/${encodeURIComponent(webhookId)}`,
+    );
   }
 
   /**

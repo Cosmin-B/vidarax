@@ -41,7 +41,14 @@ The exact rules a maintainer or operator can rely on, as implemented today:
 
 ## Who appends, and every kind
 
-All appends funnel through one thread, `vidarax-timeline-writer`, which owns the `WalWriter`, assigns `seq`, stamps `pts_ms` with wall-clock milliseconds, applies the event to the run registry, updates the in-memory tails, and publishes a fresh snapshot. Async handlers reach it through `AppState::append_run_event_async`; the append is acknowledged over a oneshot channel only after the WAL write succeeded, and a failed write rolls the writer's sequence counter back so the numbering stays dense. Cancellation has one linearization point: before the bounded-channel send completes, the caller still owns the command and no append occurs; after it completes, the writer owns the command and finishes it even if the request disappears while waiting for the acknowledgement. Retried state transitions therefore need an idempotency rule; `run_deleted` has one, while ordinary telemetry events are append-only observations.
+All appends funnel through one thread, `vidarax-timeline-writer`, which owns the `WalWriter`, assigns `seq`, stamps `pts_ms` with wall-clock milliseconds, applies the event to the run registry, updates the in-memory tails, and publishes a fresh snapshot. Only after that commit does it publish a best-effort notification into a bounded broadcast ring. SSE and webhook consumers treat the notification as a wake-up and recover by sequence from the WAL, so subscriber lag never blocks this writer. Async handlers reach it through `AppState::append_run_event_async`; the append is acknowledged over a oneshot channel only after the WAL write succeeded, and a failed write rolls the writer's sequence counter back so the numbering stays dense. Cancellation has one linearization point: before the bounded-channel send completes, the caller still owns the command and no append occurs; after it completes, the writer owns the command and finishes it even if the request disappears while waiting for the acknowledgement. Retried state transitions therefore need an idempotency rule; `run_deleted` has one, while ordinary telemetry events are append-only observations.
+
+`read_events_after` streams at most one fixed-size batch from disk. It is the
+bounded cold-path primitive behind SSE reconnect and webhook recovery; neither
+consumer materializes an unbounded historical log. Webhook registrations and
+deletions are themselves timeline events, while attempt/checkpoint/dead-letter
+records use the separate `webhook-delivery.wal`. Those bookkeeping records are
+not timeline events and can never recursively trigger delivery.
 
 Handler-appended kinds, by string literal in `handlers.rs` (all through `append_run_event_async`):
 

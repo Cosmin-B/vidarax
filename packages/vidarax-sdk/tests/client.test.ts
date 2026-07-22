@@ -104,3 +104,52 @@ describe("policy lifecycle", () => {
     ]);
   });
 });
+
+describe("durable event subscription", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("parses CloudEvents SSE and sends the durable cursor", async () => {
+  it("parses CloudEvents SSE and sends the durable cursor", async () => {
+    const body = [
+      "id: 6",
+      "event: gate",
+      'data: {"sequence":6,"pts_ms":100,"data":{"decision":"keep"}}',
+      "",
+      "id: 7",
+      "event: keyframe_stored",
+      'data: {"sequence":7,"pts_ms":110,"data":{"image_ref":"/v1/runs/run/keyframes/abc"}}',
+      "",
+      "",
+    ].join("\n");
+    const fetchMock = vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new Vidarax("https://vidarax.example", { apiKey: "test-key" });
+    const events = [];
+    for await (const event of client.subscribeEvents("run-0000000000000000", {
+      after: 5,
+      reconnect: false,
+    })) {
+      events.push(event);
+    }
+
+    expect(events).toEqual([
+      { seq: 6, pts_ms: 100, kind: "gate", payload: { decision: "keep" } },
+      {
+        seq: 7,
+        pts_ms: 110,
+        kind: "keyframe_stored",
+        payload: { image_ref: "/v1/runs/run/keyframes/abc" },
+      },
+    ]);
+    expect(fetchMock.mock.calls[0][0]).toContain("after=5");
+    const headers = fetchMock.mock.calls[0][1]?.headers as Record<string, string>;
+    expect(headers["Last-Event-ID"]).toBe("5");
+    expect(headers["x-api-key"]).toBe("test-key");
+  });
+});

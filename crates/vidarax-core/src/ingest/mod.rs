@@ -15,4 +15,4 @@ pub(crate) use ffmpeg::{
     ffmpeg_input_options_for_source, ffmpeg_protocol_whitelist_for_source,
     parse_jpeg_stream_to_frames,
 };
-pub use validate::InputSource;
+pub use validate::{validate_public_https_url, InputSource};

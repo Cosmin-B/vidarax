@@ -25,6 +25,41 @@ A timeline event has a fixed envelope with a kind-specific payload:
 
 `GET /v1/runs/{id}/events` returns `{ request_id, run_id, events }` with events in sequence order, and accepts `?index=<name>` to filter to events whose payload carries a matching `index_name`.
 
+## Live subscriptions and actions
+
+`GET /v1/runs/{id}/events/stream` is the durable live subscription. Pass
+`?after=<seq>` initially, then reconnect with the most recent SSE `id` in the
+`Last-Event-ID` header. Replay is strictly after the cursor. An optional exact
+`?kind=<kind>` filter reduces the stream without changing cursor progression.
+
+The SSE `data` is a CloudEvents-compatible JSON envelope:
+
+```json
+{
+  "specversion": "1.0",
+  "id": "run-0123:17",
+  "source": "/v1/runs/run-0123",
+  "type": "dev.vidarax.timeline.marker_emitted",
+  "subject": "stream-0",
+  "datacontenttype": "application/json",
+  "sequence": 17,
+  "pts_ms": 1764316800123,
+  "data": {}
+}
+```
+
+The event ID is stable, and delivery is at least once across reconnects. Use it
+for deduplication. Notifications and subscriber output are bounded; if a reader
+lags, its cursor replays from the WAL instead of applying backpressure to
+capture.
+
+For action hooks, configure `VIDARAX_WEBHOOK_SECRET` and register a target with
+`POST /v1/runs/{id}/webhooks`. Webhooks send the same envelope, optionally
+filtered by exact event kinds. Failed attempts retry and then enter visible
+dead-letter state from `GET /v1/runs/{id}/webhooks`. Binary images and clips are
+not transformed into JSON/base64: `data` carries their sidecar reference, hash,
+media type, and byte count exactly as the timeline event does.
+
 ## Event kinds and payloads
 
 Run lifecycle and analysis kinds written by the API handlers, with the payload fields each one carries:
@@ -145,7 +180,9 @@ The full public surface:
 | `getEvents(id, index?)` / `getMarkers(id, query?)` | Fetch the current event list or filtered marker list. |
 | `getInteractions(id, index?)` | Fetch guided semantic interactions derived from chunk events. |
 | `getKeyframe(id, sha256)` | Fetch a referenced keyframe as a raw JPEG `Blob`. |
-| `streamEvents(id, index?)` / `streamMarkers(id, query?)` | Async iterators over one fetched snapshot. |
+| `streamEvents(id, index?)` / `streamMarkers(id, query?)` | Async iterators over one fetched snapshot. Use the SSE API directly for a durable live subscription. |
+| `subscribeEvents(id, options?)` | Durable SSE replay/follow iterator with API-key headers and `Last-Event-ID` reconnect. |
+| `createWebhook(id, request)` / `listWebhooks(id)` / `deleteWebhook(id, webhookId)` | Register filtered signed hooks and inspect delivery/dead-letter state. |
 | `query(request)` | Cross-run event query with a `from_seq` cursor. |
 | `search(query, opts?)` | Substring search over VLM descriptions, with optional `run_id` and `limit`. |
 | `infer(opts)` / `inferBatch(requests, opts?)` | Single or batch inference. |
@@ -159,6 +196,6 @@ The full public surface:
 | `whipTerminate(sessionId)` | End a WebRTC session. |
 | `listModels()` / `health()` / `waitUntilHealthy(opts?)` | Model catalog and health checks. |
 
-`streamEvents` and `streamMarkers` are convenience iterators over a single fetched snapshot, not push streams. Live consumers poll `query()` with a `from_seq` cursor. Structured inference and live prompt updates accept `output_schema` as a JSON Schema object; callers do not stringify it first.
+`streamEvents` and `streamMarkers` remain compatibility iterators over a single fetched snapshot, not push streams. Live SDK consumers use `subscribeEvents`; direct HTTP consumers use `GET /v1/runs/{id}/events/stream` and reconnect with `Last-Event-ID`. Structured inference and live prompt updates accept `output_schema` as a JSON Schema object; callers do not stringify it first.
 
 All SDK errors extend `VidaraxError`, with subclasses `HttpError`, `NetworkError`, `RetryExhaustedError`, `UploadError`, and `ParseError`.

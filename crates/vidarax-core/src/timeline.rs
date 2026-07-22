@@ -151,6 +151,41 @@ pub fn read_all_events(path: impl AsRef<Path>) -> Result<Vec<TimelineEvent>, Tim
     Ok(out)
 }
 
+/// Read at most `limit` events newer than `after_seq` without materializing the
+/// full WAL. Delivery consumers use this as their recovery path after a
+/// bounded live-notification queue lags. Sequence numbers are global and
+/// monotonic, so reaching `limit` is a safe batch boundary for the next scan.
+pub fn read_events_after(
+    path: impl AsRef<Path>,
+    after_seq: u64,
+    limit: usize,
+) -> Result<Vec<TimelineEvent>, TimelineError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let file = match OpenOptions::new().read(true).open(path.as_ref()) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(TimelineError::Io(err)),
+    };
+    let reader = BufReader::new(file);
+    let mut out = Vec::with_capacity(limit.min(256));
+    for line in reader.lines() {
+        let line = line?;
+        let Some(event) = TimelineEvent::decode_line(&line) else {
+            continue;
+        };
+        if event.seq <= after_seq {
+            continue;
+        }
+        out.push(event);
+        if out.len() == limit {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 pub trait EventIndex {
     fn append(&mut self, event: &TimelineEvent) -> Result<(), String>;
     fn has_sequence(&self, seq: u64) -> bool;
@@ -246,8 +281,8 @@ fn restore(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_event, read_all_events, DualWriter, EventIndex, TimelineError, TimelineEvent,
-        WalWriter,
+        append_event, read_all_events, read_events_after, DualWriter, EventIndex, TimelineError,
+        TimelineEvent, WalWriter,
     };
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -333,6 +368,22 @@ mod tests {
         let events = read_all_events(&path).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0], event);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bounded_cursor_read_is_strictly_after_and_capped() {
+        let path = test_path("cursor");
+        for seq in 1..=8 {
+            append_event(&path, &event(seq)).unwrap();
+        }
+        let events = read_events_after(&path, 3, 2).unwrap();
+        assert_eq!(
+            events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        assert!(read_events_after(&path, 8, 2).unwrap().is_empty());
+        assert!(read_events_after(&path, 0, 0).unwrap().is_empty());
         let _ = std::fs::remove_file(path);
     }
 }

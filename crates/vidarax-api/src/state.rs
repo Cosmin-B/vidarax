@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 
 use serde_json::Value;
 
@@ -26,10 +26,11 @@ use vidarax_core::novelty::LiveNoveltyConfig;
 use vidarax_core::provider::{AdmittedProvider, InferenceProvider};
 #[cfg(test)]
 use vidarax_core::timeline::append_event;
-use vidarax_core::timeline::{read_all_events, TimelineEvent, WalWriter};
+use vidarax_core::timeline::{read_all_events, read_events_after, TimelineEvent, WalWriter};
 use vidarax_core::webrtc::resources::MediaSessionResources;
 use vidarax_core::webrtc::session::WebRtcSession;
 
+use crate::delivery::{DeliveryHub, DeliveryMetrics};
 use crate::ids::{parse_run_sequence, random_run_id};
 use crate::inference_metrics::InferenceMetrics;
 use crate::security::SecurityPolicy;
@@ -291,6 +292,7 @@ pub struct AppStateInner {
     run_registry: Arc<RunRegistry>,
     timeline_tx: mpsc::Sender<TimelineCommand>,
     timeline_snapshot: Arc<ArcSwap<RingSnapshot>>,
+    delivery: DeliveryHub,
     #[cfg(test)]
     timeline_test_control: Arc<TimelineWriterTestControl>,
     stream_reservations: StreamReservations,
@@ -357,6 +359,7 @@ struct AppStateConfig {
     inference_admission_limits: AdmissionLimits,
     media_memory_budget_bytes: u64,
     media_worker_thread_budget: usize,
+    webhook_signing_secret: Option<String>,
 }
 
 impl AppStateConfig {
@@ -375,6 +378,7 @@ impl AppStateConfig {
             },
             media_memory_budget_bytes: u64::MAX,
             media_worker_thread_budget: usize::MAX,
+            webhook_signing_secret: None,
         }
     }
 
@@ -383,12 +387,15 @@ impl AppStateConfig {
         let wal = WalWriter::open(wal_path.as_ref()).expect("timeline WAL should open");
         let run_registry = Arc::new(RunRegistry::default());
         let timeline_snapshot = Arc::new(ArcSwap::from_pointee(RingSnapshot::default()));
+        let delivery =
+            DeliveryHub::spawn(wal_path.as_ref().clone(), &[], self.webhook_signing_secret);
         #[cfg(test)]
         let timeline_test_control = Arc::new(TimelineWriterTestControl::default());
         let timeline_tx = spawn_timeline_writer(
             wal,
             Arc::clone(&run_registry),
             Arc::clone(&timeline_snapshot),
+            delivery.event_sender(),
             0,
             HashMap::new(),
             #[cfg(test)]
@@ -414,6 +421,7 @@ impl AppStateConfig {
                 run_registry,
                 timeline_tx,
                 timeline_snapshot,
+                delivery,
                 #[cfg(test)]
                 timeline_test_control,
                 stream_reservations: Arc::new(DashMap::new()),
@@ -465,6 +473,11 @@ impl AppState {
         let novelty_embedding_timeout_ms = novelty.embedding_timeout_ms;
         let admission_wait_ms = inference_admission_limits.wait_timeout.as_millis() as u64;
         let existing_events = read_all_events(&wal_path).map_err(|err| err.to_string())?;
+        let delivery = DeliveryHub::spawn(
+            wal_path.clone(),
+            &existing_events,
+            std::env::var("VIDARAX_WEBHOOK_SECRET").ok(),
+        );
         let run_registry = build_run_registry(&existing_events);
         let initial_tails = build_event_tails(&existing_events);
         let timeline_snapshot = Arc::new(ArcSwap::from_pointee(RingSnapshot::from_tails(
@@ -497,6 +510,7 @@ impl AppState {
             wal,
             Arc::clone(&run_registry),
             Arc::clone(&timeline_snapshot),
+            delivery.event_sender(),
             max_seq,
             initial_tails,
             #[cfg(test)]
@@ -523,6 +537,7 @@ impl AppState {
                 run_registry,
                 timeline_tx,
                 timeline_snapshot,
+                delivery,
                 #[cfg(test)]
                 timeline_test_control,
                 stream_reservations: Arc::new(DashMap::new()),
@@ -567,6 +582,17 @@ impl AppState {
         provider: Option<Arc<dyn InferenceProvider + Send + Sync>>,
     ) -> Self {
         Self::with_wal_for_tests_full(wal_path, provider, SecurityPolicy::from_config_for_tests())
+    }
+
+    pub fn with_wal_for_tests_and_webhook_secret(
+        wal_path: PathBuf,
+        webhook_signing_secret: String,
+    ) -> Self {
+        AppStateConfig {
+            webhook_signing_secret: Some(webhook_signing_secret),
+            ..AppStateConfig::for_tests(wal_path)
+        }
+        .build()
     }
 
     pub fn with_wal_for_tests_full(
@@ -1195,6 +1221,33 @@ impl AppState {
         .map_err(|err| format!("timeline read worker join failure: {err}"))?
     }
 
+    /// Bounded WAL scan used by reconnecting delivery consumers. The scan runs
+    /// on the blocking pool and never materializes more than `limit` records.
+    pub(crate) async fn read_timeline_after(
+        &self,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<TimelineEvent>, String> {
+        let wal_path = Arc::clone(&self.wal_path);
+        tokio::task::spawn_blocking(move || {
+            read_events_after(wal_path.as_ref(), after_seq, limit).map_err(|err| err.to_string())
+        })
+        .await
+        .map_err(|err| format!("timeline delivery read worker join failure: {err}"))?
+    }
+
+    pub(crate) fn subscribe_timeline_events(&self) -> broadcast::Receiver<TimelineEvent> {
+        self.delivery.subscribe()
+    }
+
+    pub(crate) fn delivery(&self) -> &DeliveryHub {
+        &self.delivery
+    }
+
+    pub(crate) fn delivery_metrics(&self) -> &Arc<DeliveryMetrics> {
+        self.delivery.metrics()
+    }
+
     /// Read a run's events with `seq >= from_seq`, served from the in-memory
     /// tail when it still holds that range and falling back to a WAL scan only
     /// on a cold ring or a cursor older than the tail. The result is filtered to
@@ -1563,6 +1616,7 @@ struct TimelineWriter {
     wal: WalWriter,
     registry: Arc<RunRegistry>,
     snapshot: Arc<ArcSwap<RingSnapshot>>,
+    delivery_events: broadcast::Sender<TimelineEvent>,
     next_seq: u64,
     tails: HashMap<String, Arc<VecDeque<TimelineEvent>>>,
     tail_recency: HashMap<String, u64>,
@@ -1644,6 +1698,10 @@ impl TimelineWriter {
             guard.commit();
         }
         self.publish();
+        // This notification is deliberately best effort. Every consumer owns
+        // a durable sequence cursor and recovers a missed notification from the
+        // WAL, so sending never waits for network delivery or subscriber space.
+        let _ = self.delivery_events.send(event.clone());
         Ok(event)
     }
 
@@ -1667,6 +1725,7 @@ fn spawn_timeline_writer(
     wal: WalWriter,
     registry: Arc<RunRegistry>,
     snapshot: Arc<ArcSwap<RingSnapshot>>,
+    delivery_events: broadcast::Sender<TimelineEvent>,
     next_seq: u64,
     tails: HashMap<String, Arc<VecDeque<TimelineEvent>>>,
     #[cfg(test)] test_control: Arc<TimelineWriterTestControl>,
@@ -1680,6 +1739,7 @@ fn spawn_timeline_writer(
         wal,
         registry,
         snapshot,
+        delivery_events,
         next_seq,
         tails,
         tail_recency,
@@ -2344,10 +2404,12 @@ mod tests {
             std::env::temp_dir().join(format!("vidarax-state-cow-tail-{}.wal", std::process::id()));
         std::fs::remove_file(&wal_path).ok();
         let snapshot = Arc::new(ArcSwap::from_pointee(RingSnapshot::default()));
+        let (delivery_events, _) = broadcast::channel(1);
         let mut writer = TimelineWriter {
             wal: WalWriter::open(&wal_path).unwrap(),
             registry: Arc::new(RunRegistry::default()),
             snapshot: Arc::clone(&snapshot),
+            delivery_events,
             next_seq: 0,
             tails: HashMap::new(),
             tail_recency: HashMap::new(),
@@ -2455,10 +2517,12 @@ mod tests {
         ));
         std::fs::remove_file(&wal_path).ok();
         let snapshot = Arc::new(ArcSwap::from_pointee(RingSnapshot::default()));
+        let (delivery_events, _) = broadcast::channel(1);
         let mut writer = TimelineWriter {
             wal: WalWriter::open(&wal_path).unwrap(),
             registry: Arc::new(RunRegistry::default()),
             snapshot,
+            delivery_events,
             next_seq: 0,
             tails: HashMap::new(),
             tail_recency: HashMap::new(),

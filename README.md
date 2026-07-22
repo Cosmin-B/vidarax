@@ -115,7 +115,10 @@ The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via
 | `POST` | `/v1/runs/:id/reason` | Realtime semantic reasoning (tiered VLM) |
 | `POST` | `/v1/runs/:id/stop` | Stop a run |
 | `POST` | `/v1/runs/:id/keepalive` | Refresh active run TTL |
-| `GET` | `/v1/runs/:id/events` | List run events (poll; the SDK does not push-stream this) |
+| `GET` | `/v1/runs/:id/events` | List the current run-event snapshot |
+| `GET` | `/v1/runs/:id/events/stream` | Replay and follow run events over cursor-based SSE |
+| `GET`, `POST` | `/v1/runs/:id/webhooks` | List or register signed event webhooks |
+| `DELETE` | `/v1/runs/:id/webhooks/:webhook_id` | Remove a webhook |
 | `GET` | `/v1/runs/:id/markers` | Marker timeline (filterable) |
 | `GET` | `/v1/runs/:id/state` | Derived run state |
 | `GET` | `/v1/runs/:id/interactions` | Interaction timeline |
@@ -156,6 +159,7 @@ The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via
 | `VIDARAX_MEDIA_MEMORY_BUDGET_BYTES` | `8589934592` | Process-wide reservation budget for live media payloads |
 | `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` | `64` | Process-wide reservation budget for live pipeline OS threads |
 | `VIDARAX_STREAM_TTL_SECS` | `3600` | Run idle TTL |
+| `VIDARAX_WEBHOOK_SECRET` | — | Process signing secret for webhooks; 32 bytes minimum |
 
 Full configuration reference in [docs/deployment.md](docs/deployment.md).
 

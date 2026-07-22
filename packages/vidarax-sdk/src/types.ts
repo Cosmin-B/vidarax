@@ -110,6 +110,54 @@ export interface EventsResponse {
   events: AgentEvent[];
 }
 
+/** Options for the durable SSE event subscription. */
+export interface EventSubscriptionOptions {
+  /** Start strictly after this durable timeline sequence. */
+  after?: number;
+  /** Optional exact event-kind filter. */
+  kind?: string;
+  /** Cancels the current request and prevents reconnect. */
+  signal?: AbortSignal;
+  /** Reconnect when the response ends unexpectedly (default: true). */
+  reconnect?: boolean;
+  /** Delay before reconnecting an ended or failed stream (default: 500 ms). */
+  reconnectDelayMs?: number;
+}
+
+/** Request accepted by `createWebhook()`. */
+export interface CreateWebhookRequest {
+  url: string;
+  event_kinds?: string[];
+}
+
+/** Durable webhook configuration and delivery state. */
+export interface Webhook {
+  webhook_id: string;
+  url: string;
+  event_kinds: string[];
+  registered_seq: number;
+  last_terminal_seq: number;
+  delivered: number;
+  dead_letters: number;
+  last_error: string | null;
+  state: "pending" | "active";
+}
+
+export interface CreateWebhookResponse {
+  request_id: string;
+  run_id: string;
+  webhook_id: string;
+  url: string;
+  event_kinds: string[];
+  registered_seq: number;
+}
+
+export interface WebhookListResponse {
+  request_id: string;
+  run_id: string;
+  webhooks: Webhook[];
+}
+
 // ─── Markers ─────────────────────────────────────────────────────────────────
 
 /**

@@ -4,6 +4,7 @@ use std::{io, sync::Arc};
 
 mod auth;
 pub mod config;
+mod delivery;
 mod handlers;
 mod ids;
 mod inference_metrics;

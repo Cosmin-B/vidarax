@@ -27,6 +27,9 @@ The API is served over HTTP/1.1 and HTTP/2, with optional HTTP/3 behind the `h3-
 | `POST` | `/v1/runs/:id/stop` | Stop a run |
 | `POST` | `/v1/runs/:id/keepalive` | Refresh active run TTL |
 | `GET` | `/v1/runs/:id/events` | Read run events |
+| `GET` | `/v1/runs/:id/events/stream` | Replay and follow events over SSE |
+| `GET`, `POST` | `/v1/runs/:id/webhooks` | List or register signed webhooks |
+| `DELETE` | `/v1/runs/:id/webhooks/:webhook_id` | Remove a webhook |
 | `GET` | `/v1/runs/:id/markers` | Marker timeline (filterable) |
 | `GET` | `/v1/runs/:id/state` | Derived run state |
 | `GET` | `/v1/runs/:id/interactions` | Interaction timeline |
@@ -79,10 +82,41 @@ The API is served over HTTP/1.1 and HTTP/2, with optional HTTP/3 behind the `h3-
 | Route | Request | Success (200) | Failures |
 |---|---|---|---|
 | `GET /v1/runs/:id/events` | `?index=<name>` optional payload filter | `{ request_id, run_id, events[] }` in sequence order | 404, 422, 500 |
+| `GET /v1/runs/:id/events/stream` | `?after=<seq>` and exact `?kind=<kind>` optional; `Last-Event-ID` takes precedence over `after` | `text/event-stream`; each event has `id: <seq>`, `event: <kind>`, and a CloudEvents-compatible JSON body | 404, 422, 500 |
 | `GET /v1/runs/:id/markers` | `?status`, `?event_type`, `?from_frame`, `?to_frame` | `{ request_id, run_id, markers[] }` sorted by frame range | 404, 422, 500 |
 | `GET /v1/runs/:id/interactions` | `?index=<name>` optional | `{ run_id, count, interactions[] }` derived from semantic chunk events | 404, 422, 500 |
 | `POST /v1/query` | `{ run_id, kind?, from_seq? }`; `run_id` is required and ownership-checked | `{ request_id, query, matches[] }` | 404, 422, 500 |
 | `POST /v1/search` | `{ query, run_id?, limit? }`; query trimmed, 1 to 1024 bytes; limit in [1, 500], default 50 | `{ request_id, scanned, total_hits, hits[] }`; case-insensitive substring over payload `description` (fallback `summary`); scoped to owned runs when `run_id` is absent | 404, 422, 500 |
+
+SSE cursors are durable timeline sequence numbers. Reconnect with the last
+received `id` in `Last-Event-ID`; replay is strictly after that value. The
+server subscribes to its bounded notification ring before reading the WAL, and
+recovers notification lag from the WAL, so a slow consumer cannot block ingest
+or create an unbounded server queue. Delivery is at least once around reconnect:
+deduplicate with the CloudEvent `id`, `<run_id>:<seq>`.
+
+### Webhooks
+
+| Route | Request | Success | Failures |
+|---|---|---|---|
+| `POST /v1/runs/:id/webhooks` | `{ url, event_kinds?: string[] }`; HTTPS public target, up to 32 exact kinds; an empty list means every non-bookkeeping event | 201 with `{ request_id, run_id, webhook_id, url, event_kinds, registered_seq }` | 404, 422, 500, 503 webhooks disabled or capacity unavailable |
+| `GET /v1/runs/:id/webhooks` | none | `{ request_id, run_id, webhooks[] }`, including cursor, successful-delivery, dead-letter, and last-error state | 404, 500 |
+| `DELETE /v1/runs/:id/webhooks/:webhook_id` | none | `{ request_id, run_id, webhook_id, deleted: true }` | 404, 500 |
+
+Registrations and deletions are timeline events and survive restart. A bounded
+per-hook wake queue only signals work; each isolated worker reads its next batch
+from the WAL, retries failed requests three times, and records terminal state in
+`${VIDARAX_DATA_DIR}/webhook-delivery.wal`. A receiver may see a duplicate when
+the process stops after the receiver accepted a request but before the terminal
+record was flushed. Treat `x-vidarax-event-id` as the idempotency key. Delivery
+bookkeeping events are never delivered recursively.
+
+Requests use `Content-Type: application/cloudevents+json`,
+`x-vidarax-event-id: <run_id>:<seq>`, and
+`x-vidarax-signature: v1=<HMAC-SHA256(body)>`. Binary media remains in the
+content-addressed sidecar; event bodies carry only its existing reference and
+hash. `VIDARAX_WEBHOOK_SECRET` must contain at least 32 bytes and is one signing
+trust domain for the process.
 
 ### Inference
 
@@ -208,6 +242,7 @@ Not everything uses the envelope. WHIP routes return raw SDP on success and bare
 | `VIDARAX_MEDIA_MEMORY_BUDGET_BYTES` | `8589934592` | Process-wide byte reservation for admitted live media generations |
 | `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` | `64` | Process-wide OS-thread reservation for admitted live media generations |
 | `VIDARAX_STREAM_TTL_SECS` | `3600` | Run idle TTL |
+| `VIDARAX_WEBHOOK_SECRET` | unset | Enables HMAC-SHA256 webhooks; at least 32 bytes, never persisted in the timeline |
 | `VIDARAX_NOVELTY_EMBEDDING_ADDR` | unset | Binary TCP embedding sidecar; setting it enables live semantic novelty |
 | `VIDARAX_NOVELTY_REUSE_THRESHOLD` | `0.01` | Conservative embedding-distance ceiling for description reuse; calibrate it on labelled deployment traffic |
 

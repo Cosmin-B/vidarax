@@ -25,6 +25,28 @@ The earlier `api-key:<fnv1a64>` and `tenant:<id>` principal formats were
 introduced only within this same unreleased change set. They were never
 shipped, so there is no production data in those formats to migrate or trust.
 
+## Outbound Webhooks
+
+Webhook registration inherits run ownership: a principal can list, create, or
+delete hooks only for its own run. `VIDARAX_WEBHOOK_SECRET` is a process-level
+HMAC-SHA256 secret and must contain at least 32 bytes. It is held in memory,
+never persisted in the timeline, and never returned by an API response. Each
+request carries `x-vidarax-event-id: <run_id>:<seq>` and
+`x-vidarax-signature: v1=<hex-hmac>` over the exact request body.
+
+Targets must be HTTPS URLs without credentials or fragments. Registration and
+every delivery attempt resolve the hostname and reject private, loopback,
+link-local, documentation, multicast, and cloud-metadata address ranges. The
+HTTP client pins the validated addresses, bypasses ambient proxies, refuses all
+redirects, and limits the complete attempt to three seconds. Operators should
+still restrict process egress to expected receiver networks as defense in
+depth.
+
+Webhook bodies are CloudEvents-compatible event metadata. Binary keyframes and
+clips are never embedded or base64-encoded; the existing content-addressed
+sidecar reference remains in `data`. Receivers must fetch media through the
+authenticated blob route when needed.
+
 ## Ingest File Ownership
 
 Files uploaded through `POST /v1/upload` are owned by the authenticated

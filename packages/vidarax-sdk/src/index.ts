@@ -59,6 +59,11 @@ export type {
   // Events
   AgentEvent,
   EventsResponse,
+  EventSubscriptionOptions,
+  CreateWebhookRequest,
+  CreateWebhookResponse,
+  Webhook,
+  WebhookListResponse,
 
   // Markers
   Marker,

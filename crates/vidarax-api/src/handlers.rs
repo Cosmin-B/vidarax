@@ -2276,6 +2276,7 @@ pub async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     ));
     metrics.push_str(&state.pipeline_metrics().render_prometheus());
     metrics.push_str(&state.render_media_capacity_prometheus());
+    metrics.push_str(&state.delivery_metrics().render_prometheus());
     (axum::http::StatusCode::OK, metrics)
 }
 
@@ -3707,7 +3708,7 @@ async fn load_existing_events(
         .map_err(|err| internal_error(state, format!("failed to read run events: {err}")))
 }
 
-fn load_run_snapshot(
+pub(crate) fn load_run_snapshot(
     state: &AppState,
     headers: &HeaderMap,
     run_id: &str,

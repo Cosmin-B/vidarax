@@ -59,6 +59,7 @@ paths. Values below come from the current Rust source, mainly
 | `VIDARAX_TENANT_LABEL_MAPS_PATH` | unset | Optional JSON file for event and object label mapping by tenant metadata. |
 | `VIDARAX_SPACETIMEDB_URL` | unset | Adds a best-effort feedback and blocking-description mirror after local WAL commit. Feedback works without it; raw keyframes stay local. |
 | `VIDARAX_SPACETIMEDB_MODULE` | `vidarax` | SpacetimeDB database/module name. Only used when `VIDARAX_SPACETIMEDB_URL` is set. |
+| `VIDARAX_WEBHOOK_SECRET` | unset | Enables outbound webhooks when set to at least 32 bytes. The value signs every delivery in this process and is never written to the timeline WAL or returned by the API. |
 | `RUST_LOG` | `info` | Tracing filter used by `tracing_subscriber`. |
 | `VIDARAX_TRACES_ENDPOINT` | unset | Optional OTLP gRPC endpoint for trace export. |
 
@@ -70,6 +71,13 @@ probes configured backends and reports readiness per curated model.
 
 The `VIDARAX_STAGING_*` names are live-test fixtures, not server settings.
 WHIP events always commit locally. SpacetimeDB receives descriptions only.
+
+Webhook registration is disabled until `VIDARAX_WEBHOOK_SECRET` is configured.
+One secret defines one deployment trust domain; rotate it as an application
+credential and update receivers before restarting Vidarax. Webhook targets must
+use HTTPS and resolve only to public addresses. Vidarax pins the validated
+addresses for each attempt, disables proxies and redirects, and applies a
+three-second total attempt deadline.
 
 ## Build and run
 

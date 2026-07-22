@@ -28,6 +28,8 @@ arc-swap = "1.8"
 dashmap = "5.5"
 base64 = "0.22.1"
 sha2 = "0.10"
+hmac = "0.12"
+tokio-stream = "0.1"
 vidarax-contracts = { path = "../vidarax-contracts" }
 vidarax-core = { path = "../vidarax-core" }
 kanal = "0.1.1"

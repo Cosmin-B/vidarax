@@ -125,6 +125,28 @@ pub(crate) fn validate_remote_fetch_url(url: &reqwest::Url) -> Result<Vec<Socket
     validate_resolved_public_host(host, port)
 }
 
+/// Validate an outbound HTTPS callback and resolve it only to public addresses.
+///
+/// The returned addresses are intended to be pinned into the HTTP client that
+/// performs the request. Call this for every attempt so DNS changes are checked
+/// again rather than trusted indefinitely. Redirects still need to be disabled
+/// by the caller because a redirect target has not passed this validation.
+pub fn validate_public_https_url(url: &reqwest::Url) -> Result<Vec<SocketAddr>, String> {
+    if url.scheme() != "https" {
+        return Err("callback URL must use https".to_string());
+    }
+    if url.fragment().is_some() {
+        return Err("callback URL must not contain a fragment".to_string());
+    }
+    let host = validate_remote_host(url).map_err(callback_error)?;
+    validate_resolved_public_host(host, url.port_or_known_default().unwrap_or(443))
+        .map_err(callback_error)
+}
+
+fn callback_error(message: String) -> String {
+    message.replace("source_uri", "callback URL")
+}
+
 fn validate_remote_url_string_with_resolver<F, R>(
     url: reqwest::Url,
     default_port: u16,
@@ -298,7 +320,7 @@ fn blocked_ip(ip: &IpAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::InputSource;
+    use super::{validate_public_https_url, InputSource};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -374,6 +396,20 @@ mod tests {
         let source = InputSource::parse_and_validate(video.to_string_lossy().as_ref(), &[root])
             .expect("file path should be valid");
         assert!(matches!(source, InputSource::FilePath(_)));
+    }
+
+    #[test]
+    fn public_callback_validation_rejects_insecure_and_internal_targets() {
+        for raw in [
+            "http://example.com/hook",
+            "https://127.0.0.1/hook",
+            "https://169.254.169.254/latest/meta-data",
+            "https://user:secret@example.com/hook",
+            "https://example.com/hook#fragment",
+        ] {
+            let url = reqwest::Url::parse(raw).unwrap();
+            assert!(validate_public_https_url(&url).is_err(), "accepted {raw}");
+        }
     }
 
     #[test]
