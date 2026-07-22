@@ -57,7 +57,7 @@ paths. Values below come from the current Rust source, mainly
 | `VIDARAX_ALLOW_UNENCRYPTED_RTSP` | `false` | Allow `rtsp://` camera sources. |
 | `VIDARAX_ALLOW_INSECURE_TLS` | `false` | Omit ffmpeg TLS verification arguments for supported live sources. |
 | `VIDARAX_TENANT_LABEL_MAPS_PATH` | unset | Optional JSON file for event and object label mapping by tenant metadata. |
-| `VIDARAX_SPACETIMEDB_URL` | unset | Enables feedback endpoints and mirrors blocking WHIP description events after local WAL commit. Raw keyframes stay local. |
+| `VIDARAX_SPACETIMEDB_URL` | unset | Adds a best-effort feedback and blocking-description mirror after local WAL commit. Feedback works without it; raw keyframes stay local. |
 | `VIDARAX_SPACETIMEDB_MODULE` | `vidarax` | SpacetimeDB database/module name. Only used when `VIDARAX_SPACETIMEDB_URL` is set. |
 | `RUST_LOG` | `info` | Tracing filter used by `tracing_subscriber`. |
 | `VIDARAX_TRACES_ENDPOINT` | unset | Optional OTLP gRPC endpoint for trace export. |
@@ -236,8 +236,8 @@ A useful deployment needs:
 - Optional HTTP/3 TLS certificate and key when `VIDARAX_TRANSPORT=h3`. The
   binary must be built with `--features h3-experimental`; otherwise the server
   rejects H3 transport at startup.
-- Optional SpacetimeDB for feedback and description mirroring. The local WAL
-  and JPEG blobs remain the source of record.
+- Optional SpacetimeDB as an additive feedback and description mirror. The
+  local WAL and JPEG blobs remain the source of record.
 
 ## Docker and compose
 

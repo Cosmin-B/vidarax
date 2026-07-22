@@ -40,3 +40,67 @@ describe("WHIP offer", () => {
     expect(JSON.parse(new TextDecoder().decode(bytes))).toEqual(attachConfig);
   });
 });
+
+describe("policy lifecycle", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("uses the run-scoped revision, replay, and activation endpoints", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/replay")) {
+        return Response.json({
+          request_id: "req-replay",
+          run_id: "run-sdk0001",
+          evaluation_id: 8,
+          evaluation: {
+            revision: 2,
+            source: "local_wal",
+            comparison: "persisted candidates",
+            from_seq: 0,
+            to_seq: null,
+            candidate_events: 1,
+            accepted_events: 1,
+            rejected_events: 0,
+            events_without_score: 0,
+            threshold: 0.6,
+            limitation: "persisted candidates only",
+          },
+        });
+      }
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      return Response.json({
+        request_id: "req-policy",
+        run_id: "run-sdk0001",
+        policy: {
+          revision: 2,
+          parent_revision: null,
+          status: body.stage ?? "draft",
+          prompt: body.prompt ?? null,
+          output_schema: null,
+          parameters: body.parameters ?? {},
+          created_at_ms: 1,
+          updated_at_ms: 1,
+          effective_generation: null,
+          effective_on_current_generation: false,
+          deferred_fields: [],
+        },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new Vidarax("http://127.0.0.1:8080");
+    const created = await client.createPolicy("run-sdk0001", { prompt: "watch the bay" });
+    await client.activatePolicy("run-sdk0001", created.policy.revision, { stage: "shadow" });
+    const replay = await client.replayPolicy("run-sdk0001", created.policy.revision);
+
+    expect(created.policy.status).toBe("draft");
+    expect(replay.evaluation.source).toBe("local_wal");
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      "http://127.0.0.1:8080/v1/runs/run-sdk0001/policies",
+      "http://127.0.0.1:8080/v1/runs/run-sdk0001/policies/2/activate",
+      "http://127.0.0.1:8080/v1/runs/run-sdk0001/policies/2/replay",
+    ]);
+  });
+});

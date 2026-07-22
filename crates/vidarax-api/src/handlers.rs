@@ -2549,12 +2549,11 @@ fn infer_execution_error_to_response(state: &AppState, err: InferExecutionError)
 #[cfg(test)]
 mod tests {
     use super::{
-        feedback_payload_error, feedback_rows_to_json_for_owned_runs, marker_to_emit_event_request,
-        owned_run_ids_from_events, parse_provider, run_command_with_timeout,
-        validate_infer_request, AnalyzeMarker, InferRequest, ProviderKind,
-        MAX_FEEDBACK_CATEGORY_LEN, MAX_FEEDBACK_TEXT_LEN,
+        feedback_events_to_json_for_owned_runs, feedback_payload_error,
+        marker_to_emit_event_request, owned_run_ids_from_events, parse_provider,
+        run_command_with_timeout, validate_infer_request, AnalyzeMarker, InferRequest,
+        ProviderKind, MAX_FEEDBACK_CATEGORY_LEN, MAX_FEEDBACK_TEXT_LEN,
     };
-    use crate::spacetime_client::FeedbackRow;
     use crate::state::AppState;
     use axum::http::HeaderMap;
     use serde_json::json;
@@ -2562,6 +2561,7 @@ mod tests {
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
+    use vidarax_core::timeline::TimelineEvent;
 
     #[test]
     fn parse_provider_accepts_every_configured_backend() {
@@ -2704,32 +2704,40 @@ mod tests {
     }
 
     #[test]
-    fn feedback_list_filters_rows_to_owned_runs() {
-        let rows = vec![
-            FeedbackRow {
-                id: 1,
-                agent_id: "0xagent".to_string(),
+    fn feedback_list_filters_wal_events_to_owned_runs() {
+        let events = vec![
+            TimelineEvent {
+                seq: 1,
                 run_id: "run-00000000000000aa".to_string(),
-                session_id: "sess-a".to_string(),
-                rating: 8,
-                category: "quality".to_string(),
-                feedback: "owned".to_string(),
-                timestamp_micros: 1,
+                stream_id: "stream-0".to_string(),
+                pts_ms: 10,
+                kind: "operator_feedback_submitted".to_string(),
+                payload: json!({
+                    "session_id": "sess-a",
+                    "rating": 8,
+                    "category": "quality",
+                    "feedback": "owned",
+                })
+                .to_string(),
             },
-            FeedbackRow {
-                id: 2,
-                agent_id: "0xagent".to_string(),
+            TimelineEvent {
+                seq: 2,
                 run_id: "run-00000000000000bb".to_string(),
-                session_id: "sess-b".to_string(),
-                rating: 2,
-                category: "quality".to_string(),
-                feedback: "other".to_string(),
-                timestamp_micros: 2,
+                stream_id: "stream-0".to_string(),
+                pts_ms: 20,
+                kind: "operator_feedback_submitted".to_string(),
+                payload: json!({
+                    "session_id": "sess-b",
+                    "rating": 2,
+                    "category": "quality",
+                    "feedback": "other",
+                })
+                .to_string(),
             },
         ];
         let owned = HashSet::from(["run-00000000000000aa".to_string()]);
 
-        let filtered = feedback_rows_to_json_for_owned_runs(rows, &owned);
+        let filtered = feedback_events_to_json_for_owned_runs(&events, &owned);
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["run_id"].as_str(), Some("run-00000000000000aa"));
@@ -2853,15 +2861,6 @@ pub async fn submit_feedback(
         return error;
     }
 
-    // SpacetimeDB is an optional dependency, so its absence is a 503, not a 500.
-    let Some(stdb) = state.spacetime_client() else {
-        return service_unavailable(
-            &state,
-            "spacetimedb_not_configured",
-            "feedback requires SpacetimeDB, which is not configured",
-        );
-    };
-
     let req = crate::spacetime_client::SubmitFeedbackRequest {
         run_id: run_id.clone(),
         session_id: String::new(),
@@ -2869,44 +2868,64 @@ pub async fn submit_feedback(
         category: payload.category,
         feedback: payload.feedback.unwrap_or_default(),
     };
-    if let Err(err) = stdb.submit_feedback_async(&req).await {
-        return internal_error(&state, format!("spacetimedb submit_feedback failed: {err}"));
+    // The local WAL is the source of truth. Persist before attempting the
+    // optional mirror so feedback remains available in a standalone install
+    // and a mirror outage can never turn a durable operator decision into a
+    // failed request.
+    let feedback_event = match state
+        .append_run_event_async(
+            &run_id,
+            "operator_feedback_submitted",
+            json!({
+                "session_id": req.session_id,
+                "rating": req.rating,
+                "category": req.category,
+                "feedback": req.feedback,
+            }),
+        )
+        .await
+    {
+        Ok(event) => event,
+        Err(err) => return internal_error(&state, format!("failed to append feedback: {err}")),
+    };
+
+    let mut mirrored_to_spacetimedb = false;
+    if let Some(stdb) = state.spacetime_client() {
+        match stdb.submit_feedback_async(&req).await {
+            Ok(()) => mirrored_to_spacetimedb = true,
+            Err(err) => tracing::warn!(
+                run_id,
+                feedback_seq = feedback_event.seq,
+                %err,
+                "SpacetimeDB feedback mirror failed after local WAL commit"
+            ),
+        }
     }
 
     ok(json!({
         "request_id": state.next_request_id(),
         "run_id": run_id,
-        "status": "submitted"
+        "feedback_id": feedback_event.seq,
+        "status": "submitted",
+        "storage": "local_wal",
+        "mirrored_to_spacetimedb": mirrored_to_spacetimedb,
     }))
 }
 
 #[tracing::instrument(name = "api.list_feedback", skip_all)]
 pub async fn list_feedback(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    // SpacetimeDB is an optional dependency, so its absence is a 503, not a 500.
-    let Some(stdb) = state.spacetime_client() else {
-        return service_unavailable(
-            &state,
-            "spacetimedb_not_configured",
-            "feedback requires SpacetimeDB, which is not configured",
-        );
-    };
     let principal = state.security_policy().principal_key_from_headers(&headers);
     let all_events = match state.read_all_events_async().await {
         Ok(events) => events,
         Err(err) => return internal_error(&state, format!("failed to read events: {err}")),
     };
     let owned_run_ids = owned_run_ids_from_events(&all_events, &principal);
-
-    match stdb.query_feedback_async(None).await {
-        Ok(rows) => {
-            let items = feedback_rows_to_json_for_owned_runs(rows, &owned_run_ids);
-            ok(json!({
-                "request_id": state.next_request_id(),
-                "feedback": items
-            }))
-        }
-        Err(err) => internal_error(&state, format!("spacetimedb query feedback failed: {err}")),
-    }
+    let items = feedback_events_to_json_for_owned_runs(&all_events, &owned_run_ids);
+    ok(json!({
+        "request_id": state.next_request_id(),
+        "feedback": items,
+        "storage": "local_wal",
+    }))
 }
 
 // ─── New resource endpoints ────────────────────────────────────────────────
@@ -3416,21 +3435,26 @@ fn label_map_key_from_principal(principal: &str) -> Option<&str> {
     (principal != "public").then_some(principal)
 }
 
-fn feedback_rows_to_json_for_owned_runs(
-    rows: Vec<crate::spacetime_client::FeedbackRow>,
+fn feedback_events_to_json_for_owned_runs(
+    events: &[TimelineEvent],
     owned_run_ids: &HashSet<String>,
 ) -> Vec<Value> {
-    rows.into_iter()
-        .filter(|r| owned_run_ids.contains(&r.run_id))
-        .map(|r| {
+    events
+        .iter()
+        .filter(|event| {
+            event.kind == "operator_feedback_submitted" && owned_run_ids.contains(&event.run_id)
+        })
+        .map(|event| {
+            let payload = parse_payload(&event.payload);
             json!({
-                "id": r.id,
-                "run_id": r.run_id,
-                "session_id": r.session_id,
-                "rating": r.rating,
-                "category": r.category,
-                "feedback": r.feedback,
-                "timestamp_micros": r.timestamp_micros,
+                "id": event.seq,
+                "run_id": event.run_id,
+                "session_id": payload.get("session_id").and_then(Value::as_str).unwrap_or(""),
+                "rating": payload.get("rating").and_then(Value::as_u64).unwrap_or(0),
+                "category": payload.get("category").and_then(Value::as_str).unwrap_or(""),
+                "feedback": payload.get("feedback").and_then(Value::as_str).unwrap_or(""),
+                "timestamp_micros": event.pts_ms.saturating_mul(1000),
+                "storage": "local_wal",
             })
         })
         .collect()

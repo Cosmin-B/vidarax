@@ -12,7 +12,7 @@ This page covers what a deployment consists of, what the server exposes for obse
 - Network egress controls for untrusted remote media (see below).
 - Optionally, a TLS certificate and key when running the experimental HTTP/3 transport; the binary must be built with `--features h3-experimental`, otherwise the server rejects H3 transport at startup.
 - Optionally, the SigLIP2 embedding sidecar: setting `VIDARAX_NOVELTY_EMBEDDING_ADDR` enables live semantic novelty. It uses raw binary JPEG and embedding payloads over TCP.
-- Optionally, SpacetimeDB: setting `VIDARAX_SPACETIMEDB_URL` enables feedback and mirrors blocking WHIP description events after their local WAL commit. Nonblocking events and keyframe blobs stay local.
+- Optionally, SpacetimeDB: setting `VIDARAX_SPACETIMEDB_URL` adds a best-effort feedback and blocking-description mirror after local WAL commit. Feedback does not require it. Nonblocking events and keyframe blobs stay local.
 
 ## Docker and compose
 

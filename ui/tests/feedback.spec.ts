@@ -19,6 +19,7 @@ const MOCK_RUN = {
 
 test.describe('Run detail — feedback panel', () => {
   test.beforeEach(async ({ page }) => {
+    let policies: Array<Record<string, unknown>> = []
     // Mock the run GET endpoint so the page loads without a real API server
     await page.route(`http://localhost:8080/v1/runs/${RUN_ID}`, async route => {
       if (route.request().method() === 'GET') {
@@ -41,6 +42,66 @@ test.describe('Run detail — feedback panel', () => {
       })
     })
 
+    await page.route(`http://localhost:8080/v1/runs/${RUN_ID}/policies**`, async route => {
+      const url = route.request().url()
+      const method = route.request().method()
+      if (method === 'GET') {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ request_id: 'req-policies', run_id: RUN_ID, policies }),
+        })
+        return
+      }
+      if (url.endsWith('/replay')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            request_id: 'req-replay',
+            run_id: RUN_ID,
+            evaluation_id: 9,
+            evaluation: {
+              candidate_events: 3,
+              accepted_events: 2,
+              rejected_events: 1,
+              events_without_score: 0,
+              threshold: 0.6,
+              limitation: 'persisted candidates only',
+            },
+          }),
+        })
+        return
+      }
+      const body = route.request().postDataJSON() as Record<string, unknown>
+      if (url.endsWith('/activate')) {
+        const parts = url.split('/')
+        const revision = Number(parts[parts.length - 2])
+        policies = policies.map(policy => policy.revision === revision
+          ? { ...policy, status: body.stage, updated_at_ms: 2 }
+          : policy)
+      } else {
+        policies.push({
+          revision: 2,
+          parent_revision: null,
+          status: 'draft',
+          prompt: body.prompt,
+          output_schema: null,
+          parameters: {},
+          created_at_ms: 1,
+          updated_at_ms: 1,
+          effective_generation: null,
+          effective_on_current_generation: false,
+          deferred_fields: [],
+        })
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ request_id: 'req-policy', run_id: RUN_ID, policy: policies[0] }),
+      })
+    })
+
     // Seed localStorage with API endpoints
     await page.goto('/')
     await page.evaluate(() => {
@@ -55,11 +116,24 @@ test.describe('Run detail — feedback panel', () => {
 
   // ── Page structure ───────────────────────────────────────────────────────────
 
-  test('run ID and all three tabs render after load', async ({ page }) => {
+  test('run ID and all four tabs render after load', async ({ page }) => {
     await expect(page.getByText(RUN_ID)).toBeVisible()
     await expect(page.getByRole('button', { name: /player/i })).toBeVisible()
     await expect(page.getByRole('button', { name: /keyframes/i })).toBeVisible()
+    await expect(page.getByRole('button', { name: /policies/i })).toBeVisible()
     await expect(page.getByRole('button', { name: /metadata/i })).toBeVisible()
+  })
+
+  test('creates, promotes, and replays a policy revision', async ({ page }) => {
+    await page.getByRole('button', { name: /policies/i }).click()
+    await expect(page.getByRole('heading', { name: /policy control loop/i })).toBeVisible()
+    await page.getByLabel('New policy prompt').fill('Watch the loading bay')
+    await page.getByRole('button', { name: /create revision/i }).click()
+    await expect(page.getByText('Revision 2')).toBeVisible()
+    await page.getByRole('button', { name: /promote to shadow/i }).click()
+    await expect(page.getByText('shadow', { exact: true })).toBeVisible()
+    await page.getByRole('button', { name: 'Replay', exact: true }).click()
+    await expect(page.getByText(/2 accepted · 1 rejected/)).toBeVisible()
   })
 
   test('tab switching shows correct content', async ({ page }) => {

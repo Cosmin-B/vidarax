@@ -223,9 +223,9 @@ async fn feedback_empty_category_returns_unprocessable_entity() {
 }
 
 #[tokio::test]
-async fn feedback_without_spacetimedb_returns_service_unavailable() {
+async fn feedback_without_spacetimedb_commits_to_local_wal() {
     // AppState::with_wal_for_tests has no SpacetimeDB client attached.
-    // SpacetimeDB is optional, so the endpoint reports 503, not a server error.
+    // Feedback remains durable because SpacetimeDB is only an additive mirror.
     let state = AppState::with_wal_for_tests(tmp_wal("fb-stdb"));
     state
         .append_run_event(
@@ -244,12 +244,11 @@ async fn feedback_without_spacetimedb_returns_service_unavailable() {
         .await
         .unwrap();
 
-    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(res.status(), StatusCode::OK);
     let body = collect_json(res.into_body()).await;
-    assert_eq!(
-        body["error"]["code"].as_str().unwrap_or(""),
-        "spacetimedb_not_configured"
-    );
+    assert_eq!(body["storage"], "local_wal");
+    assert_eq!(body["mirrored_to_spacetimedb"], false);
+    assert!(body["feedback_id"].as_u64().is_some());
 }
 
 #[tokio::test]

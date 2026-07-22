@@ -32,6 +32,11 @@ The API is served over HTTP/1.1 and HTTP/2, with optional HTTP/3 behind the `h3-
 | `GET` | `/v1/runs/:id/interactions` | Interaction timeline |
 | `POST` | `/v1/runs/:id/feedback` | Submit feedback for a run |
 | `GET` | `/v1/feedback` | List feedback |
+| `GET/POST` | `/v1/runs/:id/policies` | List or create policy revisions |
+| `GET` | `/v1/runs/:id/policies/:revision` | Read a policy revision |
+| `POST` | `/v1/runs/:id/policies/:revision/activate` | Promote a revision |
+| `POST` | `/v1/runs/:id/policies/:revision/rollback` | Restore an older active revision |
+| `POST` | `/v1/runs/:id/policies/:revision/replay` | Evaluate persisted candidates |
 | `POST` | `/v1/query` | Query events across runs |
 | `POST` | `/v1/search` | Search VLM descriptions |
 | `POST` | `/v1/infer` | Single VLM inference |
@@ -89,12 +94,48 @@ The API is served over HTTP/1.1 and HTTP/2, with optional HTTP/3 behind the `h3-
 
 ### Feedback
 
-Both feedback routes require the optional SpacetimeDB integration. Without `VIDARAX_SPACETIMEDB_URL` they return 503 with code `spacetimedb_not_configured`, because a missing optional dependency is unavailability, not a server fault.
+Feedback commits to the run's local WAL before the request succeeds. When SpacetimeDB is configured, the same entry is mirrored after the local commit; mirror failure is logged and does not make the durable local request fail.
 
 | Route | Request | Success (200) | Failures |
 |---|---|---|---|
-| `POST /v1/runs/:id/feedback` | `{ rating, category, feedback? }`; rating in [0, 10], category non-empty | `{ request_id, run_id, status: "submitted" }` | 404, 422, 500, 503 SpacetimeDB not configured |
-| `GET /v1/feedback` | none | `{ request_id, feedback[] }`, filtered to caller-owned runs | 500, 503 SpacetimeDB not configured |
+| `POST /v1/runs/:id/feedback` | `{ rating, category, feedback? }`; rating in [0, 10], category non-empty | `{ request_id, run_id, feedback_id, status: "submitted", storage: "local_wal", mirrored_to_spacetimedb }` | 404, 422, 500 |
+| `GET /v1/feedback` | none | `{ request_id, feedback[], storage: "local_wal" }`, filtered to caller-owned runs | 500 |
+
+### Policy revisions and replay
+
+Policy control is event-sourced on each run's WAL. A revision is the sequence number of its immutable `policy_revision_created` event. `parent_revision` must name the latest revision, which makes stale editors fail instead of silently overwriting a newer policy.
+
+```json
+{
+  "parent_revision": null,
+  "prompt": "Describe activity in the loading bay",
+  "parameters": {
+    "restricted_zone": {
+      "policy_id": "loading-bay",
+      "policy_version": 1,
+      "device_id": "camera-1",
+      "region": { "x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4 },
+      "enter_motion_score": 0.6,
+      "exit_motion_score": 0.2,
+      "enter_after_frames": 2,
+      "exit_after_frames": 3
+    }
+  }
+}
+```
+
+| Route | Request | Success (200) | Failures |
+|---|---|---|---|
+| `POST /v1/runs/:id/policies` | `{ parent_revision?, prompt?, output_schema?, parameters? }`; one of prompt or restricted-zone parameters is required | `{ request_id, run_id, policy }` with status `draft` | 404, 409 stale parent, 422, 500 |
+| `GET /v1/runs/:id/policies` | none | `{ request_id, run_id, policies[] }` | 404, 422, 500 |
+| `GET /v1/runs/:id/policies/:revision` | none | `{ request_id, run_id, policy }` | 404, 422, 500 |
+| `POST /v1/runs/:id/policies/:revision/activate` | `{ stage: "shadow" | "canary" | "active", expected_generation? }`; progression is draft → shadow → canary → active | `{ request_id, run_id, policy, application }` | 404, 409 invalid transition/stale generation, 422, 500, 503 acknowledgement timeout |
+| `POST /v1/runs/:id/policies/:revision/rollback` | `{ expected_generation? }`; target must have previously been active | `{ request_id, run_id, policy, application }` | 404, 409, 422, 500, 503 acknowledgement timeout |
+| `POST /v1/runs/:id/policies/:revision/replay` | `{ from_seq?, to_seq? }` | `{ request_id, run_id, evaluation_id, evaluation }` | 404, 422, 500 |
+
+On a live WHIP run, activation and rollback require `expected_generation`. Prompt/schema changes return success only after the existing generation-tagged worker command acknowledges them. Restricted-zone detector parameters are static-at-generation in this release: responses list `parameters.restricted_zone` in `deferred_fields` and set `effective_on_current_generation` to false until a new generation starts.
+
+Replay compares only persisted `restricted_zone_activity_entered` candidates with the revision's `enter_motion_score`. It reports accepted, rejected, and scoreless counts, plus the exact limitation that it cannot discover an event the original pipeline never emitted. It is evidence replay, not model retraining or missed-event measurement.
 
 ### Files
 

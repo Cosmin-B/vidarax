@@ -65,6 +65,9 @@ const v = new Vidarax(baseUrl, options?)
 | `uploadFile(file, onProgress?)` | Upload a video file. |
 | `whipOffer(sdp, opts)` | WebRTC WHIP session (browser). |
 | `whipUpdatePrompt(id, request)` | Update the prompt and optional JSON Schema object. |
+| `submitFeedback(id, feedback)` / `listFeedback()` | Store and list durable operator feedback. |
+| `createPolicy(id, request)` / `listPolicies(id)` | Create and inspect immutable policy revisions. |
+| `activatePolicy` / `rollbackPolicy` / `replayPolicy` | Exercise the staged policy control loop. |
 | `listModels()` / `health()` | Models and health checks. |
 
 ## Error handling

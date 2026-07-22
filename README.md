@@ -121,6 +121,11 @@ The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via
 | `GET` | `/v1/runs/:id/interactions` | Interaction timeline |
 | `POST` | `/v1/runs/:id/feedback` | Submit feedback for a run |
 | `GET` | `/v1/feedback` | List feedback |
+| `GET/POST` | `/v1/runs/:id/policies` | List or create immutable policy revisions |
+| `GET` | `/v1/runs/:id/policies/:revision` | Read reconstructed policy state |
+| `POST` | `/v1/runs/:id/policies/:revision/activate` | Promote through shadow, canary, and active |
+| `POST` | `/v1/runs/:id/policies/:revision/rollback` | Restore a previously active revision |
+| `POST` | `/v1/runs/:id/policies/:revision/replay` | Re-evaluate persisted restricted-zone candidates |
 | `POST` | `/v1/query` | Query events across runs |
 | `POST` | `/v1/search` | Search VLM descriptions |
 | `POST` | `/v1/infer` | Single VLM inference |

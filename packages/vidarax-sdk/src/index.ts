@@ -119,8 +119,25 @@ export type {
 
   // Feedback
   FeedbackRequest,
+  FeedbackSubmitResponse,
   FeedbackItem,
   FeedbackListResponse,
+
+  // Policy revisions
+  PolicyStatus,
+  NormalizedRect,
+  RestrictedZonePolicyParameters,
+  PolicyParameters,
+  CreatePolicyRequest,
+  PolicyRevision,
+  PolicyApplication,
+  PolicyResponse,
+  PolicyListResponse,
+  ActivatePolicyRequest,
+  RollbackPolicyRequest,
+  ReplayPolicyRequest,
+  PolicyReplayEvaluation,
+  PolicyReplayResponse,
 
   // WHIP
   AttachStreamRequest,

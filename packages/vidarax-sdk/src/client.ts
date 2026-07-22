@@ -36,6 +36,7 @@ import type {
   FeedbackItem,
   FeedbackListResponse,
   FeedbackRequest,
+  FeedbackSubmitResponse,
   HealthStatus,
   Interaction,
   InteractionsResponse,
@@ -53,10 +54,17 @@ import type {
   Model,
   ModelCatalogResponse,
   ProgressCallback,
+  ActivatePolicyRequest,
+  CreatePolicyRequest as CreatePolicyRevisionRequest,
+  PolicyListResponse,
+  PolicyReplayResponse,
+  PolicyResponse,
   QueryRequest,
   QueryResponse,
   RealtimeReasonRequest,
   RealtimeReasonResponse,
+  ReplayPolicyRequest,
+  RollbackPolicyRequest,
   Run,
   SearchResponse,
   UploadResponse,
@@ -896,11 +904,11 @@ export class Vidarax {
   /**
    * Submit quality feedback for a completed run.
    *
-   * Ratings are on a 0–10 scale.  Requires a SpacetimeDB connection on the
-   * server side; throws `HttpError` with a 500 status if not configured.
+   * Ratings are on a 0–10 scale. The server commits feedback to its local WAL
+   * before attempting the optional SpacetimeDB mirror.
    */
-  async submitFeedback(runId: string, feedback: FeedbackRequest): Promise<void> {
-    await this.post<void>(
+  async submitFeedback(runId: string, feedback: FeedbackRequest): Promise<FeedbackSubmitResponse> {
+    return this.post<FeedbackSubmitResponse>(
       `/v1/runs/${encodeURIComponent(runId)}/feedback`,
       feedback,
     );
@@ -909,11 +917,74 @@ export class Vidarax {
   /**
    * Retrieve all stored feedback entries.
    *
-   * Requires a SpacetimeDB connection on the server side.
+   * The local WAL is the source of truth; no optional database is required.
    */
   async listFeedback(): Promise<FeedbackItem[]> {
     const res = await this.get<FeedbackListResponse>("/v1/feedback");
     return res.feedback;
+  }
+
+  // ─── Policy revisions ────────────────────────────────────────────────────
+
+  /** Create an immutable policy revision on a run's local timeline. */
+  async createPolicy(
+    runId: string,
+    request: CreatePolicyRevisionRequest,
+  ): Promise<PolicyResponse> {
+    return this.post<PolicyResponse>(
+      `/v1/runs/${encodeURIComponent(runId)}/policies`,
+      request,
+    );
+  }
+
+  /** List policy revisions reconstructed from the run's WAL events. */
+  async listPolicies(runId: string): Promise<PolicyListResponse> {
+    return this.get<PolicyListResponse>(
+      `/v1/runs/${encodeURIComponent(runId)}/policies`,
+    );
+  }
+
+  /** Read one immutable policy revision and its current deployment status. */
+  async getPolicy(runId: string, revision: number): Promise<PolicyResponse> {
+    return this.get<PolicyResponse>(
+      `/v1/runs/${encodeURIComponent(runId)}/policies/${revision}`,
+    );
+  }
+
+  /** Promote a policy through shadow, canary, and active stages. */
+  async activatePolicy(
+    runId: string,
+    revision: number,
+    request: ActivatePolicyRequest,
+  ): Promise<PolicyResponse> {
+    return this.post<PolicyResponse>(
+      `/v1/runs/${encodeURIComponent(runId)}/policies/${revision}/activate`,
+      request,
+    );
+  }
+
+  /** Restore a previously active revision. */
+  async rollbackPolicy(
+    runId: string,
+    revision: number,
+    request: RollbackPolicyRequest = {},
+  ): Promise<PolicyResponse> {
+    return this.post<PolicyResponse>(
+      `/v1/runs/${encodeURIComponent(runId)}/policies/${revision}/rollback`,
+      request,
+    );
+  }
+
+  /** Re-evaluate persisted restricted-zone candidates against a revision. */
+  async replayPolicy(
+    runId: string,
+    revision: number,
+    request: ReplayPolicyRequest = {},
+  ): Promise<PolicyReplayResponse> {
+    return this.post<PolicyReplayResponse>(
+      `/v1/runs/${encodeURIComponent(runId)}/policies/${revision}/replay`,
+      request,
+    );
   }
 
   // ─── Search ───────────────────────────────────────────────────────────────

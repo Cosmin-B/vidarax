@@ -14,7 +14,7 @@ import { useEventStream } from '@/composables/useEventStream'
 import { api, ApiError } from '@/lib/api'
 import { useAuthStore } from '@/stores/auth'
 import { lsNum, STORAGE_KEYS, UI_DEFAULTS } from '@/lib/config'
-import type { FeedbackRequest } from '@/lib/api'
+import type { FeedbackRequest, PolicyRevision, PolicyStatus } from '@/lib/api'
 import type { RunStatus } from '@/stores/runs'
 import type { AgentEvent } from '@/stores/events'
 import { ChevronLeft, Image, Radio, Zap } from 'lucide-vue-next'
@@ -29,13 +29,109 @@ const authStore = useAuthStore()
 const { connect: connectEvents, disconnect: disconnectEvents, isConnected: timelineConnected } = useEventStream()
 
 const runId = computed(() => route.params.runId as string)
-const activeTab = ref<'player' | 'keyframes' | 'metadata'>('player')
+const activeTab = ref<'player' | 'keyframes' | 'policies' | 'metadata'>('player')
 const loading = ref(false)
 const fetchError = ref<string | null>(null)
 const actionLoading = ref<'stop' | 'delete' | 'keepalive' | null>(null)
 const confirmDelete = ref(false)
 let keepaliveTimer: ReturnType<typeof setInterval> | null = null
 const eventsPollingTimer = ref<ReturnType<typeof setInterval> | null>(null)
+
+// ── Policy control loop ──────────────────────────────────────────────────────
+
+const policies = ref<PolicyRevision[]>([])
+const policyLoading = ref(false)
+const policyActionRevision = ref<number | null>(null)
+const policyError = ref<string | null>(null)
+const policyPrompt = ref('')
+const policyExpectedGeneration = ref('')
+const replayResults = ref<Record<number, string>>({})
+
+async function loadPolicies(): Promise<void> {
+  policyLoading.value = true
+  try {
+    const response = await api.runs.policies(runId.value)
+    policies.value = response.policies
+    policyError.value = null
+  } catch (err) {
+    policyError.value = err instanceof Error ? err.message : 'Failed to load policies'
+  } finally {
+    policyLoading.value = false
+  }
+}
+
+async function createPolicyRevision(): Promise<void> {
+  const prompt = policyPrompt.value.trim()
+  if (!prompt) return
+  policyLoading.value = true
+  policyError.value = null
+  try {
+    const parent = policies.value[policies.value.length - 1]?.revision ?? null
+    await api.runs.createPolicy(runId.value, { parent_revision: parent, prompt })
+    policyPrompt.value = ''
+    await loadPolicies()
+  } catch (err) {
+    policyError.value = err instanceof Error ? err.message : 'Failed to create policy'
+  } finally {
+    policyLoading.value = false
+  }
+}
+
+function nextPolicyStage(status: PolicyStatus): 'shadow' | 'canary' | 'active' | null {
+  if (status === 'draft') return 'shadow'
+  if (status === 'shadow') return 'canary'
+  if (status === 'canary') return 'active'
+  return null
+}
+
+function expectedGeneration(): number | undefined {
+  const parsed = Number(policyExpectedGeneration.value)
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined
+}
+
+async function promotePolicy(policy: PolicyRevision): Promise<void> {
+  const stage = nextPolicyStage(policy.status)
+  if (!stage || policyActionRevision.value !== null) return
+  policyActionRevision.value = policy.revision
+  policyError.value = null
+  try {
+    await api.runs.promotePolicy(runId.value, policy.revision, stage, expectedGeneration())
+    await loadPolicies()
+  } catch (err) {
+    policyError.value = err instanceof Error ? err.message : 'Policy promotion failed'
+  } finally {
+    policyActionRevision.value = null
+  }
+}
+
+async function replayPolicy(policy: PolicyRevision): Promise<void> {
+  if (policyActionRevision.value !== null) return
+  policyActionRevision.value = policy.revision
+  policyError.value = null
+  try {
+    const response = await api.runs.replayPolicy(runId.value, policy.revision)
+    const result = response.evaluation
+    replayResults.value[policy.revision] = `${result.accepted_events} accepted · ${result.rejected_events} rejected · ${result.events_without_score} without score`
+  } catch (err) {
+    policyError.value = err instanceof Error ? err.message : 'Policy replay failed'
+  } finally {
+    policyActionRevision.value = null
+  }
+}
+
+async function rollbackPolicy(policy: PolicyRevision): Promise<void> {
+  if (policyActionRevision.value !== null) return
+  policyActionRevision.value = policy.revision
+  policyError.value = null
+  try {
+    await api.runs.rollbackPolicy(runId.value, policy.revision, expectedGeneration())
+    await loadPolicies()
+  } catch (err) {
+    policyError.value = err instanceof Error ? err.message : 'Policy rollback failed'
+  } finally {
+    policyActionRevision.value = null
+  }
+}
 
 // ── Video player state ────────────────────────────────────────────────────────
 
@@ -351,6 +447,7 @@ onMounted(async () => {
   }
 
   await connectEvents(runId.value)
+  await loadPolicies()
   startEventsPolling(runId.value)
 
   if (isProcessing.value) {
@@ -603,7 +700,7 @@ function formatTime(ms: number): string {
       <!-- Tabs ─────────────────────────────────────────────────────────────── -->
       <div class="flex gap-1 p-1 rounded-[10px] w-fit" style="background: #0f1117; border: 1px solid #1e2633;">
         <button
-          v-for="tab in ['player', 'keyframes', 'metadata'] as const"
+          v-for="tab in ['player', 'keyframes', 'policies', 'metadata'] as const"
           :key="tab"
           class="px-4 py-1.5 rounded-[8px] text-sm font-medium transition-all duration-200 capitalize"
           :class="activeTab === tab ? 'text-[#e2e8f0]' : 'text-[#475569] hover:text-[#64748b]'"
@@ -612,12 +709,15 @@ function formatTime(ms: number): string {
             : ''"
           @click="activeTab = tab"
         >
-          {{ tab === 'player' ? 'Player' : tab === 'keyframes' ? 'Keyframes' : 'Metadata' }}
+          {{ tab === 'player' ? 'Player' : tab === 'keyframes' ? 'Keyframes' : tab === 'policies' ? 'Policies' : 'Metadata' }}
           <span v-if="tab === 'player' && events.length > 0" class="ml-1 badge badge-muted">
             {{ events.length }}
           </span>
           <span v-if="tab === 'keyframes' && (keyframes.length > 0 || extractedKeyframes.length > 0)" class="ml-1 badge badge-teal">
             {{ keyframes.length > 0 ? keyframes.length : extractedKeyframes.length }}
+          </span>
+          <span v-if="tab === 'policies' && policies.length > 0" class="ml-1 badge badge-muted">
+            {{ policies.length }}
           </span>
         </button>
       </div>
@@ -1036,6 +1136,104 @@ function formatTime(ms: number): string {
           class="mono text-xs text-[#94a3b8] rounded-[8px] p-4 overflow-x-auto"
           style="background: #050507; border: 1px solid #1e2633; line-height: 1.7;"
         >{{ JSON.stringify(run, null, 2) }}</pre>
+      </div>
+
+      <!-- Tab: Policies ───────────────────────────────────────────────────── -->
+      <div v-if="activeTab === 'policies'" class="space-y-4">
+        <div class="card-skeuo p-5 space-y-4">
+          <div class="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <h3 class="text-[#e2e8f0] font-medium text-sm">Policy control loop</h3>
+              <p class="mt-1 text-xs text-[#64748b]">Immutable revisions, evidence replay, staged promotion, and rollback.</p>
+            </div>
+            <span class="badge badge-muted">Local WAL</span>
+          </div>
+
+          <div class="grid gap-3 lg:grid-cols-[1fr_220px_auto]">
+            <input
+              v-model="policyPrompt"
+              class="rounded-[8px] px-3 py-2 text-xs mono"
+              style="background: #050507; border: 1px solid #1e2633; color: #e2e8f0; outline: none;"
+              placeholder="New analysis policy prompt"
+              aria-label="New policy prompt"
+            >
+            <input
+              v-model="policyExpectedGeneration"
+              inputmode="numeric"
+              class="rounded-[8px] px-3 py-2 text-xs mono"
+              style="background: #050507; border: 1px solid #1e2633; color: #e2e8f0; outline: none;"
+              placeholder="Live generation for activation"
+              aria-label="Expected live generation"
+            >
+            <button
+              class="rounded-[8px] px-4 py-2 text-xs font-medium text-[#2dd4bf] disabled:opacity-40"
+              style="background: rgba(45,212,191,0.1); border: 1px solid rgba(45,212,191,0.25);"
+              :disabled="policyLoading || !policyPrompt.trim()"
+              @click="createPolicyRevision"
+            >
+              Create revision
+            </button>
+          </div>
+          <p class="text-[11px] text-[#475569]">A live active/rollback request requires the exact pipeline generation. Static zone parameters take effect on the next generation.</p>
+          <p v-if="policyError" class="text-xs text-[#ef4444]">{{ policyError }}</p>
+        </div>
+
+        <div v-if="policyLoading && policies.length === 0" class="card-skeuo p-8 flex justify-center">
+          <div class="w-5 h-5 rounded-full border-2 border-[#1e2633] border-t-[#2dd4bf] animate-spin" />
+        </div>
+        <div v-else-if="policies.length === 0" class="card-skeuo p-8 text-center">
+          <p class="text-sm text-[#64748b]">No policy revisions yet.</p>
+          <p class="mt-1 text-xs text-[#334155]">Create one above to begin the review and rollout trail.</p>
+        </div>
+        <div v-else class="space-y-3">
+          <article
+            v-for="policy in [...policies].reverse()"
+            :key="policy.revision"
+            class="card-skeuo p-4"
+          >
+            <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div class="min-w-0">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="mono text-sm text-[#e2e8f0]">Revision {{ policy.revision }}</span>
+                  <span
+                    class="badge"
+                    :class="policy.status === 'active' ? 'badge-green' : policy.status === 'canary' ? 'badge-amber' : 'badge-muted'"
+                  >{{ policy.status.replace('_', ' ') }}</span>
+                  <span v-if="policy.effective_generation !== null" class="text-[11px] text-[#64748b] mono">generation {{ policy.effective_generation }}</span>
+                </div>
+                <p class="mt-2 truncate text-xs text-[#94a3b8]">{{ policy.prompt ?? 'Restricted-zone detector policy' }}</p>
+                <p v-if="policy.deferred_fields.length" class="mt-1 text-[11px] text-[#f59e0b]">
+                  Next generation: {{ policy.deferred_fields.join(', ') }}
+                </p>
+                <p v-if="replayResults[policy.revision]" class="mt-2 text-xs text-[#2dd4bf] mono">
+                  {{ replayResults[policy.revision] }}
+                </p>
+              </div>
+              <div class="flex shrink-0 flex-wrap gap-2">
+                <button
+                  class="rounded-[7px] px-3 py-1.5 text-xs text-[#94a3b8] disabled:opacity-40"
+                  style="background: rgba(255,255,255,0.04); border: 1px solid #1e2633;"
+                  :disabled="policyActionRevision !== null"
+                  @click="replayPolicy(policy)"
+                >Replay</button>
+                <button
+                  v-if="nextPolicyStage(policy.status)"
+                  class="rounded-[7px] px-3 py-1.5 text-xs font-medium text-[#2dd4bf] disabled:opacity-40"
+                  style="background: rgba(45,212,191,0.08); border: 1px solid rgba(45,212,191,0.2);"
+                  :disabled="policyActionRevision !== null"
+                  @click="promotePolicy(policy)"
+                >Promote to {{ nextPolicyStage(policy.status) }}</button>
+                <button
+                  v-if="policy.status === 'retired' || policy.status === 'rolled_back'"
+                  class="rounded-[7px] px-3 py-1.5 text-xs text-[#f59e0b] disabled:opacity-40"
+                  style="background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.2);"
+                  :disabled="policyActionRevision !== null"
+                  @click="rollbackPolicy(policy)"
+                >Rollback here</button>
+              </div>
+            </div>
+          </article>
+        </div>
       </div>
 
       <!-- Feedback ─────────────────────────────────────────────────────────── -->

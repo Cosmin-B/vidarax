@@ -587,6 +587,16 @@ export interface FeedbackRequest {
   feedback?: string;
 }
 
+/** Confirmation returned after feedback is durable in the local WAL. */
+export interface FeedbackSubmitResponse {
+  request_id: string;
+  run_id: string;
+  feedback_id: number;
+  status: "submitted";
+  storage: "local_wal";
+  mirrored_to_spacetimedb: boolean;
+}
+
 /** A stored feedback row from GET /v1/feedback. */
 export interface FeedbackItem {
   id: number | string;
@@ -596,12 +606,125 @@ export interface FeedbackItem {
   category: string;
   feedback: string;
   timestamp_micros: number;
+  storage?: "local_wal";
 }
 
 /** Response body from GET /v1/feedback. */
 export interface FeedbackListResponse {
   request_id: string;
   feedback: FeedbackItem[];
+  storage?: "local_wal";
+}
+
+// ─── Policy revisions ───────────────────────────────────────────────────────
+
+export type PolicyStatus =
+  | "draft"
+  | "shadow"
+  | "canary"
+  | "active"
+  | "retired"
+  | "rolled_back";
+
+export interface NormalizedRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface RestrictedZonePolicyParameters {
+  policy_id: string;
+  policy_version: number;
+  device_id: string;
+  region: NormalizedRect;
+  enter_motion_score: number;
+  exit_motion_score: number;
+  enter_after_frames: number;
+  exit_after_frames: number;
+}
+
+export interface PolicyParameters {
+  restricted_zone?: RestrictedZonePolicyParameters;
+}
+
+export interface CreatePolicyRequest {
+  /** Must equal the latest revision, or be omitted for the first revision. */
+  parent_revision?: number | null;
+  prompt?: string;
+  output_schema?: Record<string, unknown>;
+  parameters?: PolicyParameters;
+}
+
+export interface PolicyRevision {
+  revision: number;
+  parent_revision: number | null;
+  status: PolicyStatus;
+  prompt: string | null;
+  output_schema: Record<string, unknown> | null;
+  parameters: PolicyParameters;
+  created_at_ms: number;
+  updated_at_ms: number;
+  effective_generation: number | null;
+  effective_on_current_generation: boolean;
+  deferred_fields: string[];
+}
+
+export interface PolicyApplication {
+  session_id: string | null;
+  generation: number | null;
+  prompt_acknowledged: boolean;
+  effective_on_current_generation: boolean;
+  deferred_fields: string[];
+  note: string;
+}
+
+export interface PolicyResponse {
+  request_id: string;
+  run_id: string;
+  policy: PolicyRevision;
+  application?: PolicyApplication;
+}
+
+export interface PolicyListResponse {
+  request_id: string;
+  run_id: string;
+  policies: PolicyRevision[];
+}
+
+export interface ActivatePolicyRequest {
+  stage: "shadow" | "canary" | "active";
+  expected_generation?: number;
+}
+
+export interface RollbackPolicyRequest {
+  expected_generation?: number;
+}
+
+export interface ReplayPolicyRequest {
+  from_seq?: number;
+  to_seq?: number;
+}
+
+export interface PolicyReplayEvaluation {
+  revision: number;
+  source: "local_wal";
+  comparison: string;
+  from_seq: number;
+  to_seq: number | null;
+  candidate_events: number;
+  accepted_events: number;
+  rejected_events: number;
+  events_without_score: number;
+  threshold: number | null;
+  limitation: string;
+}
+
+export interface PolicyReplayResponse {
+  request_id: string;
+  run_id: string;
+  evaluation_id: number;
+  evaluation: PolicyReplayEvaluation;
 }
 
 // ─── WHIP ─────────────────────────────────────────────────────────────────────

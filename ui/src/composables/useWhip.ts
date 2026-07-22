@@ -18,6 +18,7 @@ import { api } from '@/lib/api'
 import { iceServersWithTurn, ls, STORAGE_KEYS, UI_DEFAULTS } from '@/lib/config'
 import { useStreamStore } from '@/stores/stream'
 import type { StreamSourceType } from '@/stores/stream'
+import { stopDurableWhipSession } from '@/lib/whipLifecycle'
 
 /** Wait for ICE gathering to complete, with a 3 s timeout fallback. */
 function waitForIceComplete(pc: RTCPeerConnection): Promise<string> {
@@ -140,8 +141,8 @@ export function useWhip() {
 
   async function stopStream(): Promise<void> {
     const session = streamStore.activeSession
-    if (session?.sessionId) {
-      api.stream.whipTerminate(session.sessionId).catch(() => { /* best-effort */ })
+    if (session) {
+      await stopDurableWhipSession(session, api.runs.stop, api.stream.whipTerminate)
     }
     cleanup()
     streamStore.reset()

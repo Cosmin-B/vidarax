@@ -11,5 +11,7 @@ For related details:
 - Authentication and ingest hardening: [`security.md`](security.md)
 - Event payloads and SDK methods:
   [`docs-site/src/content/docs/events.md`](../docs-site/src/content/docs/events.md)
+- Policy revision and rollout semantics:
+  [`docs-site/src/content/docs/policy-rollouts.md`](../docs-site/src/content/docs/policy-rollouts.md)
 
 Build the rendered reference from `docs-site/` with `npm run build`.

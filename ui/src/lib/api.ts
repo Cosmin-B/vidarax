@@ -174,7 +174,10 @@ export interface FeedbackRequest {
 export interface FeedbackResponse {
   request_id: string
   run_id: string
+  feedback_id: number
   status: string
+  storage: 'local_wal'
+  mirrored_to_spacetimedb: boolean
 }
 
 export interface FeedbackItem {
@@ -190,6 +193,59 @@ export interface FeedbackItem {
 export interface FeedbackListResponse {
   request_id: string
   feedback: FeedbackItem[]
+  storage: 'local_wal'
+}
+
+export type PolicyStatus = 'draft' | 'shadow' | 'canary' | 'active' | 'retired' | 'rolled_back'
+
+export interface PolicyRevision {
+  revision: number
+  parent_revision: number | null
+  status: PolicyStatus
+  prompt: string | null
+  output_schema: Record<string, unknown> | null
+  parameters: Record<string, unknown>
+  created_at_ms: number
+  updated_at_ms: number
+  effective_generation: number | null
+  effective_on_current_generation: boolean
+  deferred_fields: string[]
+}
+
+export interface PolicyApplication {
+  session_id: string | null
+  generation: number | null
+  prompt_acknowledged: boolean
+  effective_on_current_generation: boolean
+  deferred_fields: string[]
+  note: string
+}
+
+export interface PolicyResponse {
+  request_id: string
+  run_id: string
+  policy: PolicyRevision
+  application?: PolicyApplication
+}
+
+export interface PolicyListResponse {
+  request_id: string
+  run_id: string
+  policies: PolicyRevision[]
+}
+
+export interface PolicyReplayResponse {
+  request_id: string
+  run_id: string
+  evaluation_id: number
+  evaluation: {
+    candidate_events: number
+    accepted_events: number
+    rejected_events: number
+    events_without_score: number
+    threshold: number | null
+    limitation: string
+  }
 }
 
 export interface HealthResponse {
@@ -253,6 +309,45 @@ export const api = {
     },
     feedback(runId: string, data: FeedbackRequest): Promise<FeedbackResponse> {
       return request<FeedbackResponse>('POST', `/v1/runs/${validateId(runId)}/feedback`, data)
+    },
+    policies(runId: string): Promise<PolicyListResponse> {
+      return request<PolicyListResponse>('GET', `/v1/runs/${validateId(runId)}/policies`)
+    },
+    createPolicy(
+      runId: string,
+      data: { parent_revision?: number | null; prompt?: string; parameters?: Record<string, unknown> },
+    ): Promise<PolicyResponse> {
+      return request<PolicyResponse>('POST', `/v1/runs/${validateId(runId)}/policies`, data)
+    },
+    promotePolicy(
+      runId: string,
+      revision: number,
+      stage: 'shadow' | 'canary' | 'active',
+      expectedGeneration?: number,
+    ): Promise<PolicyResponse> {
+      return request<PolicyResponse>(
+        'POST',
+        `/v1/runs/${validateId(runId)}/policies/${revision}/activate`,
+        { stage, expected_generation: expectedGeneration },
+      )
+    },
+    rollbackPolicy(
+      runId: string,
+      revision: number,
+      expectedGeneration?: number,
+    ): Promise<PolicyResponse> {
+      return request<PolicyResponse>(
+        'POST',
+        `/v1/runs/${validateId(runId)}/policies/${revision}/rollback`,
+        { expected_generation: expectedGeneration },
+      )
+    },
+    replayPolicy(runId: string, revision: number): Promise<PolicyReplayResponse> {
+      return request<PolicyReplayResponse>(
+        'POST',
+        `/v1/runs/${validateId(runId)}/policies/${revision}/replay`,
+        {},
+      )
     },
     events(runId: string): Promise<RunEventsResponse> {
       return request<RunEventsResponse>('GET', `/v1/runs/${validateId(runId)}/events`)

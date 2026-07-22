@@ -66,7 +66,8 @@ Worker threads report results through an `EventSink` trait rather than writing s
 - It bridges worker events into the API timeline, so live VLM results appear in `GET /v1/runs/{id}/events` without an external database. Appends funnel through a bounded channel into the single timeline-writer thread, which assigns sequence numbers and swaps the registry snapshot.
 - `store_keyframe_sync` writes raw JPEG bytes to the content-addressed blob sidecar before appending a `keyframe_stored` metadata event. The WAL never carries JSON-encoded or base64 image bytes.
 - Frame and keyframe events carry `coordinate_schema: "vidarax.image.v1"` plus source dimensions, the requested normalized crop, the exact resolved pixel region, and the analyzed extent. The contract describes image coordinates, not camera extrinsics or a robot/world transform.
-- When `VIDARAX_SPACETIMEDB_URL` is set, successful blocking description events are mirrored after the WAL commit and feedback endpoints are enabled. Mirror failure is logged and does not roll back local durability. Nonblocking events and raw keyframes remain local.
+- Operator feedback, policy revisions, deployments, rollbacks, and replay evaluations commit to the same local WAL as media events. Their current state is reconstructed from immutable events rather than a process-global mutable registry.
+- When `VIDARAX_SPACETIMEDB_URL` is set, successful blocking description events and feedback are mirrored after the WAL commit. Mirror failure is logged and does not roll back local durability. Nonblocking events and raw keyframes remain local.
 
 ## How state is persisted
 

@@ -118,7 +118,7 @@ pub struct ServerConfig {
     pub webrtc_turn_username: Option<String>,
     /// TURN credential (`VIDARAX_WEBRTC_TURN_CREDENTIAL`).
     pub webrtc_turn_credential: Option<String>,
-    /// Optional SpacetimeDB mirror and feedback endpoint.
+    /// Optional SpacetimeDB mirror for locally committed descriptions and feedback.
     pub spacetimedb_url: Option<String>,
     /// SpacetimeDB database/module name (`VIDARAX_SPACETIMEDB_MODULE`). Only
     /// used when `spacetimedb_url` is set; defaults to "vidarax".

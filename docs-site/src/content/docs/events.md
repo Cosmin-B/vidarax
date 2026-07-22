@@ -150,7 +150,9 @@ The full public surface:
 | `search(query, opts?)` | Substring search over VLM descriptions, with optional `run_id` and `limit`. |
 | `infer(opts)` / `inferBatch(requests, opts?)` | Single or batch inference. |
 | `uploadFile(file, onProgress?)` | Upload a video file; returns the server-side path. |
-| `submitFeedback(runId, feedback)` / `listFeedback()` | Feedback endpoints (require the SpacetimeDB integration server-side). |
+| `submitFeedback(runId, feedback)` / `listFeedback()` | Durable local-WAL operator feedback; SpacetimeDB is an optional mirror. |
+| `createPolicy` / `listPolicies` / `getPolicy` | Immutable per-run policy revisions and reconstructed status. |
+| `activatePolicy` / `rollbackPolicy` / `replayPolicy` | Promote, restore, or evaluate a revision against persisted candidates. |
 | `whipOffer(sdp, opts?)` | WebRTC WHIP session setup (browser). |
 | `whipIce(sessionId, candidate)` | Trickle a single ICE candidate. |
 | `whipUpdatePrompt(sessionId, config)` | Update a live session's prompt and output schema. |

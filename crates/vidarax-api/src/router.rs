@@ -10,6 +10,9 @@ use crate::handlers::{
     list_runs, metrics, query, reason_realtime_run, search, serve_file, serve_keyframe, stop_run,
     submit_feedback, upload_file,
 };
+use crate::policies::{
+    activate_policy, create_policy, get_policy, list_policies, replay_policy, rollback_policy,
+};
 use crate::security::enforce_security;
 use crate::state::AppState;
 use crate::whip::{whip_ice, whip_offer, whip_terminate, whip_update_prompt};
@@ -36,6 +39,23 @@ pub fn app_router(state: AppState) -> Router {
         .route("/v1/runs/{run_id}/state", get(get_state))
         .route("/v1/runs/{run_id}/interactions", get(get_interactions))
         .route("/v1/runs/{run_id}/feedback", post(submit_feedback))
+        .route(
+            "/v1/runs/{run_id}/policies",
+            get(list_policies).post(create_policy),
+        )
+        .route("/v1/runs/{run_id}/policies/{revision}", get(get_policy))
+        .route(
+            "/v1/runs/{run_id}/policies/{revision}/activate",
+            post(activate_policy),
+        )
+        .route(
+            "/v1/runs/{run_id}/policies/{revision}/rollback",
+            post(rollback_policy),
+        )
+        .route(
+            "/v1/runs/{run_id}/policies/{revision}/replay",
+            post(replay_policy),
+        )
         .route("/v1/feedback", get(list_feedback))
         .route("/v1/query", post(query))
         .route("/v1/search", post(search))

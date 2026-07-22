@@ -31,6 +31,7 @@ export default defineConfig({
         { label: 'The gate', slug: 'gate' },
         { label: 'API reference', slug: 'api' },
         { label: 'Events and SDK', slug: 'events' },
+        { label: 'Policy rollouts', slug: 'policy-rollouts' },
         { label: 'Operations', slug: 'operations' },
         { label: 'Development', slug: 'development' },
         {

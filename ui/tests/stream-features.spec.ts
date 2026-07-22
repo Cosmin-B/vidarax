@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
+import { stopDurableWhipSession } from '../src/lib/whipLifecycle'
 
 /**
  * Stream page feature E2E tests.
@@ -227,5 +228,15 @@ test.describe('Stream page — WHIP connection UI', () => {
     await page.getByRole('button', { name: /start stream/i }).click()
 
     await expect(page.locator('.sp-hud-badge').filter({ hasText: /fps/ })).toBeVisible({ timeout: 10_000 })
+  })
+
+  test('stops the durable run before terminating its WHIP transport', async () => {
+    const lifecycle: string[] = []
+    await stopDurableWhipSession(
+      { runId: 'run-stream-history', sessionId: 'test-session-history' },
+      async () => { lifecycle.push('stop-run') },
+      async () => { lifecycle.push('terminate-whip') },
+    )
+    expect(lifecycle).toEqual(['stop-run', 'terminate-whip'])
   })
 })

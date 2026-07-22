@@ -8,6 +8,7 @@ mod handlers;
 mod ids;
 mod inference_metrics;
 mod models;
+mod policies;
 mod response;
 mod router;
 mod security;
@@ -134,7 +135,7 @@ pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>>
 
 /// Attach a SpacetimeDB client when VIDARAX_SPACETIMEDB_URL is configured.
 /// With no URL the state is returned unchanged: stream events use the local
-/// WAL and the feedback endpoints stay disabled.
+/// WAL, including operator feedback. SpacetimeDB is only an additive mirror.
 fn attach_spacetime_client(state: AppState, config: &ServerConfig) -> AppState {
     match config.spacetimedb_url.as_deref() {
         Some(url) => {
@@ -148,7 +149,7 @@ fn attach_spacetime_client(state: AppState, config: &ServerConfig) -> AppState {
         }
         None => {
             tracing::info!(
-                "SpacetimeDB not configured; stream events use the local WAL and feedback endpoints are disabled"
+                "SpacetimeDB not configured; stream events and feedback use the local WAL"
             );
             state
         }
@@ -1688,6 +1689,125 @@ mod tests {
 
         let second = app.clone().oneshot(create()).await.unwrap();
         assert_eq!(second.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn local_feedback_and_policy_replay_work_without_spacetimedb() {
+        let state = test_state();
+        let app = app_router(state.clone());
+        let create = Request::builder()
+            .uri("/v1/runs")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"mode":"balanced"}"#))
+            .unwrap();
+        let response = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let run_id = created["run_id"].as_str().unwrap();
+
+        let feedback = Request::builder()
+            .uri(format!("/v1/runs/{run_id}/feedback"))
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"rating":3,"category":"false_positive","feedback":"forklift shadow"}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(feedback).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let list = Request::builder()
+            .uri("/v1/feedback")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(list).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed["storage"], "local_wal");
+        assert_eq!(listed["feedback"].as_array().unwrap().len(), 1);
+
+        let policy = Request::builder()
+            .uri(format!("/v1/runs/{run_id}/policies"))
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "parent_revision": null,
+                    "parameters": {
+                        "restricted_zone": {
+                            "policy_id": "loading-bay",
+                            "policy_version": 1,
+                            "device_id": "camera-1",
+                            "region": {"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4},
+                            "enter_motion_score": 0.6,
+                            "exit_motion_score": 0.2,
+                            "enter_after_frames": 2,
+                            "exit_after_frames": 3
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(policy).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let created_policy: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let revision = created_policy["policy"]["revision"].as_u64().unwrap();
+
+        state
+            .append_run_event(
+                run_id,
+                "restricted_zone_activity_entered",
+                json!({"confidence": 0.75}),
+            )
+            .unwrap();
+        state
+            .append_run_event(
+                run_id,
+                "restricted_zone_activity_entered",
+                json!({"confidence": 0.4}),
+            )
+            .unwrap();
+        let replay = Request::builder()
+            .uri(format!("/v1/runs/{run_id}/policies/{revision}/replay"))
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = app.clone().oneshot(replay).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let evaluation: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(evaluation["evaluation"]["candidate_events"], 2);
+        assert_eq!(evaluation["evaluation"]["accepted_events"], 1);
+        assert_eq!(evaluation["evaluation"]["rejected_events"], 1);
+
+        for stage in ["shadow", "canary", "active"] {
+            let promote = Request::builder()
+                .uri(format!("/v1/runs/{run_id}/policies/{revision}/activate"))
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"stage": stage}).to_string()))
+                .unwrap();
+            let response = app.clone().oneshot(promote).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let get = Request::builder()
+            .uri(format!("/v1/runs/{run_id}/policies/{revision}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(get).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let policy: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(policy["policy"]["status"], "active");
+        assert_eq!(
+            policy["policy"]["deferred_fields"][0],
+            "parameters.restricted_zone"
+        );
     }
 
     #[tokio::test]

@@ -773,6 +773,20 @@ impl AppState {
             .map(|entry| entry.value().clone())
     }
 
+    /// Return the live session that owns a run, if one exists. Control-plane
+    /// handlers use this only after run ownership has been authenticated. The
+    /// returned generation-bound session handle cannot target a replacement:
+    /// its command channel closes with the generation that created it.
+    pub(crate) fn live_session_for_run(
+        &self,
+        run_id: &str,
+    ) -> Option<(String, Arc<WebRtcSession>)> {
+        self.sessions.iter().find_map(|entry| {
+            let (_principal, existing_run_id, session) = entry.value();
+            (&**existing_run_id == run_id).then(|| (entry.key().clone(), Arc::clone(session)))
+        })
+    }
+
     /// Remove and return a WebRTC session only if it still belongs to `run_id`.
     ///
     /// `remove_if` evaluates ownership and removes under one shard lock, so the
