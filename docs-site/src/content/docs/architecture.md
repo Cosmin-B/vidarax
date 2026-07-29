@@ -14,9 +14,9 @@ local write-ahead log before any optional mirror or delivery path observes it.
 ┌──────────┐   ┌──────────────────────────────┐   ┌─────────────────┐   ┌─────────────┐
 │ MP4/File │──>│ Decode -> Frame filter -> VLM│──>│ WAL event log   │──>│ REST / SSE  │
 │ WebRTC   │──>│    │                         │   │                 │   │ Webhooks    │
-│ RTSP/HLS │──>│    ├─ Trigger VM             │   │ Binary JPEG/MP4 │   │ TypeScript  │
-│ Upload   │──>│    └─ Synced A/V windows     │   │ sidecars        │   │ SDK / UI    │
-│          │   │       supervised generation  │   │                 │   │ Prometheus  │
+│ RTSP/HLS │──>│    ├─ Trigger VM             │   │ JPEG/MP4/WAV    │   │ TypeScript  │
+│ Upload   │──>│    ├─ Synced A/V windows     │   │ binary sidecars │   │ SDK / UI    │
+│          │   │    └─ Local audio sidecar    │   │                 │   │ Prometheus  │
 └──────────┘   └──────────────────────────────┘   └─────────────────┘   └─────────────┘
 
  Signed release manifest -> edge updater -> shadow -> canary -> active model
@@ -46,6 +46,10 @@ timeline into bounded windows. Each active inference task extracts one
 self-contained MP4 just before its provider call, so memory grows with bounded
 concurrency rather than file duration. Audio-video mode resamples and mixes up
 to eight input audio streams while preserving the shared source-time window.
+An optional local pass extracts a mono PCM WAV from that window. Silero VAD
+selects speech-bearing regions, EfficientAT labels sound events, and one chosen
+ASR model handles speech. The observations can stand alone or enter the VLM
+prompt as timestamped hypotheses.
 Gemini receives the MP4 through File API and deletes its temporary upload after
 the call. See [Ingest](/docs/ingest/) for decode paths and [The per-frame
 filter](/docs/gate/) for frame mode.
@@ -120,7 +124,8 @@ The durable store is a write-ahead log at `${VIDARAX_DATA_DIR}/timeline.wal` (da
 
 - Append-only plain text, one event per line, tab-separated with escaped fields.
   JPEG bytes live under `${VIDARAX_DATA_DIR}/keyframes/blobs/`. Retained A/V
-  windows live under `${VIDARAX_DATA_DIR}/media/blobs/`. The WAL stores their
+  windows and synthesized WAV feedback live under
+  `${VIDARAX_DATA_DIR}/media/blobs/`. The WAL stores their
   relative reference, media type, size, and SHA-256.
 - Each event carries a monotonic sequence number, a run ID, a stream ID, a presentation timestamp, a kind, and a JSON payload.
 - The file is created with owner-only read and write permissions on Unix.

@@ -293,6 +293,10 @@ test.describe('Upload reason settings', () => {
       buffer: Buffer.from('fake media'),
     })
     await page.getByRole('radio', { name: 'Audio + video' }).click()
+    await page.getByRole('switch', { name: 'Local audio events and selective speech' }).click()
+    await page.getByLabel('Audio profile').selectOption('screen_recording')
+    await page.getByLabel('Speech engine').selectOption('moonshine')
+    await page.getByRole('switch', { name: 'Store spoken feedback as WAV evidence' }).click()
     await page.getByRole('button', { name: /start analysis/i }).click()
 
     await expect.poll(() => reasonBody).not.toBeNull()
@@ -304,6 +308,13 @@ test.describe('Upload reason settings', () => {
         window_ms: 8_000,
         resolution: 'low',
         persist_evidence: true,
+      },
+      local_audio: {
+        profile: 'screen_recording',
+        speech_engine: 'moonshine',
+        min_confidence: 0.35,
+        max_events: 32,
+        voice_feedback: true,
       },
     })
     expect(reasonBody).not.toHaveProperty('chunk_size')

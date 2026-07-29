@@ -60,6 +60,10 @@ export interface MetricsData {
   mediaBlobsReusedTotal: number
   mediaBlobFailuresTotal: number
   multimodalMomentsTotal: number
+  localAudioWindowsTotal: number
+  localAudioAnalysisFailuresTotal: number
+  localAudioObservationsTotal: number
+  localAudioProcessingLatency: HistogramPercentiles | null
   restrictedZoneAssertionsTotal: number
   restrictedZoneEvidenceFailuresTotal: number
   restrictedZoneQueueDroppedTotal: number
@@ -329,6 +333,14 @@ function mediaExtractionPercentilesMs(
   return toPercentiles(h)
 }
 
+function localAudioPercentilesMs(
+  histograms: Map<string, RawHistogram>,
+): HistogramPercentiles | null {
+  const h = histograms.get('vidarax_pipeline_local_audio_processing_latency_ms')
+  if (!h || h.totalCount === 0) return null
+  return toPercentiles(h)
+}
+
 function buildMetrics(
   map: Map<string, number>,
   histograms: Map<string, RawHistogram>,
@@ -345,6 +357,7 @@ function buildMetrics(
   const eventMirrorPct = eventMirrorPercentilesMs(histograms)
   const sseCommitPct = sseCommitPercentilesMs(histograms)
   const mediaExtractionPct = mediaExtractionPercentilesMs(histograms)
+  const localAudioPct = localAudioPercentilesMs(histograms)
 
   const decodeLatency = decodePct?.mean ?? 0
   const gateLatency = gatePct?.mean ?? 0
@@ -471,6 +484,7 @@ function buildMetrics(
   if (noveltyPct) histogramsOut['Novelty'] = noveltyPct
   if (keyframeBlobPct) histogramsOut['Keyframe store'] = keyframeBlobPct
   if (mediaExtractionPct) histogramsOut['A/V extraction'] = mediaExtractionPct
+  if (localAudioPct) histogramsOut['Local audio'] = localAudioPct
   if (eventMirrorPct) histogramsOut['Event mirror'] = eventMirrorPct
   if (sseCommitPct) histogramsOut['SSE delivery'] = sseCommitPct
 
@@ -502,6 +516,10 @@ function buildMetrics(
     mediaBlobsReusedTotal: get('vidarax_pipeline_media_blobs_reused_total'),
     mediaBlobFailuresTotal: get('vidarax_pipeline_media_blob_failures_total'),
     multimodalMomentsTotal: get('vidarax_pipeline_multimodal_moments_total'),
+    localAudioWindowsTotal: get('vidarax_pipeline_local_audio_windows_total'),
+    localAudioAnalysisFailuresTotal: get('vidarax_pipeline_local_audio_analysis_failures_total'),
+    localAudioObservationsTotal: get('vidarax_pipeline_local_audio_observations_total'),
+    localAudioProcessingLatency: localAudioPct,
     restrictedZoneAssertionsTotal: get('vidarax_pipeline_restricted_zone_assertions_total'),
     restrictedZoneEvidenceFailuresTotal: get('vidarax_pipeline_restricted_zone_evidence_failures_total'),
     restrictedZoneQueueDroppedTotal: get('vidarax_pipeline_restricted_zone_queue_dropped_total'),

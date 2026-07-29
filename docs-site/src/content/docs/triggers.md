@@ -41,10 +41,20 @@ Attach the resulting `trigger_program` in the WHIP attach configuration. The
 program is fixed for one pipeline generation. The current live scalar path
 supports `motion_score`, `novelty_score`, and `confidence`, requires one
 keyframe capture, and stores the binary JPEG before committing the metadata
-event. Detector, tracking, world-geometry, uncertainty, teacher-disagreement,
-and clip actions are already represented in the ISA but are rejected at live
+event. Detector, tracking, world geometry, uncertainty, teacher disagreement,
+audio events, audio novelty, speech confidence, Mage cognition scores, and clip
+actions are represented in the ISA but are rejected at live
 attach until their corresponding producers are connected. Replay supports all
 signals through explicit observations.
+
+Audio and proactive video signals use the observation form:
+
+```text
+audio_event:<label>
+speech_confidence
+audio_novelty_score
+cognition_gate_score
+```
 
 An `emit loading_bay_entry` instruction commits the event as
 `trigger.loading_bay_entry`. Trigger programs cannot impersonate run lifecycle

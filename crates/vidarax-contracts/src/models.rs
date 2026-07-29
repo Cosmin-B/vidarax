@@ -19,6 +19,11 @@ pub const REQUIRED_SMALL_MODELS: &[&str] = &[
     "LiquidAI/LFM2.5-VL-1.6B",
 ];
 
+/// Optional models with narrower runtime or preprocessing requirements.
+pub const EXPERIMENTAL_MODELS: &[&str] = &["microsoft/Mage-VL"];
+
+const MAGE_FALLBACK_MODELS: &[&str] = &["microsoft/Mage-VL", "Qwen/Qwen3-VL-4B-Instruct"];
+
 pub const REQUIRED_MODELS: &[&str] = &[
     "Qwen/Qwen3.5-35B-A3B-FP8",
     "Qwen/Qwen3.5-9B",
@@ -65,6 +70,7 @@ pub fn normalize_model_id(input: &str) -> Option<&'static str> {
         "openbmb/minicpm-v-4_5" | "openbmb/minicpm-v-4.5" => Some("openbmb/MiniCPM-V-4_5"),
         "liquidai/lfm2-vl-450m" => Some("LiquidAI/LFM2-VL-450M"),
         "liquidai/lfm2.5-vl-1.6b" | "lfm2.5-vl-1.6b-q4_0.gguf" => Some("LiquidAI/LFM2.5-VL-1.6B"),
+        "microsoft/mage-vl" | "mage-vl" => Some(EXPERIMENTAL_MODELS[0]),
         "gemini-3.5-flash-lite" | "gemini-flash-lite-latest" | "gemini-flash-latest" => {
             Some(DEFAULT_GEMINI_MODEL)
         }
@@ -88,6 +94,7 @@ pub fn fallback_candidates(requested: &str) -> &'static [&'static str] {
         | "Qwen/Qwen3.5-9B"
         | "Qwen/Qwen3-VL-8B-Instruct"
         | "allenai/Molmo2-8B" => REQUIRED_MEDIUM_MODELS,
+        "microsoft/Mage-VL" => MAGE_FALLBACK_MODELS,
         _ => REQUIRED_SMALL_MODELS,
     }
 }

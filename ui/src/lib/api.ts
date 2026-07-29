@@ -204,6 +204,13 @@ export interface ReasonRequest {
     resolution?: 'low' | 'medium' | 'high'
     persist_evidence?: boolean
   }
+  local_audio?: {
+    profile?: 'general' | 'gameplay' | 'screen_recording' | 'physical_world'
+    speech_engine?: 'none' | 'auto' | 'sensevoice' | 'moonshine' | 'qwen3_asr' | 'lfm2_5_audio'
+    min_confidence?: number
+    max_events?: number
+    voice_feedback?: boolean
+  }
 }
 
 export interface ReasonResponse {
@@ -382,6 +389,7 @@ export const api = {
         body.sampling_policy = 'fixed'
       }
       if (data.media) body.media = data.media
+      if (data.local_audio) body.local_audio = data.local_audio
       if (data.semantic_timeout_ms !== undefined) {
         body.semantic_timeout_ms = data.semantic_timeout_ms
       }

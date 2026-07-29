@@ -12,8 +12,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
 use vidarax_contracts::models::{
-    fallback_candidates, GEMINI_MODELS, REQUIRED_MEDIUM_MODELS, REQUIRED_SMALL_MODELS,
+    fallback_candidates, EXPERIMENTAL_MODELS, GEMINI_MODELS, REQUIRED_MEDIUM_MODELS,
+    REQUIRED_SMALL_MODELS,
 };
+use vidarax_core::audio_sidecar::AudioSidecarClient;
 use vidarax_core::coordinates::{FrameCoordinates, IMAGE_COORDINATE_SCHEMA};
 use vidarax_core::gate::{FrameSignal, GateEventType};
 use vidarax_core::ingest::{
@@ -48,7 +50,7 @@ use crate::semantic_infer::{
     adaptive_sample_fps, compose_frame_metadata, estimate_sample_fps,
     load_decoded_signals_from_events, percentile_ms, prepare_realtime_chunks,
     run_semantic_dispatch, semantic_marker_to_api_marker, ChunkPrep, ChunkSemanticResult,
-    SemanticMediaConfig, SemanticMediaMode,
+    LocalAudioConfig, SemanticMediaConfig, SemanticMediaMode,
 };
 use crate::state::AppState;
 use crate::wal_sink::persist_media_blob;
@@ -1064,6 +1066,7 @@ struct RealtimeReasonParams {
     tiered_config: vidarax_core::tiered_vlm::TieredVlmConfig,
     decode_source: InputSource,
     media: SemanticMediaConfig,
+    local_audio: Option<LocalAudioConfig>,
     fixed_fps: f32,
 }
 
@@ -1278,6 +1281,68 @@ fn validate_realtime_reason_params(
             timestamp_windows: false,
         }
     };
+    let local_audio = if let Some(options) = payload.local_audio {
+        if media.mode != SemanticMediaMode::AudioVideo {
+            return Err(validation_error(
+                state,
+                "invalid realtime reason request",
+                vec![field_error(
+                    "local_audio",
+                    "local_audio requires media.mode=audio_video".to_string(),
+                )],
+            ));
+        }
+        if !options.min_confidence.is_finite() || !(0.0..=1.0).contains(&options.min_confidence) {
+            return Err(validation_error(
+                state,
+                "invalid realtime reason request",
+                vec![field_error(
+                    "local_audio.min_confidence",
+                    "min_confidence must be finite and in [0, 1]".to_string(),
+                )],
+            ));
+        }
+        if !(1..=64).contains(&options.max_events) {
+            return Err(validation_error(
+                state,
+                "invalid realtime reason request",
+                vec![field_error(
+                    "local_audio.max_events",
+                    "max_events must be in [1, 64]".to_string(),
+                )],
+            ));
+        }
+        let address = std::env::var("VIDARAX_AUDIO_SIDECAR_ADDR")
+            .ok()
+            .filter(|address| !address.trim().is_empty())
+            .ok_or_else(|| {
+                service_unavailable(
+                    state,
+                    "audio_sidecar_unavailable",
+                    "local_audio requires VIDARAX_AUDIO_SIDECAR_ADDR",
+                )
+            })?;
+        AudioSidecarClient::new(&address, semantic_timeout_ms).map_err(|error| {
+            validation_error(
+                state,
+                "invalid realtime reason request",
+                vec![field_error(
+                    "local_audio",
+                    format!("invalid audio sidecar configuration: {error}"),
+                )],
+            )
+        })?;
+        Some(LocalAudioConfig {
+            sidecar_addr: Arc::from(address),
+            profile: options.profile,
+            speech_engine: options.speech_engine,
+            min_confidence: options.min_confidence,
+            max_events: options.max_events,
+            voice_feedback: options.voice_feedback,
+        })
+    } else {
+        None
+    };
     let semantic_prompt = payload.semantic_prompt.clone().unwrap_or_else(|| {
         if media.mode == SemanticMediaMode::AudioVideo {
             "Analyze the synchronized audio and video as one physical event window. Return strict JSON with a moments array. Include speech intent only when the sound supports it. Include non-speech sounds, effects, music, ambient or mechanical noise, and their relationship to visible actions.".to_string()
@@ -1352,6 +1417,7 @@ fn validate_realtime_reason_params(
         tiered_config,
         decode_source,
         media,
+        local_audio,
         fixed_fps,
     })
 }
@@ -1404,6 +1470,13 @@ async fn append_semantic_chunk_event(
     {
         state.pipeline_metrics().inc_media_clip_extraction_failure();
     }
+    if let Some(audio) = &result.local_audio {
+        state
+            .pipeline_metrics()
+            .record_local_audio_window(audio.observations.len() as u64, audio.processing_ms);
+    } else if result.local_audio_error.is_some() {
+        state.pipeline_metrics().inc_local_audio_analysis_failure();
+    }
     let mut evidence = None;
     if let Some(media) = &result.media {
         state
@@ -1412,8 +1485,9 @@ async fn append_semantic_chunk_event(
         if media.persist_evidence {
             let state_for_blob = state.clone();
             let bytes = Arc::clone(&media.bytes);
+            let media_type = media.media_type;
             let blob_result = tokio::task::spawn_blocking(move || {
-                persist_media_blob(&state_for_blob, bytes.as_ref())
+                persist_media_blob(&state_for_blob, bytes.as_ref(), media_type)
             })
             .await
             .map_err(|error| format!("media sidecar worker failed: {error}"))?;
@@ -1457,6 +1531,39 @@ async fn append_semantic_chunk_event(
             if let Some(evidence) = &evidence {
                 object.insert("evidence".to_string(), evidence.clone());
             }
+        }
+    }
+    if let Some(feedback) = &result.feedback_audio {
+        let state_for_blob = state.clone();
+        let bytes = Arc::clone(&feedback.bytes);
+        let media_type = feedback.media_type;
+        let blob_result = tokio::task::spawn_blocking(move || {
+            persist_media_blob(&state_for_blob, bytes.as_ref(), media_type)
+        })
+        .await
+        .map_err(|error| format!("feedback audio sidecar worker failed: {error}"))?;
+        let blob = match blob_result {
+            Ok(blob) => blob,
+            Err(error) => {
+                state.pipeline_metrics().inc_media_blob_failure();
+                return Err(error);
+            }
+        };
+        state.pipeline_metrics().record_media_blob(blob.created);
+        if let Some(object) = details.as_object_mut() {
+            object.insert(
+                "feedback_audio".to_string(),
+                json!({
+                    "media_ref": blob.media_ref,
+                    "media_type": feedback.media_type,
+                    "media_bytes": blob.bytes,
+                    "media_sha256": blob.sha256,
+                    "created": blob.created,
+                    "model": feedback.model,
+                    "sample_rate_hz": feedback.sample_rate_hz,
+                    "processing_ms": feedback.processing_ms,
+                }),
+            );
         }
     }
     if let Some(index) = index_name {
@@ -1762,15 +1869,21 @@ pub async fn reason_realtime_run(
     let semantic_prompt = params.semantic_prompt;
     let tiered_config = params.tiered_config;
     let media = params.media;
+    let local_audio = params.local_audio;
     let fixed_fps = params.fixed_fps;
-    let semantic_decode_enabled = semantic_inference && state.provider().is_some();
-    if media.timestamp_windows && media.mode != SemanticMediaMode::Frames && !semantic_inference {
+    let semantic_decode_enabled =
+        (semantic_inference && state.provider().is_some()) || local_audio.is_some();
+    if media.timestamp_windows
+        && media.mode != SemanticMediaMode::Frames
+        && !semantic_inference
+        && local_audio.is_none()
+    {
         return validation_error(
             &state,
             "invalid realtime reason request",
             vec![field_error(
                 "semantic_inference",
-                "native media analysis requires semantic_inference=true".to_string(),
+                "native media analysis requires semantic_inference=true or local_audio".to_string(),
             )],
         );
     }
@@ -1954,8 +2067,12 @@ pub async fn reason_realtime_run(
         state.webrtc_config().gate_config.clone(),
     );
 
-    let providers = state.admitted_provider(&principal);
-    let semantic_available = semantic_inference && providers.is_some();
+    let providers = if semantic_inference {
+        state.admitted_provider(&principal)
+    } else {
+        None
+    };
+    let semantic_available = local_audio.is_some() || providers.is_some();
     let semantic_segment_ms = segment_ms;
     if semantic_inference && !semantic_available {
         if let Err(err) = state
@@ -1992,6 +2109,7 @@ pub async fn reason_realtime_run(
         media,
         semantic_decode_enabled,
         crop,
+        local_audio.clone(),
     )
     .await;
     let gate_elapsed_us = gate_started.elapsed().as_micros() as u64;
@@ -2189,7 +2307,10 @@ pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
         }
     };
     let mut models = Vec::with_capacity(
-        REQUIRED_MEDIUM_MODELS.len() + REQUIRED_SMALL_MODELS.len() + GEMINI_MODELS.len(),
+        REQUIRED_MEDIUM_MODELS.len()
+            + REQUIRED_SMALL_MODELS.len()
+            + EXPERIMENTAL_MODELS.len()
+            + GEMINI_MODELS.len(),
     );
     for model in REQUIRED_MEDIUM_MODELS {
         let (status, providers_available) =
@@ -2211,6 +2332,20 @@ pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
         models.push(ModelCatalogItem {
             id: (*model).to_string(),
             tier: "small".to_string(),
+            availability: status.to_string(),
+            providers_available,
+            fallback_candidates: fallback_candidates(model)
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        });
+    }
+    for model in EXPERIMENTAL_MODELS {
+        let (status, providers_available) =
+            model_availability(provider.as_ref(), &availability, model);
+        models.push(ModelCatalogItem {
+            id: (*model).to_string(),
+            tier: "experimental".to_string(),
             availability: status.to_string(),
             providers_available,
             fallback_candidates: fallback_candidates(model)
@@ -2846,7 +2981,7 @@ fn infer_execution_error_to_response(state: &AppState, err: InferExecutionError)
 #[cfg(test)]
 mod tests {
     use super::{
-        event_references_keyframe_blob, event_references_media_blob,
+        event_media_type_for_blob, event_references_keyframe_blob,
         feedback_events_to_json_for_owned_runs, feedback_payload_error,
         infer_execution_error_to_response, marker_to_emit_event_request, owned_run_ids_from_events,
         parse_provider, run_command_with_timeout, validate_infer_request, AnalyzeMarker,
@@ -3146,22 +3281,46 @@ mod tests {
     fn media_authorization_accepts_only_semantic_evidence_references() {
         let sha = "d".repeat(64);
         for kind in ["semantic_chunk_inferred", "multimodal_moment"] {
-            assert!(event_references_media_blob(
-                kind,
-                &json!({ "evidence": { "media_sha256": sha } }),
-                &"D".repeat(64),
-            ));
+            assert_eq!(
+                event_media_type_for_blob(
+                    kind,
+                    &json!({ "evidence": {
+                        "media_sha256": sha,
+                        "media_type": "video/mp4"
+                    } }),
+                    &"D".repeat(64),
+                )
+                .as_deref(),
+                Some("video/mp4")
+            );
         }
-        assert!(!event_references_media_blob(
+        assert_eq!(
+            event_media_type_for_blob(
+                "semantic_chunk_inferred",
+                &json!({ "feedback_audio": {
+                    "media_sha256": "e".repeat(64),
+                    "media_type": "audio/wav"
+                } }),
+                &"e".repeat(64),
+            )
+            .as_deref(),
+            Some("audio/wav")
+        );
+        assert!(event_media_type_for_blob(
             "untrusted_event",
-            &json!({ "evidence": { "media_sha256": "d".repeat(64) } }),
+            &json!({ "evidence": {
+                "media_sha256": "d".repeat(64),
+                "media_type": "video/mp4"
+            } }),
             &"d".repeat(64),
-        ));
-        assert!(!event_references_media_blob(
+        )
+        .is_none());
+        assert!(event_media_type_for_blob(
             "multimodal_moment",
             &json!({ "media_sha256": "d".repeat(64) }),
             &"d".repeat(64),
-        ));
+        )
+        .is_none());
     }
 
     #[test]
@@ -3636,7 +3795,7 @@ pub async fn serve_keyframe(
         .unwrap()
 }
 
-/// Return a raw MP4 referenced by an owned semantic event.
+/// Return raw binary media referenced by an owned semantic event.
 pub async fn serve_media(
     State(state): State<AppState>,
     Path((run_id, sha256)): Path<(String, String)>,
@@ -3675,23 +3834,31 @@ pub async fn serve_media(
         )
         .into_response();
     }
-    let referenced = events.iter().any(|event| {
-        event_references_media_blob(&event.kind, &parse_payload(&event.payload), &sha256)
+    let referenced_media_type = events.iter().find_map(|event| {
+        event_media_type_for_blob(&event.kind, &parse_payload(&event.payload), &sha256)
     });
-    if !referenced {
+    let Some(media_type) = referenced_media_type else {
         return not_found_error(
             &state,
             "media was not found",
             vec![field_error("sha256", sha256)],
         )
         .into_response();
-    }
+    };
 
     let sha256 = sha256.to_ascii_lowercase();
+    let extension = match media_type.as_str() {
+        "video/mp4" => "mp4",
+        "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
+        _ => {
+            return internal_error(&state, "event references an unsupported media type")
+                .into_response()
+        }
+    };
     let path = state
         .media_blob_root()
         .join(&sha256[..2])
-        .join(format!("{sha256}.mp4"));
+        .join(format!("{sha256}.{extension}"));
     let data = match tokio::fs::read(path).await {
         Ok(data) => data,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -3710,7 +3877,7 @@ pub async fn serve_media(
 
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "video/mp4")
+        .header(header::CONTENT_TYPE, media_type)
         .header(header::CONTENT_LENGTH, data.len())
         .header(header::ACCEPT_RANGES, "bytes")
         .header(
@@ -3750,15 +3917,26 @@ fn event_references_keyframe_blob(kind: &str, payload: &Value, sha256: &str) -> 
         .is_some_and(|value| value.eq_ignore_ascii_case(sha256))
 }
 
-fn event_references_media_blob(kind: &str, payload: &Value, sha256: &str) -> bool {
+fn event_media_type_for_blob(kind: &str, payload: &Value, sha256: &str) -> Option<String> {
     if !matches!(kind, "semantic_chunk_inferred" | "multimodal_moment") {
-        return false;
+        return None;
     }
-    payload
-        .get("evidence")
-        .and_then(|evidence| evidence.get("media_sha256"))
-        .and_then(Value::as_str)
-        .is_some_and(|value| value.eq_ignore_ascii_case(sha256))
+    for field in ["evidence", "feedback_audio"] {
+        let Some(media) = payload.get(field) else {
+            continue;
+        };
+        if media
+            .get("media_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case(sha256))
+        {
+            return media
+                .get("media_type")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+        }
+    }
+    None
 }
 
 pub async fn upload_file(

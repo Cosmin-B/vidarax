@@ -28,6 +28,8 @@ export default defineConfig({
         { label: 'Quickstart', slug: 'quickstart' },
         { label: 'Architecture', slug: 'architecture' },
         { label: 'Ingest', slug: 'ingest' },
+        { label: 'Local audio', slug: 'audio' },
+        { label: 'Mage-VL debug', slug: 'mage-vl' },
         { label: 'Per-frame filter', slug: 'gate' },
         { label: 'API reference', slug: 'api' },
         { label: 'Events and SDK', slug: 'events' },

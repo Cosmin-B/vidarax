@@ -3,6 +3,7 @@
 /.vidarax-data
 /.vidarax-models
 /.venv-model-provision
+/.venv-audio
 /.env
 /.env.*
 !/.env.example
