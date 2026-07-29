@@ -18,6 +18,7 @@ come from `crates/vidarax-api/src/config.rs`.
 | `VIDARAX_CONFIG` | `vidarax.toml` | Backend TOML path, used when explicit backend URLs are not set. |
 | `VIDARAX_VLLM_BASE_URL` | unset | vLLM OpenAI-compatible base URL. When set, it is used as priority 1. |
 | `VIDARAX_SGLANG_BASE_URL` | unset | SGLang OpenAI-compatible base URL. When set, it is used as priority 2. |
+| `VIDARAX_AUDIO_SIDECAR_ADDR` | unset | Binary TCP sidecar for local sound events, selective ASR, and optional WAV feedback. |
 | `VIDARAX_INFERENCE_GLOBAL_LIMIT` | `8` | Maximum concurrent provider calls across the process. |
 | `VIDARAX_INFERENCE_PER_PRINCIPAL_LIMIT` | `4` | Maximum concurrent provider calls for one authenticated principal. |
 | `VIDARAX_INFERENCE_WAITER_LIMIT` | `128` | Maximum queued provider calls. |
@@ -131,9 +132,10 @@ Keyframe JPEGs are stored at
 Identical JPEGs share a blob. Writes are flushed but not fsynced per keyframe.
 
 Recorded native media uses
-`media/blobs/<sha-prefix>/<sha256>.mp4`. The bounded MP4 window is written
+`media/blobs/<sha-prefix>/<sha256>.mp4`. Optional spoken feedback uses the same
+directory with a `.wav` suffix. Each bounded media object is written
 atomically before `semantic_chunk_inferred` and `multimodal_moment` events
-reference it. Identical windows share a blob. `GET
+reference it. Identical objects share a blob. `GET
 /v1/runs/{id}/media/{sha256}` serves only hashes referenced by a run owned by
 the caller.
 

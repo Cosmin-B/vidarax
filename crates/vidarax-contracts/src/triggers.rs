@@ -35,6 +35,10 @@ pub enum TriggerSignal {
     DwellMs { label: String, zone: String },
     ModelUncertainty,
     TeacherDisagreement,
+    AudioEventConfidence { label: String },
+    SpeechConfidence,
+    AudioNoveltyScore,
+    CognitionGateScore,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -475,11 +479,17 @@ fn validate_signal(signal: &TriggerSignal) -> Result<(), TriggerError> {
             validate_identifier(label, "object label")?;
             validate_identifier(zone, "zone")?;
         }
+        TriggerSignal::AudioEventConfidence { label } => {
+            validate_identifier(label, "audio event label")?;
+        }
         TriggerSignal::MotionScore
         | TriggerSignal::NoveltyScore
         | TriggerSignal::Confidence
         | TriggerSignal::ModelUncertainty
-        | TriggerSignal::TeacherDisagreement => {}
+        | TriggerSignal::TeacherDisagreement
+        | TriggerSignal::SpeechConfidence
+        | TriggerSignal::AudioNoveltyScore
+        | TriggerSignal::CognitionGateScore => {}
     }
     Ok(())
 }
@@ -712,6 +722,9 @@ fn parse_signal(raw: &str, line: usize) -> Result<TriggerSignal, TriggerError> {
         "confidence" => return Ok(TriggerSignal::Confidence),
         "model_uncertainty" => return Ok(TriggerSignal::ModelUncertainty),
         "teacher_disagreement" => return Ok(TriggerSignal::TeacherDisagreement),
+        "speech_confidence" => return Ok(TriggerSignal::SpeechConfidence),
+        "audio_novelty_score" => return Ok(TriggerSignal::AudioNoveltyScore),
+        "cognition_gate_score" => return Ok(TriggerSignal::CognitionGateScore),
         _ => {}
     }
     let (kind, args) = raw
@@ -752,6 +765,9 @@ fn parse_signal(raw: &str, line: usize) -> Result<TriggerSignal, TriggerError> {
                 zone: zone.to_string(),
             })
         }
+        "audio_event" => Ok(TriggerSignal::AudioEventConfidence {
+            label: args.to_string(),
+        }),
         _ => Err(TriggerError::at(line, "unknown trigger signal")),
     }
 }
@@ -812,6 +828,29 @@ end
                 kind: CaptureKind::Clip,
                 ..
             }
+        )));
+    }
+
+    #[test]
+    fn compiles_audio_and_cognition_gate_program() {
+        let source = r#"
+trigger gameplay-commentary version 1
+when audio_event:explosion >= 0.75
+and speech_confidence <= 0.30
+and cognition_gate_score >= 0.60
+cooldown 3000ms
+emit gameplay_highlight
+capture clip 2000ms 4000ms
+notify webhook
+end
+"#;
+        let program = compile_trigger(source).unwrap();
+        program.validate().unwrap();
+        assert!(program.instructions.iter().any(|instruction| matches!(
+            instruction,
+            TriggerInstruction::Load {
+                signal: TriggerSignal::AudioEventConfidence { label }
+            } if label == "explosion"
         )));
     }
 

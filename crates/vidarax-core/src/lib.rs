@@ -6,6 +6,7 @@
 #![deny(unsafe_code)]
 
 pub mod admission;
+pub mod audio_sidecar;
 pub mod backends;
 pub mod coordinates;
 pub mod crop;

@@ -55,6 +55,41 @@ The shipped reuse threshold is deliberately conservative. It is a safe starting 
 
 The novelty anchor advances only after a successful, non-empty VLM description. Reused frames and failed inference do not change it. The embedding sidecar receives raw JPEG bytes over a length-prefixed TCP protocol and returns 768 little-endian `f32` values. Images never pass through a JSON or base64 transform. See [Operations](/docs/operations/) and the repository's `docs/deployment.md` for calibration and provider/hardware measurement commands.
 
+## Text-encoder probe
+
+[LFM2.5-Encoder-230M](https://huggingface.co/LiquidAI/LFM2.5-Encoder-230M)
+and
+[LFM2.5-Encoder-350M](https://huggingface.co/LiquidAI/LFM2.5-Encoder-350M)
+are useful candidates for transcript and event-description deduplication. They
+are bidirectional 8k-context base encoders. Their model cards call for
+task-specific fine-tuning before classification, retrieval, or semantic
+similarity work.
+
+Vidarax keeps them out of the live image gate until deployment labels show that
+their cosine scores separate repeated and changed meanings. The probe compares
+both checkpoints on a tab-separated manifest:
+
+```text
+same	left	right
+1	forklift stopped beside bay	forklift remains stopped beside loading bay
+0	forklift stopped beside bay	forklift entered the pedestrian aisle
+```
+
+```bash
+python -m pip install "torch>=2.5" "transformers>=5.13"
+python scripts/lfm_encoder_probe.py /tmp/vidarax-text-pairs.tsv \
+  --device cpu \
+  --max-length 512
+```
+
+The JSON output reports model size, hidden width, batch latency, cosine
+separation, and the best balanced-accuracy threshold for that labelled set.
+The probe pins the reviewed model revisions because each checkpoint loads its
+published encoder implementation.
+Use the 230M checkpoint for the tighter CPU budget. Test the 350M checkpoint
+when the measured separation gain justifies its footprint. The benchmark
+manifest and output belong outside the repository.
+
 ## Tiered escalation to a second-pass model
 
 Frames the filter keeps reach inference, and inference itself can be two-tiered. A first-pass model handles the common case. When its output contains a confidence score below the configured threshold, the same frame is sent to a second-pass model. This is an uncalibrated model-reported schema value, not a validated probability of correctness.

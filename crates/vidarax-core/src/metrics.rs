@@ -137,6 +137,9 @@ pub struct PipelineMetrics {
     media_blobs_reused_total: AtomicU64,
     media_blob_failures_total: AtomicU64,
     multimodal_moments_total: AtomicU64,
+    local_audio_windows_total: AtomicU64,
+    local_audio_analysis_failures_total: AtomicU64,
+    local_audio_observations_total: AtomicU64,
     /// Restricted-zone assertions durably committed with their evidence.
     restricted_zone_assertions_total: AtomicU64,
     /// Restricted-zone evidence that failed before the assertion commit.
@@ -200,6 +203,8 @@ pub struct PipelineMetrics {
     pub keyframe_blob_latency_ms: LatencyHistogram,
     /// ffmpeg audio-video window extraction latency.
     pub media_extraction_latency_ms: LatencyHistogram,
+    /// Local audio sidecar model processing latency.
+    pub local_audio_processing_latency_ms: LatencyHistogram,
     /// SpacetimeDB HTTP POST latency in milliseconds.
     pub stdb_emit_latency_ms: LatencyHistogram,
 }
@@ -228,6 +233,9 @@ impl PipelineMetrics {
             media_blobs_reused_total: AtomicU64::new(0),
             media_blob_failures_total: AtomicU64::new(0),
             multimodal_moments_total: AtomicU64::new(0),
+            local_audio_windows_total: AtomicU64::new(0),
+            local_audio_analysis_failures_total: AtomicU64::new(0),
+            local_audio_observations_total: AtomicU64::new(0),
             restricted_zone_assertions_total: AtomicU64::new(0),
             restricted_zone_evidence_failures_total: AtomicU64::new(0),
             restricted_zone_queue_dropped_total: AtomicU64::new(0),
@@ -263,6 +271,7 @@ impl PipelineMetrics {
             novelty_embedding_latency_ms: LatencyHistogram::new(EMBEDDING_LATENCY_MS_BUCKETS),
             keyframe_blob_latency_ms: LatencyHistogram::new(STDB_EMIT_LATENCY_MS_BUCKETS),
             media_extraction_latency_ms: LatencyHistogram::new(VLM_LATENCY_MS_BUCKETS),
+            local_audio_processing_latency_ms: LatencyHistogram::new(VLM_LATENCY_MS_BUCKETS),
             stdb_emit_latency_ms: LatencyHistogram::new(STDB_EMIT_LATENCY_MS_BUCKETS),
         }
     }
@@ -422,6 +431,23 @@ impl PipelineMetrics {
     pub fn add_multimodal_moments(&self, count: u64) {
         self.multimodal_moments_total
             .fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_local_audio_window(&self, observations: u64, processing_ms: u64) {
+        self.local_audio_windows_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.local_audio_observations_total
+            .fetch_add(observations, Ordering::Relaxed);
+        self.local_audio_processing_latency_ms.record(processing_ms);
+    }
+
+    #[inline]
+    pub fn inc_local_audio_analysis_failure(&self) {
+        self.local_audio_windows_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.local_audio_analysis_failures_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -638,6 +664,11 @@ impl PipelineMetrics {
         let media_blobs_reused = self.media_blobs_reused_total.load(Ordering::Relaxed);
         let media_blob_failures = self.media_blob_failures_total.load(Ordering::Relaxed);
         let multimodal_moments = self.multimodal_moments_total.load(Ordering::Relaxed);
+        let local_audio_windows = self.local_audio_windows_total.load(Ordering::Relaxed);
+        let local_audio_analysis_failures = self
+            .local_audio_analysis_failures_total
+            .load(Ordering::Relaxed);
+        let local_audio_observations = self.local_audio_observations_total.load(Ordering::Relaxed);
         let restricted_zone_assertions = self
             .restricted_zone_assertions_total
             .load(Ordering::Relaxed);
@@ -719,6 +750,9 @@ impl PipelineMetrics {
              vidarax_pipeline_media_blobs_reused_total {media_blobs_reused}\n\
              vidarax_pipeline_media_blob_failures_total {media_blob_failures}\n\
              vidarax_pipeline_multimodal_moments_total {multimodal_moments}\n\
+             vidarax_pipeline_local_audio_windows_total {local_audio_windows}\n\
+             vidarax_pipeline_local_audio_analysis_failures_total {local_audio_analysis_failures}\n\
+             vidarax_pipeline_local_audio_observations_total {local_audio_observations}\n\
              vidarax_pipeline_restricted_zone_assertions_total {restricted_zone_assertions}\n\
              vidarax_pipeline_restricted_zone_evidence_failures_total {restricted_zone_evidence_failures}\n\
              vidarax_pipeline_restricted_zone_queue_dropped_total {restricted_zone_queue_dropped}\n\
@@ -808,6 +842,11 @@ impl PipelineMetrics {
         );
         out.push_str(
             &self
+                .local_audio_processing_latency_ms
+                .render_prometheus("vidarax_pipeline_local_audio_processing_latency_ms", "ms"),
+        );
+        out.push_str(
+            &self
                 .stdb_emit_latency_ms
                 .render_prometheus("vidarax_pipeline_stdb_emit_latency_ms", "ms"),
         );
@@ -848,6 +887,8 @@ mod tests {
         m.inc_trigger_missing_signal();
         m.inc_trigger_local_output();
         m.inc_trigger_local_output_failure();
+        m.record_local_audio_window(3, 12);
+        m.inc_local_audio_analysis_failure();
 
         let text = m.render_prometheus();
         assert!(text.contains("vidarax_pipeline_rtp_frames_received_total 2"));
@@ -867,6 +908,9 @@ mod tests {
         assert!(text.contains("vidarax_pipeline_trigger_missing_signal_total 1"));
         assert!(text.contains("vidarax_pipeline_trigger_local_outputs_total 1"));
         assert!(text.contains("vidarax_pipeline_trigger_local_output_failures_total 1"));
+        assert!(text.contains("vidarax_pipeline_local_audio_windows_total 2"));
+        assert!(text.contains("vidarax_pipeline_local_audio_analysis_failures_total 1"));
+        assert!(text.contains("vidarax_pipeline_local_audio_observations_total 3"));
     }
 
     #[test]

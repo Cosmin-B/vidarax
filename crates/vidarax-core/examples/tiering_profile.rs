@@ -413,11 +413,9 @@ fn print_metrics_split(path: &Path, totals: &BTreeMap<String, ProviderTotals>) {
     let total_requests = local.requests().saturating_add(gemini.requests());
     let total_tokens = local.tokens().saturating_add(gemini.tokens());
 
-    // These are per-provider inference totals from /metrics (includes any
-    // direct inference on that provider, not only WHIP tiering escalations);
-    // see the module doc comment. Grouping vllm+sglang+mlx as "local" and
-    // gemini separately is a labeling convenience, not a claim that this
-    // isolates tiering activity.
+    // These are per-provider inference totals from /metrics, including direct
+    // inference outside WHIP tiering escalations. See the module doc comment.
+    // The local and Gemini groups summarize provider activity across all paths.
     println!("  per-provider inference totals from /metrics (includes any direct inference):");
     println!("  LOCAL (vllm + sglang + mlx) vs GEMINI:");
     println!("    requests, {total_requests} total:");

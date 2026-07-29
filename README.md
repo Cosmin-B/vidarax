@@ -3,11 +3,10 @@
 Self-hosted media intelligence for live streams and recorded files.
 
 Vidarax turns continuous video and synchronized sound into actionable,
-replayable assertions. It
-decodes each stream, runs a deterministic per-frame filter, and spends model
-calls when visual or semantic change warrants them. Bounded trigger programs
-turn perception signals into namespaced events, signed webhooks, or
-metadata-only local outputs.
+replayable assertions. It decodes each stream, runs a deterministic per-frame
+filter, and spends model calls when visual or semantic change warrants them.
+Bounded trigger programs turn perception signals into namespaced events, signed
+webhooks, or metadata-only local outputs.
 
 Events commit to a local write-ahead log. Selected JPEGs live in a
 content-addressed binary store and event metadata carries their references.
@@ -23,9 +22,9 @@ keeps running through network loss or a rejected candidate.
 ┌──────────┐   ┌──────────────────────────────┐   ┌─────────────────┐   ┌─────────────┐
 │ MP4/File │──>│ Decode -> Frame filter -> VLM│──>│ WAL event log   │──>│ REST / SSE  │
 │ WebRTC   │──>│    │                         │   │                 │   │ Webhooks    │
-│ RTSP/HLS │──>│    ├─ Trigger VM             │   │ Binary JPEG/MP4 │   │ TypeScript  │
-│ Upload   │──>│    └─ Synced A/V windows     │   │ sidecars        │   │ SDK / UI    │
-│          │   │       supervised generation  │   │                 │   │ Prometheus  │
+│ RTSP/HLS │──>│    ├─ Trigger VM             │   │ JPEG/MP4/WAV    │   │ TypeScript  │
+│ Upload   │──>│    ├─ Synced A/V windows     │   │ binary sidecars │   │ SDK / UI    │
+│          │   │    └─ Local audio sidecar    │   │                 │   │ Prometheus  │
 └──────────┘   └──────────────────────────────┘   └─────────────────┘   └─────────────┘
 
  Signed release manifest -> edge updater -> shadow -> canary -> active model
@@ -52,11 +51,11 @@ token-level batching.
 Throughput depends on your hardware, the models you run, and the input video, so
 there is no single headline number worth quoting. Measure on your own setup: the
 Python harnesses in `benchmarks/`, the bench binaries under `crates/*/src/bin`,
-and the scripts in `scripts/` cover the per-frame filter, provider transport, and the
-end-to-end API path. The deterministic filter is the cheap per-frame stage. The
-optional semantic novelty filter reduces repeat model calls, while bounded tiering
-can escalate an uncertain first pass to a second model. Calibration and
-provider/hardware measurements are deployment-specific. See
+and the scripts in `scripts/` cover the per-frame filter, provider transport,
+and the end-to-end API path. The deterministic filter is the cheap per-frame
+stage. The optional semantic novelty filter reduces repeat model calls, while
+bounded tiering can escalate an uncertain first pass to a second model.
+Calibration and provider/hardware measurements are deployment-specific. See
 [deployment and calibration](docs/deployment.md#live-semantic-novelty-calibration).
 
 ## Quick start
@@ -115,6 +114,12 @@ const result = await v.reason(run_id, {
     resolution: 'low',
     persist_evidence: true,
   },
+  local_audio: {
+    profile: 'screen_recording',
+    speech_engine: 'auto',
+    min_confidence: 0.35,
+    max_events: 32,
+  },
 })
 
 const moments = (await v.getEvents(run_id))
@@ -128,6 +133,22 @@ speech intent, an optional audio-to-visual relationship, confidence, and an MP4
 sidecar reference when retention is enabled. Gemini timestamps resolve to about
 one second. Recorded media is supported now. WHIP audio is negotiated but is
 not yet attached to the live reasoning pipeline.
+
+The optional local audio sidecar runs Silero VAD and EfficientAT before the VLM.
+It invokes one selected ASR model only when speech is present. SenseVoice is the
+default selective engine. Moonshine Streaming Tiny, Qwen3-ASR 0.6B, and
+LFM2.5-Audio 1.5B are deployment choices. LFM can also store a spoken summary
+as content-addressed WAV. See [local audio](https://vidarax.cosminbararu.com/docs/audio/).
+
+Mage-VL is available as an experimental model and as two debug commands. One
+compares codec-native visual tokens with uniform frame sampling. The other
+prints each proactive streaming decision and its `p(respond)`. See
+[Mage-VL debug modes](https://vidarax.cosminbararu.com/docs/mage-vl/).
+
+The semantic-novelty tools can also compare LFM2.5 Encoder 230M and 350M on
+labelled transcript or event-description pairs. These base encoders stay out
+of the live image gate until the probe shows useful separation on deployment
+text. See [Gate engine](https://vidarax.cosminbararu.com/docs/gate/).
 
 The SDK also supports WHIP/WebRTC video, batch inference, structured JSON
 output via `output_schema`, interactions, and snapshot reads of events and
@@ -175,7 +196,7 @@ markers.
 | `POST` | `/v1/upload` | Upload a file for processing |
 | `GET` | `/v1/files/:filename` | Serve an uploaded or allowed-root file |
 | `GET` | `/v1/runs/:id/keyframes/:sha256` | Serve a run-owned keyframe as raw JPEG |
-| `GET` | `/v1/runs/:id/media/:sha256` | Serve run-owned A/V evidence as raw MP4 |
+| `GET` | `/v1/runs/:id/media/:sha256` | Serve run-owned MP4 or WAV media by hash |
 | `GET` | `/v1/health` | Health check |
 | `GET` | `/v1/metrics` | Prometheus-compatible metrics |
 
@@ -195,6 +216,7 @@ markers.
 | `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` | `64` | Process-wide reservation budget for live pipeline OS threads |
 | `VIDARAX_INFERENCE_TOKEN_BUDGET` | `32768` | Aggregate output-token reservation across active provider calls |
 | `VIDARAX_INFERENCE_BYTE_BUDGET` | `268435456` | Aggregate encoded-media byte reservation across active provider calls |
+| `VIDARAX_AUDIO_SIDECAR_ADDR` | — | TCP address for local audio perception, for example `127.0.0.1:7790` |
 | `VIDARAX_STREAM_TTL_SECS` | `3600` | Run idle TTL |
 | `VIDARAX_WEBHOOK_SECRET` | — | Server-side root for per-webhook signing keys. 32 bytes minimum |
 | `VIDARAX_TRIGGER_LOCAL_OUTPUT_SOCKET` | — | Absolute Unix datagram socket for metadata-only local trigger actions |

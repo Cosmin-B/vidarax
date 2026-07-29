@@ -86,15 +86,21 @@ target/release/vidarax analyze /srv/vidarax-media/demo.mp4 \
   --media audio-video \
   --model gemini-3.5-flash-lite \
   --media-window-ms 8000 \
-  --media-resolution low
+  --media-resolution low \
+  --local-audio \
+  --audio-profile screen-recording \
+  --speech-engine auto
 target/release/vidarax runs list
 target/release/vidarax events <run_id>
 ```
 
 The second analysis command sends raw MP4 windows through Gemini File API and
-prints `multimodal_moment` entries with source timestamps, sound and video
+passes a mono PCM WAV to the optional local audio sidecar. It prints
+`multimodal_moment` entries with source timestamps, sound and video
 descriptions, optional speech intent, and their relationship. Retained MP4
-windows stay in the binary sidecar.
+windows and optional spoken feedback stay in the binary media store. Set
+`VIDARAX_AUDIO_SIDECAR_ADDR` before using `--local-audio`. See
+[Local audio perception](/docs/audio/) for setup and local-only analysis.
 
 Global connection values resolve in this order: command-line flags,
 `VIDARAX_API_URL` / `VIDARAX_API_KEY` / `VIDARAX_TENANT_ID`, the file selected

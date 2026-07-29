@@ -243,7 +243,11 @@ fn read_signal(sample: &TriggerSample, signal: &TriggerSignal) -> Option<f32> {
         TriggerSignal::ObjectCount { .. }
         | TriggerSignal::MinimumDistanceMm { .. }
         | TriggerSignal::TimeToCollisionMs { .. }
-        | TriggerSignal::DwellMs { .. } => None,
+        | TriggerSignal::DwellMs { .. }
+        | TriggerSignal::AudioEventConfidence { .. }
+        | TriggerSignal::SpeechConfidence
+        | TriggerSignal::AudioNoveltyScore
+        | TriggerSignal::CognitionGateScore => None,
     };
     scalar.or_else(|| {
         sample
@@ -344,6 +348,43 @@ end"#,
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn evaluates_game_audio_and_cognition_gate_observations() {
+        let program = Arc::new(
+            compile_trigger(
+                r#"trigger game-highlight version 1
+when audio_event:explosion >= 0.75
+and cognition_gate_score >= 0.60
+emit game_highlight
+capture clip 2000ms 4000ms
+end"#,
+            )
+            .unwrap(),
+        );
+        let mut vm = TriggerVm::try_new(Arc::clone(&program)).unwrap();
+        let sample = TriggerSample {
+            pts_ms: 12_000,
+            motion_score: None,
+            novelty_score: None,
+            confidence: None,
+            model_uncertainty: None,
+            teacher_disagreement: None,
+            observations: vec![
+                TriggerObservation {
+                    signal: TriggerSignal::AudioEventConfidence {
+                        label: "explosion".into(),
+                    },
+                    value: 0.91,
+                },
+                TriggerObservation {
+                    signal: TriggerSignal::CognitionGateScore,
+                    value: 0.72,
+                },
+            ],
+        };
+        assert!(vm.evaluate(&sample).fired());
     }
 
     #[test]

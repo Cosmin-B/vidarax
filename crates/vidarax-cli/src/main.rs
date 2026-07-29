@@ -328,6 +328,27 @@ struct AnalyzeArgs {
     /// Do not retain content-addressed MP4 evidence.
     #[arg(long)]
     no_persist_evidence: bool,
+    /// Run the local audio perception sidecar on each native-media window.
+    #[arg(long)]
+    local_audio: bool,
+    /// Workload-specific audio event vocabulary.
+    #[arg(long, value_enum, default_value_t = AudioProfileArg::General, requires = "local_audio")]
+    audio_profile: AudioProfileArg,
+    /// Speech engine used only after voice activity is detected.
+    #[arg(long, value_enum, default_value_t = SpeechEngineArg::Auto, requires = "local_audio")]
+    speech_engine: SpeechEngineArg,
+    /// Minimum local audio event confidence.
+    #[arg(long, default_value_t = 0.35, requires = "local_audio")]
+    audio_min_confidence: f32,
+    /// Maximum local audio observations per media window.
+    #[arg(long, default_value_t = 32, requires = "local_audio")]
+    audio_max_events: u16,
+    /// Generate a spoken WAV summary with the optional LFM audio backend.
+    #[arg(long, requires = "local_audio")]
+    voice_feedback: bool,
+    /// Skip VLM inference and emit local audio observations only.
+    #[arg(long, requires = "local_audio")]
+    no_vlm: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -352,6 +373,48 @@ enum AnalyzeMediaResolutionArg {
     Low,
     Medium,
     High,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AudioProfileArg {
+    General,
+    Gameplay,
+    ScreenRecording,
+    PhysicalWorld,
+}
+
+impl AudioProfileArg {
+    fn wire_value(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Gameplay => "gameplay",
+            Self::ScreenRecording => "screen_recording",
+            Self::PhysicalWorld => "physical_world",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SpeechEngineArg {
+    None,
+    Auto,
+    SenseVoice,
+    Moonshine,
+    Qwen3Asr,
+    Lfm25Audio,
+}
+
+impl SpeechEngineArg {
+    fn wire_value(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Auto => "auto",
+            Self::SenseVoice => "sensevoice",
+            Self::Moonshine => "moonshine",
+            Self::Qwen3Asr => "qwen3_asr",
+            Self::Lfm25Audio => "lfm2_5_audio",
+        }
+    }
 }
 
 impl AnalyzeMediaResolutionArg {
@@ -439,7 +502,19 @@ impl AnalyzeArgs {
                 }),
             );
         }
-        body.insert("semantic_inference".to_string(), Value::Bool(true));
+        body.insert("semantic_inference".to_string(), Value::Bool(!self.no_vlm));
+        if self.local_audio {
+            body.insert(
+                "local_audio".to_string(),
+                json!({
+                    "profile": self.audio_profile.wire_value(),
+                    "speech_engine": self.speech_engine.wire_value(),
+                    "min_confidence": self.audio_min_confidence,
+                    "max_events": self.audio_max_events,
+                    "voice_feedback": self.voice_feedback,
+                }),
+            );
+        }
         body.insert(
             "semantic_timeout_ms".to_string(),
             json!(self.semantic_timeout_ms),
@@ -1578,6 +1653,15 @@ fn validate_analyze_args(args: &AnalyzeArgs) -> Result<(), String> {
     if !(100..=120_000).contains(&args.semantic_timeout_ms) {
         return Err("--semantic-timeout-ms must be in [100, 120000]".to_string());
     }
+    if args.local_audio && args.media != AnalyzeMediaArg::AudioVideo {
+        return Err("--local-audio requires --media audio-video".to_string());
+    }
+    if !args.audio_min_confidence.is_finite() || !(0.0..=1.0).contains(&args.audio_min_confidence) {
+        return Err("--audio-min-confidence must be in [0, 1]".to_string());
+    }
+    if !(1..=64).contains(&args.audio_max_events) {
+        return Err("--audio-max-events must be in [1, 64]".to_string());
+    }
     if args
         .model
         .as_deref()
@@ -2599,6 +2683,13 @@ mod tests {
             media_window_ms: 8_000,
             media_resolution: AnalyzeMediaResolutionArg::Low,
             no_persist_evidence: false,
+            local_audio: false,
+            audio_profile: AudioProfileArg::General,
+            speech_engine: SpeechEngineArg::Auto,
+            audio_min_confidence: 0.35,
+            audio_max_events: 32,
+            voice_feedback: false,
+            no_vlm: false,
         }
     }
 
@@ -2727,6 +2818,33 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+    }
+
+    #[test]
+    fn local_audio_options_are_wired_without_binary_json() {
+        let mut args = analyze_args();
+        args.media = AnalyzeMediaArg::AudioVideo;
+        args.local_audio = true;
+        args.audio_profile = AudioProfileArg::Gameplay;
+        args.speech_engine = SpeechEngineArg::Moonshine;
+        args.voice_feedback = true;
+        args.no_vlm = true;
+
+        let body = args.reason_body("/tmp/uploaded.mp4");
+        assert_eq!(
+            body.pointer("/local_audio/profile").and_then(Value::as_str),
+            Some("gameplay")
+        );
+        assert_eq!(
+            body.pointer("/local_audio/speech_engine")
+                .and_then(Value::as_str),
+            Some("moonshine")
+        );
+        assert_eq!(
+            body.get("semantic_inference").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert!(body.get("audio").is_none());
     }
 
     #[test]

@@ -311,6 +311,26 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
           <span class="mono text-[#22c55e] text-xs">{{ fmtInt(metrics.multimodalMomentsTotal) }}</span>
         </div>
         <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Local audio windows</span>
+          <span class="mono text-[#22c55e] text-xs">{{ fmtInt(metrics.localAudioWindowsTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Local audio observations</span>
+          <span class="mono text-[#22c55e] text-xs">{{ fmtInt(metrics.localAudioObservationsTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Local audio p95</span>
+          <span class="mono text-[#22c55e] text-xs">
+            {{ metrics.localAudioProcessingLatency ? `${Math.floor(metrics.localAudioProcessingLatency.p95)} ms` : '—' }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Local audio failures</span>
+          <span class="mono text-xs" :class="metrics.localAudioAnalysisFailuresTotal ? 'text-[#ef4444]' : 'text-[#22c55e]'">
+            {{ fmtInt(metrics.localAudioAnalysisFailuresTotal) }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
           <span class="text-[#475569] text-xs">A/V extraction failures</span>
           <span class="mono text-xs" :class="metrics.mediaClipExtractionFailuresTotal ? 'text-[#ef4444]' : 'text-[#22c55e]'">
             {{ fmtInt(metrics.mediaClipExtractionFailuresTotal) }}
@@ -438,15 +458,15 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
           </span>
         </div>
         <div class="flex items-center justify-between">
-          <span class="text-[#475569] text-xs">MP4 blobs written</span>
+          <span class="text-[#475569] text-xs">Media blobs written</span>
           <span class="mono text-[#f59e0b] text-xs">{{ fmtInt(metrics.mediaBlobsWrittenTotal) }}</span>
         </div>
         <div class="flex items-center justify-between">
-          <span class="text-[#475569] text-xs">MP4 blobs reused</span>
+          <span class="text-[#475569] text-xs">Media blobs reused</span>
           <span class="mono text-[#2dd4bf] text-xs">{{ fmtInt(metrics.mediaBlobsReusedTotal) }}</span>
         </div>
         <div class="flex items-center justify-between">
-          <span class="text-[#475569] text-xs">MP4 write failures</span>
+          <span class="text-[#475569] text-xs">Media write failures</span>
           <span class="mono text-xs" :class="metrics.mediaBlobFailuresTotal ? 'text-[#ef4444]' : 'text-[#2dd4bf]'">
             {{ fmtInt(metrics.mediaBlobFailuresTotal) }}
           </span>

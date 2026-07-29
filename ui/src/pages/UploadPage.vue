@@ -44,6 +44,10 @@ const MEDIA_MODE_OPTIONS = [
 const mediaWindowMs = ref(8_000)
 const mediaResolution = ref<'low' | 'medium' | 'high'>('low')
 const persistEvidence = ref(true)
+const localAudio = ref(false)
+const audioProfile = ref<'general' | 'gameplay' | 'screen_recording' | 'physical_world'>('general')
+const speechEngine = ref<'none' | 'auto' | 'sensevoice' | 'moonshine' | 'qwen3_asr' | 'lfm2_5_audio'>('auto')
+const voiceFeedback = ref(false)
 const availableModels = ref<ModelInfo[]>([])
 const modelsLoading = ref(false)
 
@@ -349,6 +353,15 @@ async function startUpload(): Promise<void> {
       }
       reasonRequest.semantic_timeout_ms = 30_000
     }
+    if (analysisMode.value === 'audio_video' && localAudio.value) {
+      reasonRequest.local_audio = {
+        profile: audioProfile.value,
+        speech_engine: speechEngine.value,
+        min_confidence: 0.35,
+        max_events: 32,
+        voice_feedback: voiceFeedback.value,
+      }
+    }
     await api.runs.reason(run.run_id, reasonRequest)
 
     await refreshMultimodalMoments(run.run_id)
@@ -449,6 +462,10 @@ async function downloadEvidence(moment: MultimodalMoment): Promise<void> {
 watch(analysisMode, mode => {
   if (mode !== 'frames' && !selectedModel.value.toLowerCase().includes('gemini')) {
     selectedModel.value = DEFAULT_MULTIMODAL_MODEL
+  }
+  if (mode !== 'audio_video') {
+    localAudio.value = false
+    voiceFeedback.value = false
   }
 })
 
@@ -816,6 +833,80 @@ function formatPts(ms: number) {
               </span>
               <span class="text-sm text-[#94a3b8]">Keep content-addressed MP4 clips with events</span>
             </button>
+            <template v-if="analysisMode === 'audio_video'">
+              <button
+                type="button"
+                role="switch"
+                :aria-checked="localAudio"
+                class="sm:col-span-2 flex min-h-11 items-center gap-3 w-fit text-left"
+                @click="localAudio = !localAudio"
+              >
+                <span
+                  aria-hidden="true"
+                  class="relative w-9 h-5 rounded-full"
+                  :style="localAudio ? 'background: #0d9488;' : 'background: #1e2633;'"
+                >
+                  <span
+                    class="absolute top-0.5 w-4 h-4 rounded-full transition-all"
+                    style="background: #e2e8f0;"
+                    :style="localAudio ? 'left: 18px;' : 'left: 2px;'"
+                  />
+                </span>
+                <span class="text-sm text-[#94a3b8]">Local audio events and selective speech</span>
+              </button>
+              <template v-if="localAudio">
+                <div class="space-y-1.5">
+                  <label for="audio-profile" class="text-xs text-[#64748b] uppercase tracking-wide">Audio profile</label>
+                  <select
+                    id="audio-profile"
+                    v-model="audioProfile"
+                    class="w-full min-h-11 px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0]"
+                    style="background: #0f1117; border: 1px solid #1e2633; outline: none;"
+                  >
+                    <option value="general">General</option>
+                    <option value="gameplay">Gameplay</option>
+                    <option value="screen_recording">Screen recording</option>
+                    <option value="physical_world">Physical world</option>
+                  </select>
+                </div>
+                <div class="space-y-1.5">
+                  <label for="speech-engine" class="text-xs text-[#64748b] uppercase tracking-wide">Speech engine</label>
+                  <select
+                    id="speech-engine"
+                    v-model="speechEngine"
+                    class="w-full min-h-11 px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0]"
+                    style="background: #0f1117; border: 1px solid #1e2633; outline: none;"
+                  >
+                    <option value="auto">Automatic</option>
+                    <option value="none">No transcription</option>
+                    <option value="sensevoice">SenseVoice</option>
+                    <option value="moonshine">Moonshine Tiny</option>
+                    <option value="qwen3_asr">Qwen3-ASR 0.6B</option>
+                    <option value="lfm2_5_audio">LFM2.5 Audio</option>
+                  </select>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  :aria-checked="voiceFeedback"
+                  class="sm:col-span-2 flex min-h-11 items-center gap-3 w-fit text-left"
+                  @click="voiceFeedback = !voiceFeedback"
+                >
+                  <span
+                    aria-hidden="true"
+                    class="relative w-9 h-5 rounded-full"
+                    :style="voiceFeedback ? 'background: #0d9488;' : 'background: #1e2633;'"
+                  >
+                    <span
+                      class="absolute top-0.5 w-4 h-4 rounded-full transition-all"
+                      style="background: #e2e8f0;"
+                      :style="voiceFeedback ? 'left: 18px;' : 'left: 2px;'"
+                    />
+                  </span>
+                  <span class="text-sm text-[#94a3b8]">Store spoken feedback as WAV evidence</span>
+                </button>
+              </template>
+            </template>
           </template>
 
           <!-- Prompt -->

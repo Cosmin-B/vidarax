@@ -92,7 +92,16 @@ pub(crate) struct MediaBlob {
 ///
 /// The caller keeps binary bytes out of the WAL and delivery payloads. A
 /// repeated clip reuses the same immutable content-addressed object.
-pub(crate) fn persist_media_blob(state: &AppState, data: &[u8]) -> Result<MediaBlob, String> {
+pub(crate) fn persist_media_blob(
+    state: &AppState,
+    data: &[u8],
+    media_type: &str,
+) -> Result<MediaBlob, String> {
+    let extension = match media_type {
+        "video/mp4" => "mp4",
+        "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
+        _ => return Err(format!("unsupported media sidecar type {media_type}")),
+    };
     let digest = Sha256::digest(data);
     let mut sha256 = String::with_capacity(64);
     for byte in digest {
@@ -106,14 +115,14 @@ pub(crate) fn persist_media_blob(state: &AppState, data: &[u8]) -> Result<MediaB
             directory.display()
         )
     })?;
-    let final_path = directory.join(format!("{sha256}.mp4"));
+    let final_path = directory.join(format!("{sha256}.{extension}"));
     let created = if final_path.exists() {
         false
     } else {
         write_blob_atomically(&final_path, data)?
     };
     Ok(MediaBlob {
-        media_ref: format!("media/blobs/{shard}/{sha256}.mp4"),
+        media_ref: format!("media/blobs/{shard}/{sha256}.{extension}"),
         sha256,
         bytes: data.len(),
         created,

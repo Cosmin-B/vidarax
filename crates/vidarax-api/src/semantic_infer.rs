@@ -5,11 +5,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::{Id as TaskId, JoinError, JoinSet};
+use vidarax_core::audio_sidecar::{
+    AudioAnalysis, AudioAnalysisRequest, AudioProfile, AudioSidecarClient, SpeechEngine,
+    SynthesizedAudio,
+};
 use vidarax_core::coordinates::{FrameCoordinates, IMAGE_COORDINATE_SCHEMA};
 use vidarax_core::crop::CropRegion;
 use vidarax_core::gate::{FrameSignal, GateEventType};
 use vidarax_core::ingest::pipeline::DecodePipeline;
-use vidarax_core::ingest::{extract_audio_video_clip, DecodedJpegFrame, MediaInfo, PreparedSource};
+use vidarax_core::ingest::{
+    extract_audio_video_clip, extract_audio_wav, DecodedJpegFrame, MediaInfo, PreparedSource,
+};
 use vidarax_core::pipeline::{FrameMetadata, TwoPassPipeline};
 use vidarax_core::provider::{
     InferenceImage, InferenceObserver, InferenceProvider, InferenceRequest, InferenceVideo,
@@ -137,6 +143,17 @@ pub struct ClipSpec {
     pub mode: SemanticMediaMode,
     pub resolution: MediaResolution,
     pub persist_evidence: bool,
+    pub local_audio: Option<LocalAudioConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalAudioConfig {
+    pub sidecar_addr: Arc<str>,
+    pub profile: AudioProfile,
+    pub speech_engine: SpeechEngine,
+    pub min_confidence: f32,
+    pub max_events: u16,
+    pub voice_feedback: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +169,15 @@ pub struct SemanticMediaEvidence {
     pub extraction_ms: u64,
     pub resolution: MediaResolution,
     pub persist_evidence: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedbackAudioEvidence {
+    pub bytes: Arc<[u8]>,
+    pub media_type: &'static str,
+    pub model: String,
+    pub sample_rate_hz: u32,
+    pub processing_ms: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -171,6 +197,9 @@ pub struct ChunkSemanticResult {
     pub inference_latency_ms: u64,
     pub moments: Vec<SemanticMoment>,
     pub media: Option<SemanticMediaEvidence>,
+    pub local_audio: Option<AudioAnalysis>,
+    pub local_audio_error: Option<String>,
+    pub feedback_audio: Option<FeedbackAudioEvidence>,
 }
 
 impl ChunkSemanticResult {
@@ -203,6 +232,8 @@ impl ChunkSemanticResult {
                 "total_tokens": self.usage.total_tokens,
                 "inference_latency_ms": self.inference_latency_ms,
                 "moments": &self.moments,
+                "local_audio": &self.local_audio,
+                "local_audio_error": &self.local_audio_error,
             })
         })
     }
@@ -344,6 +375,7 @@ pub async fn prepare_realtime_chunks(
     media: SemanticMediaConfig,
     semantic_decode_enabled: bool,
     crop: Option<CropRegion>,
+    local_audio: Option<LocalAudioConfig>,
 ) -> Vec<ChunkPrep> {
     let mut chunk_preps: Vec<ChunkPrep> = Vec::new();
     let mut ranges = Vec::new();
@@ -403,6 +435,7 @@ pub async fn prepare_realtime_chunks(
                 mode: media.mode,
                 resolution: media.resolution,
                 persist_evidence: media.persist_evidence,
+                local_audio: local_audio.clone(),
             })
         } else {
             None
@@ -718,13 +751,9 @@ pub async fn infer_chunk_semantics(
         used_fallback: false,
         ..ChunkSemanticResult::default()
     };
-    let Some(provider) = providers else {
-        result.used_fallback = true;
-        result.error = Some("provider_not_configured".to_string());
-        return result;
-    };
 
     let requested_media_mode = clip_spec.as_ref().map(|spec| spec.mode);
+    let local_audio_config = clip_spec.as_ref().and_then(|spec| spec.local_audio.clone());
     let use_video_clip = clip_spec.is_some();
     let selected = if use_video_clip {
         Vec::new()
@@ -738,31 +767,14 @@ pub async fn infer_chunk_semantics(
         sel
     };
 
-    let multimodal_instruction = if requested_media_mode == Some(SemanticMediaMode::AudioVideo) {
-        "\nTreat sound as evidence, not as a transcript request. Analyze speech intent and vocal affect only when supported by the clip. Also analyze non-speech sounds, sound effects, music, ambient or mechanical noise, and how sound relates to visible actions. Return at most 32 moments. Moment offsets are milliseconds from the beginning of this clip. Each modalities array may contain only audio and video. Each kind must be exactly speech, sound_effect, music, ambient, interaction, mechanical, or other. Confidence must be between 0 and 1. Do not attribute a moment to an original audio track because input tracks may have been mixed."
-    } else {
-        ""
-    };
-    let prompt = if use_video_clip {
-        format!(
-            "{semantic_prompt}{multimodal_instruction}\nchunk_pts_start_ms={pts_start_ms}\nchunk_pts_end_ms={pts_end_ms}"
-        )
-    } else {
-        format!(
-            "{semantic_prompt}{multimodal_instruction}\nchunk_frame_start={frame_start_index}\nchunk_frame_end={}\nchunk_pts_start_ms={pts_start_ms}\nchunk_pts_end_ms={pts_end_ms}",
-            frame_start_index
-                .saturating_add(chunk_jpegs.len() as u64)
-                .saturating_sub(1)
-        )
-    };
-
-    let extracted_media = if let Some(spec) = clip_spec {
+    let (extracted_media, local_audio_wav) = if let Some(spec) = clip_spec {
         let source_start_ms = spec.source_start_ms;
         let duration_ms = spec.duration_ms;
         let extraction = tokio::task::spawn_blocking(move || {
             let start_s = source_start_ms as f32 / 1_000.0;
             let duration_s = duration_ms as f32 / 1_000.0;
-            match spec.mode {
+            let local_audio = spec.local_audio.clone();
+            let media = match spec.mode {
                 SemanticMediaMode::Video => {
                     let started = Instant::now();
                     spec.decode_pipeline
@@ -805,11 +817,23 @@ pub async fn infer_chunk_semantics(
                     })
                 }
                 SemanticMediaMode::Frames => unreachable!("frame mode has no clip spec"),
-            }
+            }?;
+            let wav = if local_audio.is_some() {
+                let info: MediaInfo = spec.source.media_info()?.clone();
+                Some(extract_audio_wav(
+                    spec.source.source(),
+                    start_s,
+                    duration_s,
+                    &info,
+                )?)
+            } else {
+                None
+            };
+            Ok::<_, String>((media, wav))
         })
         .await;
         match extraction {
-            Ok(Ok(media)) => Some(media),
+            Ok(Ok((media, wav))) => (Some(media), wav),
             Ok(Err(error)) => {
                 result.used_fallback = true;
                 result.error = Some(format!("media_extraction_failed:{error}"));
@@ -822,7 +846,69 @@ pub async fn infer_chunk_semantics(
             }
         }
     } else {
-        None
+        (None, None)
+    };
+    result.media = extracted_media.clone();
+    let audio_source_end_ms = extracted_media
+        .as_ref()
+        .map(|media| media.source_end_ms)
+        .unwrap_or_else(|| pts_end_ms.max(pts_start_ms));
+
+    if let (Some(config), Some(wav)) = (local_audio_config.as_ref(), local_audio_wav) {
+        let config = config.clone();
+        let audio_outcome = tokio::task::spawn_blocking(move || {
+            let mut client = AudioSidecarClient::new(&config.sidecar_addr, timeout_ms)?;
+            client.analyze(AudioAnalysisRequest {
+                profile: config.profile,
+                speech_engine: config.speech_engine,
+                source_start_ms: pts_start_ms,
+                min_confidence: config.min_confidence,
+                max_events: config.max_events,
+                wav: &wav,
+            })
+        })
+        .await;
+        match audio_outcome {
+            Ok(Ok(analysis)) => {
+                result
+                    .moments
+                    .extend(audio_moments(&analysis, pts_start_ms, audio_source_end_ms));
+                result.local_audio = Some(analysis);
+            }
+            Ok(Err(error)) => result.local_audio_error = Some(error.to_string()),
+            Err(error) => {
+                result.local_audio_error = Some(format!("audio_sidecar_join_error:{error}"))
+            }
+        }
+    }
+
+    let multimodal_instruction = if requested_media_mode == Some(SemanticMediaMode::AudioVideo) {
+        "\nTreat sound as evidence, not as a transcript request. Analyze speech intent and vocal affect only when supported by the clip. Also analyze non-speech sounds, sound effects, music, ambient or mechanical noise, and how sound relates to visible actions. Return at most 32 moments. Moment offsets are milliseconds from the beginning of this clip. Each modalities array may contain only audio and video. Each kind must be exactly speech, sound_effect, music, ambient, interaction, mechanical, or other. Confidence must be between 0 and 1. Do not attribute a moment to an original audio track because input tracks may have been mixed."
+    } else {
+        ""
+    };
+    let audio_context = result
+        .local_audio
+        .as_ref()
+        .map(local_audio_prompt_context)
+        .unwrap_or_default();
+    let prompt = if use_video_clip {
+        format!(
+            "{semantic_prompt}{multimodal_instruction}{audio_context}\nchunk_pts_start_ms={pts_start_ms}\nchunk_pts_end_ms={pts_end_ms}"
+        )
+    } else {
+        format!(
+            "{semantic_prompt}{multimodal_instruction}{audio_context}\nchunk_frame_start={frame_start_index}\nchunk_frame_end={}\nchunk_pts_start_ms={pts_start_ms}\nchunk_pts_end_ms={pts_end_ms}",
+            frame_start_index
+                .saturating_add(chunk_jpegs.len() as u64)
+                .saturating_sub(1)
+        )
+    };
+
+    let Some(provider) = providers else {
+        finish_local_audio_result(&mut result);
+        maybe_generate_feedback(&mut result, local_audio_config.as_ref(), timeout_ms).await;
+        return result;
     };
 
     let (images, videos) = if let Some(media) = extracted_media.as_ref() {
@@ -986,8 +1072,9 @@ pub async fn infer_chunk_semantics(
         ) {
             Ok((overlay, moments)) => {
                 result.overlay = Some(overlay);
-                result.moments = moments;
+                result.moments.extend(moments);
                 result.used_fallback = provider_result.fallback_used;
+                maybe_generate_feedback(&mut result, local_audio_config.as_ref(), timeout_ms).await;
                 result
             }
             Err(parse_error) => {
@@ -1001,6 +1088,150 @@ pub async fn infer_chunk_semantics(
                 result.error = Some(format!("semantic_parse_failed:{}", parse_error.as_str()));
                 result
             }
+        }
+    }
+}
+
+fn audio_moments(
+    analysis: &AudioAnalysis,
+    source_start_ms: u64,
+    source_end_ms: u64,
+) -> Vec<SemanticMoment> {
+    let duration_ms = source_end_ms.saturating_sub(source_start_ms);
+    analysis
+        .observations
+        .iter()
+        .map(|observation| {
+            let start_offset_ms = observation.start_offset_ms.min(duration_ms);
+            let end_offset_ms = observation
+                .end_offset_ms
+                .max(start_offset_ms)
+                .min(duration_ms);
+            let description = observation
+                .transcript
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .map_or_else(
+                    || observation.label.clone(),
+                    |transcript| format!("{}: {transcript}", observation.label),
+                );
+            SemanticMoment {
+                start_offset_ms,
+                end_offset_ms,
+                start_pts_ms: source_start_ms.saturating_add(start_offset_ms),
+                end_pts_ms: source_start_ms.saturating_add(end_offset_ms),
+                modalities: vec!["audio".to_string()],
+                kind: observation.kind.clone(),
+                description,
+                intent: observation.transcript.clone(),
+                audio_visual_relation: None,
+                confidence: observation.confidence.clamp(0.0, 1.0),
+            }
+        })
+        .collect()
+}
+
+fn local_audio_prompt_context(analysis: &AudioAnalysis) -> String {
+    if analysis.observations.is_empty() {
+        return "\nLocal audio front-end found no event above its calibrated threshold."
+            .to_string();
+    }
+    let mut context = String::from(
+        "\nLocal audio front-end observations follow. Treat them as hypotheses with source-window offsets, not ground truth:",
+    );
+    for observation in analysis.observations.iter().take(32) {
+        use std::fmt::Write as _;
+        let _ = write!(
+            context,
+            "\n- {}..{}ms kind={} label={} confidence={:.3} model={}",
+            observation.start_offset_ms,
+            observation.end_offset_ms,
+            observation.kind,
+            observation.label,
+            observation.confidence,
+            observation.model
+        );
+        if let Some(transcript) = observation.transcript.as_deref() {
+            let transcript = truncate_context(transcript, 240);
+            let _ = write!(context, " transcript={transcript}");
+        }
+        if let Some(emotion) = observation.emotion.as_deref() {
+            let _ = write!(context, " emotion={emotion}");
+        }
+    }
+    context
+}
+
+fn finish_local_audio_result(result: &mut ChunkSemanticResult) {
+    let Some(moment) = result
+        .moments
+        .iter()
+        .max_by(|left, right| left.confidence.total_cmp(&right.confidence))
+    else {
+        result.provider = Some("local_audio".to_string());
+        result.overlay = Some(SemanticOverlay {
+            event_type: "context_observation".to_string(),
+            object_label: "audio".to_string(),
+            summary: "No local audio event crossed the threshold".to_string(),
+            description: "No local audio event crossed the configured threshold".to_string(),
+            confidence: 0.0,
+        });
+        return;
+    };
+    result.provider = Some("local_audio".to_string());
+    result.overlay = Some(SemanticOverlay {
+        event_type: "context_observation".to_string(),
+        object_label: moment.kind.clone(),
+        summary: moment.description.clone(),
+        description: moment.description.clone(),
+        confidence: moment.confidence,
+    });
+}
+
+async fn maybe_generate_feedback(
+    result: &mut ChunkSemanticResult,
+    config: Option<&LocalAudioConfig>,
+    timeout_ms: u64,
+) {
+    let Some(config) = config.filter(|config| config.voice_feedback) else {
+        return;
+    };
+    let Some(text) = result
+        .overlay
+        .as_ref()
+        .map(|overlay| overlay.description.trim())
+        .filter(|text| !text.is_empty())
+    else {
+        return;
+    };
+    let address = Arc::clone(&config.sidecar_addr);
+    let text = truncate_context(text, 2_000).to_string();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut client = AudioSidecarClient::new(&address, timeout_ms)?;
+        client.synthesize(&text)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(SynthesizedAudio {
+            bytes,
+            media_type,
+            sample_rate_hz,
+            processing_ms,
+            model,
+        })) => {
+            result.feedback_audio = Some(FeedbackAudioEvidence {
+                bytes: Arc::from(bytes),
+                media_type,
+                model,
+                sample_rate_hz,
+                processing_ms,
+            });
+        }
+        Ok(Err(error)) => {
+            result.local_audio_error = Some(format!("voice_feedback_failed:{error}"));
+        }
+        Err(error) => {
+            result.local_audio_error = Some(format!("voice_feedback_join_error:{error}"));
         }
     }
 }

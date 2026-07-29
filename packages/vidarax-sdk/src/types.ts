@@ -375,6 +375,7 @@ export interface RealtimeReasonRequest {
   video_clip_mode?: boolean;
   video_clip_duration_s?: number;
   media?: MediaAnalysisOptions;
+  local_audio?: LocalAudioAnalysisOptions;
   vlm_concurrency?: number;
 }
 
@@ -386,6 +387,29 @@ export interface MediaAnalysisOptions {
   window_ms?: number;
   resolution?: MediaAnalysisResolution;
   persist_evidence?: boolean;
+}
+
+export type AudioAnalysisProfile =
+  | "general"
+  | "gameplay"
+  | "screen_recording"
+  | "physical_world";
+
+export type SpeechEngine =
+  | "none"
+  | "auto"
+  | "sensevoice"
+  | "moonshine"
+  | "qwen3_asr"
+  | "lfm2_5_audio";
+
+export interface LocalAudioAnalysisOptions {
+  profile?: AudioAnalysisProfile;
+  speech_engine?: SpeechEngine;
+  min_confidence?: number;
+  max_events?: number;
+  /** Store an LFM-generated spoken summary as content-addressed WAV evidence. */
+  voice_feedback?: boolean;
 }
 
 export type MultimodalMomentKind =

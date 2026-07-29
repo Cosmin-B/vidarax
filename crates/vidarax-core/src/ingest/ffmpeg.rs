@@ -1096,6 +1096,7 @@ pub fn extract_video_clip(
 }
 
 pub const AUDIO_VIDEO_CLIP_MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub const AUDIO_WAV_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct ExtractedAudioVideoClip {
@@ -1104,6 +1105,103 @@ pub struct ExtractedAudioVideoClip {
     pub audio_channels: u16,
     pub audio_mixed: bool,
     pub extraction_ms: u64,
+}
+
+/// Extract the same source-time audio window as 16 kHz mono PCM WAV.
+///
+/// The local audio sidecar accepts one deterministic signal regardless of the
+/// source container. Multiple source tracks are mixed with equal weights,
+/// matching the native audio-video evidence path.
+pub fn extract_audio_wav(
+    source: &InputSource,
+    start_s: f32,
+    duration_s: f32,
+    media_info: &MediaInfo,
+) -> Result<Vec<u8>, String> {
+    with_prefetched_downloadable_source(source, |source| {
+        extract_audio_wav_inner(source, start_s, duration_s, media_info)
+    })?
+}
+
+fn extract_audio_wav_inner(
+    source: &InputSource,
+    start_s: f32,
+    duration_s: f32,
+    media_info: &MediaInfo,
+) -> Result<Vec<u8>, String> {
+    if !start_s.is_finite() || start_s < 0.0 {
+        return Err("start_s must be >= 0".to_string());
+    }
+    if !duration_s.is_finite() || duration_s <= 0.0 || duration_s > 60.0 {
+        return Err("duration_s must be in (0, 60]".to_string());
+    }
+    if media_info.audio_streams == 0 {
+        return Err("local audio analysis requires an audio stream".to_string());
+    }
+    if media_info.audio_streams > 8 {
+        return Err("local audio analysis supports at most 8 audio streams".to_string());
+    }
+
+    let source_uri = source.as_ffmpeg_input();
+    let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
+    let start = format!("{start_s:.6}");
+    let duration = format!("{duration_s:.6}");
+    let mut command = Command::new(ffmpeg_path());
+    command
+        .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
+        .args(ffmpeg_input_options_for_source(source))
+        .args(["-ss", &start, "-t", &duration, "-i", source_uri]);
+
+    let audio_streams = usize::from(media_info.audio_streams);
+    if audio_streams == 1 {
+        command.args(["-map", "0:a:0"]);
+    } else {
+        let mut filter = String::new();
+        for index in 0..audio_streams {
+            use std::fmt::Write as _;
+            let _ = write!(filter, "[0:a:{index}]aresample=16000:async=1[a{index}];");
+        }
+        for index in 0..audio_streams {
+            use std::fmt::Write as _;
+            let _ = write!(filter, "[a{index}]");
+        }
+        use std::fmt::Write as _;
+        let _ = write!(
+            filter,
+            "amix=inputs={audio_streams}:normalize=1:dropout_transition=0[aout]"
+        );
+        command.args(["-filter_complex", &filter, "-map", "[aout]"]);
+    }
+    let output = command
+        .args([
+            "-vn",
+            "-sn",
+            "-dn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            "-f",
+            "wav",
+            "-",
+        ])
+        .output()
+        .map_err(|_| "failed to run ffmpeg audio extraction".to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffmpeg audio extraction failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if output.stdout.is_empty() || output.stdout.len() > AUDIO_WAV_MAX_BYTES {
+        return Err(format!(
+            "extracted WAV is {} bytes; maximum is {AUDIO_WAV_MAX_BYTES}",
+            output.stdout.len()
+        ));
+    }
+    Ok(output.stdout)
 }
 
 /// Extract a self-contained MP4 whose video and mixed audio retain one shared

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use vidarax_contracts::triggers::TriggerProgram;
+use vidarax_core::audio_sidecar::{AudioProfile, SpeechEngine};
 use vidarax_core::crop::CropRegion;
 use vidarax_core::zone::RestrictedZonePolicy;
 
@@ -169,10 +170,47 @@ pub struct RealtimeReasonRequest {
     /// synchronized sound and picture window and requires a binary-capable
     /// provider such as Gemini.
     pub media: Option<MediaAnalysisOptions>,
+    /// Optional local audio perception. The server sends binary PCM WAV to the
+    /// configured sidecar before VLM inference and adds its timestamped
+    /// observations to the model context and durable event stream.
+    pub local_audio: Option<LocalAudioAnalysisOptions>,
     /// Maximum number of concurrent VLM inference requests in parallel mode.
     /// Higher values increase throughput but may cause queueing on the GPU.
     /// Default: 4.
     pub vlm_concurrency: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalAudioAnalysisOptions {
+    #[serde(default = "default_audio_profile")]
+    pub profile: AudioProfile,
+    #[serde(default = "default_speech_engine")]
+    pub speech_engine: SpeechEngine,
+    #[serde(default = "default_audio_confidence")]
+    pub min_confidence: f32,
+    #[serde(default = "default_audio_max_events")]
+    pub max_events: u16,
+    /// Generate spoken feedback from each semantic chunk through
+    /// LFM2.5-Audio. Generated WAV bytes live in the binary media sidecar.
+    #[serde(default)]
+    pub voice_feedback: bool,
+}
+
+fn default_audio_profile() -> AudioProfile {
+    AudioProfile::General
+}
+
+fn default_speech_engine() -> SpeechEngine {
+    SpeechEngine::Auto
+}
+
+fn default_audio_confidence() -> f32 {
+    0.35
+}
+
+fn default_audio_max_events() -> u16 {
+    32
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
