@@ -66,8 +66,11 @@ export VIDARAX_AUDIO_SIDECAR_ADDR=127.0.0.1:7790
 `core`, `moonshine`, `qwen`, `lfm`, and `all` are also valid setup profiles.
 Moonshine, Qwen, and LFM profiles require Python 3.10 or newer. Set
 `VIDARAX_AUDIO_PYTHON=python3.12` when the system `python3` is older.
-The server defaults to one active inference request. Raise
-`--max-in-flight` only after measuring memory and latency on the target device.
+The server defaults to one active inference request and eight queued requests.
+Use `--max-in-flight` and `--max-queued` to set both bounds after measuring
+memory and latency on the target device. A full queue returns a typed
+`overloaded` failure. A request that exhausts its queue deadline returns
+`timeout`.
 
 ## Request
 
@@ -126,5 +129,22 @@ end
 `cognition_gate_score` are observation signals. Missing observations fail
 closed.
 
-Live WHIP audio is still receive-only at the peer boundary. This audio path
-currently runs on recorded files and server-reachable media sources.
+## Telemetry
+
+`GET /v1/metrics` separates each part of the recorded-audio path:
+
+- WAV extraction latency, encoded bytes, and source duration
+- extraction-to-result latency and real-time factor
+- VAD, sound-classifier, ASR, and TTS latency
+- sidecar active capacity and bounded queue depth
+- TTS attempts, successes, failures, output bytes, and latency
+- fixed `decode`, `timeout`, `overloaded`, `model_load`,
+  `malformed_response`, `reconnect`, and `inference` failure reasons
+
+Audio tracing links work to run, request, stream, and chunk IDs. Media stays
+outside span attributes.
+
+Live WHIP audio is drained and measured at the peer boundary. Track count,
+access units, bytes, RTP-derived duration, and receive errors prove that audio
+is arriving. Live audio is not sent to the analysis sidecar yet, so the
+dashboard labels these counters as transport telemetry.

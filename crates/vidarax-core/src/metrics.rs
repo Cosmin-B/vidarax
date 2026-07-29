@@ -11,12 +11,15 @@
 //! histogram exposition format.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::audio_sidecar::{AudioAnalysis, AudioFailureReason, AudioSidecarError, SidecarCapacity};
 use crate::webrtc::runtime::{PipelineFault, PipelineFaultReason, PipelineShutdown, PipelineStage};
 
 const PIPELINE_STAGE_COUNT: usize = 5;
 const PIPELINE_FAULT_REASON_COUNT: usize = 4;
+const AUDIO_FAILURE_REASON_COUNT: usize = 7;
 
 pub const DECODE_LATENCY_US_BUCKETS: [u64; 8] =
     [100, 250, 500, 1_000, 2_000, 5_000, 10_000, 50_000];
@@ -140,6 +143,21 @@ pub struct PipelineMetrics {
     local_audio_windows_total: AtomicU64,
     local_audio_analysis_failures_total: AtomicU64,
     local_audio_observations_total: AtomicU64,
+    local_audio_wav_bytes_total: AtomicU64,
+    local_audio_duration_ms_total: AtomicU64,
+    local_audio_failures_total: [AtomicU64; AUDIO_FAILURE_REASON_COUNT],
+    local_audio_sidecar_active: AtomicU64,
+    local_audio_sidecar_queued: AtomicU64,
+    local_audio_sidecar_capacity: AtomicU64,
+    local_audio_tts_attempts_total: AtomicU64,
+    local_audio_tts_successes_total: AtomicU64,
+    local_audio_tts_failures_total: AtomicU64,
+    local_audio_tts_bytes_total: AtomicU64,
+    webrtc_audio_tracks_total: AtomicU64,
+    webrtc_audio_access_units_total: AtomicU64,
+    webrtc_audio_bytes_total: AtomicU64,
+    webrtc_audio_duration_ms_total: AtomicU64,
+    webrtc_audio_receive_errors_total: AtomicU64,
     /// Restricted-zone assertions durably committed with their evidence.
     restricted_zone_assertions_total: AtomicU64,
     /// Restricted-zone evidence that failed before the assertion commit.
@@ -205,8 +223,29 @@ pub struct PipelineMetrics {
     pub media_extraction_latency_ms: LatencyHistogram,
     /// Local audio sidecar model processing latency.
     pub local_audio_processing_latency_ms: LatencyHistogram,
+    pub local_audio_wav_extraction_latency_ms: LatencyHistogram,
+    pub local_audio_round_trip_latency_ms: LatencyHistogram,
+    pub local_audio_decode_latency_ms: LatencyHistogram,
+    pub local_audio_vad_latency_ms: LatencyHistogram,
+    pub local_audio_classifier_latency_ms: LatencyHistogram,
+    pub local_audio_asr_latency_ms: LatencyHistogram,
+    pub local_audio_tts_latency_ms: LatencyHistogram,
+    /// Real-time factor multiplied by 1,000.
+    pub local_audio_real_time_factor_milli: LatencyHistogram,
     /// SpacetimeDB HTTP POST latency in milliseconds.
     pub stdb_emit_latency_ms: LatencyHistogram,
+}
+
+pub struct LocalAudioSidecarRequestGuard {
+    metrics: Arc<PipelineMetrics>,
+}
+
+impl Drop for LocalAudioSidecarRequestGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .local_audio_sidecar_active
+            .fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl PipelineMetrics {
@@ -236,6 +275,21 @@ impl PipelineMetrics {
             local_audio_windows_total: AtomicU64::new(0),
             local_audio_analysis_failures_total: AtomicU64::new(0),
             local_audio_observations_total: AtomicU64::new(0),
+            local_audio_wav_bytes_total: AtomicU64::new(0),
+            local_audio_duration_ms_total: AtomicU64::new(0),
+            local_audio_failures_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            local_audio_sidecar_active: AtomicU64::new(0),
+            local_audio_sidecar_queued: AtomicU64::new(0),
+            local_audio_sidecar_capacity: AtomicU64::new(0),
+            local_audio_tts_attempts_total: AtomicU64::new(0),
+            local_audio_tts_successes_total: AtomicU64::new(0),
+            local_audio_tts_failures_total: AtomicU64::new(0),
+            local_audio_tts_bytes_total: AtomicU64::new(0),
+            webrtc_audio_tracks_total: AtomicU64::new(0),
+            webrtc_audio_access_units_total: AtomicU64::new(0),
+            webrtc_audio_bytes_total: AtomicU64::new(0),
+            webrtc_audio_duration_ms_total: AtomicU64::new(0),
+            webrtc_audio_receive_errors_total: AtomicU64::new(0),
             restricted_zone_assertions_total: AtomicU64::new(0),
             restricted_zone_evidence_failures_total: AtomicU64::new(0),
             restricted_zone_queue_dropped_total: AtomicU64::new(0),
@@ -272,6 +326,16 @@ impl PipelineMetrics {
             keyframe_blob_latency_ms: LatencyHistogram::new(STDB_EMIT_LATENCY_MS_BUCKETS),
             media_extraction_latency_ms: LatencyHistogram::new(VLM_LATENCY_MS_BUCKETS),
             local_audio_processing_latency_ms: LatencyHistogram::new(VLM_LATENCY_MS_BUCKETS),
+            local_audio_wav_extraction_latency_ms: LatencyHistogram::new(VLM_LATENCY_MS_BUCKETS),
+            local_audio_round_trip_latency_ms: LatencyHistogram::new(VLM_LATENCY_MS_BUCKETS),
+            local_audio_decode_latency_ms: LatencyHistogram::new(VLM_LATENCY_MS_BUCKETS),
+            local_audio_vad_latency_ms: LatencyHistogram::new(VLM_LATENCY_MS_BUCKETS),
+            local_audio_classifier_latency_ms: LatencyHistogram::new(VLM_LATENCY_MS_BUCKETS),
+            local_audio_asr_latency_ms: LatencyHistogram::new(VLM_LATENCY_MS_BUCKETS),
+            local_audio_tts_latency_ms: LatencyHistogram::new(VLM_LATENCY_MS_BUCKETS),
+            local_audio_real_time_factor_milli: LatencyHistogram::new([
+                50, 100, 250, 500, 750, 1_000, 2_000, 5_000,
+            ]),
             stdb_emit_latency_ms: LatencyHistogram::new(STDB_EMIT_LATENCY_MS_BUCKETS),
         }
     }
@@ -440,6 +504,130 @@ impl PipelineMetrics {
         self.local_audio_observations_total
             .fetch_add(observations, Ordering::Relaxed);
         self.local_audio_processing_latency_ms.record(processing_ms);
+    }
+
+    #[inline]
+    pub fn record_local_audio_extraction(
+        &self,
+        wav_bytes: u64,
+        duration_ms: u64,
+        extraction_ms: u64,
+    ) {
+        self.local_audio_wav_bytes_total
+            .fetch_add(wav_bytes, Ordering::Relaxed);
+        self.local_audio_duration_ms_total
+            .fetch_add(duration_ms, Ordering::Relaxed);
+        self.local_audio_wav_extraction_latency_ms
+            .record(extraction_ms);
+    }
+
+    pub fn record_local_audio_analysis(&self, analysis: &AudioAnalysis, round_trip_ms: u64) {
+        self.record_local_audio_window(analysis.observations.len() as u64, analysis.processing_ms);
+        self.local_audio_round_trip_latency_ms.record(round_trip_ms);
+        self.local_audio_decode_latency_ms
+            .record(analysis.stages.decode_ms);
+        self.local_audio_vad_latency_ms
+            .record(analysis.stages.vad_ms);
+        self.local_audio_classifier_latency_ms
+            .record(analysis.stages.classifier_ms);
+        if analysis.stages.asr_ms > 0 {
+            self.local_audio_asr_latency_ms
+                .record(analysis.stages.asr_ms);
+        }
+        if analysis.audio_duration_ms > 0 {
+            self.local_audio_real_time_factor_milli.record(
+                round_trip_ms
+                    .saturating_mul(1_000)
+                    .div_ceil(analysis.audio_duration_ms),
+            );
+        }
+        self.set_local_audio_sidecar_capacity(analysis.capacity);
+    }
+
+    pub fn record_local_audio_failure(&self, error: &AudioSidecarError) {
+        self.inc_local_audio_analysis_failure();
+        let reason = error.reason();
+        self.local_audio_failures_total[reason.index()].fetch_add(1, Ordering::Relaxed);
+        if let Some(capacity) = error.capacity() {
+            self.set_local_audio_sidecar_capacity(capacity);
+        }
+    }
+
+    pub fn record_local_audio_failure_reason(&self, reason: AudioFailureReason) {
+        self.inc_local_audio_analysis_failure();
+        self.local_audio_failures_total[reason.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_local_audio_sidecar_capacity(&self, capacity: SidecarCapacity) {
+        self.local_audio_sidecar_queued
+            .store(capacity.queued, Ordering::Relaxed);
+        self.local_audio_sidecar_capacity
+            .store(capacity.limit, Ordering::Relaxed);
+    }
+
+    pub fn begin_local_audio_sidecar_request(self: &Arc<Self>) -> LocalAudioSidecarRequestGuard {
+        self.local_audio_sidecar_active
+            .fetch_add(1, Ordering::Relaxed);
+        LocalAudioSidecarRequestGuard {
+            metrics: Arc::clone(self),
+        }
+    }
+
+    #[inline]
+    pub fn inc_local_audio_tts_attempt(&self) {
+        self.local_audio_tts_attempts_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_local_audio_tts_success(
+        &self,
+        bytes: u64,
+        processing_ms: u64,
+        capacity: SidecarCapacity,
+    ) {
+        self.local_audio_tts_successes_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.local_audio_tts_bytes_total
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.local_audio_tts_latency_ms.record(processing_ms);
+        self.set_local_audio_sidecar_capacity(capacity);
+    }
+
+    pub fn record_local_audio_tts_failure(&self, error: &AudioSidecarError) {
+        self.local_audio_tts_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.local_audio_failures_total[error.reason().index()].fetch_add(1, Ordering::Relaxed);
+        if let Some(capacity) = error.capacity() {
+            self.set_local_audio_sidecar_capacity(capacity);
+        }
+    }
+
+    pub fn record_local_audio_tts_failure_reason(&self, reason: AudioFailureReason) {
+        self.local_audio_tts_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.local_audio_failures_total[reason.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_webrtc_audio_track(&self) {
+        self.webrtc_audio_tracks_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_webrtc_audio_access_unit(&self, bytes: u64, duration_ms: u64) {
+        self.webrtc_audio_access_units_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.webrtc_audio_bytes_total
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.webrtc_audio_duration_ms_total
+            .fetch_add(duration_ms, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_webrtc_audio_receive_error(&self) {
+        self.webrtc_audio_receive_errors_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     #[inline]
@@ -788,6 +976,81 @@ impl PipelineMetrics {
         );
 
         use std::fmt::Write as _;
+        let audio_scalar_metrics = [
+            (
+                "vidarax_pipeline_local_audio_wav_bytes_total",
+                self.local_audio_wav_bytes_total.load(Ordering::Relaxed),
+            ),
+            (
+                "vidarax_pipeline_local_audio_duration_ms_total",
+                self.local_audio_duration_ms_total.load(Ordering::Relaxed),
+            ),
+            (
+                "vidarax_pipeline_local_audio_sidecar_active",
+                self.local_audio_sidecar_active.load(Ordering::Relaxed),
+            ),
+            (
+                "vidarax_pipeline_local_audio_sidecar_queue_depth",
+                self.local_audio_sidecar_queued.load(Ordering::Relaxed),
+            ),
+            (
+                "vidarax_pipeline_local_audio_sidecar_capacity",
+                self.local_audio_sidecar_capacity.load(Ordering::Relaxed),
+            ),
+            (
+                "vidarax_pipeline_local_audio_tts_attempts_total",
+                self.local_audio_tts_attempts_total.load(Ordering::Relaxed),
+            ),
+            (
+                "vidarax_pipeline_local_audio_tts_successes_total",
+                self.local_audio_tts_successes_total.load(Ordering::Relaxed),
+            ),
+            (
+                "vidarax_pipeline_local_audio_tts_failures_total",
+                self.local_audio_tts_failures_total.load(Ordering::Relaxed),
+            ),
+            (
+                "vidarax_pipeline_local_audio_tts_bytes_total",
+                self.local_audio_tts_bytes_total.load(Ordering::Relaxed),
+            ),
+            (
+                "vidarax_pipeline_webrtc_audio_tracks_total",
+                self.webrtc_audio_tracks_total.load(Ordering::Relaxed),
+            ),
+            (
+                "vidarax_pipeline_webrtc_audio_access_units_total",
+                self.webrtc_audio_access_units_total.load(Ordering::Relaxed),
+            ),
+            (
+                "vidarax_pipeline_webrtc_audio_bytes_total",
+                self.webrtc_audio_bytes_total.load(Ordering::Relaxed),
+            ),
+            (
+                "vidarax_pipeline_webrtc_audio_duration_ms_total",
+                self.webrtc_audio_duration_ms_total.load(Ordering::Relaxed),
+            ),
+            (
+                "vidarax_pipeline_webrtc_audio_receive_errors_total",
+                self.webrtc_audio_receive_errors_total
+                    .load(Ordering::Relaxed),
+            ),
+        ];
+        for (name, value) in audio_scalar_metrics {
+            let _ = writeln!(out, "{name} {value}");
+        }
+        for reason in AudioFailureReason::ALL {
+            let count = self.local_audio_failures_total[reason.index()].load(Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "vidarax_pipeline_local_audio_failures_total{{reason=\"{}\"}} {count}",
+                reason.as_str()
+            );
+            let _ = writeln!(
+                out,
+                "vidarax_pipeline_local_audio_failure_{}_total {count}",
+                reason.as_str()
+            );
+        }
         for stage in PipelineStage::ALL {
             for reason in PipelineFaultReason::ALL {
                 let index = stage.index() * PIPELINE_FAULT_REASON_COUNT + reason.index();
@@ -847,6 +1110,48 @@ impl PipelineMetrics {
         );
         out.push_str(
             &self
+                .local_audio_wav_extraction_latency_ms
+                .render_prometheus(
+                    "vidarax_pipeline_local_audio_wav_extraction_latency_ms",
+                    "ms",
+                ),
+        );
+        out.push_str(
+            &self
+                .local_audio_round_trip_latency_ms
+                .render_prometheus("vidarax_pipeline_local_audio_round_trip_latency_ms", "ms"),
+        );
+        out.push_str(
+            &self
+                .local_audio_decode_latency_ms
+                .render_prometheus("vidarax_pipeline_local_audio_decode_latency_ms", "ms"),
+        );
+        out.push_str(
+            &self
+                .local_audio_vad_latency_ms
+                .render_prometheus("vidarax_pipeline_local_audio_vad_latency_ms", "ms"),
+        );
+        out.push_str(
+            &self
+                .local_audio_classifier_latency_ms
+                .render_prometheus("vidarax_pipeline_local_audio_classifier_latency_ms", "ms"),
+        );
+        out.push_str(
+            &self
+                .local_audio_asr_latency_ms
+                .render_prometheus("vidarax_pipeline_local_audio_asr_latency_ms", "ms"),
+        );
+        out.push_str(
+            &self
+                .local_audio_tts_latency_ms
+                .render_prometheus("vidarax_pipeline_local_audio_tts_latency_ms", "ms"),
+        );
+        out.push_str(&self.local_audio_real_time_factor_milli.render_prometheus(
+            "vidarax_pipeline_local_audio_real_time_factor_milli",
+            "milli",
+        ));
+        out.push_str(
+            &self
                 .stdb_emit_latency_ms
                 .render_prometheus("vidarax_pipeline_stdb_emit_latency_ms", "ms"),
         );
@@ -863,14 +1168,20 @@ impl Default for PipelineMetrics {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{LatencyHistogram, PipelineMetrics};
+    use crate::audio_sidecar::{
+        AudioAnalysis, AudioFailureReason, AudioProfile, AudioStageTimings, SidecarCapacity,
+        SpeechEngine,
+    };
     use crate::webrtc::runtime::{
         PipelineFault, PipelineFaultReason, PipelineShutdown, PipelineStage,
     };
 
     #[test]
     fn counters_increment_and_render() {
-        let m = PipelineMetrics::new();
+        let m = Arc::new(PipelineMetrics::new());
         m.inc_rtp_received();
         m.inc_rtp_received();
         m.inc_frames_decoded();
@@ -889,6 +1200,41 @@ mod tests {
         m.inc_trigger_local_output_failure();
         m.record_local_audio_window(3, 12);
         m.inc_local_audio_analysis_failure();
+        m.record_local_audio_extraction(32_044, 1_000, 8);
+        m.record_local_audio_analysis(
+            &AudioAnalysis {
+                profile: AudioProfile::PhysicalWorld,
+                speech_engine: SpeechEngine::None,
+                models: Vec::new(),
+                observations: Vec::new(),
+                audio_duration_ms: 1_000,
+                audio_bytes: 32_044,
+                queue_wait_ms: 2,
+                stages: AudioStageTimings {
+                    decode_ms: 1,
+                    vad_ms: 3,
+                    classifier_ms: 7,
+                    asr_ms: 0,
+                },
+                capacity: SidecarCapacity {
+                    active: 1,
+                    queued: 2,
+                    limit: 4,
+                },
+                processing_ms: 10,
+            },
+            20,
+        );
+        m.record_local_audio_failure_reason(AudioFailureReason::Overloaded);
+        m.inc_local_audio_tts_attempt();
+        m.record_local_audio_tts_success(8_000, 40, SidecarCapacity::default());
+        m.inc_webrtc_audio_track();
+        m.record_webrtc_audio_access_unit(120, 20);
+        let active_request = m.begin_local_audio_sidecar_request();
+        assert!(m
+            .render_prometheus()
+            .contains("vidarax_pipeline_local_audio_sidecar_active 1"));
+        drop(active_request);
 
         let text = m.render_prometheus();
         assert!(text.contains("vidarax_pipeline_rtp_frames_received_total 2"));
@@ -908,9 +1254,19 @@ mod tests {
         assert!(text.contains("vidarax_pipeline_trigger_missing_signal_total 1"));
         assert!(text.contains("vidarax_pipeline_trigger_local_outputs_total 1"));
         assert!(text.contains("vidarax_pipeline_trigger_local_output_failures_total 1"));
-        assert!(text.contains("vidarax_pipeline_local_audio_windows_total 2"));
-        assert!(text.contains("vidarax_pipeline_local_audio_analysis_failures_total 1"));
+        assert!(text.contains("vidarax_pipeline_local_audio_windows_total 4"));
+        assert!(text.contains("vidarax_pipeline_local_audio_analysis_failures_total 2"));
         assert!(text.contains("vidarax_pipeline_local_audio_observations_total 3"));
+        assert!(text.contains("vidarax_pipeline_local_audio_wav_bytes_total 32044"));
+        assert!(text.contains("vidarax_pipeline_local_audio_duration_ms_total 1000"));
+        assert!(
+            text.contains("vidarax_pipeline_local_audio_failures_total{reason=\"overloaded\"} 1")
+        );
+        assert!(text.contains("vidarax_pipeline_local_audio_sidecar_queue_depth 0"));
+        assert!(text.contains("vidarax_pipeline_local_audio_tts_successes_total 1"));
+        assert!(text.contains("vidarax_pipeline_webrtc_audio_access_units_total 1"));
+        assert!(text.contains("vidarax_pipeline_local_audio_round_trip_latency_ms_count 1"));
+        assert!(text.contains("vidarax_pipeline_local_audio_real_time_factor_milli_sum 20"));
     }
 
     #[test]

@@ -64,6 +64,35 @@ export interface MetricsData {
   localAudioAnalysisFailuresTotal: number
   localAudioObservationsTotal: number
   localAudioProcessingLatency: HistogramPercentiles | null
+  localAudioWavBytesTotal: number
+  localAudioDurationMsTotal: number
+  localAudioWavExtractionLatency: HistogramPercentiles | null
+  localAudioRoundTripLatency: HistogramPercentiles | null
+  localAudioDecodeLatency: HistogramPercentiles | null
+  localAudioRealTimeFactor: HistogramPercentiles | null
+  localAudioVadLatency: HistogramPercentiles | null
+  localAudioClassifierLatency: HistogramPercentiles | null
+  localAudioAsrLatency: HistogramPercentiles | null
+  localAudioTtsLatency: HistogramPercentiles | null
+  localAudioSidecarActive: number
+  localAudioSidecarQueueDepth: number
+  localAudioSidecarCapacity: number
+  localAudioOverloadsTotal: number
+  localAudioTimeoutsTotal: number
+  localAudioReconnectFailuresTotal: number
+  localAudioDecodeFailuresTotal: number
+  localAudioModelLoadFailuresTotal: number
+  localAudioMalformedResponseFailuresTotal: number
+  localAudioInferenceFailuresTotal: number
+  localAudioTtsAttemptsTotal: number
+  localAudioTtsSuccessesTotal: number
+  localAudioTtsFailuresTotal: number
+  localAudioTtsBytesTotal: number
+  webRtcAudioTracksTotal: number
+  webRtcAudioAccessUnitsTotal: number
+  webRtcAudioBytesTotal: number
+  webRtcAudioDurationMsTotal: number
+  webRtcAudioReceiveErrorsTotal: number
   restrictedZoneAssertionsTotal: number
   restrictedZoneEvidenceFailuresTotal: number
   restrictedZoneQueueDroppedTotal: number
@@ -341,6 +370,32 @@ function localAudioPercentilesMs(
   return toPercentiles(h)
 }
 
+function histogramPercentiles(
+  histograms: Map<string, RawHistogram>,
+  name: string,
+): HistogramPercentiles | null {
+  const h = histograms.get(name)
+  if (!h || h.totalCount === 0) return null
+  return toPercentiles(h)
+}
+
+function localAudioRealTimeFactor(
+  histograms: Map<string, RawHistogram>,
+): HistogramPercentiles | null {
+  const value = histogramPercentiles(
+    histograms,
+    'vidarax_pipeline_local_audio_real_time_factor_milli',
+  )
+  if (!value) return null
+  return {
+    p50: value.p50 / 1000,
+    p95: value.p95 / 1000,
+    p99: value.p99 / 1000,
+    mean: value.mean / 1000,
+    count: value.count,
+  }
+}
+
 function buildMetrics(
   map: Map<string, number>,
   histograms: Map<string, RawHistogram>,
@@ -358,6 +413,35 @@ function buildMetrics(
   const sseCommitPct = sseCommitPercentilesMs(histograms)
   const mediaExtractionPct = mediaExtractionPercentilesMs(histograms)
   const localAudioPct = localAudioPercentilesMs(histograms)
+  const localAudioWavExtraction = histogramPercentiles(
+    histograms,
+    'vidarax_pipeline_local_audio_wav_extraction_latency_ms',
+  )
+  const localAudioRoundTrip = histogramPercentiles(
+    histograms,
+    'vidarax_pipeline_local_audio_round_trip_latency_ms',
+  )
+  const localAudioRtf = localAudioRealTimeFactor(histograms)
+  const localAudioDecode = histogramPercentiles(
+    histograms,
+    'vidarax_pipeline_local_audio_decode_latency_ms',
+  )
+  const localAudioVad = histogramPercentiles(
+    histograms,
+    'vidarax_pipeline_local_audio_vad_latency_ms',
+  )
+  const localAudioClassifier = histogramPercentiles(
+    histograms,
+    'vidarax_pipeline_local_audio_classifier_latency_ms',
+  )
+  const localAudioAsr = histogramPercentiles(
+    histograms,
+    'vidarax_pipeline_local_audio_asr_latency_ms',
+  )
+  const localAudioTts = histogramPercentiles(
+    histograms,
+    'vidarax_pipeline_local_audio_tts_latency_ms',
+  )
 
   const decodeLatency = decodePct?.mean ?? 0
   const gateLatency = gatePct?.mean ?? 0
@@ -520,6 +604,35 @@ function buildMetrics(
     localAudioAnalysisFailuresTotal: get('vidarax_pipeline_local_audio_analysis_failures_total'),
     localAudioObservationsTotal: get('vidarax_pipeline_local_audio_observations_total'),
     localAudioProcessingLatency: localAudioPct,
+    localAudioWavBytesTotal: get('vidarax_pipeline_local_audio_wav_bytes_total'),
+    localAudioDurationMsTotal: get('vidarax_pipeline_local_audio_duration_ms_total'),
+    localAudioWavExtractionLatency: localAudioWavExtraction,
+    localAudioRoundTripLatency: localAudioRoundTrip,
+    localAudioDecodeLatency: localAudioDecode,
+    localAudioRealTimeFactor: localAudioRtf,
+    localAudioVadLatency: localAudioVad,
+    localAudioClassifierLatency: localAudioClassifier,
+    localAudioAsrLatency: localAudioAsr,
+    localAudioTtsLatency: localAudioTts,
+    localAudioSidecarActive: get('vidarax_pipeline_local_audio_sidecar_active'),
+    localAudioSidecarQueueDepth: get('vidarax_pipeline_local_audio_sidecar_queue_depth'),
+    localAudioSidecarCapacity: get('vidarax_pipeline_local_audio_sidecar_capacity'),
+    localAudioOverloadsTotal: get('vidarax_pipeline_local_audio_failure_overloaded_total'),
+    localAudioTimeoutsTotal: get('vidarax_pipeline_local_audio_failure_timeout_total'),
+    localAudioReconnectFailuresTotal: get('vidarax_pipeline_local_audio_failure_reconnect_total'),
+    localAudioDecodeFailuresTotal: get('vidarax_pipeline_local_audio_failure_decode_total'),
+    localAudioModelLoadFailuresTotal: get('vidarax_pipeline_local_audio_failure_model_load_total'),
+    localAudioMalformedResponseFailuresTotal: get('vidarax_pipeline_local_audio_failure_malformed_response_total'),
+    localAudioInferenceFailuresTotal: get('vidarax_pipeline_local_audio_failure_inference_total'),
+    localAudioTtsAttemptsTotal: get('vidarax_pipeline_local_audio_tts_attempts_total'),
+    localAudioTtsSuccessesTotal: get('vidarax_pipeline_local_audio_tts_successes_total'),
+    localAudioTtsFailuresTotal: get('vidarax_pipeline_local_audio_tts_failures_total'),
+    localAudioTtsBytesTotal: get('vidarax_pipeline_local_audio_tts_bytes_total'),
+    webRtcAudioTracksTotal: get('vidarax_pipeline_webrtc_audio_tracks_total'),
+    webRtcAudioAccessUnitsTotal: get('vidarax_pipeline_webrtc_audio_access_units_total'),
+    webRtcAudioBytesTotal: get('vidarax_pipeline_webrtc_audio_bytes_total'),
+    webRtcAudioDurationMsTotal: get('vidarax_pipeline_webrtc_audio_duration_ms_total'),
+    webRtcAudioReceiveErrorsTotal: get('vidarax_pipeline_webrtc_audio_receive_errors_total'),
     restrictedZoneAssertionsTotal: get('vidarax_pipeline_restricted_zone_assertions_total'),
     restrictedZoneEvidenceFailuresTotal: get('vidarax_pipeline_restricted_zone_evidence_failures_total'),
     restrictedZoneQueueDroppedTotal: get('vidarax_pipeline_restricted_zone_queue_dropped_total'),

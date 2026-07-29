@@ -571,7 +571,8 @@ impl WebRtcSession {
     ///   H.265 by the in-crate HEVC RTP depacketizer. Annex B start codes
     ///   (`00 00 00 01`) are **prepended** to H.264 and H.265 / HEVC payloads
     ///   before sending. VP8 payloads are passed through.
-    /// - Audio tracks are silently ignored.
+    /// - Audio tracks are drained and measured as transport telemetry. They are
+    ///   not yet connected to the local audio analysis path.
     /// - For each video track a Tokio task is spawned; all share the same
     ///   atomic sequence counter.
     ///
@@ -664,7 +665,54 @@ impl WebRtcSession {
                                 };
                                 let track = receiver.track();
 
-                                if track.kind() != MediaKind::Video {
+                                if track.kind() == MediaKind::Audio {
+                                    metrics.inc_webrtc_audio_track();
+                                    let metrics = Arc::clone(&metrics);
+                                    let mut stop = track_stop.subscribe();
+                                    track_tasks.push(tokio::spawn(async move {
+                                        let mut previous_timestamp: Option<u32> = None;
+                                        loop {
+                                            let sample = tokio::select! {
+                                                biased;
+                                                changed = stop.changed() => {
+                                                    if changed.is_err() || *stop.borrow() {
+                                                        break;
+                                                    }
+                                                    continue;
+                                                }
+                                                sample = track.recv() => sample,
+                                            };
+                                            match sample {
+                                                Ok(MediaSample::Audio(frame)) => {
+                                                    let duration_ms = previous_timestamp
+                                                        .replace(frame.rtp_timestamp)
+                                                        .filter(|_| frame.clock_rate > 0)
+                                                        .map_or(0, |previous| {
+                                                            u64::from(
+                                                                frame.rtp_timestamp
+                                                                    .wrapping_sub(previous),
+                                                            )
+                                                            .saturating_mul(1_000)
+                                                            / u64::from(frame.clock_rate)
+                                                        })
+                                                        .min(1_000);
+                                                    metrics.record_webrtc_audio_access_unit(
+                                                        frame.data.len() as u64,
+                                                        duration_ms,
+                                                    );
+                                                }
+                                                Ok(MediaSample::Video(_)) => {}
+                                                Err(error) => {
+                                                    metrics.inc_webrtc_audio_receive_error();
+                                                    tracing::warn!(
+                                                        error = %error,
+                                                        "WebRTC audio receive failed"
+                                                    );
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }));
                                     continue;
                                 }
 

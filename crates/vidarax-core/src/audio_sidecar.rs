@@ -94,7 +94,41 @@ pub struct AudioAnalysis {
     pub speech_engine: SpeechEngine,
     pub models: Vec<String>,
     pub observations: Vec<AudioObservation>,
+    #[serde(default)]
+    pub audio_duration_ms: u64,
+    #[serde(default)]
+    pub audio_bytes: u64,
+    #[serde(default)]
+    pub queue_wait_ms: u64,
+    #[serde(default)]
+    pub stages: AudioStageTimings,
+    #[serde(default)]
+    pub capacity: SidecarCapacity,
     pub processing_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AudioStageTimings {
+    #[serde(default)]
+    pub decode_ms: u64,
+    #[serde(default)]
+    pub vad_ms: u64,
+    #[serde(default)]
+    pub classifier_ms: u64,
+    #[serde(default)]
+    pub asr_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SidecarCapacity {
+    #[serde(default)]
+    pub active: u64,
+    #[serde(default)]
+    pub queued: u64,
+    #[serde(default)]
+    pub limit: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +148,54 @@ pub struct SynthesizedAudio {
     pub sample_rate_hz: u32,
     pub processing_ms: u64,
     pub model: String,
+    pub capacity: SidecarCapacity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioFailureReason {
+    Decode,
+    Timeout,
+    Overloaded,
+    ModelLoad,
+    MalformedResponse,
+    Reconnect,
+    Inference,
+}
+
+impl AudioFailureReason {
+    pub const ALL: [Self; 7] = [
+        Self::Decode,
+        Self::Timeout,
+        Self::Overloaded,
+        Self::ModelLoad,
+        Self::MalformedResponse,
+        Self::Reconnect,
+        Self::Inference,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Decode => "decode",
+            Self::Timeout => "timeout",
+            Self::Overloaded => "overloaded",
+            Self::ModelLoad => "model_load",
+            Self::MalformedResponse => "malformed_response",
+            Self::Reconnect => "reconnect",
+            Self::Inference => "inference",
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Decode => 0,
+            Self::Timeout => 1,
+            Self::Overloaded => 2,
+            Self::ModelLoad => 3,
+            Self::MalformedResponse => 4,
+            Self::Reconnect => 5,
+            Self::Inference => 6,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -122,10 +204,45 @@ pub enum AudioSidecarError {
     AudioTooLarge(usize),
     TextTooLarge(usize),
     BackingOff,
+    ReconnectFailed(std::io::Error),
     Io(std::io::Error),
     Protocol(&'static str),
     Metadata(String),
-    SidecarStatus(u8, String),
+    SidecarStatus {
+        status: u8,
+        reason: AudioFailureReason,
+        message: String,
+        capacity: SidecarCapacity,
+    },
+}
+
+impl AudioSidecarError {
+    pub fn reason(&self) -> AudioFailureReason {
+        match self {
+            Self::AudioTooLarge(_) | Self::TextTooLarge(_) | Self::InvalidAddress(_) => {
+                AudioFailureReason::MalformedResponse
+            }
+            Self::BackingOff | Self::ReconnectFailed(_) => AudioFailureReason::Reconnect,
+            Self::Io(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                AudioFailureReason::Timeout
+            }
+            Self::Io(_) => AudioFailureReason::Reconnect,
+            Self::Protocol(_) | Self::Metadata(_) => AudioFailureReason::MalformedResponse,
+            Self::SidecarStatus { reason, .. } => *reason,
+        }
+    }
+
+    pub fn capacity(&self) -> Option<SidecarCapacity> {
+        match self {
+            Self::SidecarStatus { capacity, .. } => Some(*capacity),
+            _ => None,
+        }
+    }
 }
 
 impl Display for AudioSidecarError {
@@ -145,10 +262,13 @@ impl Display for AudioSidecarError {
                 "feedback text is {bytes} bytes; maximum is {MAX_FEEDBACK_TEXT_BYTES}"
             ),
             Self::BackingOff => f.write_str("audio sidecar reconnect backoff is active"),
+            Self::ReconnectFailed(error) => write!(f, "audio sidecar reconnect failed: {error}"),
             Self::Io(error) => write!(f, "audio sidecar I/O: {error}"),
             Self::Protocol(message) => write!(f, "audio sidecar protocol: {message}"),
             Self::Metadata(message) => write!(f, "audio sidecar metadata: {message}"),
-            Self::SidecarStatus(status, message) => {
+            Self::SidecarStatus {
+                status, message, ..
+            } => {
                 write!(f, "audio sidecar returned status {status}: {message}")
             }
         }
@@ -176,6 +296,16 @@ struct SynthesisMetadata {
     model: String,
     sample_rate_hz: u32,
     processing_ms: u64,
+    #[serde(default)]
+    capacity: SidecarCapacity,
+}
+
+#[derive(Debug, Deserialize)]
+struct ErrorMetadata {
+    reason: String,
+    message: String,
+    #[serde(default)]
+    capacity: SidecarCapacity,
 }
 
 /// Persistent connection with bounded payloads and reconnect backoff.
@@ -264,6 +394,7 @@ impl AudioSidecarClient {
             sample_rate_hz: metadata.sample_rate_hz,
             processing_ms: metadata.processing_ms,
             model: metadata.model,
+            capacity: metadata.capacity,
         })
     }
 
@@ -374,15 +505,43 @@ impl AudioSidecarClient {
         let mut response_audio = vec![0_u8; response_audio_len];
         stream.read_exact(&mut response_audio)?;
         if status != 0 {
-            let message = String::from_utf8_lossy(&metadata).into_owned();
-            return Err(AudioSidecarError::SidecarStatus(status, message));
+            let decoded = rmp_serde::from_slice::<ErrorMetadata>(&metadata).ok();
+            let message = decoded
+                .as_ref()
+                .map(|error| error.message.clone())
+                .unwrap_or_else(|| String::from_utf8_lossy(&metadata).into_owned());
+            let reason = decoded
+                .as_ref()
+                .map(|error| parse_failure_reason(&error.reason))
+                .unwrap_or_else(|| {
+                    if status == 3 {
+                        AudioFailureReason::Overloaded
+                    } else {
+                        AudioFailureReason::Inference
+                    }
+                });
+            let capacity = decoded.map_or_else(SidecarCapacity::default, |error| error.capacity);
+            return Err(AudioSidecarError::SidecarStatus {
+                status,
+                reason,
+                message,
+                capacity,
+            });
         }
         Ok((metadata, response_audio))
     }
 
     fn connection(&mut self) -> Result<&mut TcpStream, AudioSidecarError> {
         if self.stream.is_none() {
-            let stream = TcpStream::connect_timeout(&self.address, self.timeout)?;
+            let reconnecting = self.consecutive_failures > 0;
+            let stream =
+                TcpStream::connect_timeout(&self.address, self.timeout).map_err(|error| {
+                    if reconnecting {
+                        AudioSidecarError::ReconnectFailed(error)
+                    } else {
+                        AudioSidecarError::Io(error)
+                    }
+                })?;
             stream.set_read_timeout(Some(self.timeout))?;
             stream.set_write_timeout(Some(self.timeout))?;
             stream.set_nodelay(true)?;
@@ -391,6 +550,18 @@ impl AudioSidecarClient {
         self.stream
             .as_mut()
             .ok_or(AudioSidecarError::Protocol("missing connection"))
+    }
+}
+
+fn parse_failure_reason(value: &str) -> AudioFailureReason {
+    match value {
+        "decode" => AudioFailureReason::Decode,
+        "timeout" => AudioFailureReason::Timeout,
+        "overloaded" => AudioFailureReason::Overloaded,
+        "model_load" => AudioFailureReason::ModelLoad,
+        "malformed_response" => AudioFailureReason::MalformedResponse,
+        "reconnect" => AudioFailureReason::Reconnect,
+        _ => AudioFailureReason::Inference,
     }
 }
 
@@ -445,8 +616,8 @@ fn validate_metadata_text(
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_analysis, AudioAnalysis, AudioObservation, AudioProfile, AudioSidecarError,
-        SpeechEngine,
+        validate_analysis, AudioAnalysis, AudioFailureReason, AudioObservation, AudioProfile,
+        AudioSidecarError, SidecarCapacity, SpeechEngine,
     };
 
     #[test]
@@ -474,11 +645,32 @@ mod tests {
                 language: None,
                 emotion: None,
             }],
+            audio_duration_ms: 1_000,
+            audio_bytes: 32_044,
+            queue_wait_ms: 0,
+            stages: Default::default(),
+            capacity: Default::default(),
             processing_ms: 1,
         };
         assert!(matches!(
             validate_analysis(&analysis),
             Err(AudioSidecarError::Metadata(_))
         ));
+    }
+
+    #[test]
+    fn sidecar_errors_keep_fixed_reason_and_capacity() {
+        let error = AudioSidecarError::SidecarStatus {
+            status: 3,
+            reason: AudioFailureReason::Overloaded,
+            message: "full".to_string(),
+            capacity: SidecarCapacity {
+                active: 2,
+                queued: 8,
+                limit: 2,
+            },
+        };
+        assert_eq!(error.reason(), AudioFailureReason::Overloaded);
+        assert_eq!(error.capacity().expect("capacity").queued, 8);
     }
 }

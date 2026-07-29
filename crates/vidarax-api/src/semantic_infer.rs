@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::{Id as TaskId, JoinError, JoinSet};
 use vidarax_core::audio_sidecar::{
-    AudioAnalysis, AudioAnalysisRequest, AudioProfile, AudioSidecarClient, SpeechEngine,
-    SynthesizedAudio,
+    AudioAnalysis, AudioAnalysisRequest, AudioFailureReason, AudioProfile, AudioSidecarClient,
+    SidecarCapacity, SpeechEngine, SynthesizedAudio,
 };
 use vidarax_core::coordinates::{FrameCoordinates, IMAGE_COORDINATE_SCHEMA};
 use vidarax_core::crop::CropRegion;
@@ -16,6 +16,7 @@ use vidarax_core::ingest::pipeline::DecodePipeline;
 use vidarax_core::ingest::{
     extract_audio_video_clip, extract_audio_wav, DecodedJpegFrame, MediaInfo, PreparedSource,
 };
+use vidarax_core::metrics::PipelineMetrics;
 use vidarax_core::pipeline::{FrameMetadata, TwoPassPipeline};
 use vidarax_core::provider::{
     InferenceImage, InferenceObserver, InferenceProvider, InferenceRequest, InferenceVideo,
@@ -144,9 +145,17 @@ pub struct ClipSpec {
     pub resolution: MediaResolution,
     pub persist_evidence: bool,
     pub local_audio: Option<LocalAudioConfig>,
+    pub chunk_index: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+pub struct AudioTraceContext {
+    pub run_id: Arc<str>,
+    pub request_id: Arc<str>,
+    pub stream_id: Arc<str>,
+}
+
+#[derive(Clone)]
 pub struct LocalAudioConfig {
     pub sidecar_addr: Arc<str>,
     pub profile: AudioProfile,
@@ -154,6 +163,8 @@ pub struct LocalAudioConfig {
     pub min_confidence: f32,
     pub max_events: u16,
     pub voice_feedback: bool,
+    pub trace: AudioTraceContext,
+    pub metrics: Arc<PipelineMetrics>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +189,24 @@ pub struct FeedbackAudioEvidence {
     pub model: String,
     pub sample_rate_hz: u32,
     pub processing_ms: u64,
+    pub capacity: SidecarCapacity,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LocalAudioTelemetry {
+    pub wav_extraction_ms: u64,
+    pub wav_bytes: u64,
+    pub requested_duration_ms: u64,
+    pub round_trip_ms: u64,
+    pub failure_reason: Option<AudioFailureReason>,
+    pub tts_attempted: bool,
+    pub tts_round_trip_ms: u64,
+    pub tts_failure_reason: Option<AudioFailureReason>,
+}
+
+struct ExtractedLocalAudio {
+    wav: Vec<u8>,
+    extraction_ms: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -200,6 +229,7 @@ pub struct ChunkSemanticResult {
     pub local_audio: Option<AudioAnalysis>,
     pub local_audio_error: Option<String>,
     pub feedback_audio: Option<FeedbackAudioEvidence>,
+    pub local_audio_telemetry: LocalAudioTelemetry,
 }
 
 impl ChunkSemanticResult {
@@ -398,7 +428,7 @@ pub async fn prepare_realtime_chunks(
         );
     }
 
-    for range in ranges {
+    for (chunk_index, range) in ranges.into_iter().enumerate() {
         let chunk = &signals[range.clone()];
         let started = Instant::now();
         let analyzed = pipeline.analyze_batch(chunk).to_vec();
@@ -436,6 +466,7 @@ pub async fn prepare_realtime_chunks(
                 resolution: media.resolution,
                 persist_evidence: media.persist_evidence,
                 local_audio: local_audio.clone(),
+                chunk_index,
             })
         } else {
             None
@@ -753,6 +784,8 @@ pub async fn infer_chunk_semantics(
     };
 
     let requested_media_mode = clip_spec.as_ref().map(|spec| spec.mode);
+    let requested_audio_duration_ms = clip_spec.as_ref().map_or(0, |spec| spec.duration_ms);
+    let audio_chunk_index = clip_spec.as_ref().map_or(0, |spec| spec.chunk_index);
     let local_audio_config = clip_spec.as_ref().and_then(|spec| spec.local_audio.clone());
     let use_video_clip = clip_spec.is_some();
     let selected = if use_video_clip {
@@ -820,12 +853,12 @@ pub async fn infer_chunk_semantics(
             }?;
             let wav = if local_audio.is_some() {
                 let info: MediaInfo = spec.source.media_info()?.clone();
-                Some(extract_audio_wav(
-                    spec.source.source(),
-                    start_s,
-                    duration_s,
-                    &info,
-                )?)
+                let started = Instant::now();
+                let wav = extract_audio_wav(spec.source.source(), start_s, duration_s, &info)?;
+                Some(ExtractedLocalAudio {
+                    wav,
+                    extraction_ms: started.elapsed().as_millis() as u64,
+                })
             } else {
                 None
             };
@@ -854,9 +887,27 @@ pub async fn infer_chunk_semantics(
         .map(|media| media.source_end_ms)
         .unwrap_or_else(|| pts_end_ms.max(pts_start_ms));
 
-    if let (Some(config), Some(wav)) = (local_audio_config.as_ref(), local_audio_wav) {
+    if let (Some(config), Some(extracted)) = (local_audio_config.as_ref(), local_audio_wav) {
+        result.local_audio_telemetry.wav_extraction_ms = extracted.extraction_ms;
+        result.local_audio_telemetry.wav_bytes = extracted.wav.len() as u64;
+        result.local_audio_telemetry.requested_duration_ms = requested_audio_duration_ms;
         let config = config.clone();
+        let trace = config.trace.clone();
+        let wav = extracted.wav;
+        let round_trip_started = Instant::now();
+        let audio_span = tracing::info_span!(
+            "audio.sidecar.analyze",
+            profile = config.profile.as_str(),
+            speech_engine = config.speech_engine.as_str(),
+            wav_bytes = wav.len(),
+            run_id = %trace.run_id,
+            request_id = %trace.request_id,
+            stream_id = %trace.stream_id,
+            chunk_id = audio_chunk_index,
+        );
         let audio_outcome = tokio::task::spawn_blocking(move || {
+            let _entered = audio_span.enter();
+            let _active = config.metrics.begin_local_audio_sidecar_request();
             let mut client = AudioSidecarClient::new(&config.sidecar_addr, timeout_ms)?;
             client.analyze(AudioAnalysisRequest {
                 profile: config.profile,
@@ -868,6 +919,8 @@ pub async fn infer_chunk_semantics(
             })
         })
         .await;
+        result.local_audio_telemetry.round_trip_ms =
+            round_trip_started.elapsed().as_millis() as u64;
         match audio_outcome {
             Ok(Ok(analysis)) => {
                 result
@@ -875,8 +928,12 @@ pub async fn infer_chunk_semantics(
                     .extend(audio_moments(&analysis, pts_start_ms, audio_source_end_ms));
                 result.local_audio = Some(analysis);
             }
-            Ok(Err(error)) => result.local_audio_error = Some(error.to_string()),
+            Ok(Err(error)) => {
+                result.local_audio_telemetry.failure_reason = Some(error.reason());
+                result.local_audio_error = Some(error.to_string());
+            }
             Err(error) => {
+                result.local_audio_telemetry.failure_reason = Some(AudioFailureReason::Inference);
                 result.local_audio_error = Some(format!("audio_sidecar_join_error:{error}"))
             }
         }
@@ -907,7 +964,13 @@ pub async fn infer_chunk_semantics(
 
     let Some(provider) = providers else {
         finish_local_audio_result(&mut result);
-        maybe_generate_feedback(&mut result, local_audio_config.as_ref(), timeout_ms).await;
+        maybe_generate_feedback(
+            &mut result,
+            local_audio_config.as_ref(),
+            timeout_ms,
+            audio_chunk_index,
+        )
+        .await;
         return result;
     };
 
@@ -1074,7 +1137,13 @@ pub async fn infer_chunk_semantics(
                 result.overlay = Some(overlay);
                 result.moments.extend(moments);
                 result.used_fallback = provider_result.fallback_used;
-                maybe_generate_feedback(&mut result, local_audio_config.as_ref(), timeout_ms).await;
+                maybe_generate_feedback(
+                    &mut result,
+                    local_audio_config.as_ref(),
+                    timeout_ms,
+                    audio_chunk_index,
+                )
+                .await;
                 result
             }
             Err(parse_error) => {
@@ -1192,6 +1261,7 @@ async fn maybe_generate_feedback(
     result: &mut ChunkSemanticResult,
     config: Option<&LocalAudioConfig>,
     timeout_ms: u64,
+    chunk_index: usize,
 ) {
     let Some(config) = config.filter(|config| config.voice_feedback) else {
         return;
@@ -1204,13 +1274,29 @@ async fn maybe_generate_feedback(
     else {
         return;
     };
+    result.local_audio_telemetry.tts_attempted = true;
     let address = Arc::clone(&config.sidecar_addr);
+    let trace = config.trace.clone();
+    let metrics = Arc::clone(&config.metrics);
     let text = truncate_context(text, 2_000).to_string();
+    let round_trip_started = Instant::now();
+    let tts_span = tracing::info_span!(
+        "audio.sidecar.synthesize",
+        text_bytes = text.len(),
+        run_id = %trace.run_id,
+        request_id = %trace.request_id,
+        stream_id = %trace.stream_id,
+        chunk_id = chunk_index,
+    );
     let outcome = tokio::task::spawn_blocking(move || {
+        let _entered = tts_span.enter();
+        let _active = metrics.begin_local_audio_sidecar_request();
         let mut client = AudioSidecarClient::new(&address, timeout_ms)?;
         client.synthesize(&text)
     })
     .await;
+    result.local_audio_telemetry.tts_round_trip_ms =
+        round_trip_started.elapsed().as_millis() as u64;
     match outcome {
         Ok(Ok(SynthesizedAudio {
             bytes,
@@ -1218,6 +1304,7 @@ async fn maybe_generate_feedback(
             sample_rate_hz,
             processing_ms,
             model,
+            capacity,
         })) => {
             result.feedback_audio = Some(FeedbackAudioEvidence {
                 bytes: Arc::from(bytes),
@@ -1225,12 +1312,15 @@ async fn maybe_generate_feedback(
                 model,
                 sample_rate_hz,
                 processing_ms,
+                capacity,
             });
         }
         Ok(Err(error)) => {
+            result.local_audio_telemetry.tts_failure_reason = Some(error.reason());
             result.local_audio_error = Some(format!("voice_feedback_failed:{error}"));
         }
         Err(error) => {
+            result.local_audio_telemetry.tts_failure_reason = Some(AudioFailureReason::Inference);
             result.local_audio_error = Some(format!("voice_feedback_join_error:{error}"));
         }
     }

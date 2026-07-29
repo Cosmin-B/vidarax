@@ -114,6 +114,22 @@ SCREEN_LABELS = {
 }
 
 
+class DecodeError(RuntimeError):
+    pass
+
+
+class ModelLoadError(RuntimeError):
+    pass
+
+
+class AdmissionTimeout(RuntimeError):
+    pass
+
+
+def _elapsed_ms(started: float) -> int:
+    return round((time.perf_counter() - started) * 1000)
+
+
 def _read_exact(sock: socket.socket, length: int) -> bytes | None:
     data = bytearray(length)
     view = memoryview(data)
@@ -127,13 +143,16 @@ def _read_exact(sock: socket.socket, length: int) -> bytes | None:
 
 
 def _decode_pcm_wav(data: bytes) -> tuple[np.ndarray, int]:
-    with wave.open(io.BytesIO(data), "rb") as wav:
-        channels = wav.getnchannels()
-        sample_rate = wav.getframerate()
-        sample_width = wav.getsampwidth()
-        frames = wav.readframes(wav.getnframes())
+    try:
+        with wave.open(io.BytesIO(data), "rb") as wav:
+            channels = wav.getnchannels()
+            sample_rate = wav.getframerate()
+            sample_width = wav.getsampwidth()
+            frames = wav.readframes(wav.getnframes())
+    except (EOFError, wave.Error) as error:
+        raise DecodeError(f"invalid PCM WAV: {error}") from error
     if channels != 1 or sample_width != 2:
-        raise ValueError("audio must be mono 16-bit PCM WAV")
+        raise DecodeError("audio must be mono 16-bit PCM WAV")
     samples = np.frombuffer(frames, dtype="<i2").astype(np.float32)
     return samples / 32768.0, sample_rate
 
@@ -538,19 +557,24 @@ class PerceptionEngine:
             return None
         with self._backend_lock:
             if name not in self._speech_backends:
-                if name == "sensevoice":
-                    backend: SpeechBackend = SenseVoiceBackend()
-                elif name == "moonshine":
-                    backend = TransformersAsrBackend(
-                        "moonshine",
-                        "UsefulSensors/moonshine-streaming-tiny",
-                    )
-                elif name == "qwen3_asr":
-                    backend = Qwen3AsrBackend()
-                elif name == "lfm2_5_audio":
-                    backend = LfmAudioBackend()
-                else:
-                    raise ValueError(f"unsupported speech engine {name}")
+                try:
+                    if name == "sensevoice":
+                        backend: SpeechBackend = SenseVoiceBackend()
+                    elif name == "moonshine":
+                        backend = TransformersAsrBackend(
+                            "moonshine",
+                            "UsefulSensors/moonshine-streaming-tiny",
+                        )
+                    elif name == "qwen3_asr":
+                        backend = Qwen3AsrBackend()
+                    elif name == "lfm2_5_audio":
+                        backend = LfmAudioBackend()
+                    else:
+                        raise ValueError(f"unsupported speech engine {name}")
+                except Exception as error:
+                    raise ModelLoadError(
+                        f"failed to load speech engine {name}: {error}"
+                    ) from error
                 self._speech_backends[name] = backend
             return self._speech_backends[name]
 
@@ -563,14 +587,19 @@ class PerceptionEngine:
         max_events: int,
     ) -> dict[str, Any]:
         started = time.perf_counter()
+        decode_started = time.perf_counter()
         samples, sample_rate = _decode_pcm_wav(wav_bytes)
+        decode_ms = _elapsed_ms(decode_started)
         duration_ms = round(samples.size * 1000 / sample_rate)
         observations: list[Observation] = []
         models: list[str] = []
 
         speech_ranges: list[tuple[int, int, float]] = []
+        vad_ms = 0
         if self.vad is not None:
+            vad_started = time.perf_counter()
             speech_ranges = self.vad.speech_ranges(samples, sample_rate)
+            vad_ms = _elapsed_ms(vad_started)
             models.append(self.vad.model_name)
             observations.extend(
                 Observation(
@@ -585,7 +614,9 @@ class PerceptionEngine:
                 if confidence >= threshold
             )
 
+        classifier_ms = 0
         if self.tagger is not None:
+            classifier_started = time.perf_counter()
             models.append(self.tagger.model_name)
             observations.extend(
                 self.tagger.tag(
@@ -596,7 +627,10 @@ class PerceptionEngine:
                     max_events,
                 )
             )
+            classifier_ms = _elapsed_ms(classifier_started)
 
+        asr_ms = 0
+        asr_started = time.perf_counter()
         backend = self._speech_backend(requested_engine) if speech_ranges else None
         actual_engine = backend.name if backend is not None else "none"
         if backend is not None:
@@ -623,6 +657,8 @@ class PerceptionEngine:
                         emotion=emotion,
                     )
                 )
+        if backend is not None:
+            asr_ms = _elapsed_ms(asr_started)
 
         observations = _deduplicate_observations(observations)
         observations.sort(key=lambda item: (item.start_offset_ms, -item.confidence, item.label))
@@ -635,7 +671,17 @@ class PerceptionEngine:
             "speech_engine": actual_engine,
             "models": list(dict.fromkeys(models)),
             "observations": [item.wire() for item in observations],
-            "processing_ms": round((time.perf_counter() - started) * 1000),
+            "audio_duration_ms": duration_ms,
+            "audio_bytes": len(wav_bytes),
+            "queue_wait_ms": 0,
+            "stages": {
+                "decode_ms": decode_ms,
+                "vad_ms": vad_ms,
+                "classifier_ms": classifier_ms,
+                "asr_ms": asr_ms,
+            },
+            "capacity": {},
+            "processing_ms": _elapsed_ms(started),
         }
 
     def synthesize(self, text: str) -> tuple[dict[str, Any], bytes]:
@@ -648,7 +694,8 @@ class PerceptionEngine:
             {
                 "model": backend.model_id,
                 "sample_rate_hz": 24_000,
-                "processing_ms": round((time.perf_counter() - started) * 1000),
+                "processing_ms": _elapsed_ms(started),
+                "capacity": {},
             },
             wav,
         )
@@ -662,6 +709,50 @@ def _deduplicate_observations(items: list[Observation]) -> list[Observation]:
         if previous is None or item.confidence > previous.confidence:
             best[key] = item
     return list(best.values())
+
+
+class Admission:
+    def __init__(self, limit: int, max_queued: int) -> None:
+        self.limit = limit
+        self.max_queued = max_queued
+        self._semaphore = threading.BoundedSemaphore(limit)
+        self._lock = threading.Lock()
+        self._active = 0
+        self._queued = 0
+
+    def acquire(self, timeout_s: float) -> int:
+        started = time.perf_counter()
+        if self._semaphore.acquire(blocking=False):
+            with self._lock:
+                self._active += 1
+                return 0
+        with self._lock:
+            if self._queued >= self.max_queued:
+                raise OverflowError("audio inference queue is full")
+            self._queued += 1
+        acquired = self._semaphore.acquire(timeout=timeout_s)
+        with self._lock:
+            self._queued -= 1
+            if not acquired:
+                raise AdmissionTimeout("audio inference queue wait timed out")
+            self._active += 1
+            return _elapsed_ms(started)
+
+    def release(self) -> None:
+        with self._lock:
+            self._active -= 1
+        self._semaphore.release()
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return self._snapshot_locked()
+
+    def _snapshot_locked(self) -> dict[str, int]:
+        return {
+            "active": self._active,
+            "queued": self._queued,
+            "limit": self.limit,
+        }
 
 
 class AudioRequestHandler(socketserver.BaseRequestHandler):
@@ -698,7 +789,9 @@ class AudioRequestHandler(socketserver.BaseRequestHandler):
                 or profile_id not in PROFILE_NAMES
                 or engine_id not in ENGINE_NAMES
             ):
-                self._respond_error(STATUS_BAD_REQUEST, "invalid request header")
+                self._respond_error(
+                    STATUS_BAD_REQUEST, "malformed_response", "invalid request header"
+                )
                 return
             if (
                 audio_len > MAX_AUDIO_BYTES
@@ -706,26 +799,43 @@ class AudioRequestHandler(socketserver.BaseRequestHandler):
                 or max_events == 0
                 or max_events > 64
             ):
-                self._respond_error(STATUS_BAD_REQUEST, "request payload exceeds limits")
+                self._respond_error(
+                    STATUS_BAD_REQUEST,
+                    "malformed_response",
+                    "request payload exceeds limits",
+                )
                 return
             if operation == OP_ANALYZE and (audio_len == 0 or text_len != 0):
-                self._respond_error(STATUS_BAD_REQUEST, "analyze requires WAV only")
+                self._respond_error(
+                    STATUS_BAD_REQUEST, "malformed_response", "analyze requires WAV only"
+                )
                 return
             if operation == OP_SYNTHESIZE and (audio_len != 0 or text_len == 0):
-                self._respond_error(STATUS_BAD_REQUEST, "synthesize requires text only")
+                self._respond_error(
+                    STATUS_BAD_REQUEST,
+                    "malformed_response",
+                    "synthesize requires text only",
+                )
                 return
             if operation not in (OP_ANALYZE, OP_SYNTHESIZE):
-                self._respond_error(STATUS_BAD_REQUEST, "unknown operation")
+                self._respond_error(
+                    STATUS_BAD_REQUEST, "malformed_response", "unknown operation"
+                )
                 return
 
-            if not self.server.capacity.acquire(blocking=False):
-                self._respond_error(STATUS_OVERLOADED, "audio inference capacity is full")
+            audio = _read_exact(self.request, audio_len)
+            text = _read_exact(self.request, text_len)
+            if audio is None or text is None:
                 return
             try:
-                audio = _read_exact(self.request, audio_len)
-                text = _read_exact(self.request, text_len)
-                if audio is None or text is None:
-                    return
+                queue_wait_ms = self.server.admission.acquire(self.server.request_timeout_s)
+            except OverflowError as error:
+                self._respond_error(STATUS_OVERLOADED, "overloaded", str(error))
+                return
+            except AdmissionTimeout as error:
+                self._respond_error(STATUS_INFERENCE_ERROR, "timeout", str(error))
+                return
+            try:
                 if operation == OP_ANALYZE:
                     metadata = self.server.engine.analyze(
                         audio,
@@ -734,17 +844,28 @@ class AudioRequestHandler(socketserver.BaseRequestHandler):
                         threshold / 10_000.0,
                         max_events,
                     )
+                    metadata["queue_wait_ms"] = queue_wait_ms
+                    metadata["capacity"] = self.server.admission.snapshot()
                     self._respond(metadata, b"")
                 else:
                     metadata, synthesized = self.server.engine.synthesize(
                         text.decode("utf-8")
                     )
+                    metadata["capacity"] = self.server.admission.snapshot()
                     self._respond(metadata, synthesized)
             except Exception as error:
                 logger.exception("audio request failed")
-                self._respond_error(STATUS_INFERENCE_ERROR, str(error))
+                if isinstance(error, DecodeError):
+                    reason = "decode"
+                elif isinstance(error, ModelLoadError):
+                    reason = "model_load"
+                elif isinstance(error, (TimeoutError, socket.timeout)):
+                    reason = "timeout"
+                else:
+                    reason = "inference"
+                self._respond_error(STATUS_INFERENCE_ERROR, reason, str(error))
             finally:
-                self.server.capacity.release()
+                self.server.admission.release()
 
     def _respond(self, metadata: dict[str, Any], audio: bytes) -> None:
         packed = msgpack.packb(metadata, use_bin_type=True)
@@ -763,8 +884,15 @@ class AudioRequestHandler(socketserver.BaseRequestHandler):
         self.request.sendall(packed)
         self.request.sendall(audio)
 
-    def _respond_error(self, status: int, message: str) -> None:
-        payload = message.encode("utf-8", errors="replace")[:4096]
+    def _respond_error(self, status: int, reason: str, message: str) -> None:
+        payload = msgpack.packb(
+            {
+                "reason": reason,
+                "message": message[:4096],
+                "capacity": self.server.admission.snapshot(),
+            },
+            use_bin_type=True,
+        )
         self.request.sendall(
             RESPONSE_HEADER.pack(
                 RESPONSE_MAGIC,
@@ -787,11 +915,12 @@ class AudioTcpServer(socketserver.ThreadingTCPServer):
         address: tuple[str, int],
         engine: PerceptionEngine,
         max_in_flight: int,
+        max_queued: int,
         request_timeout_s: float,
     ) -> None:
         super().__init__(address, AudioRequestHandler)
         self.engine = engine
-        self.capacity = threading.BoundedSemaphore(max_in_flight)
+        self.admission = Admission(max_in_flight, max_queued)
         self.request_timeout_s = request_timeout_s
 
 
@@ -819,6 +948,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-vad", action="store_true")
     parser.add_argument("--disable-efficientat", action="store_true")
     parser.add_argument("--max-in-flight", type=int, default=1)
+    parser.add_argument("--max-queued", type=int, default=8)
     parser.add_argument("--request-timeout-seconds", type=float, default=120.0)
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
@@ -832,11 +962,14 @@ def main() -> None:
     )
     if args.max_in_flight < 1 or args.max_in_flight > 16:
         raise SystemExit("--max-in-flight must be in [1, 16]")
+    if args.max_queued < 0 or args.max_queued > 256:
+        raise SystemExit("--max-queued must be in [0, 256]")
     engine = PerceptionEngine(args)
     with AudioTcpServer(
         (args.host, args.port),
         engine,
         args.max_in_flight,
+        args.max_queued,
         args.request_timeout_seconds,
     ) as server:
         logger.info(
