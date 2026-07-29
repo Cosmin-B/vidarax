@@ -203,4 +203,113 @@ test.describe('Upload reason settings', () => {
     await expect.poll(() => reasonBody).not.toBeNull()
     expect(reasonBody).not.toHaveProperty('semantic_frames_per_chunk')
   })
+
+  test('audio and video mode sends native media options and renders timestamped moments', async ({ page }) => {
+    let reasonBody: Record<string, unknown> | null = null
+    const hash = 'a'.repeat(64)
+
+    await page.route('http://localhost:8080/v1/models', async route => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          models: [{ id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash-Lite', tier: 'cloud' }],
+        }),
+      })
+    })
+    await page.route('http://localhost:8080/v1/upload', async route => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ file_path: '/tmp/session.mp4' }),
+      })
+    })
+    await page.route('http://localhost:8080/v1/runs', async route => {
+      if (route.request().method() !== 'POST') return route.continue()
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          run_id: 'run-audio-video',
+          status: 'created',
+          mode: 'balanced',
+          model: 'gemini-3.5-flash-lite',
+        }),
+      })
+    })
+    await page.route('http://localhost:8080/v1/runs/run-audio-video/reason', async route => {
+      reasonBody = route.request().postDataJSON() as Record<string, unknown>
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          request_id: 'req-av',
+          run_id: 'run-audio-video',
+          generated: 1,
+          markers_emitted: 0,
+          decoded_frames: 80,
+          sample_fps: 10,
+          lag_p95_ms: 0,
+          lag_p99_ms: 0,
+          tokens: {},
+          metadata: [],
+          markers: [],
+        }),
+      })
+    })
+    await page.route('http://localhost:8080/v1/runs/run-audio-video/events', async route => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          request_id: 'req-events',
+          run_id: 'run-audio-video',
+          events: [{
+            seq: 4,
+            pts_ms: 2_000,
+            kind: 'multimodal_moment',
+            payload: {
+              moment_id: 'req-av:0:0',
+              start_pts_ms: 2_000,
+              end_pts_ms: 3_000,
+              modalities: ['audio', 'video'],
+              kind: 'interaction',
+              description: 'The click sound coincides with the visible button press.',
+              intent: 'The speaker is trying to run the build.',
+              audio_visual_relation: 'Sound and press occur together.',
+              evidence: { media_sha256: hash },
+            },
+          }],
+        }),
+      })
+    })
+
+    await page.goto('/upload')
+    await page.evaluate(() => localStorage.setItem('vidarax_endpoint', 'http://localhost:8080'))
+    await page.reload()
+    await page.locator('input[type="file"]').setInputFiles({
+      name: 'session.mp4',
+      mimeType: 'video/mp4',
+      buffer: Buffer.from('fake media'),
+    })
+    await page.getByRole('radio', { name: 'Audio + video' }).click()
+    await page.getByRole('button', { name: /start analysis/i }).click()
+
+    await expect.poll(() => reasonBody).not.toBeNull()
+    expect(reasonBody).toMatchObject({
+      model: 'gemini-3.5-flash-lite',
+      semantic_timeout_ms: 30_000,
+      media: {
+        mode: 'audio_video',
+        window_ms: 8_000,
+        resolution: 'low',
+        persist_evidence: true,
+      },
+    })
+    expect(reasonBody).not.toHaveProperty('chunk_size')
+    await expect(page.getByTestId('multimodal-moment')).toContainText(
+      'The click sound coincides with the visible button press.',
+    )
+    await expect(page.getByRole('button', { name: 'Download clip' })).toBeVisible()
+  })
 })

@@ -6,13 +6,14 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::{Id as TaskId, JoinError, JoinSet};
 use vidarax_core::coordinates::{FrameCoordinates, IMAGE_COORDINATE_SCHEMA};
+use vidarax_core::crop::CropRegion;
 use vidarax_core::gate::{FrameSignal, GateEventType};
 use vidarax_core::ingest::pipeline::DecodePipeline;
-use vidarax_core::ingest::{DecodedJpegFrame, PreparedSource};
+use vidarax_core::ingest::{extract_audio_video_clip, DecodedJpegFrame, MediaInfo, PreparedSource};
 use vidarax_core::pipeline::{FrameMetadata, TwoPassPipeline};
 use vidarax_core::provider::{
     InferenceImage, InferenceObserver, InferenceProvider, InferenceRequest, InferenceVideo,
-    ProviderError, TokenUsage,
+    MediaResolution, ProviderError, TokenUsage,
 };
 use vidarax_core::tiered_vlm::{run_tiered_with_second_pass_schema, TieredVlmConfig};
 use vidarax_core::timeline::TimelineEvent;
@@ -39,8 +40,36 @@ const SEMANTIC_OVERLAY_SCHEMA: &str = r#"{
   },
   "required": ["event_type", "object_label", "summary", "description", "confidence"]
 }"#;
+const MULTIMODAL_OVERLAY_SCHEMA: &str = r#"{
+  "type": "object",
+  "properties": {
+    "moments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "start_offset_ms": { "type": "integer" },
+          "end_offset_ms": { "type": "integer" },
+          "modalities": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "kind": { "type": "string" },
+          "description": { "type": "string" },
+          "intent": { "type": "string" },
+          "audio_visual_relation": { "type": "string" },
+          "confidence": { "type": "number" }
+        },
+        "required": ["start_offset_ms", "end_offset_ms", "modalities", "kind", "description", "confidence"]
+      }
+    }
+  },
+  "required": ["moments"]
+}"#;
 const DEFAULT_SEMANTIC_MAX_TOKENS: u32 = 320;
-const CUSTOM_SCHEMA_MAX_TOKENS: u32 = 1024;
+const MULTIMODAL_MAX_TOKENS: u32 = 1_024;
+const CUSTOM_SCHEMA_MAX_TOKENS: u32 = 1_024;
+const MAX_MULTIMODAL_MOMENTS: usize = 32;
 
 pub struct DecodedSignals {
     pub signals: Vec<FrameSignal>,
@@ -58,6 +87,73 @@ pub struct SemanticOverlay {
     pub confidence: f32,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SemanticMoment {
+    pub start_offset_ms: u64,
+    pub end_offset_ms: u64,
+    pub start_pts_ms: u64,
+    pub end_pts_ms: u64,
+    pub modalities: Vec<String>,
+    pub kind: String,
+    pub description: String,
+    pub intent: Option<String>,
+    pub audio_visual_relation: Option<String>,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticMediaMode {
+    Frames,
+    Video,
+    AudioVideo,
+}
+
+impl SemanticMediaMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Frames => "frames",
+            Self::Video => "video",
+            Self::AudioVideo => "audio_video",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SemanticMediaConfig {
+    pub mode: SemanticMediaMode,
+    pub window_ms: u64,
+    pub resolution: MediaResolution,
+    pub persist_evidence: bool,
+    pub timestamp_windows: bool,
+}
+
+#[derive(Clone)]
+pub struct ClipSpec {
+    pub source: Arc<PreparedSource>,
+    pub decode_pipeline: Arc<dyn DecodePipeline>,
+    pub source_start_ms: u64,
+    pub duration_ms: u64,
+    pub crop: Option<CropRegion>,
+    pub mode: SemanticMediaMode,
+    pub resolution: MediaResolution,
+    pub persist_evidence: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SemanticMediaEvidence {
+    pub bytes: Arc<[u8]>,
+    pub media_type: &'static str,
+    pub mode: SemanticMediaMode,
+    pub source_start_ms: u64,
+    pub source_end_ms: u64,
+    pub audio_streams: u16,
+    pub audio_channels: u16,
+    pub audio_mixed: bool,
+    pub extraction_ms: u64,
+    pub resolution: MediaResolution,
+    pub persist_evidence: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChunkSemanticResult {
     pub overlay: Option<SemanticOverlay>,
@@ -73,6 +169,8 @@ pub struct ChunkSemanticResult {
     pub usage: TokenUsage,
     /// Wall-clock inference latency for this chunk (summed across passes).
     pub inference_latency_ms: u64,
+    pub moments: Vec<SemanticMoment>,
+    pub media: Option<SemanticMediaEvidence>,
 }
 
 impl ChunkSemanticResult {
@@ -104,6 +202,7 @@ impl ChunkSemanticResult {
                 "thinking_tokens": self.usage.thinking_tokens,
                 "total_tokens": self.usage.total_tokens,
                 "inference_latency_ms": self.inference_latency_ms,
+                "moments": &self.moments,
             })
         })
     }
@@ -113,7 +212,7 @@ pub struct ChunkPrep {
     pub analyzed: Vec<FrameMetadata>,
     pub frame_offset: usize,
     pub chunk_jpegs: Arc<[DecodedJpegFrame]>,
-    pub chunk_video_clip: Option<Arc<[u8]>>,
+    pub clip_spec: Option<ClipSpec>,
     pub pts_start_ms: u64,
     pub pts_end_ms: u64,
     pub chunk_len: usize,
@@ -242,16 +341,36 @@ pub async fn prepare_realtime_chunks(
     pipeline: &mut TwoPassPipeline,
     decode_pipeline: &Arc<dyn DecodePipeline>,
     prepared_source: &Arc<PreparedSource>,
-    video_clip_mode: bool,
+    media: SemanticMediaConfig,
     semantic_decode_enabled: bool,
-    video_clip_duration_s: f32,
-    crop: Option<vidarax_core::crop::CropRegion>,
+    crop: Option<CropRegion>,
 ) -> Vec<ChunkPrep> {
     let mut chunk_preps: Vec<ChunkPrep> = Vec::new();
-    for (chunk_idx, chunk) in signals.chunks(chunk_size).enumerate() {
+    let mut ranges = Vec::new();
+    if media.timestamp_windows && media.mode != SemanticMediaMode::Frames {
+        let mut start = 0usize;
+        while start < signals.len() {
+            let window_end = signals[start].pts_ms.saturating_add(media.window_ms);
+            let mut end = start + 1;
+            while end < signals.len() && signals[end].pts_ms < window_end {
+                end += 1;
+            }
+            ranges.push(start..end);
+            start = end;
+        }
+    } else {
+        ranges.extend(
+            (0..signals.len())
+                .step_by(chunk_size)
+                .map(|start| start..(start + chunk_size).min(signals.len())),
+        );
+    }
+
+    for range in ranges {
+        let chunk = &signals[range.clone()];
         let started = Instant::now();
         let analyzed = pipeline.analyze_batch(chunk).to_vec();
-        let frame_offset = chunk_idx * chunk_size;
+        let frame_offset = range.start;
         let chunk_jpegs: Arc<[DecodedJpegFrame]> = decoded_jpegs
             .map(|lookup| {
                 let mut jpegs: Vec<DecodedJpegFrame> = (frame_offset..frame_offset + chunk.len())
@@ -262,37 +381,29 @@ pub async fn prepare_realtime_chunks(
             })
             .unwrap_or_else(|| Arc::from([]));
 
-        let pts_start_ms_for_clip = chunk.first().map(|f| f.pts_ms).unwrap_or(0);
-        let chunk_video_clip: Option<Arc<[u8]>> = if video_clip_mode && semantic_decode_enabled {
-            let clip_start = pts_start_ms_for_clip as f32 / 1000.0;
-            // Hold an owning handle to the prepared source for the whole blocking
-            // task. spawn_blocking runs detached, so if the request future is
-            // cancelled mid-extraction this clone keeps the prefetched temp file
-            // alive until ffmpeg is done reading it.
-            let clip_source = Arc::clone(prepared_source);
-            let clip_pipeline = Arc::clone(decode_pipeline);
-            let duration = video_clip_duration_s;
-            match tokio::task::spawn_blocking(move || {
-                clip_pipeline.extract_clip(clip_source.source(), clip_start, duration, crop)
+        let pts_start_ms = chunk.first().map(|frame| frame.pts_ms).unwrap_or(0);
+        let duration_ms = prepared_source
+            .media_info()
+            .ok()
+            .and_then(|info| info.duration_ms)
+            .map(|source_duration| {
+                media
+                    .window_ms
+                    .min(source_duration.saturating_sub(pts_start_ms))
             })
-            .await
-            {
-                Ok(Ok(bytes)) => Some(Arc::from(bytes)),
-                Ok(Err(err)) => {
-                    tracing::warn!(
-                        chunk_idx,
-                        clip_start_ms = pts_start_ms_for_clip,
-                        duration = video_clip_duration_s,
-                        error = %err,
-                        "video clip extraction failed for chunk; falling back to no-video"
-                    );
-                    None
-                }
-                Err(err) => {
-                    tracing::warn!(chunk_idx, error = %err, "clip extraction task panicked");
-                    None
-                }
-            }
+            .unwrap_or(media.window_ms)
+            .max(1);
+        let clip_spec = if media.mode != SemanticMediaMode::Frames && semantic_decode_enabled {
+            Some(ClipSpec {
+                source: Arc::clone(prepared_source),
+                decode_pipeline: Arc::clone(decode_pipeline),
+                source_start_ms: pts_start_ms,
+                duration_ms,
+                crop,
+                mode: media.mode,
+                resolution: media.resolution,
+                persist_evidence: media.persist_evidence,
+            })
         } else {
             None
         };
@@ -302,8 +413,8 @@ pub async fn prepare_realtime_chunks(
             analyzed,
             frame_offset,
             chunk_jpegs,
-            chunk_video_clip,
-            pts_start_ms: chunk.first().map(|f| f.pts_ms).unwrap_or(0),
+            clip_spec,
+            pts_start_ms,
             pts_end_ms: chunk.last().map(|f| f.pts_ms).unwrap_or(0),
             chunk_len: chunk.len(),
         });
@@ -370,7 +481,7 @@ pub async fn run_semantic_dispatch(
                 tiered_config.clone(),
                 guided_json_str.as_ref().map(Arc::clone),
                 prev_jpeg_ref,
-                prep.chunk_video_clip.as_ref().map(Arc::clone),
+                prep.clip_spec.clone(),
                 observer.clone(),
                 inference_dispatch.clone(),
             )
@@ -491,7 +602,7 @@ fn spawn_semantic_task(
     let providers_c = providers;
     let prompt_c = semantic_prompt.to_string();
     let chunk_jpegs_c = Arc::clone(&prep.chunk_jpegs);
-    let chunk_video_clip_c = prep.chunk_video_clip.as_ref().map(Arc::clone);
+    let clip_spec_c = prep.clip_spec.clone();
     let frame_offset = prep.frame_offset as u64;
     let pts_start_ms = prep.pts_start_ms;
     let pts_end_ms = prep.pts_end_ms;
@@ -520,7 +631,7 @@ fn spawn_semantic_task(
             tiered_config_c,
             guided_json_c,
             None,
-            chunk_video_clip_c,
+            clip_spec_c,
             observer_c,
             inference_dispatch_c,
         )
@@ -594,7 +705,7 @@ pub async fn infer_chunk_semantics(
     tiered_config: TieredVlmConfig,
     guided_json: Option<Arc<str>>,
     prev_jpeg: Option<&[u8]>,
-    video_clip: Option<Arc<[u8]>>,
+    clip_spec: Option<ClipSpec>,
     observer: Option<Arc<dyn InferenceObserver>>,
     inference_dispatch: Option<Arc<tokio::sync::Semaphore>>,
 ) -> ChunkSemanticResult {
@@ -613,7 +724,8 @@ pub async fn infer_chunk_semantics(
         return result;
     };
 
-    let use_video_clip = video_clip.is_some();
+    let requested_media_mode = clip_spec.as_ref().map(|spec| spec.mode);
+    let use_video_clip = clip_spec.is_some();
     let selected = if use_video_clip {
         Vec::new()
     } else {
@@ -626,16 +738,99 @@ pub async fn infer_chunk_semantics(
         sel
     };
 
-    let prompt = format!(
-        "{semantic_prompt}\nchunk_frame_start={frame_start_index}\nchunk_frame_end={}\nchunk_pts_start_ms={pts_start_ms}\nchunk_pts_end_ms={pts_end_ms}",
-        frame_start_index.saturating_add(chunk_jpegs.len() as u64).saturating_sub(1)
-    );
+    let multimodal_instruction = if requested_media_mode == Some(SemanticMediaMode::AudioVideo) {
+        "\nTreat sound as evidence, not as a transcript request. Analyze speech intent and vocal affect only when supported by the clip. Also analyze non-speech sounds, sound effects, music, ambient or mechanical noise, and how sound relates to visible actions. Return at most 32 moments. Moment offsets are milliseconds from the beginning of this clip. Each modalities array may contain only audio and video. Each kind must be exactly speech, sound_effect, music, ambient, interaction, mechanical, or other. Confidence must be between 0 and 1. Do not attribute a moment to an original audio track because input tracks may have been mixed."
+    } else {
+        ""
+    };
+    let prompt = if use_video_clip {
+        format!(
+            "{semantic_prompt}{multimodal_instruction}\nchunk_pts_start_ms={pts_start_ms}\nchunk_pts_end_ms={pts_end_ms}"
+        )
+    } else {
+        format!(
+            "{semantic_prompt}{multimodal_instruction}\nchunk_frame_start={frame_start_index}\nchunk_frame_end={}\nchunk_pts_start_ms={pts_start_ms}\nchunk_pts_end_ms={pts_end_ms}",
+            frame_start_index
+                .saturating_add(chunk_jpegs.len() as u64)
+                .saturating_sub(1)
+        )
+    };
 
-    let (images, videos) = if let Some(clip_bytes) = video_clip {
+    let extracted_media = if let Some(spec) = clip_spec {
+        let source_start_ms = spec.source_start_ms;
+        let duration_ms = spec.duration_ms;
+        let extraction = tokio::task::spawn_blocking(move || {
+            let start_s = source_start_ms as f32 / 1_000.0;
+            let duration_s = duration_ms as f32 / 1_000.0;
+            match spec.mode {
+                SemanticMediaMode::Video => {
+                    let started = Instant::now();
+                    spec.decode_pipeline
+                        .extract_clip(spec.source.source(), start_s, duration_s, spec.crop)
+                        .map(|bytes| SemanticMediaEvidence {
+                            bytes: Arc::from(bytes),
+                            media_type: "video/mp4",
+                            mode: spec.mode,
+                            source_start_ms,
+                            source_end_ms: source_start_ms.saturating_add(duration_ms),
+                            audio_streams: 0,
+                            audio_channels: 0,
+                            audio_mixed: false,
+                            extraction_ms: started.elapsed().as_millis() as u64,
+                            resolution: spec.resolution,
+                            persist_evidence: spec.persist_evidence,
+                        })
+                }
+                SemanticMediaMode::AudioVideo => {
+                    let info: MediaInfo = spec.source.media_info()?.clone();
+                    extract_audio_video_clip(
+                        spec.source.source(),
+                        start_s,
+                        duration_s,
+                        spec.crop,
+                        &info,
+                    )
+                    .map(|clip| SemanticMediaEvidence {
+                        bytes: Arc::from(clip.bytes),
+                        media_type: "video/mp4",
+                        mode: spec.mode,
+                        source_start_ms,
+                        source_end_ms: source_start_ms.saturating_add(duration_ms),
+                        audio_streams: clip.audio_streams,
+                        audio_channels: clip.audio_channels,
+                        audio_mixed: clip.audio_mixed,
+                        extraction_ms: clip.extraction_ms,
+                        resolution: spec.resolution,
+                        persist_evidence: spec.persist_evidence,
+                    })
+                }
+                SemanticMediaMode::Frames => unreachable!("frame mode has no clip spec"),
+            }
+        })
+        .await;
+        match extraction {
+            Ok(Ok(media)) => Some(media),
+            Ok(Err(error)) => {
+                result.used_fallback = true;
+                result.error = Some(format!("media_extraction_failed:{error}"));
+                return result;
+            }
+            Err(error) => {
+                result.used_fallback = true;
+                result.error = Some(format!("media_extraction_join_error:{error}"));
+                return result;
+            }
+        }
+    } else {
+        None
+    };
+
+    let (images, videos) = if let Some(media) = extracted_media.as_ref() {
         let vids = vec![InferenceVideo {
-            media_type: "video/mp4",
-            raw_bytes: Some(Arc::clone(&clip_bytes)),
+            media_type: media.media_type,
+            raw_bytes: Some(Arc::clone(&media.bytes)),
             data_base64: String::new(),
+            media_resolution: Some(media.resolution),
         }];
         (Vec::new(), vids)
     } else {
@@ -654,17 +849,30 @@ pub async fn infer_chunk_semantics(
     };
 
     let has_custom_output_schema = guided_json.is_some();
+    let multimodal = extracted_media
+        .as_ref()
+        .is_some_and(|media| media.mode == SemanticMediaMode::AudioVideo);
     let first_pass_max_tokens = if has_custom_output_schema {
         CUSTOM_SCHEMA_MAX_TOKENS
+    } else if multimodal {
+        MULTIMODAL_MAX_TOKENS
     } else {
         DEFAULT_SEMANTIC_MAX_TOKENS
     };
-    let request_guided_json = guided_json
-        .as_ref()
-        .map(Arc::clone)
-        .or_else(|| Some(Arc::from(SEMANTIC_OVERLAY_SCHEMA)));
-    let second_pass_guided_json =
-        (!has_custom_output_schema).then(|| Arc::from(SEMANTIC_OVERLAY_SCHEMA));
+    let request_guided_json = guided_json.as_ref().map(Arc::clone).or_else(|| {
+        Some(Arc::from(if multimodal {
+            MULTIMODAL_OVERLAY_SCHEMA
+        } else {
+            SEMANTIC_OVERLAY_SCHEMA
+        }))
+    });
+    let second_pass_guided_json = (!has_custom_output_schema).then(|| {
+        Arc::from(if multimodal {
+            MULTIMODAL_OVERLAY_SCHEMA
+        } else {
+            SEMANTIC_OVERLAY_SCHEMA
+        })
+    });
     let request = InferenceRequest {
         model: tiered_config.first_pass_model.clone(),
         prompt: Arc::from(prompt),
@@ -754,6 +962,7 @@ pub async fn infer_chunk_semantics(
     result.response_chars = Some(provider_result.output_text.chars().count());
     result.usage = provider_result.usage;
     result.inference_latency_ms = provider_result.inference_latency_ms;
+    result.media = extracted_media;
 
     if has_custom_output_schema {
         let parsed = serde_json::from_str::<Value>(&provider_result.output_text)
@@ -762,9 +971,22 @@ pub async fn infer_chunk_semantics(
         result.overlay = None;
         result
     } else {
-        match parse_semantic_overlay(&provider_result.output_text) {
-            Ok(overlay) => {
+        match parse_semantic_overlay(
+            &provider_result.output_text,
+            multimodal
+                .then(|| {
+                    result.media.as_ref().map(|media| {
+                        (
+                            media.source_start_ms,
+                            media.source_end_ms.saturating_sub(media.source_start_ms),
+                        )
+                    })
+                })
+                .flatten(),
+        ) {
+            Ok((overlay, moments)) => {
                 result.overlay = Some(overlay);
+                result.moments = moments;
                 result.used_fallback = provider_result.fallback_used;
                 result
             }
@@ -830,12 +1052,36 @@ impl SemanticParseError {
     }
 }
 
-fn parse_semantic_overlay(raw: &str) -> Result<SemanticOverlay, SemanticParseError> {
+fn parse_semantic_overlay(
+    raw: &str,
+    media_window: Option<(u64, u64)>,
+) -> Result<(SemanticOverlay, Vec<SemanticMoment>), SemanticParseError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(SemanticParseError::EmptyResponse);
     }
     let value = parse_first_json_object(trimmed)?;
+
+    if let Some((source_start_ms, duration_ms)) = media_window {
+        let moments = parse_semantic_moments(&value, source_start_ms, duration_ms)?;
+        let overlay = moments.first().map_or_else(
+            || SemanticOverlay {
+                event_type: "context_observation".to_string(),
+                object_label: "multimodal_activity".to_string(),
+                summary: "No distinct audio-video moment".to_string(),
+                description: "The window contained no moment above the event threshold".to_string(),
+                confidence: 0.0,
+            },
+            |moment| SemanticOverlay {
+                event_type: "context_observation".to_string(),
+                object_label: moment.kind.clone(),
+                summary: moment.description.clone(),
+                description: moment.description.clone(),
+                confidence: moment.confidence,
+            },
+        );
+        return Ok((overlay, moments));
+    }
 
     let event_type = normalize_semantic_event(required_string(&value, "event_type")?);
     let object_label = normalize_semantic_object(required_string(&value, "object_label")?);
@@ -859,13 +1105,147 @@ fn parse_semantic_overlay(raw: &str) -> Result<SemanticOverlay, SemanticParseErr
         .filter(|v| (0.0..=1.0).contains(v))
         .ok_or(SemanticParseError::SchemaMismatch)? as f32;
 
-    Ok(SemanticOverlay {
-        event_type,
-        object_label,
-        summary,
-        description,
-        confidence,
-    })
+    Ok((
+        SemanticOverlay {
+            event_type,
+            object_label,
+            summary,
+            description,
+            confidence,
+        },
+        Vec::new(),
+    ))
+}
+
+fn parse_semantic_moments(
+    value: &Value,
+    source_start_ms: u64,
+    duration_ms: u64,
+) -> Result<Vec<SemanticMoment>, SemanticParseError> {
+    let values = value
+        .get("moments")
+        .and_then(Value::as_array)
+        .ok_or(SemanticParseError::SchemaMismatch)?;
+    let mut moments = Vec::with_capacity(values.len().min(MAX_MULTIMODAL_MOMENTS));
+    for value in values.iter().take(MAX_MULTIMODAL_MOMENTS) {
+        let start_offset_ms = value
+            .get("start_offset_ms")
+            .and_then(Value::as_u64)
+            .ok_or(SemanticParseError::SchemaMismatch)?
+            .min(duration_ms);
+        let end_offset_ms = value
+            .get("end_offset_ms")
+            .and_then(Value::as_u64)
+            .ok_or(SemanticParseError::SchemaMismatch)?
+            .clamp(start_offset_ms, duration_ms);
+        let mut modalities = Vec::with_capacity(2);
+        for modality in value
+            .get("modalities")
+            .and_then(Value::as_array)
+            .ok_or(SemanticParseError::SchemaMismatch)?
+        {
+            let modality = modality
+                .as_str()
+                .ok_or(SemanticParseError::SchemaMismatch)?;
+            let normalized = modality.trim().to_ascii_lowercase();
+            let mapped = if normalized == "video"
+                || normalized == "visual"
+                || normalized.contains("picture")
+            {
+                Some("video")
+            } else if normalized == "audio"
+                || normalized.contains("speech")
+                || normalized.contains("sound")
+                || normalized.contains("voice")
+                || normalized.contains("music")
+            {
+                Some("audio")
+            } else {
+                None
+            };
+            if let Some(mapped) = mapped {
+                if !modalities.iter().any(|existing| existing == mapped) {
+                    modalities.push(mapped.to_string());
+                }
+            }
+        }
+        let kind = value
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(normalize_moment_kind)
+            .ok_or(SemanticParseError::SchemaMismatch)?;
+        if modalities.is_empty() {
+            if matches!(
+                kind.as_str(),
+                "speech" | "sound_effect" | "music" | "ambient" | "mechanical"
+            ) {
+                modalities.push("audio".to_string());
+            } else {
+                return Err(SemanticParseError::SchemaMismatch);
+            }
+        }
+        let description = required_string(value, "description")?.trim();
+        if description.is_empty() {
+            return Err(SemanticParseError::SchemaMismatch);
+        }
+        let confidence = value
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .filter(|confidence| confidence.is_finite())
+            .ok_or(SemanticParseError::SchemaMismatch)?
+            .clamp(0.0, 1.0) as f32;
+        let optional_text = |field: &str| {
+            value
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(|text| truncate_context(text, 1_024).to_string())
+        };
+        moments.push(SemanticMoment {
+            start_offset_ms,
+            end_offset_ms,
+            start_pts_ms: source_start_ms.saturating_add(start_offset_ms),
+            end_pts_ms: source_start_ms.saturating_add(end_offset_ms),
+            modalities,
+            kind,
+            description: truncate_context(description, 1_024).to_string(),
+            intent: optional_text("intent"),
+            audio_visual_relation: optional_text("audio_visual_relation"),
+            confidence,
+        });
+    }
+    moments.sort_by_key(|moment| (moment.start_offset_ms, moment.end_offset_ms));
+    Ok(moments)
+}
+
+fn normalize_moment_kind(raw: &str) -> String {
+    let kind = raw.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+    if kind == "speech"
+        || kind.contains("dialog")
+        || kind.contains("voice")
+        || kind.contains("spoken")
+    {
+        "speech"
+    } else if kind == "sound_effect"
+        || kind.contains("effect")
+        || kind.contains("beep")
+        || kind.contains("tone")
+        || kind.contains("impact")
+    {
+        "sound_effect"
+    } else if kind.contains("music") {
+        "music"
+    } else if kind.contains("ambient") || kind.contains("background") {
+        "ambient"
+    } else if kind.contains("interaction") {
+        "interaction"
+    } else if kind.contains("mechanical") || kind.contains("machine") {
+        "mechanical"
+    } else {
+        "other"
+    }
+    .to_string()
 }
 
 fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, SemanticParseError> {
@@ -1058,37 +1438,85 @@ mod tests {
 ```
 Ignore this trailing {not json}."#;
 
-        let overlay = parse_semantic_overlay(raw).expect("fenced overlay should parse");
+        let (overlay, moments) =
+            parse_semantic_overlay(raw, None).expect("fenced overlay should parse");
         assert_eq!(overlay.object_label, "subject");
         assert_eq!(overlay.summary, "turn {left}");
         assert_eq!(overlay.confidence, 0.8);
+        assert!(moments.is_empty());
+    }
+
+    #[test]
+    fn multimodal_parser_keeps_audio_video_timestamps_on_the_source_timeline() {
+        let raw = r#"{
+          "moments":[
+            {
+              "start_offset_ms":1200,
+              "end_offset_ms":2400,
+              "modalities":["video","audio","audio"],
+              "kind":"interaction",
+              "description":"The button is clicked as its click sound plays.",
+              "intent":"The speaker is trying to run the build.",
+              "audio_visual_relation":"The click sound coincides with the visible press.",
+              "confidence":0.91
+            },
+            {
+              "start_offset_ms":9000,
+              "end_offset_ms":9500,
+              "modalities":["audio"],
+              "kind":"error tone",
+              "description":"An error sound plays.",
+              "confidence":1.4
+            }
+          ]
+        }"#;
+
+        let (overlay, moments) =
+            parse_semantic_overlay(raw, Some((20_000, 8_000))).expect("multimodal overlay");
+        assert_eq!(
+            overlay.summary,
+            "The button is clicked as its click sound plays."
+        );
+        assert_eq!(moments.len(), 2);
+        assert_eq!(moments[0].start_pts_ms, 21_200);
+        assert_eq!(moments[0].end_pts_ms, 22_400);
+        assert_eq!(moments[0].modalities, ["video", "audio"]);
+        assert_eq!(
+            moments[0].intent.as_deref(),
+            Some("The speaker is trying to run the build.")
+        );
+        assert_eq!(moments[1].start_pts_ms, 28_000);
+        assert_eq!(moments[1].end_pts_ms, 28_000);
+        assert_eq!(moments[1].kind, "sound_effect");
+        assert_eq!(moments[1].confidence, 1.0);
     }
 
     #[test]
     fn semantic_overlay_parser_reports_actionable_failure_categories() {
         assert_eq!(
-            parse_semantic_overlay("   ").unwrap_err(),
+            parse_semantic_overlay("   ", None).unwrap_err(),
             SemanticParseError::EmptyResponse
         );
         assert_eq!(
-            parse_semantic_overlay("plain prose only").unwrap_err(),
+            parse_semantic_overlay("plain prose only", None).unwrap_err(),
             SemanticParseError::JsonObjectNotFound
         );
         assert_eq!(
-            parse_semantic_overlay("prefix {not-json} suffix").unwrap_err(),
+            parse_semantic_overlay("prefix {not-json} suffix", None).unwrap_err(),
             SemanticParseError::InvalidJson
         );
         assert_eq!(
-            parse_semantic_overlay("{\"summary\": \"truncated\"").unwrap_err(),
+            parse_semantic_overlay("{\"summary\": \"truncated\"", None).unwrap_err(),
             SemanticParseError::JsonObjectNotFound
         );
         assert_eq!(
-            parse_semantic_overlay("{}").unwrap_err(),
+            parse_semantic_overlay("{}", None).unwrap_err(),
             SemanticParseError::SchemaMismatch
         );
         assert_eq!(
             parse_semantic_overlay(
-                r#"{"event_type":"event","object_label":"object","summary":"summary","description":"description","confidence":2}"#
+                r#"{"event_type":"event","object_label":"object","summary":"summary","description":"description","confidence":2}"#,
+                None
             )
             .unwrap_err(),
             SemanticParseError::SchemaMismatch
@@ -1098,7 +1526,8 @@ Ignore this trailing {not json}."#;
     #[test]
     fn semantic_overlay_parser_skips_invalid_balanced_braces_before_valid_json() {
         let raw = r#"The set {left, right} resolves to {"event_type":"scene_cut","object_label":"subject","summary":"left turn","description":"The subject turns left.","confidence":0.8}."#;
-        let overlay = parse_semantic_overlay(raw).expect("later valid object should parse");
+        let (overlay, _) =
+            parse_semantic_overlay(raw, None).expect("later valid object should parse");
         assert_eq!(overlay.event_type, "scene_cut");
         assert_eq!(overlay.confidence, 0.8);
     }
@@ -1209,9 +1638,8 @@ Ignore this trailing {not json}."#;
     }
 
     #[test]
-    fn chunk_prep_dispatch_clones_share_heavy_payload_storage() {
+    fn chunk_prep_dispatch_clones_share_jpeg_storage() {
         let jpeg_bytes: Arc<[u8]> = Arc::from(vec![0xff, 0xd8, 0xff, 0xd9]);
-        let clip_bytes: Arc<[u8]> = Arc::from(vec![0, 0, 0, 24, b'f', b't', b'y', b'p']);
         let prep = ChunkPrep {
             analyzed: Vec::new(),
             frame_offset: 0,
@@ -1219,7 +1647,7 @@ Ignore this trailing {not json}."#;
                 frame_index: 0,
                 jpeg_bytes: Arc::clone(&jpeg_bytes),
             }]),
-            chunk_video_clip: Some(Arc::clone(&clip_bytes)),
+            clip_spec: None,
             pts_start_ms: 0,
             pts_end_ms: 33,
             chunk_len: 1,
@@ -1227,7 +1655,6 @@ Ignore this trailing {not json}."#;
         };
 
         let chunk_jpegs_c = Arc::clone(&prep.chunk_jpegs);
-        let chunk_video_clip_c = prep.chunk_video_clip.as_ref().map(Arc::clone);
         let cloned_frame = prep.chunk_jpegs[0].clone();
 
         assert!(Arc::ptr_eq(&prep.chunk_jpegs, &chunk_jpegs_c));
@@ -1239,10 +1666,6 @@ Ignore this trailing {not json}."#;
             &prep.chunk_jpegs[0].jpeg_bytes,
             &cloned_frame.jpeg_bytes
         ));
-        assert!(Arc::ptr_eq(
-            prep.chunk_video_clip.as_ref().expect("clip present"),
-            chunk_video_clip_c.as_ref().expect("clip clone present")
-        ));
     }
 
     fn test_chunk_prep(idx: usize) -> ChunkPrep {
@@ -1253,7 +1676,7 @@ Ignore this trailing {not json}."#;
                 frame_index: idx as u64,
                 jpeg_bytes: Arc::from(vec![0xff, 0xd8, 0xff, idx as u8]),
             }]),
-            chunk_video_clip: None,
+            clip_spec: None,
             pts_start_ms: idx as u64 * 33,
             pts_end_ms: idx as u64 * 33,
             chunk_len: 1,

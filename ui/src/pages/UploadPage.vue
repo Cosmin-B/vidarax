@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useRunsStore } from '@/stores/runs'
 import { useEventsStore } from '@/stores/events'
@@ -8,6 +8,7 @@ import { useAuthStore } from '@/stores/auth'
 import { api, ApiError } from '@/lib/api'
 import { ls, lsBool, lsNum, STORAGE_KEYS, UI_DEFAULTS } from '@/lib/config'
 import type { RunStatus } from '@/stores/runs'
+import type { ModelInfo } from '@/lib/api'
 import { ChevronLeft, UploadCloud, CheckCircle, AlertCircle, Upload, Zap } from 'lucide-vue-next'
 import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
 import ProcessingVisualization from '@/components/stream/ProcessingVisualization.vue'
@@ -26,12 +27,39 @@ const uploadProgress = ref(0)
 const uploadState = ref<'idle' | 'uploading' | 'creating' | 'analyzing' | 'done' | 'error'>('idle')
 const uploadError = ref<string | null>(null)
 
-const DEFAULT_ANALYSIS_PROMPT = 'Describe what is happening in this video frame.'
+const DEFAULT_FRAME_PROMPT = 'Describe what is happening in this video frame.'
+const DEFAULT_MULTIMODAL_PROMPT = 'Identify meaningful audio, visual, and combined moments. Explain speech intent, sound effects, and how sound relates to what is visible.'
+const DEFAULT_MULTIMODAL_MODEL = 'gemini-3.5-flash-lite'
 
 // Config for the run
 const selectedModel = ref(ls(STORAGE_KEYS.defaultModel, UI_DEFAULTS.defaultModel))
 const prompt = ref('')
 const semanticInference = ref(lsBool(STORAGE_KEYS.semanticInference, UI_DEFAULTS.semanticInference))
+const analysisMode = ref<'frames' | 'video' | 'audio_video'>('frames')
+const MEDIA_MODE_OPTIONS = [
+  { value: 'frames', label: 'Frames' },
+  { value: 'video', label: 'Video' },
+  { value: 'audio_video', label: 'Audio + video' },
+] as const
+const mediaWindowMs = ref(8_000)
+const mediaResolution = ref<'low' | 'medium' | 'high'>('low')
+const persistEvidence = ref(true)
+const availableModels = ref<ModelInfo[]>([])
+const modelsLoading = ref(false)
+
+interface MultimodalMoment {
+  id: string
+  start_pts_ms: number
+  end_pts_ms: number
+  modalities: string[]
+  kind: string
+  description: string
+  intent?: string
+  audio_visual_relation?: string
+  evidence_sha256?: string
+}
+
+const multimodalMoments = ref<MultimodalMoment[]>([])
 
 // Created run
 const createdRunId = ref<string | null>(null)
@@ -84,6 +112,10 @@ function startVizPolling(runId: string): void {
           if (evtType === 'keyframe') newKf.push(startFrame)
           if (evtType === 'vlm_description') newVlm.push(startFrame)
         }
+
+        if (raw.kind === 'multimodal_moment') {
+          addMultimodalMoment(raw)
+        }
       }
 
       if (maxFrame > 0) {
@@ -114,13 +146,59 @@ function stopVizPolling(): void {
   }
 }
 
-const MODELS = [
-  { id: 'Qwen/Qwen3-VL-8B-Instruct',    label: 'Qwen3-VL 8B'    },
-  { id: 'Qwen/Qwen3-VL-4B-Instruct',    label: 'Qwen3-VL 4B'    },
-  { id: 'Qwen/Qwen3-VL-2B-Instruct',    label: 'Qwen3-VL 2B'    },
-  { id: 'OpenGVLab/InternVL3_5-4B',     label: 'InternVL3.5 4B' },
-  { id: 'LiquidAI/LFM2.5-VL-1.6B',     label: 'LFM2.5-VL 1.6B' },
+function addMultimodalMoment(raw: { seq: number; pts_ms: number; payload: Record<string, unknown> }): void {
+  const p = raw.payload
+  const evidence = p.evidence && typeof p.evidence === 'object'
+    ? p.evidence as Record<string, unknown>
+    : undefined
+  const id = String(p.event_id ?? `${raw.seq}`)
+  if (multimodalMoments.value.some(moment => moment.id === id)) return
+  multimodalMoments.value.push({
+    id,
+    start_pts_ms: Number(p.start_pts_ms ?? raw.pts_ms ?? 0),
+    end_pts_ms: Number(p.end_pts_ms ?? p.start_pts_ms ?? raw.pts_ms ?? 0),
+    modalities: Array.isArray(p.modalities) ? p.modalities.map(String) : [],
+    kind: String(p.kind ?? 'moment'),
+    description: String(p.description ?? ''),
+    intent: typeof p.intent === 'string' ? p.intent : undefined,
+    audio_visual_relation: typeof p.audio_visual_relation === 'string'
+      ? p.audio_visual_relation
+      : undefined,
+    evidence_sha256: typeof evidence?.media_sha256 === 'string'
+      ? evidence.media_sha256
+      : undefined,
+  })
+  multimodalMoments.value.sort((a, b) =>
+    a.start_pts_ms - b.start_pts_ms || a.end_pts_ms - b.end_pts_ms
+  )
+}
+
+async function refreshMultimodalMoments(runId: string): Promise<void> {
+  const response = await api.runs.events(runId)
+  for (const raw of response.events) {
+    if (raw.kind === 'multimodal_moment') addMultimodalMoment(raw)
+  }
+}
+
+function selectAnalysisMode(mode: 'frames' | 'video' | 'audio_video'): void {
+  analysisMode.value = mode
+}
+
+const FALLBACK_MODELS: ModelInfo[] = [
+  { id: 'Qwen/Qwen3-VL-8B-Instruct', name: 'Qwen3-VL 8B' },
+  { id: 'Qwen/Qwen3-VL-4B-Instruct', name: 'Qwen3-VL 4B' },
+  { id: 'Qwen/Qwen3-VL-2B-Instruct', name: 'Qwen3-VL 2B' },
+  { id: 'OpenGVLab/InternVL3_5-4B', name: 'InternVL3.5 4B' },
+  { id: 'LiquidAI/LFM2.5-VL-1.6B', name: 'LFM2.5-VL 1.6B' },
 ]
+
+const modelOptions = computed(() =>
+  availableModels.value.length > 0 ? availableModels.value : FALLBACK_MODELS
+)
+
+function modelLabel(model: ModelInfo): string {
+  return model.name || model.id
+}
 
 const acceptedTypes = ['video/mp4', 'video/webm', 'video/quicktime']
 
@@ -220,7 +298,8 @@ async function startUpload(): Promise<void> {
         ?? String(UI_DEFAULTS.semanticFramesPerChunk),
     )
 
-    const effectivePrompt = prompt.value.trim() || DEFAULT_ANALYSIS_PROMPT
+    const effectivePrompt = prompt.value.trim()
+      || (analysisMode.value === 'audio_video' ? DEFAULT_MULTIMODAL_PROMPT : DEFAULT_FRAME_PROMPT)
 
     const run = await api.runs.create({
       mode: 'balanced',
@@ -249,17 +328,30 @@ async function startUpload(): Promise<void> {
     uploadState.value = 'analyzing'
 
     // ── Step 4: Run analysis (blocks until complete) ───────────────────────
-    await api.runs.reason(run.run_id, {
+    const reasonRequest: Parameters<typeof api.runs.reason>[1] = {
       source_uri: filePath,
       model: selectedModel.value,
       prompt: effectivePrompt,
       semantic_inference: semanticInference.value,
       fps,
-      chunk_size: chunkSize,
       firstPassModel: firstPassModel || undefined,
       secondPassModel: secondPassModel || undefined,
       semanticFramesPerChunk,
-    })
+    }
+    if (analysisMode.value === 'frames') {
+      reasonRequest.chunk_size = chunkSize
+    } else {
+      reasonRequest.media = {
+        mode: analysisMode.value,
+        window_ms: mediaWindowMs.value,
+        resolution: mediaResolution.value,
+        persist_evidence: persistEvidence.value,
+      }
+      reasonRequest.semantic_timeout_ms = 30_000
+    }
+    await api.runs.reason(run.run_id, reasonRequest)
+
+    await refreshMultimodalMoments(run.run_id)
 
     stopVizPolling()
     uploadState.value = 'done'
@@ -324,8 +416,43 @@ function reset(): void {
   vizChunkEnd.value = 0
   vizVlmFrames.value = []
   vizKfIndices.value = []
+  multimodalMoments.value = []
   if (fileInputRef.value) fileInputRef.value.value = ''
 }
+
+async function loadModels(): Promise<void> {
+  modelsLoading.value = true
+  try {
+    availableModels.value = (await api.models()).models ?? []
+  } catch {
+    availableModels.value = []
+  } finally {
+    modelsLoading.value = false
+  }
+}
+
+async function downloadEvidence(moment: MultimodalMoment): Promise<void> {
+  if (!createdRunId.value || !moment.evidence_sha256) return
+  try {
+    const blob = await api.runs.media(createdRunId.value, moment.evidence_sha256)
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `vidarax-${formatPts(moment.start_pts_ms)}-${moment.evidence_sha256.slice(0, 12)}.mp4`
+    anchor.click()
+    URL.revokeObjectURL(url)
+  } catch (err) {
+    uploadError.value = err instanceof Error ? err.message : 'Unable to download evidence'
+  }
+}
+
+watch(analysisMode, mode => {
+  if (mode !== 'frames' && !selectedModel.value.toLowerCase().includes('gemini')) {
+    selectedModel.value = DEFAULT_MULTIMODAL_MODEL
+  }
+})
+
+onMounted(loadModels)
 
 onUnmounted(() => {
   disconnectEvents()
@@ -360,8 +487,8 @@ function formatPts(ms: number) {
         <AnimatedIcon :icon="ChevronLeft" :size="16" :stroke-width="2" />
       </RouterLink>
       <div>
-        <h2 class="text-[#e2e8f0] font-semibold text-xl">Upload Video</h2>
-        <p class="text-[#64748b] text-sm mt-0.5">Upload a video file for batch semantic analysis</p>
+        <h2 class="text-[#e2e8f0] font-semibold text-xl">Analyze Recorded Media</h2>
+        <p class="text-[#64748b] text-sm mt-0.5">Build a synchronized timeline from frames, video, or audio + video</p>
       </div>
     </div>
 
@@ -411,7 +538,51 @@ function formatPts(ms: number) {
       </div>
 
       <!-- Inline results on done -->
-      <div v-if="activeEvents.length > 0 || activeKeyframes.length > 0" class="space-y-4">
+      <div
+        v-if="activeEvents.length > 0 || activeKeyframes.length > 0 || multimodalMoments.length > 0"
+        class="space-y-4"
+      >
+
+        <div v-if="multimodalMoments.length > 0" class="card-skeuo overflow-hidden">
+          <div class="px-5 py-4 border-b border-[#1e2633] flex items-center justify-between">
+            <div>
+              <h3 class="text-[#e2e8f0] font-medium text-sm">Synchronized Audio + Video</h3>
+              <p class="text-[#475569] text-xs mt-1">Speech intent, sound, and visual context share one source timeline.</p>
+            </div>
+            <span class="badge badge-teal mono">{{ multimodalMoments.length }}</span>
+          </div>
+          <div class="divide-y divide-[#1e2633] max-h-96 overflow-y-auto">
+            <div
+              v-for="moment in multimodalMoments"
+              :key="moment.id"
+              class="px-5 py-3 space-y-1"
+              data-testid="multimodal-moment"
+            >
+              <div class="flex items-center gap-2">
+                <span class="mono text-[#2dd4bf] text-xs">
+                  {{ formatPts(moment.start_pts_ms) }}–{{ formatPts(moment.end_pts_ms) }}
+                </span>
+                <span class="badge badge-amber">{{ moment.kind.replace(/_/g, ' ') }}</span>
+                <span class="mono text-[#64748b] text-[10px]">{{ moment.modalities.join(' + ') }}</span>
+                <button
+                  v-if="moment.evidence_sha256"
+                  class="ml-auto text-[#64748b] hover:text-[#2dd4bf] text-xs underline"
+                  type="button"
+                  @click="downloadEvidence(moment)"
+                >
+                  Download clip
+                </button>
+              </div>
+              <p class="text-[#cbd5e1] text-sm">{{ moment.description }}</p>
+              <p v-if="moment.intent" class="text-[#94a3b8] text-xs">
+                <span class="text-[#64748b]">Intent:</span> {{ moment.intent }}
+              </p>
+              <p v-if="moment.audio_visual_relation" class="text-[#94a3b8] text-xs">
+                <span class="text-[#64748b]">A/V relation:</span> {{ moment.audio_visual_relation }}
+              </p>
+            </div>
+          </div>
+        </div>
 
         <!-- Event timeline -->
         <div v-if="activeEvents.length > 0" class="card-skeuo overflow-hidden">
@@ -562,6 +733,30 @@ function formatPts(ms: number) {
         <h3 class="text-[#e2e8f0] font-medium text-sm">Analysis Settings</h3>
 
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div class="space-y-1.5 sm:col-span-2">
+            <label class="text-xs text-[#64748b] uppercase tracking-wide">Input understanding</label>
+            <div class="grid grid-cols-3 gap-2" role="radiogroup" aria-label="Input understanding">
+              <button
+                v-for="choice in MEDIA_MODE_OPTIONS"
+                :key="choice.value"
+                type="button"
+                role="radio"
+                :aria-checked="analysisMode === choice.value"
+                class="min-h-11 rounded-[8px] text-sm transition-colors"
+                :class="analysisMode === choice.value ? 'text-[#e2e8f0]' : 'text-[#64748b]'"
+                :style="analysisMode === choice.value
+                  ? 'background: rgba(45,212,191,0.12); border: 1px solid rgba(45,212,191,0.35);'
+                  : 'background: #0f1117; border: 1px solid #1e2633;'"
+                @click="selectAnalysisMode(choice.value)"
+              >
+                {{ choice.label }}
+              </button>
+            </div>
+            <p class="text-[#475569] text-xs">
+              Audio + video sends MP4 bytes through Gemini File API. Media is never placed in JSON.
+            </p>
+          </div>
+
           <!-- Model selector -->
           <div class="space-y-1.5">
             <label class="text-xs text-[#64748b] uppercase tracking-wide">Model</label>
@@ -570,9 +765,58 @@ function formatPts(ms: number) {
               class="w-full min-h-11 px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0] transition-colors duration-200"
               style="background: #0f1117; border: 1px solid #1e2633; outline: none;"
             >
-              <option v-for="m in MODELS" :key="m.id" :value="m.id">{{ m.label }}</option>
+              <option v-if="modelsLoading" disabled>Loading models…</option>
+              <option v-for="m in modelOptions" :key="m.id" :value="m.id">{{ modelLabel(m) }}</option>
             </select>
           </div>
+
+          <template v-if="analysisMode !== 'frames'">
+            <div class="space-y-1.5">
+              <label class="text-xs text-[#64748b] uppercase tracking-wide">Window</label>
+              <select
+                v-model.number="mediaWindowMs"
+                class="w-full min-h-11 px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0]"
+                style="background: #0f1117; border: 1px solid #1e2633; outline: none;"
+              >
+                <option :value="4000">4 seconds</option>
+                <option :value="8000">8 seconds</option>
+                <option :value="12000">12 seconds</option>
+                <option :value="20000">20 seconds</option>
+              </select>
+            </div>
+            <div class="space-y-1.5">
+              <label class="text-xs text-[#64748b] uppercase tracking-wide">Media resolution</label>
+              <select
+                v-model="mediaResolution"
+                class="w-full min-h-11 px-3 py-2 rounded-[8px] mono text-sm text-[#e2e8f0]"
+                style="background: #0f1117; border: 1px solid #1e2633; outline: none;"
+              >
+                <option value="low">Low · fastest</option>
+                <option value="medium">Medium</option>
+                <option value="high">High · most tokens</option>
+              </select>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              :aria-checked="persistEvidence"
+              class="sm:col-span-2 flex min-h-11 items-center gap-3 w-fit text-left"
+              @click="persistEvidence = !persistEvidence"
+            >
+              <span
+                aria-hidden="true"
+                class="relative w-9 h-5 rounded-full"
+                :style="persistEvidence ? 'background: #0d9488;' : 'background: #1e2633;'"
+              >
+                <span
+                  class="absolute top-0.5 w-4 h-4 rounded-full transition-all"
+                  style="background: #e2e8f0;"
+                  :style="persistEvidence ? 'left: 18px;' : 'left: 2px;'"
+                />
+              </span>
+              <span class="text-sm text-[#94a3b8]">Keep content-addressed MP4 clips with events</span>
+            </button>
+          </template>
 
           <!-- Prompt -->
           <div class="space-y-1.5 sm:col-span-2">
@@ -580,7 +824,7 @@ function formatPts(ms: number) {
             <textarea
               v-model="prompt"
               rows="2"
-              :placeholder="DEFAULT_ANALYSIS_PROMPT"
+              :placeholder="analysisMode === 'audio_video' ? DEFAULT_MULTIMODAL_PROMPT : DEFAULT_FRAME_PROMPT"
               class="w-full px-3 py-2 rounded-[8px] text-sm text-[#e2e8f0] placeholder-[#475569] resize-none transition-colors duration-200"
               style="background: #0f1117; border: 1px solid #1e2633; outline: none; font-family: inherit;"
               aria-label="Analysis prompt for VLM"

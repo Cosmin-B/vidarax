@@ -310,7 +310,7 @@ export class Vidarax {
     }
   }
 
-  private async requestBlob(path: string): Promise<Blob> {
+  private async requestBlob(path: string, accept: string): Promise<Blob> {
     let lastError!: NetworkError | HttpError;
     const maxAttempts = this.maxRetries + 1;
 
@@ -319,7 +319,7 @@ export class Vidarax {
       const timerId = setTimeout(() => controller.abort(), this.timeoutMs);
       try {
         const response = await fetch(`${this.baseUrl}${path}`, {
-          headers: this.headers({ Accept: "image/jpeg" }),
+          headers: this.headers({ Accept: accept }),
           signal: controller.signal,
         });
         if (response.ok) return await response.blob();
@@ -558,6 +558,18 @@ export class Vidarax {
     }
     return this.requestBlob(
       `/v1/runs/${encodeURIComponent(runId)}/keyframes/${sha256.toLowerCase()}`,
+      "image/jpeg",
+    );
+  }
+
+  /** Fetch durable synchronized audio-video evidence as raw MP4 bytes. */
+  async getMedia(runId: string, sha256: string): Promise<Blob> {
+    if (!/^[0-9a-fA-F]{64}$/.test(sha256)) {
+      throw new VidaraxError("sha256 must be 64 hexadecimal characters", "validation_error");
+    }
+    return this.requestBlob(
+      `/v1/runs/${encodeURIComponent(runId)}/media/${sha256.toLowerCase()}`,
+      "video/mp4",
     );
   }
 

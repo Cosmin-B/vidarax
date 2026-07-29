@@ -35,10 +35,12 @@ PRICES_PER_MTOK = {
     # prices, not a live quote: override them per run with VIDARAX_PRICE_INPUT /
     # VIDARAX_PRICE_OUTPUT for exact accounting. Longest matching key wins in
     # price_for_model(), so version-qualified ids resolve exactly.
+    "gemini-3.6-flash": (1.50, 7.50),
+    "gemini-3.5-flash-lite": (0.30, 2.50),
     "gemini-3.1-flash-lite": (0.25, 1.50),
-    "gemini-flash-lite-latest": (0.25, 1.50),     # alias -> 3.1-flash-lite
-    "gemini-flash-lite": (0.25, 1.50),
-    "gemini-flash-latest": (0.25, 1.50),          # alias -> 3.1-flash-lite
+    "gemini-flash-lite-latest": (0.30, 2.50),     # alias -> 3.5-flash-lite
+    "gemini-flash-lite": (0.30, 2.50),
+    "gemini-flash-latest": (0.30, 2.50),          # alias -> 3.5-flash-lite
     "gemini-flash": (0.25, 1.50),
     "gemini": (0.25, 1.50),  # generic fallback
 }
@@ -359,7 +361,7 @@ def run_single(api, model, source_uri, gt, preset_name, preset):
     if total_tokens == 0 and (prompt_tokens or completion_tokens):
         total_tokens = prompt_tokens + completion_tokens
 
-    # Thinking models (e.g. gemini-3.1-flash-lite) burn thoughtsTokenCount that shows
+    # Thinking models in the Gemini 3 family burn thoughtsTokenCount that shows
     # up in total_tokens but not completion_tokens — bill on the full output.
     billed_output = billed_output_tokens(prompt_tokens, completion_tokens, total_tokens)
     thinking_tokens = max(0, billed_output - completion_tokens)

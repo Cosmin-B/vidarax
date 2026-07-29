@@ -76,7 +76,8 @@ Run lifecycle and analysis kinds written by the API handlers, with the payload f
 | `frames_decoded` | A decode pass finished and reported its frames. | `request_id`, `source_uri`, `stream_id`, `sampling_policy`, `source_fps`, `sample_fps`, `decoded_frames`, `width`, `height`, `pixel_format`, `coordinate_schema`, `coordinates`, `signals` (per-frame signal array) |
 | `marker_emitted` | The analysis pass produced a marker. The payload is the marker object. | `marker_id`, `run_id`, `stream_id`, `event_type`, `status`, `start_frame`, `end_frame`, `start_pts_ms`, `end_pts_ms`, `confidence`, `supersedes_marker_id` |
 | `analysis_generated` | A deterministic analysis pass produced its result. | `request_id`, `stream_id`, `frames`, `window_size`, `segment_ms`, `sampling_policy`, `sample_fps`, `mode`, `model`, `markers` |
-| `semantic_chunk_inferred` | A chunk finished tiered VLM inference. | `request_id`, `stream_id`, `chunk_index`, `provider`, `provider_fallback_used`, `semantic_fallback_used`, `semantic_error`, `finish_reason`, `response_chars`, `event_type`, `object_label`, `summary`, `description`, `confidence`, `raw_output`, token counts (`prompt_tokens`, `completion_tokens`, `thinking_tokens`, `total_tokens`), `inference_latency_ms`, optional `index_name` |
+| `semantic_chunk_inferred` | A chunk finished tiered VLM inference. | `request_id`, `stream_id`, `chunk_index`, `provider`, `provider_fallback_used`, `semantic_fallback_used`, `semantic_error`, `finish_reason`, `response_chars`, `event_type`, `object_label`, `summary`, `description`, `confidence`, `raw_output`, token counts, `inference_latency_ms`, optional `index_name`. Native media adds mode, resolution, source PTS range, extraction time, audio counts, and optional MP4 evidence |
+| `multimodal_moment` | Gemini identified a timestamped audible, visual, or combined moment inside a native A/V window. | Stable `moment_id`, request and chunk identity, source-relative start/end PTS, timestamp resolution, modalities, kind, description, optional intent, optional audio-visual relationship, confidence, provider, index, and optional MP4 evidence |
 | `semantic_chunk_generated` | A semantic result for a chunk was recorded. | `request_id`, `stream_id`, `chunk_index`, `chunk_frames`, `process_ms`, `source_span_ms`, `lag_ms`, `index_name`, token counts, `inference_latency_ms` |
 | `semantic_fallback_activated` | The semantic path fell back (for example, no provider). | `request_id`, `stream_id`, `reason` |
 | `inference_completed` | A direct inference request completed. | `request_id`, `provider`, `model`, `fallback_used`, `prompt_bytes`, `output_bytes` |
@@ -143,6 +144,22 @@ The value is fixed-size frame metadata. Copying it between stages neither owns
 nor allocates image bytes. It describes image-space provenance. Robotics and
 other embodied consumers attach camera extrinsics and world transforms
 downstream.
+
+## Recorded audio-video moments
+
+Native `audio_video` reasoning writes a `semantic_chunk_inferred` event for
+each bounded source-time window and one `multimodal_moment` event for each
+model-selected interval. Moment timestamps are media-relative. Gemini reports
+them at about one-second resolution, recorded as
+`timestamp_resolution_ms: 1000`.
+
+Retained windows are written as raw MP4 under the media sidecar before their
+timeline events commit. The semantic chunk and each moment carry the same
+`evidence` object with `media_ref`, `media_type`, `media_bytes`, and
+`media_sha256`. Consumers fetch it through
+`GET /v1/runs/{id}/media/{sha256}`. The route checks both run ownership and
+that the run timeline references the hash. MP4 bytes do not enter the WAL, SSE
+body, webhook body, or JSON API response.
 
 ## Restricted-zone activity
 
@@ -229,6 +246,7 @@ The full public surface:
 | `getEvents(id, index?)` / `getMarkers(id, query?)` | Fetch the current event list or filtered marker list. |
 | `getInteractions(id, index?)` | Fetch guided semantic interactions derived from chunk events. |
 | `getKeyframe(id, sha256)` | Fetch a referenced keyframe as a raw JPEG `Blob`. |
+| `getMedia(id, sha256)` | Fetch referenced A/V evidence as a raw MP4 `Blob`. |
 | `streamEvents(id, index?)` / `streamMarkers(id, query?)` | Async iterators over one fetched snapshot. Use the SSE API directly for a durable live subscription. |
 | `subscribeEvents(id, options?)` | Durable SSE replay/follow iterator with API-key headers and `Last-Event-ID` reconnect. |
 | `createWebhook(id, request)` / `listWebhooks(id)` / `deleteWebhook(id, webhookId)` | Register filtered signed hooks and inspect delivery/dead-letter state. |

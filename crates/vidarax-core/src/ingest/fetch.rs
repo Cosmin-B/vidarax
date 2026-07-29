@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -13,7 +13,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use reqwest::blocking::Client;
 use reqwest::redirect;
 
-use super::ffmpeg::{ffprobe_path, FFMPEG_LOCAL_PROTOCOL_WHITELIST};
+use super::ffmpeg::{ffprobe_path, probe_media_info, MediaInfo, FFMPEG_LOCAL_PROTOCOL_WHITELIST};
 use super::validate::{validate_remote_fetch_url, InputSource};
 
 pub const REMOTE_MEDIA_PREFETCH_MAX_BYTES: u64 = 256 * 1024 * 1024;
@@ -55,6 +55,7 @@ pub struct PreparedSource {
     // Kept only for its Drop: deleting the temp file once the guard falls out of
     // scope. A local passthrough leaves this None.
     _prefetched: Option<PrefetchedMedia>,
+    media_info: OnceLock<Result<MediaInfo, String>>,
 }
 
 impl PreparedSource {
@@ -62,6 +63,18 @@ impl PreparedSource {
     /// prefetched remote URL, or the original source when nothing was fetched.
     pub fn source(&self) -> &InputSource {
         &self.source
+    }
+
+    /// Probe the prepared local source at most once, even when several bounded
+    /// semantic tasks need its stream layout.
+    pub fn media_info(&self) -> Result<&MediaInfo, String> {
+        match self
+            .media_info
+            .get_or_init(|| probe_media_info(&self.source))
+        {
+            Ok(info) => Ok(info),
+            Err(error) => Err(error.clone()),
+        }
     }
 }
 
@@ -81,6 +94,7 @@ fn prepare_source_for_reuse_with_validator(
         return Ok(PreparedSource {
             source: source.clone(),
             _prefetched: None,
+            media_info: OnceLock::new(),
         });
     }
 
@@ -93,6 +107,7 @@ fn prepare_source_for_reuse_with_validator(
     Ok(PreparedSource {
         source,
         _prefetched: Some(prefetched),
+        media_info: OnceLock::new(),
     })
 }
 

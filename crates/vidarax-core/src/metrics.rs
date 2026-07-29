@@ -129,6 +129,14 @@ pub struct PipelineMetrics {
     keyframe_blob_failures_total: AtomicU64,
     /// Raw JPEG bytes committed for newly-created local blobs.
     keyframe_blob_bytes_total: AtomicU64,
+    /// Encoded audio-video windows prepared for native provider inference.
+    media_clips_extracted_total: AtomicU64,
+    media_clip_extraction_failures_total: AtomicU64,
+    media_clip_bytes_total: AtomicU64,
+    media_blobs_written_total: AtomicU64,
+    media_blobs_reused_total: AtomicU64,
+    media_blob_failures_total: AtomicU64,
+    multimodal_moments_total: AtomicU64,
     /// Restricted-zone assertions durably committed with their evidence.
     restricted_zone_assertions_total: AtomicU64,
     /// Restricted-zone evidence that failed before the assertion commit.
@@ -190,6 +198,8 @@ pub struct PipelineMetrics {
     pub novelty_embedding_latency_ms: LatencyHistogram,
     /// Content-address/hash/write latency for local keyframe blobs.
     pub keyframe_blob_latency_ms: LatencyHistogram,
+    /// ffmpeg audio-video window extraction latency.
+    pub media_extraction_latency_ms: LatencyHistogram,
     /// SpacetimeDB HTTP POST latency in milliseconds.
     pub stdb_emit_latency_ms: LatencyHistogram,
 }
@@ -211,6 +221,13 @@ impl PipelineMetrics {
             keyframe_blobs_reused_total: AtomicU64::new(0),
             keyframe_blob_failures_total: AtomicU64::new(0),
             keyframe_blob_bytes_total: AtomicU64::new(0),
+            media_clips_extracted_total: AtomicU64::new(0),
+            media_clip_extraction_failures_total: AtomicU64::new(0),
+            media_clip_bytes_total: AtomicU64::new(0),
+            media_blobs_written_total: AtomicU64::new(0),
+            media_blobs_reused_total: AtomicU64::new(0),
+            media_blob_failures_total: AtomicU64::new(0),
+            multimodal_moments_total: AtomicU64::new(0),
             restricted_zone_assertions_total: AtomicU64::new(0),
             restricted_zone_evidence_failures_total: AtomicU64::new(0),
             restricted_zone_queue_dropped_total: AtomicU64::new(0),
@@ -245,6 +262,7 @@ impl PipelineMetrics {
             vlm_latency_ms: LatencyHistogram::new(VLM_LATENCY_MS_BUCKETS),
             novelty_embedding_latency_ms: LatencyHistogram::new(EMBEDDING_LATENCY_MS_BUCKETS),
             keyframe_blob_latency_ms: LatencyHistogram::new(STDB_EMIT_LATENCY_MS_BUCKETS),
+            media_extraction_latency_ms: LatencyHistogram::new(VLM_LATENCY_MS_BUCKETS),
             stdb_emit_latency_ms: LatencyHistogram::new(STDB_EMIT_LATENCY_MS_BUCKETS),
         }
     }
@@ -366,6 +384,44 @@ impl PipelineMetrics {
     pub fn inc_keyframe_blob_failure(&self) {
         self.keyframe_blob_failures_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_media_clip_extracted(&self, bytes: u64, extraction_ms: u64) {
+        self.media_clips_extracted_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.media_clip_bytes_total
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.media_extraction_latency_ms.record(extraction_ms);
+    }
+
+    #[inline]
+    pub fn inc_media_clip_extraction_failure(&self) {
+        self.media_clip_extraction_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_media_blob(&self, created: bool) {
+        if created {
+            self.media_blobs_written_total
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.media_blobs_reused_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn inc_media_blob_failure(&self) {
+        self.media_blob_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn add_multimodal_moments(&self, count: u64) {
+        self.multimodal_moments_total
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     #[inline]
@@ -573,6 +629,15 @@ impl PipelineMetrics {
         let keyframe_blobs_reused = self.keyframe_blobs_reused_total.load(Ordering::Relaxed);
         let keyframe_blob_failures = self.keyframe_blob_failures_total.load(Ordering::Relaxed);
         let keyframe_blob_bytes = self.keyframe_blob_bytes_total.load(Ordering::Relaxed);
+        let media_clips_extracted = self.media_clips_extracted_total.load(Ordering::Relaxed);
+        let media_clip_extraction_failures = self
+            .media_clip_extraction_failures_total
+            .load(Ordering::Relaxed);
+        let media_clip_bytes = self.media_clip_bytes_total.load(Ordering::Relaxed);
+        let media_blobs_written = self.media_blobs_written_total.load(Ordering::Relaxed);
+        let media_blobs_reused = self.media_blobs_reused_total.load(Ordering::Relaxed);
+        let media_blob_failures = self.media_blob_failures_total.load(Ordering::Relaxed);
+        let multimodal_moments = self.multimodal_moments_total.load(Ordering::Relaxed);
         let restricted_zone_assertions = self
             .restricted_zone_assertions_total
             .load(Ordering::Relaxed);
@@ -647,6 +712,13 @@ impl PipelineMetrics {
              vidarax_pipeline_keyframe_blobs_reused_total {keyframe_blobs_reused}\n\
              vidarax_pipeline_keyframe_blob_failures_total {keyframe_blob_failures}\n\
              vidarax_pipeline_keyframe_blob_bytes_total {keyframe_blob_bytes}\n\
+             vidarax_pipeline_media_clips_extracted_total {media_clips_extracted}\n\
+             vidarax_pipeline_media_clip_extraction_failures_total {media_clip_extraction_failures}\n\
+             vidarax_pipeline_media_clip_bytes_total {media_clip_bytes}\n\
+             vidarax_pipeline_media_blobs_written_total {media_blobs_written}\n\
+             vidarax_pipeline_media_blobs_reused_total {media_blobs_reused}\n\
+             vidarax_pipeline_media_blob_failures_total {media_blob_failures}\n\
+             vidarax_pipeline_multimodal_moments_total {multimodal_moments}\n\
              vidarax_pipeline_restricted_zone_assertions_total {restricted_zone_assertions}\n\
              vidarax_pipeline_restricted_zone_evidence_failures_total {restricted_zone_evidence_failures}\n\
              vidarax_pipeline_restricted_zone_queue_dropped_total {restricted_zone_queue_dropped}\n\
@@ -728,6 +800,11 @@ impl PipelineMetrics {
             &self
                 .keyframe_blob_latency_ms
                 .render_prometheus("vidarax_pipeline_keyframe_blob_latency_ms", "ms"),
+        );
+        out.push_str(
+            &self
+                .media_extraction_latency_ms
+                .render_prometheus("vidarax_pipeline_media_extraction_latency_ms", "ms"),
         );
         out.push_str(
             &self

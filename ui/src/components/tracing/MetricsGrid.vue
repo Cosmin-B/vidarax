@@ -17,8 +17,13 @@ const passRatePct = computed(() =>
 const noveltyReusePct = computed(() => props.metrics.noveltyReuseRatio * 100)
 
 const blobSuccessPct = computed(() => {
-  const successes = props.metrics.keyframeBlobsWrittenTotal + props.metrics.keyframeBlobsReusedTotal
-  const attempts = successes + props.metrics.keyframeBlobFailuresTotal
+  const successes = props.metrics.keyframeBlobsWrittenTotal
+    + props.metrics.keyframeBlobsReusedTotal
+    + props.metrics.mediaBlobsWrittenTotal
+    + props.metrics.mediaBlobsReusedTotal
+  const attempts = successes
+    + props.metrics.keyframeBlobFailuresTotal
+    + props.metrics.mediaBlobFailuresTotal
   return attempts > 0 ? (successes / attempts) * 100 : 0
 })
 
@@ -298,6 +303,20 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
           <span class="mono text-[#f59e0b] text-xs">{{ fmtInt(metrics.vlmInferencesTotal) }}</span>
         </div>
         <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">A/V clips extracted</span>
+          <span class="mono text-[#22c55e] text-xs">{{ fmtInt(metrics.mediaClipsExtractedTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Timestamped moments</span>
+          <span class="mono text-[#22c55e] text-xs">{{ fmtInt(metrics.multimodalMomentsTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">A/V extraction failures</span>
+          <span class="mono text-xs" :class="metrics.mediaClipExtractionFailuresTotal ? 'text-[#ef4444]' : 'text-[#22c55e]'">
+            {{ fmtInt(metrics.mediaClipExtractionFailuresTotal) }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
           <span class="text-[#475569] text-xs">Novelty evaluated</span>
           <span class="mono text-[#22c55e] text-xs">{{ fmtInt(metrics.noveltyEvaluatedTotal) }}</span>
         </div>
@@ -390,7 +409,7 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
           <AnimatedIcon :icon="Database" :size="14" :stroke-width="1.75"
                         class="text-[#2dd4bf]" />
         </div>
-        <h4 class="text-[#94a3b8] text-xs font-medium uppercase tracking-wider">Keyframe sidecar</h4>
+        <h4 class="text-[#94a3b8] text-xs font-medium uppercase tracking-wider">Binary sidecars</h4>
         <span class="badge badge-teal ml-auto text-[9px]">BINARY</span>
       </div>
 
@@ -398,7 +417,7 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
       <div>
         <div class="text-[#475569] text-[10px] uppercase tracking-wider mb-1">Bytes stored</div>
         <div class="mono text-3xl font-semibold text-[#2dd4bf]">
-          {{ formatBytes(metrics.keyframeBlobBytesTotal) }}
+          {{ formatBytes(metrics.keyframeBlobBytesTotal + metrics.mediaClipBytesTotal) }}
         </div>
       </div>
 
@@ -416,6 +435,20 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
           <span class="text-[#475569] text-xs">Write failures</span>
           <span class="mono text-xs" :class="metrics.keyframeBlobFailuresTotal ? 'text-[#ef4444]' : 'text-[#2dd4bf]'">
             {{ fmtInt(metrics.keyframeBlobFailuresTotal) }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">MP4 blobs written</span>
+          <span class="mono text-[#f59e0b] text-xs">{{ fmtInt(metrics.mediaBlobsWrittenTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">MP4 blobs reused</span>
+          <span class="mono text-[#2dd4bf] text-xs">{{ fmtInt(metrics.mediaBlobsReusedTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">MP4 write failures</span>
+          <span class="mono text-xs" :class="metrics.mediaBlobFailuresTotal ? 'text-[#ef4444]' : 'text-[#2dd4bf]'">
+            {{ fmtInt(metrics.mediaBlobFailuresTotal) }}
           </span>
         </div>
       </div>

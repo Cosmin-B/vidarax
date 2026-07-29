@@ -55,6 +55,7 @@ The API is served over HTTP/1.1 and HTTP/2, with optional HTTP/3 behind the `h3-
 | `POST` | `/v1/upload` | Upload a file for processing |
 | `GET` | `/v1/files/:filename` | Serve an uploaded or allowed-root file |
 | `GET` | `/v1/runs/:id/keyframes/:sha256` | Serve a run-owned keyframe as raw JPEG |
+| `GET` | `/v1/runs/:id/media/:sha256` | Serve run-owned A/V evidence as raw MP4 |
 | `GET` | `/v1/health` | Health check |
 | `GET` | `/v1/metrics` | Prometheus-compatible metrics |
 
@@ -78,7 +79,25 @@ The API is served over HTTP/1.1 and HTTP/2, with optional HTTP/3 behind the `h3-
 |---|---|---|---|---|
 | `POST /v1/runs/:id/ingest` | `{ source_uri, sampling_policy?, fixed_fps?, sample_fps?, max_frames?, stream_id? }`. `source_uri` is required and must resolve under an ingest root or the upload root. `sampling_policy` is `source_fps_adaptive` (default) or `fixed`. `fixed_fps` must be in [0.2, 120] and is required for `fixed`. `max_frames` is in [1, 500000], default 512. Unknown fields are rejected. | `{ request_id, run_id, status: "processing", decoded_frames, source_uri, sampling_policy, source_fps, sample_fps }` | 404, 409 terminal run, 422 (including source validation), 500 | Appends `ingest_received` and `frames_decoded` |
 | `POST /v1/runs/:id/analyze` | `{ model, mode?, stream_id?, sampling_policy?, fixed_fps?, frames?, window_size?, segment_ms?, trace_id? }`. Supply 1 to 4096 frames with normalized scores, or omit `frames` to reuse signals from the run's latest `frames_decoded` event. `window_size` is in [2, 256]. `segment_ms` is in [50, 60000]. | `{ request_id, run_id, generated, metadata[], markers[] }`. Metadata sourced from decoded video includes `coordinate_schema` and `coordinates`. Caller-supplied signal arrays do not claim image provenance. | 404, 409 terminal run, 422, 500 | Appends one `marker_emitted` per marker, then `analysis_generated` |
-| `POST /v1/runs/:id/reason` | `{ source_uri, model, ... }` with `chunk_size` in [5, 500], `window_size` in [2, 256], `segment_ms >= 1`, `max_frames` in [1, 500000], `semantic_inference?`, `semantic_frames_per_chunk` in [1, 4], `semantic_frame_max_edge` in [64, 4096], `crop?: { x, y, width, height }` as normalized fractions, `semantic_timeout_ms` in [100, 120000], `semantic_prompt` up to 4096 bytes, `output_schema?`, `first_pass_model?`, `second_pass_model?`, `second_pass_threshold?`, `index_name?`, `temporal_chain?`, `visual_diff?`, `video_clip_mode?`, `video_clip_duration_s` in (0, 60], `vlm_concurrency?` clamped to [1, 64] | `{ request_id, run_id, generated, markers_emitted, decoded_frames, sample_fps, lag_p95_ms, lag_p99_ms, tokens, metadata[], markers[] }`. Metadata carries the `vidarax.image.v1` source/crop/analysis transform. | 404, 409 terminal run, 422, 500 | Appends `semantic_chunk_inferred` and `semantic_chunk_generated` per chunk, `marker_emitted` per marker, `semantic_fallback_activated` when semantic inference was requested with no provider, and `run_completed` |
+| `POST /v1/runs/:id/reason` | `{ source_uri, model, ... }` with `chunk_size` in [5, 500] for frame mode, `media?: { mode, window_ms?, resolution?, persist_evidence? }`, `window_size` in [2, 256], `segment_ms >= 1`, `max_frames` in [1, 500000], `semantic_inference?`, `semantic_frames_per_chunk` in [1, 4], `semantic_frame_max_edge` in [64, 4096], `crop?: { x, y, width, height }` as normalized fractions, `semantic_timeout_ms` in [100, 120000], `semantic_prompt` up to 4096 bytes, `output_schema?`, `first_pass_model?`, `second_pass_model?`, `second_pass_threshold?`, `index_name?`, `temporal_chain?`, `visual_diff?`, compatibility fields `video_clip_mode?` and `video_clip_duration_s`, and `vlm_concurrency?` clamped to [1, 64] | `{ request_id, run_id, generated, markers_emitted, decoded_frames, sample_fps, lag_p95_ms, lag_p99_ms, tokens, metadata[], markers[] }`. Metadata carries the `vidarax.image.v1` source/crop/analysis transform. | 404, 409 terminal run, 422, 500, 503 provider unavailable | Appends `semantic_chunk_inferred` and `semantic_chunk_generated` per chunk, `multimodal_moment` per timestamped A/V moment, `marker_emitted` per marker, and `run_completed` |
+
+`media.mode` is `frames`, `video`, or `audio_video`. Native `video` and
+`audio_video` modes require `semantic_inference: true`, reject `chunk_size`, and
+require a provider with binary media transport. Gemini is the current built-in
+provider for this route. `window_ms` defaults to 8000 and must be in [100,
+60000]. `resolution` is `low`, `medium`, or `high`. Audio-video evidence
+retention defaults on. Video-only retention defaults off.
+
+Audio-video extraction accepts one video stream and up to eight audio streams.
+It uses one shared source-time window, resamples audio to 48 kHz, and mixes
+input streams into one mono track before the provider call. The model receives
+sound, not a transcript. The output can describe speech intent, vocal affect,
+sound effects, music, ambient or mechanical sound, visible action, and their
+relationship. Original audio-track attribution is unavailable after the mix.
+Gemini timestamps are recorded with `timestamp_resolution_ms: 1000`.
+
+Native MP4 bytes go through Gemini File API. They never enter the JSON request.
+Temporary provider uploads are deleted after success or failure.
 
 ### Reading events and markers
 
@@ -202,7 +221,7 @@ model.
 | `POST /v1/upload` | multipart form with a `file` field. Body capped at 200 MiB by the route's body limit | 200 `{ file_path }`, the server-side path to use as `source_uri` | 422 unsupported type or invalid media container, 500 | Filenames are sanitized and prefixed per principal. The content must validate as a media container, not a playlist |
 | `GET /v1/files/:filename` | bare filename only | 200 file bytes with a video content type and `Accept-Ranges: bytes` | 400 `bad_request`, 404 `not_found` | Errors use the structured JSON envelope. Uploads are only visible to the uploading principal. Operator-configured roots are shared |
 
-### Keyframe blobs
+### Binary media blobs
 
 `GET /v1/runs/:id/keyframes/:sha256` returns `image/jpeg` bytes for a hash
 referenced by a `keyframe_stored` event. It also accepts hashes from the literal
@@ -214,6 +233,12 @@ access. Responses use a private immutable cache policy and an ETag equal to the
 content hash. Invalid hashes return the JSON validation envelope. Missing
 references or files return the JSON not-found envelope. This API never places
 image bytes in JSON or base64.
+
+`GET /v1/runs/:id/media/:sha256` returns `video/mp4` bytes for a hash
+referenced by a `semantic_chunk_inferred` or `multimodal_moment` event. It uses
+the same run ownership check, immutable private cache policy, ETag behavior,
+hash checks, and structured errors as the keyframe route. The MP4 is the exact
+bounded window sent to the provider.
 
 ### WebRTC (WHIP)
 

@@ -28,7 +28,7 @@ use std::collections::HashSet;
 
 use crate::provider::{
     cached_arc_str, new_arc_str_cache, InferenceProvider, InferenceRequest, InferenceResult,
-    InferenceVideo, ProviderError, ProviderKind, TokenUsage,
+    InferenceVideo, MediaTransport, ProviderError, ProviderKind, TokenUsage,
 };
 
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
@@ -121,7 +121,16 @@ impl GeminiProvider {
     ) -> Result<String, ProviderError> {
         let model = self.request_model(request);
         let deadline = request_deadline(request)?;
-        self.build_payload_with_max_tokens(request, request.max_tokens, model, deadline)
+        let mut uploaded_files = Vec::new();
+        let payload = self.build_payload_with_max_tokens(
+            request,
+            request.max_tokens,
+            model,
+            deadline,
+            &mut uploaded_files,
+        );
+        self.delete_uploaded_files(&uploaded_files);
+        payload
     }
 
     fn build_payload_with_max_tokens(
@@ -130,6 +139,7 @@ impl GeminiProvider {
         max_tokens: u32,
         model: &str,
         deadline: Instant,
+        uploaded_files: &mut Vec<String>,
     ) -> Result<String, ProviderError> {
         // Media parts first (Gemini best practice), text prompt last.
         let mut parts: Vec<Value> = Vec::new();
@@ -147,7 +157,8 @@ impl GeminiProvider {
         // Videos — inline if small, File API if large
         for video in &request.input_videos {
             if video.raw_bytes.is_some() {
-                let uri = self.upload_file(video, deadline)?;
+                let (uri, name) = self.upload_file(video, deadline)?;
+                uploaded_files.push(name);
                 parts.push(serde_json::json!({
                     "fileData": {
                         "mimeType": video.media_type,
@@ -162,7 +173,8 @@ impl GeminiProvider {
                     }
                 }));
             } else {
-                let uri = self.upload_file(video, deadline)?;
+                let (uri, name) = self.upload_file(video, deadline)?;
+                uploaded_files.push(name);
                 parts.push(serde_json::json!({
                     "fileData": {
                         "mimeType": video.media_type,
@@ -178,6 +190,18 @@ impl GeminiProvider {
         let mut gen_config = serde_json::json!({"maxOutputTokens": max_tokens});
         if supports_sampling_parameters(model) {
             gen_config["temperature"] = Value::from(request.temperature);
+        }
+        if let Some(resolution) = request
+            .input_videos
+            .iter()
+            .filter_map(|video| video.media_resolution)
+            .max_by_key(|resolution| match resolution {
+                crate::provider::MediaResolution::Low => 0,
+                crate::provider::MediaResolution::Medium => 1,
+                crate::provider::MediaResolution::High => 2,
+            })
+        {
+            gen_config["mediaResolution"] = Value::String(resolution.as_gemini_value().to_string());
         }
 
         if let Some(schema_str) = &request.guided_json {
@@ -202,7 +226,7 @@ impl GeminiProvider {
         &self,
         video: &InferenceVideo,
         deadline: Instant,
-    ) -> Result<String, ProviderError> {
+    ) -> Result<(String, String), ProviderError> {
         let (upload_body, byte_count) = match &video.raw_bytes {
             Some(bytes) => (
                 reqwest::blocking::Body::sized(Cursor::new(Arc::clone(bytes)), bytes.len() as u64),
@@ -292,18 +316,61 @@ impl GeminiProvider {
             })?
             .to_string();
 
-        // The name is the last path segment of the URI or the `file.name` field.
+        // Prefer the explicit resource name. Older responses can be recovered
+        // from the URI without copying media or issuing another request.
         let file_name = upload_json["file"]["name"]
             .as_str()
+            .map(str::to_string)
+            .or_else(|| {
+                file_uri
+                    .split("/v1beta/")
+                    .nth(1)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        file_uri
+                            .split('/')
+                            .next_back()
+                            .map(|name| format!("files/{name}"))
+                    })
+            })
             .ok_or_else(|| {
                 ProviderError::InvalidResponse("file API response missing file.name".into())
-            })?
-            .to_string();
+            })?;
 
         // Step 3: poll until ACTIVE, within the caller's inference deadline.
-        self.poll_file_active(&file_name, deadline)?;
+        if let Err(error) = self.poll_file_active(&file_name, deadline) {
+            self.delete_uploaded_files(std::slice::from_ref(&file_name));
+            return Err(error);
+        }
 
-        Ok(file_uri)
+        Ok((file_uri, file_name))
+    }
+
+    fn delete_uploaded_files(&self, file_names: &[String]) {
+        for file_name in file_names {
+            let url = format!(
+                "{}/v1beta/{}?key={}",
+                GEMINI_API_BASE, file_name, self.api_key
+            );
+            match self
+                .client
+                .delete(url)
+                .timeout(Duration::from_secs(2))
+                .send()
+            {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => tracing::warn!(
+                    file_name,
+                    status = response.status().as_u16(),
+                    "Gemini file cleanup returned an error"
+                ),
+                Err(error) => tracing::warn!(
+                    file_name,
+                    error = %redact_url(error),
+                    "Gemini file cleanup failed"
+                ),
+            }
+        }
     }
 
     /// Poll `GET /v1beta/files/{name}` until `state == "ACTIVE"`.
@@ -372,6 +439,26 @@ impl GeminiProvider {
 
         let status = response.status();
         if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            let error = serde_json::from_str::<Value>(&body).ok();
+            let provider_status = error
+                .as_ref()
+                .and_then(|value| value.pointer("/error/status"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let mut provider_message = error
+                .as_ref()
+                .and_then(|value| value.pointer("/error/message"))
+                .and_then(Value::as_str)
+                .unwrap_or("request rejected")
+                .replace(['\r', '\n'], " ");
+            provider_message.truncate(512);
+            tracing::warn!(
+                status = status.as_u16(),
+                provider_status,
+                provider_message,
+                "Gemini generateContent rejected the request"
+            );
             return Err(ProviderError::HttpStatus(status.as_u16()));
         }
 
@@ -452,6 +539,10 @@ impl InferenceProvider for GeminiProvider {
         ProviderKind::Gemini
     }
 
+    fn media_transport_for_model(&self, _model: &str) -> MediaTransport {
+        MediaTransport::BinaryFile
+    }
+
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
         let model = self.request_model(request);
         let deadline = request_deadline(request)?;
@@ -466,37 +557,57 @@ impl InferenceProvider for GeminiProvider {
         } else {
             request.max_tokens
         };
-        let body = if reserve {
-            self.build_payload_with_max_tokens(request, max_tokens, model, deadline)?
+        let mut uploaded_files = Vec::with_capacity(request.input_videos.len());
+        let body_result = if reserve {
+            self.build_payload_with_max_tokens(
+                request,
+                max_tokens,
+                model,
+                deadline,
+                &mut uploaded_files,
+            )
         } else {
-            self.build_payload_with_max_tokens(request, request.max_tokens, model, deadline)?
+            self.build_payload_with_max_tokens(
+                request,
+                request.max_tokens,
+                model,
+                deadline,
+                &mut uploaded_files,
+            )
         };
-        let result = self.attempt(model, &body, started, deadline)?;
-
-        // First encounter with a thinking model: the response itself reports the
-        // starvation (MAX_TOKENS + thoughtsTokenCount + empty text). Learn it and
-        // retry once with headroom. We only retry when we did not already
-        // reserve, so this can never loop.
-        if !reserve && is_thinking_starved(&result) {
-            self.learn_thinking(model);
-            let retry_started = Instant::now();
-            let retry_body = payload_with_max_output_tokens(
-                &body,
-                request.max_tokens.saturating_add(GEMINI_THINKING_HEADROOM),
-            )?;
-            let mut retry = self.attempt(model, &retry_body, retry_started, deadline)?;
-            // The starved first attempt was still billed (prompt + hidden
-            // thinking tokens) and cost wall-clock time. Fold it into the
-            // surfaced totals so token/latency accounting reflects the whole
-            // inference, not just the retry.
-            retry.usage.accumulate(result.usage);
-            retry.inference_latency_ms = retry
-                .inference_latency_ms
-                .saturating_add(result.inference_latency_ms);
-            return Ok(retry);
-        }
-
-        Ok(result)
+        let body = match body_result {
+            Ok(body) => body,
+            Err(error) => {
+                self.delete_uploaded_files(&uploaded_files);
+                return Err(error);
+            }
+        };
+        let result = self.attempt(model, &body, started, deadline);
+        let outcome = match result {
+            Ok(result) if !reserve && is_thinking_starved(&result) => {
+                self.learn_thinking(model);
+                let retry_started = Instant::now();
+                let retry_body = payload_with_max_output_tokens(
+                    &body,
+                    request.max_tokens.saturating_add(GEMINI_THINKING_HEADROOM),
+                );
+                match retry_body {
+                    Ok(retry_body) => self
+                        .attempt(model, &retry_body, retry_started, deadline)
+                        .map(|mut retry| {
+                            retry.usage.accumulate(result.usage);
+                            retry.inference_latency_ms = retry
+                                .inference_latency_ms
+                                .saturating_add(result.inference_latency_ms);
+                            retry
+                        }),
+                    Err(error) => Err(error),
+                }
+            }
+            other => other,
+        };
+        self.delete_uploaded_files(&uploaded_files);
+        outcome
     }
 
     fn available_kinds(&self) -> Vec<ProviderKind> {
@@ -582,7 +693,7 @@ mod tests {
     use std::sync::Arc;
 
     fn provider() -> GeminiProvider {
-        GeminiProvider::new("test-key".to_string(), "gemini-3.1-flash-lite".to_string()).unwrap()
+        GeminiProvider::new("test-key".to_string(), "gemini-3.5-flash-lite".to_string()).unwrap()
     }
 
     fn request() -> InferenceRequest {
@@ -656,6 +767,7 @@ mod tests {
             media_type: "video/mp4",
             raw_bytes: None,
             data_base64: "dmlkZW8=".to_string(),
+            media_resolution: Some(crate::provider::MediaResolution::Medium),
         }];
         let body = p.build_payload(&req).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
@@ -668,6 +780,14 @@ mod tests {
         assert_eq!(
             video_part["inlineData"]["mimeType"].as_str(),
             Some("video/mp4")
+        );
+        assert_eq!(
+            v["generationConfig"]["mediaResolution"].as_str(),
+            Some("MEDIA_RESOLUTION_MEDIUM")
+        );
+        assert_eq!(
+            p.media_transport_for_model("gemini-3.5-flash-lite"),
+            MediaTransport::BinaryFile
         );
     }
 
@@ -1022,6 +1142,7 @@ mod tests {
                 media_type: "video/mp4",
                 raw_bytes: Some(Arc::from(mp4)),
                 data_base64: String::new(),
+                media_resolution: None,
             }],
             max_tokens: 100,
             temperature: 0.0,

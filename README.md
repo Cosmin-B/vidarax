@@ -1,8 +1,9 @@
 # vidarax
 
-Self-hosted video intelligence for live streams and recorded files.
+Self-hosted media intelligence for live streams and recorded files.
 
-Vidarax turns continuous video into actionable, replayable assertions. It
+Vidarax turns continuous video and synchronized sound into actionable,
+replayable assertions. It
 decodes each stream, runs a deterministic per-frame filter, and spends model
 calls when visual or semantic change warrants them. Bounded trigger programs
 turn perception signals into namespaced events, signed webhooks, or
@@ -18,14 +19,14 @@ keeps running through network loss or a rejected candidate.
 ## Architecture
 
 ```
- Sources          Per-session generation          Durable state       Delivery
-┌──────────┐   ┌────────────────────────────────┐   ┌─────────────────┐   ┌─────────────┐
-│ MP4/File │──>│ Decode -> Frame filter -> VLM  │──>│ WAL event log   │──>│ REST / SSE  │
-│ WebRTC   │──>│              |                 │   │                 │   │ Webhooks    │
-│ RTSP/HLS │──>│          Trigger VM            │   │ Binary media    │   │ TypeScript  │
-│ Upload   │──>│              |                 │   │ sidecar         │   │ SDK / UI    │
-│          │   │        supervised generation     │   │                 │   │ Prometheus  │
-└──────────┘   └────────────────────────────────┘   └─────────────────┘   └─────────────┘
+ Sources          Per-session work               Durable state       Delivery
+┌──────────┐   ┌──────────────────────────────┐   ┌─────────────────┐   ┌─────────────┐
+│ MP4/File │──>│ Decode -> Frame filter -> VLM│──>│ WAL event log   │──>│ REST / SSE  │
+│ WebRTC   │──>│    │                         │   │                 │   │ Webhooks    │
+│ RTSP/HLS │──>│    ├─ Trigger VM             │   │ Binary JPEG/MP4 │   │ TypeScript  │
+│ Upload   │──>│    └─ Synced A/V windows     │   │ sidecars        │   │ SDK / UI    │
+│          │   │       supervised generation  │   │                 │   │ Prometheus  │
+└──────────┘   └──────────────────────────────┘   └─────────────────┘   └─────────────┘
 
  Signed release manifest -> edge updater -> shadow -> canary -> active model
 ```
@@ -105,14 +106,32 @@ For prompt-driven semantic analysis, create a run and call `reason()` with a
 ```typescript
 const { run_id } = await v.createRun()
 const result = await v.reason(run_id, {
-  source_uri: 'video.mp4',
-  model: 'your-model',
-  semantic_prompt: 'Describe what happens in each scene',
+  source_uri: '/srv/vidarax-media/session.mp4',
+  model: 'gemini-3.5-flash-lite',
+  semantic_prompt: 'Find meaningful sound, speech intent, and visible actions',
+  media: {
+    mode: 'audio_video',
+    window_ms: 8000,
+    resolution: 'low',
+    persist_evidence: true,
+  },
 })
+
+const moments = (await v.getEvents(run_id))
+  .filter(event => event.kind === 'multimodal_moment')
 ```
 
-The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via
-`output_schema`, interactions, and snapshot reads of events and markers.
+Native media modes send raw MP4 bytes through Gemini File API. They do not place
+media in JSON or base64. Each `multimodal_moment` carries source-relative start
+and end timestamps, the contributing modalities, a description, optional
+speech intent, an optional audio-to-visual relationship, confidence, and an MP4
+sidecar reference when retention is enabled. Gemini timestamps resolve to about
+one second. Recorded media is supported now. WHIP audio is negotiated but is
+not yet attached to the live reasoning pipeline.
+
+The SDK also supports WHIP/WebRTC video, batch inference, structured JSON
+output via `output_schema`, interactions, and snapshot reads of events and
+markers.
 
 ## API endpoints
 
@@ -156,6 +175,7 @@ The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via
 | `POST` | `/v1/upload` | Upload a file for processing |
 | `GET` | `/v1/files/:filename` | Serve an uploaded or allowed-root file |
 | `GET` | `/v1/runs/:id/keyframes/:sha256` | Serve a run-owned keyframe as raw JPEG |
+| `GET` | `/v1/runs/:id/media/:sha256` | Serve run-owned A/V evidence as raw MP4 |
 | `GET` | `/v1/health` | Health check |
 | `GET` | `/v1/metrics` | Prometheus-compatible metrics |
 

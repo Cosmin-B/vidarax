@@ -217,3 +217,73 @@ describe("durable event subscription", () => {
     expect(headers["x-api-key"]).toBe("test-key");
   });
 });
+
+describe("synchronized audio-video reasoning", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("sends the native media contract and fetches evidence as MP4", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/media/")) {
+        return new Response(new Uint8Array([0, 0, 0, 24]), {
+          headers: { "content-type": "video/mp4" },
+        });
+      }
+      return Response.json({
+        request_id: "req-av",
+        run_id: "run-av",
+        generated: 1,
+        markers_emitted: 0,
+        decoded_frames: 80,
+        sample_fps: 10,
+        lag_p95_ms: 0,
+        lag_p99_ms: 0,
+        tokens: {
+          prompt_tokens: 1,
+          completion_tokens: 1,
+          thinking_tokens: 0,
+          total_tokens: 2,
+          inference_latency_ms: 10,
+          chunks_analyzed: 1,
+        },
+        metadata: [],
+        markers: [],
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new Vidarax("https://vidarax.example", { apiKey: "test-key" });
+    await client.reason("run-av", {
+      source_uri: "/srv/session.mp4",
+      model: "gemini-3.5-flash-lite",
+      semantic_inference: true,
+      media: {
+        mode: "audio_video",
+        window_ms: 8_000,
+        resolution: "low",
+        persist_evidence: true,
+      },
+    });
+    const hash = "a".repeat(64);
+    const media = await client.getMedia("run-av", hash);
+
+    const reasonInit = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(JSON.parse(String(reasonInit.body))).toMatchObject({
+      model: "gemini-3.5-flash-lite",
+      media: {
+        mode: "audio_video",
+        window_ms: 8_000,
+        resolution: "low",
+        persist_evidence: true,
+      },
+    });
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      `https://vidarax.example/v1/runs/run-av/media/${hash}`,
+    );
+    const mediaHeaders = fetchMock.mock.calls[1][1]?.headers as Record<string, string>;
+    expect(mediaHeaders.Accept).toBe("video/mp4");
+    expect(media.type).toBe("video/mp4");
+  });
+});

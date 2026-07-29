@@ -165,10 +165,51 @@ pub struct RealtimeReasonRequest {
     /// Duration of each video clip in seconds when `video_clip_mode` is true.
     /// Must be > 0.  Default: 0.5.
     pub video_clip_duration_s: Option<f32>,
+    /// Native media analysis configuration. `audio_video` preserves the
+    /// synchronized sound and picture window and requires a binary-capable
+    /// provider such as Gemini.
+    pub media: Option<MediaAnalysisOptions>,
     /// Maximum number of concurrent VLM inference requests in parallel mode.
     /// Higher values increase throughput but may cause queueing on the GPU.
     /// Default: 4.
     pub vlm_concurrency: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaAnalysisMode {
+    Frames,
+    Video,
+    AudioVideo,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaAnalysisResolution {
+    Low,
+    Medium,
+    High,
+}
+
+impl From<MediaAnalysisResolution> for vidarax_core::provider::MediaResolution {
+    fn from(value: MediaAnalysisResolution) -> Self {
+        match value {
+            MediaAnalysisResolution::Low => Self::Low,
+            MediaAnalysisResolution::Medium => Self::Medium,
+            MediaAnalysisResolution::High => Self::High,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaAnalysisOptions {
+    pub mode: MediaAnalysisMode,
+    /// Duration of the source-time window sent to the model.
+    pub window_ms: Option<u64>,
+    pub resolution: Option<MediaAnalysisResolution>,
+    /// Store the encoded MP4 in the content-addressed binary sidecar.
+    pub persist_evidence: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

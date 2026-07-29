@@ -8,8 +8,8 @@ use crate::delivery::{create_webhook, delete_webhook, list_webhooks, stream_even
 use crate::handlers::{
     analyze_run, create_run, delete_run, get_events, get_interactions, get_markers, get_run,
     get_state, health, infer, infer_batch, ingest_run, keepalive_run, list_feedback, list_models,
-    list_runs, metrics, query, reason_realtime_run, search, serve_file, serve_keyframe, stop_run,
-    submit_feedback, upload_file,
+    list_runs, metrics, query, reason_realtime_run, search, serve_file, serve_keyframe,
+    serve_media, stop_run, submit_feedback, upload_file,
 };
 use crate::policies::{
     activate_policy, create_policy, get_policy, list_policies, replay_policy, rollback_policy,
@@ -31,6 +31,7 @@ pub fn app_router(state: AppState) -> Router {
         )
         .route("/v1/files/{filename}", get(serve_file))
         .route("/v1/runs/{run_id}/keyframes/{sha256}", get(serve_keyframe))
+        .route("/v1/runs/{run_id}/media/{sha256}", get(serve_media))
         .route("/v1/runs/{run_id}/ingest", post(ingest_run))
         .route("/v1/runs/{run_id}/analyze", post(analyze_run))
         .route("/v1/runs/{run_id}/reason", post(reason_realtime_run))

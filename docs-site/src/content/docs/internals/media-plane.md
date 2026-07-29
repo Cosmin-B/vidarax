@@ -26,6 +26,16 @@ The complete per-session inventory, grouped by runtime and mode:
 
 One process-wide thread sits behind all sessions: `vidarax-timeline-writer`, which owns the WAL writer and is described in [WAL and events](/docs/internals/wal-and-events/#who-appends-each-event-family).
 
+Recorded native media uses the async request path plus bounded blocking tasks,
+not the live generation worker set. `prepare_source_for_reuse` downloads an
+eligible remote object once and caches one media probe. The signal pass defines
+source-time windows. `run_semantic_dispatch` admits only
+`vlm_concurrency` windows at once, and each task extracts its MP4 immediately
+before inference. Raw clip memory is therefore bounded by active tasks and the
+process-wide inference byte budget. Audio-video extraction runs in one ffmpeg
+process per active window and caps output at 64 MiB. Evidence persistence uses
+the timeline writer only after the MP4 sidecar write finishes.
+
 `PipelineGeneration`, `PipelineStage`, and `PipelineHealth` make lifecycle state
 explicit and typed. Live prompt/schema changes travel over an eight-slot
 `SessionCommand` channel with the generation attached. The PATCH request returns

@@ -80,10 +80,10 @@ async function request<T>(
   return res.text() as unknown as Promise<T>
 }
 
-async function requestBlob(path: string): Promise<Blob> {
+async function requestBlob(path: string, accept: string): Promise<Blob> {
   const auth = useAuthStore()
   const res = await fetch(`${auth.apiEndpoint}${path}`, {
-    headers: { ...auth.defaultHeaders(), Accept: 'image/jpeg' },
+    headers: { ...auth.defaultHeaders(), Accept: accept },
   })
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText)
@@ -197,6 +197,13 @@ export interface ReasonRequest {
   firstPassModel?: string
   secondPassModel?: string
   semanticFramesPerChunk?: number
+  semantic_timeout_ms?: number
+  media?: {
+    mode: 'frames' | 'video' | 'audio_video'
+    window_ms?: number
+    resolution?: 'low' | 'medium' | 'high'
+    persist_evidence?: boolean
+  }
 }
 
 export interface ReasonResponse {
@@ -374,6 +381,10 @@ export const api = {
         body.fixed_fps = data.fps
         body.sampling_policy = 'fixed'
       }
+      if (data.media) body.media = data.media
+      if (data.semantic_timeout_ms !== undefined) {
+        body.semantic_timeout_ms = data.semantic_timeout_ms
+      }
       return request<ReasonResponse>('POST', `/v1/runs/${validateId(runId)}/reason`, body)
     },
     stop(runId: string): Promise<void> {
@@ -434,6 +445,14 @@ export const api = {
       if (!/^[0-9a-fA-F]{64}$/.test(sha256)) throw new Error('Invalid keyframe SHA-256')
       return requestBlob(
         `/v1/runs/${validateId(runId)}/keyframes/${sha256.toLowerCase()}`,
+        'image/jpeg',
+      )
+    },
+    media(runId: string, sha256: string): Promise<Blob> {
+      if (!/^[0-9a-fA-F]{64}$/.test(sha256)) throw new Error('Invalid media SHA-256')
+      return requestBlob(
+        `/v1/runs/${validateId(runId)}/media/${sha256.toLowerCase()}`,
+        'video/mp4',
       )
     },
   },
