@@ -266,6 +266,80 @@ pub fn probe_source_fps(source: &InputSource) -> Option<f32> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaInfo {
+    pub video_streams: u16,
+    pub audio_streams: u16,
+    pub audio_channels: u16,
+    pub duration_ms: Option<u64>,
+}
+
+/// Inspect container-level media shape once before scheduling clip work.
+///
+/// Audio stream and channel counts are bounded before conversion so malformed
+/// external metadata cannot wrap into a small value.
+pub fn probe_media_info(source: &InputSource) -> Result<MediaInfo, String> {
+    with_prefetched_downloadable_source(source, probe_media_info_inner)?
+}
+
+fn probe_media_info_inner(source: &InputSource) -> Result<MediaInfo, String> {
+    let source_uri = source.as_ffmpeg_input();
+    let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
+    let output = Command::new(ffprobe_path())
+        .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
+        .args(ffmpeg_input_options_for_source(source))
+        .args([
+            "-show_entries",
+            "stream=codec_type,channels:format=duration",
+            "-of",
+            "json",
+            source_uri,
+        ])
+        .output()
+        .map_err(|_| "failed to run ffprobe".to_string())?;
+    if !output.status.success() {
+        return Err("media probe failed".to_string());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "media probe returned invalid JSON".to_string())?;
+    let streams = value
+        .get("streams")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "media probe did not return streams".to_string())?;
+
+    let mut video_streams = 0_u64;
+    let mut audio_streams = 0_u64;
+    let mut audio_channels = 0_u64;
+    for stream in streams {
+        match stream.get("codec_type").and_then(serde_json::Value::as_str) {
+            Some("video") => video_streams = video_streams.saturating_add(1),
+            Some("audio") => {
+                audio_streams = audio_streams.saturating_add(1);
+                audio_channels = audio_channels.saturating_add(
+                    stream
+                        .get("channels")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                );
+            }
+            _ => {}
+        }
+    }
+    let duration_ms = value
+        .pointer("/format/duration")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .filter(|duration| duration.is_finite() && *duration >= 0.0)
+        .map(|duration| (duration * 1_000.0).round() as u64);
+
+    Ok(MediaInfo {
+        video_streams: u16::try_from(video_streams).unwrap_or(u16::MAX),
+        audio_streams: u16::try_from(audio_streams).unwrap_or(u16::MAX),
+        audio_channels: u16::try_from(audio_channels).unwrap_or(u16::MAX),
+        duration_ms,
+    })
+}
+
 fn probe_source_fps_inner(source: &InputSource) -> Option<f32> {
     let source_uri = source.as_ffmpeg_input();
     let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
@@ -1021,6 +1095,168 @@ pub fn extract_video_clip(
     })?
 }
 
+pub const AUDIO_VIDEO_CLIP_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug)]
+pub struct ExtractedAudioVideoClip {
+    pub bytes: Vec<u8>,
+    pub audio_streams: u16,
+    pub audio_channels: u16,
+    pub audio_mixed: bool,
+    pub extraction_ms: u64,
+}
+
+/// Extract a self-contained MP4 whose video and mixed audio retain one shared
+/// source-time window. Multiple input audio streams are deliberately mixed
+/// because Gemini combines channels during video processing and cannot return
+/// trustworthy source-track attribution.
+pub fn extract_audio_video_clip(
+    source: &InputSource,
+    start_s: f32,
+    duration_s: f32,
+    crop: Option<CropRegion>,
+    media_info: &MediaInfo,
+) -> Result<ExtractedAudioVideoClip, String> {
+    with_prefetched_downloadable_source(source, |source| {
+        extract_audio_video_clip_inner(source, start_s, duration_s, crop, media_info)
+    })?
+}
+
+fn extract_audio_video_clip_inner(
+    source: &InputSource,
+    start_s: f32,
+    duration_s: f32,
+    crop: Option<CropRegion>,
+    media_info: &MediaInfo,
+) -> Result<ExtractedAudioVideoClip, String> {
+    if !start_s.is_finite() || start_s < 0.0 {
+        return Err("start_s must be >= 0".to_string());
+    }
+    if !duration_s.is_finite() || duration_s <= 0.0 || duration_s > 60.0 {
+        return Err("duration_s must be in (0, 60]".to_string());
+    }
+    if media_info.video_streams == 0 {
+        return Err("audio-video analysis requires a video stream".to_string());
+    }
+    if media_info.audio_streams == 0 {
+        return Err("audio-video analysis requires an audio stream".to_string());
+    }
+    if media_info.audio_streams > 8 {
+        return Err("audio-video analysis supports at most 8 audio streams".to_string());
+    }
+    if let Some(crop) = crop {
+        crop.validate().map_err(|error| error.to_string())?;
+    }
+
+    let started = std::time::Instant::now();
+    let source_uri = source.as_ffmpeg_input();
+    let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
+    let start_str = format!("{start_s:.6}");
+    let duration_str = format!("{duration_s:.6}");
+    let tmp = std::env::temp_dir().join(format!(
+        "vidarax_av_clip_{}_{}.mp4",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let tmp_str = tmp.to_string_lossy().to_string();
+
+    let mut command = Command::new(ffmpeg_path());
+    command
+        .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
+        .args(ffmpeg_input_options_for_source(source))
+        .args(["-ss", &start_str, "-t", &duration_str, "-i", source_uri])
+        .args(["-map", "0:v:0"]);
+
+    let audio_streams = usize::from(media_info.audio_streams);
+    if audio_streams == 1 {
+        command.args(["-map", "0:a:0"]);
+    } else {
+        let mut filter = String::new();
+        for index in 0..audio_streams {
+            use std::fmt::Write as _;
+            let _ = write!(filter, "[0:a:{index}]aresample=48000:async=1[a{index}];");
+        }
+        for index in 0..audio_streams {
+            use std::fmt::Write as _;
+            let _ = write!(filter, "[a{index}]");
+        }
+        use std::fmt::Write as _;
+        let _ = write!(
+            filter,
+            "amix=inputs={audio_streams}:duration=longest:normalize=1[aout]"
+        );
+        command.args(["-filter_complex", &filter, "-map", "[aout]"]);
+    }
+
+    if let Some(crop_filter) = crop
+        .filter(|region| !region.is_full_frame())
+        .map(|region| region.ffmpeg_crop_filter())
+    {
+        command.args(["-vf", &crop_filter]);
+    }
+    let output = command
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-ac",
+            "1",
+            "-ar",
+            "48000",
+            "-b:a",
+            "96k",
+            "-movflags",
+            "+faststart",
+            "-y",
+            &tmp_str,
+        ])
+        .output()
+        .map_err(|_| "failed to run ffmpeg".to_string())?;
+
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            start_s,
+            duration_s,
+            "ffmpeg audio-video extraction failed"
+        );
+        return Err("audio-video clip extraction failed".to_string());
+    }
+    let size = match std::fs::metadata(&tmp) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("failed to inspect audio-video clip: {error}"));
+        }
+    };
+    if size == 0 || size > AUDIO_VIDEO_CLIP_MAX_BYTES {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "audio-video clip size must be in [1, {AUDIO_VIDEO_CLIP_MAX_BYTES}] bytes"
+        ));
+    }
+    let bytes = std::fs::read(&tmp);
+    let _ = std::fs::remove_file(&tmp);
+    let bytes = bytes.map_err(|error| format!("failed to read audio-video clip: {error}"))?;
+
+    Ok(ExtractedAudioVideoClip {
+        bytes,
+        audio_streams: media_info.audio_streams,
+        audio_channels: media_info.audio_channels,
+        audio_mixed: media_info.audio_streams > 1 || media_info.audio_channels > 1,
+        extraction_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
 fn extract_video_clip_inner(
     source: &InputSource,
     start_s: f32,
@@ -1236,12 +1472,13 @@ mod tests {
 
     use super::{
         ahash_cell_grid, ahashes_from_gray_grid, build_decode_vf, clip_encode_plan,
-        ffmpeg_input_options_for_source, ffmpeg_protocol_whitelist_for_source,
-        longest_edge_scale_filter, parse_ffprobe_frame_rate, parse_framemd5_to_signals,
-        parse_jpeg_stream_to_frames, CropRegion, Mp4DecodeConfig, Timebase, TimestampNormalizer,
-        FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST, FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST,
-        FFMPEG_HTTPS_PROTOCOL_WHITELIST, FFMPEG_HTTP_PROTOCOL_WHITELIST,
-        FFMPEG_LOCAL_PROTOCOL_WHITELIST, FFMPEG_RTSPS_PROTOCOL_WHITELIST,
+        extract_audio_video_clip, ffmpeg_input_options_for_source,
+        ffmpeg_protocol_whitelist_for_source, longest_edge_scale_filter, parse_ffprobe_frame_rate,
+        parse_framemd5_to_signals, parse_jpeg_stream_to_frames, probe_media_info, CropRegion,
+        Mp4DecodeConfig, Timebase, TimestampNormalizer, FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST,
+        FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST, FFMPEG_HTTPS_PROTOCOL_WHITELIST,
+        FFMPEG_HTTP_PROTOCOL_WHITELIST, FFMPEG_LOCAL_PROTOCOL_WHITELIST,
+        FFMPEG_RTSPS_PROTOCOL_WHITELIST,
     };
     use crate::ingest::InputSource;
 
@@ -1649,6 +1886,116 @@ mod tests {
 
         assert_eq!(decoded.source_uri, url);
         assert_eq!(decoded.frame_signals.len(), 1);
+    }
+
+    #[test]
+    fn audio_video_extraction_keeps_one_source_window_and_all_input_tracks() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let source_path = std::env::temp_dir().join(format!(
+            "vidarax-test-av-source-{}-{nanos}.mp4",
+            std::process::id()
+        ));
+        let output = Command::new(super::ffmpeg_path())
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=10:duration=3",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000:duration=3",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=880:sample_rate=48000:duration=3",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-map",
+                "2:a:0",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                "-y",
+            ])
+            .arg(&source_path)
+            .output()
+            .expect("run ffmpeg to generate A/V input");
+        assert!(
+            output.status.success(),
+            "ffmpeg failed to generate A/V input: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let source = InputSource::FilePath(source_path.to_string_lossy().to_string());
+        let source_info = probe_media_info(&source).expect("probe source media");
+        assert_eq!(source_info.video_streams, 1);
+        assert_eq!(source_info.audio_streams, 2);
+        let clip = extract_audio_video_clip(&source, 0.5, 1.5, None, &source_info)
+            .expect("extract synchronized A/V window");
+        assert!(!clip.bytes.is_empty());
+        assert_eq!(clip.audio_streams, 2);
+        assert_eq!(clip.audio_channels, 2);
+        assert!(clip.audio_mixed);
+
+        let clip_path = std::env::temp_dir().join(format!(
+            "vidarax-test-av-output-{}-{nanos}.mp4",
+            std::process::id()
+        ));
+        fs::write(&clip_path, &clip.bytes).expect("write extracted clip for probe");
+        let clip_source = InputSource::FilePath(clip_path.to_string_lossy().to_string());
+        let clip_info = probe_media_info(&clip_source).expect("probe extracted clip");
+        assert_eq!(clip_info.video_streams, 1);
+        assert_eq!(clip_info.audio_streams, 1);
+        assert_eq!(clip_info.audio_channels, 1);
+        assert!(clip_info
+            .duration_ms
+            .is_some_and(|duration| (1_400..=1_650).contains(&duration)));
+        let timing = Command::new(super::ffprobe_path())
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,start_time",
+                "-of",
+                "json",
+            ])
+            .arg(&clip_path)
+            .output()
+            .expect("probe extracted stream timing");
+        assert!(timing.status.success(), "ffprobe timing probe failed");
+        let timing: serde_json::Value =
+            serde_json::from_slice(&timing.stdout).expect("parse stream timing");
+        let streams = timing["streams"]
+            .as_array()
+            .expect("stream timing should be an array");
+        let start = |kind: &str| {
+            streams
+                .iter()
+                .find(|stream| stream["codec_type"].as_str() == Some(kind))
+                .and_then(|stream| stream["start_time"].as_str())
+                .and_then(|start| start.parse::<f64>().ok())
+                .expect("stream start time")
+        };
+        assert!(
+            (start("video") - start("audio")).abs() <= 0.05,
+            "extracted audio and video must start within 50 ms"
+        );
+
+        let _ = fs::remove_file(source_path);
+        let _ = fs::remove_file(clip_path);
     }
 
     fn create_test_mp4_bytes() -> Vec<u8> {

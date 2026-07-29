@@ -52,9 +52,17 @@ conversion.
 | Media capacity | `vidarax_media_capacity_memory_*`, `vidarax_media_capacity_worker_*`, `vidarax_media_capacity_rejections_total` | Compare reserved bytes and worker threads with process limits. A rejected generation never starts. |
 | Inference admission | `vidarax_infer_admission_active`, `vidarax_infer_admission_waiting`, active token and byte reservations, deadline misses, budget rejections, and acquisitions by latency class | Find provider saturation before it turns into unbounded queueing. |
 | Frame pipeline | Decode, frame-filter, novelty, embedding, binary-store, restricted-zone, and trigger counters and latency histograms | Follow work from decoded frames through assertions and durable media references. Live and recorded paths contribute to the same decode and filter series. |
+| Recorded A/V | `vidarax_pipeline_media_clips_extracted_total`, extraction failures and latency, clip bytes, MP4 writes and reuse, and `vidarax_pipeline_multimodal_moments_total` | Separate ffmpeg pressure, provider work, evidence storage, and useful timestamped output. An extraction failure must not be counted as a provider failure. |
 | Delivery | `vidarax_sse_*` and `vidarax_webhook_*` | Observe subscribers, WAL replay, queue stalls, delivery lag, attempts, retries, successes, and dead letters. Labels never include a target URL or event kind. |
 
-The Pipeline Observability page reads those metrics without synthesizing missing values. It reports `faulted` when a worker fault occurred within the last 60 seconds or a detached worker exists. It reports `saturated` when inference is waiting, capacity is full, or a recent admission rejection occurred. An active generation with neither condition is `healthy`. No active generation is `idle`. The Per-frame filter card shows selection and zone activity. The Delivery card shows SSE and webhook pressure.
+The Pipeline Observability page reads those metrics without synthesizing missing
+values. It reports `faulted` when a worker fault occurred within the last 60
+seconds or a detached worker exists. It reports `saturated` when inference is
+waiting, capacity is full, or a recent admission rejection occurred. An active
+generation with neither condition is `healthy`. No active generation is
+`idle`. The pipeline strip includes A/V extraction. The inference card counts
+timestamped moments and extraction failures. The binary sidecar card combines
+JPEG and MP4 storage. The Delivery card shows SSE and webhook pressure.
 
 When the UI and API use different origins, include the exact UI origin in `VIDARAX_CORS_ALLOWED_ORIGINS`.
 

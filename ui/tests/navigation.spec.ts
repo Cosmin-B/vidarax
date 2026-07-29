@@ -32,7 +32,7 @@ test.describe('App navigation', () => {
   test('upload page renders at /upload', async ({ page }) => {
     await page.goto('/upload')
     await expect(page).toHaveTitle(/Upload.*Vidarax/i)
-    await expect(page.getByRole('heading', { name: /upload video/i })).toBeVisible()
+    await expect(page.getByRole('heading', { name: /analyze recorded media/i })).toBeVisible()
     // Dropzone should be present
     await expect(page.getByRole('button', { name: /drop video file/i })).toBeVisible()
   })

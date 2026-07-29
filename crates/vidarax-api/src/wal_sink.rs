@@ -81,6 +81,45 @@ struct KeyframeBlob {
     created: bool,
 }
 
+pub(crate) struct MediaBlob {
+    pub media_ref: String,
+    pub sha256: String,
+    pub bytes: usize,
+    pub created: bool,
+}
+
+/// Persist an encoded MP4 before any event publishes its reference.
+///
+/// The caller keeps binary bytes out of the WAL and delivery payloads. A
+/// repeated clip reuses the same immutable content-addressed object.
+pub(crate) fn persist_media_blob(state: &AppState, data: &[u8]) -> Result<MediaBlob, String> {
+    let digest = Sha256::digest(data);
+    let mut sha256 = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(sha256, "{byte:02x}");
+    }
+    let shard = &sha256[..2];
+    let directory = state.media_blob_root().join(shard);
+    std::fs::create_dir_all(&directory).map_err(|error| {
+        format!(
+            "create media sidecar directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    let final_path = directory.join(format!("{sha256}.mp4"));
+    let created = if final_path.exists() {
+        false
+    } else {
+        write_blob_atomically(&final_path, data)?
+    };
+    Ok(MediaBlob {
+        media_ref: format!("media/blobs/{shard}/{sha256}.mp4"),
+        sha256,
+        bytes: data.len(),
+        created,
+    })
+}
+
 static NEXT_BLOB_TEMP: AtomicU64 = AtomicU64::new(0);
 
 fn write_blob_atomically(final_path: &Path, data: &[u8]) -> Result<bool, String> {

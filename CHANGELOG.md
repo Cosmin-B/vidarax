@@ -9,6 +9,14 @@ release yet.
 
 ### Added
 
+- Recorded audio-video reasoning with bounded source-time windows, deterministic
+  audio-track mixing, Gemini File API uploads, timestamped `multimodal_moment`
+  events, and content-addressed MP4 evidence.
+- Gemini 3.5 Flash-Lite and Gemini 3.6 Flash in the model catalog, with
+  request-level media resolution and cleanup of temporary Gemini File API
+  uploads.
+- `vidarax analyze --media audio-video` plus matching API, TypeScript SDK, Vue
+  interface, and Prometheus telemetry.
 - Supervised live media pipeline generations: every worker of a session joins
   one stage-tagged generation, and the first unexpected exit faults the whole
   set, closes the peer, and joins the siblings.

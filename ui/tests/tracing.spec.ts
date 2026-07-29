@@ -160,7 +160,7 @@ test.describe('Tracing page', () => {
     const metricsSection = page.getByRole('region', { name: 'Live pipeline metrics' })
     await expect(metricsSection).toBeVisible({ timeout: 10_000 })
 
-    for (const cardName of ['Decode', 'Per-frame filter', 'VLM Inference', 'Keyframe sidecar', 'Delivery']) {
+    for (const cardName of ['Decode', 'Per-frame filter', 'VLM Inference', 'Binary sidecars', 'Delivery']) {
       await expect(metricsSection.getByRole('heading', { name: cardName })).toBeVisible()
     }
     await expect(metricsSection.getByText('Trigger queue drops', { exact: true })).toBeVisible()

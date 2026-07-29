@@ -13,7 +13,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use comfy_table::{presets, Cell, Table};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use owo_colors::OwoColorize;
@@ -27,6 +27,7 @@ const API_TIMEOUT_SECS: u64 = 10;
 // TypeScript SDK's default. A made-up id here means the headline command
 // fails with 422 on a fresh install.
 const DEFAULT_ANALYZE_MODEL: &str = "Qwen/Qwen3-VL-2B-Instruct";
+const DEFAULT_MULTIMODAL_MODEL: &str = "gemini-3.5-flash-lite";
 const ANALYZE_PROGRESS_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
@@ -285,9 +286,10 @@ struct AnalyzeArgs {
     /// Optional semantic prompt.
     #[arg(long, value_name = "TEXT")]
     prompt: Option<String>,
-    /// Model ID.
-    #[arg(long, value_name = "ID", default_value = DEFAULT_ANALYZE_MODEL)]
-    model: String,
+    /// Model ID. Defaults to Gemini 3.5 Flash-Lite for native media and the
+    /// local small model for frame analysis.
+    #[arg(long, value_name = "ID")]
+    model: Option<String>,
     /// Optional run mode.
     #[arg(long, value_name = "MODE")]
     mode: Option<String>,
@@ -314,15 +316,74 @@ struct AnalyzeArgs {
     /// gate and the VLM to that part of the screen. Omit to analyze the whole frame.
     #[arg(long, value_name = "X,Y,W,H")]
     crop: Option<CropArg>,
+    /// Media sent to semantic inference.
+    #[arg(long, value_enum, default_value_t = AnalyzeMediaArg::Frames)]
+    media: AnalyzeMediaArg,
+    /// Native video window duration in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 8_000)]
+    media_window_ms: u64,
+    /// Gemini media sampling resolution.
+    #[arg(long, value_enum, default_value_t = AnalyzeMediaResolutionArg::Low)]
+    media_resolution: AnalyzeMediaResolutionArg,
+    /// Do not retain content-addressed MP4 evidence.
+    #[arg(long)]
+    no_persist_evidence: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AnalyzeMediaArg {
+    Frames,
+    Video,
+    AudioVideo,
+}
+
+impl AnalyzeMediaArg {
+    fn wire_value(self) -> &'static str {
+        match self {
+            Self::Frames => "frames",
+            Self::Video => "video",
+            Self::AudioVideo => "audio_video",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AnalyzeMediaResolutionArg {
+    Low,
+    Medium,
+    High,
+}
+
+impl AnalyzeMediaResolutionArg {
+    fn wire_value(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
 }
 
 impl AnalyzeArgs {
+    fn model_id(&self) -> &str {
+        self.model
+            .as_deref()
+            .unwrap_or(if self.media == AnalyzeMediaArg::Frames {
+                DEFAULT_ANALYZE_MODEL
+            } else {
+                DEFAULT_MULTIMODAL_MODEL
+            })
+    }
+
     fn create_run_body(&self) -> Value {
         let mut body = Map::new();
         if let Some(mode) = self.mode.as_deref().and_then(non_empty_opt) {
             body.insert("mode".to_string(), Value::String(mode.to_string()));
         }
-        body.insert("model".to_string(), Value::String(self.model.clone()));
+        body.insert(
+            "model".to_string(),
+            Value::String(self.model_id().to_string()),
+        );
         Value::Object(body)
     }
 
@@ -353,7 +414,10 @@ impl AnalyzeArgs {
             "source_uri".to_string(),
             Value::String(source_uri.to_string()),
         );
-        body.insert("model".to_string(), Value::String(self.model.clone()));
+        body.insert(
+            "model".to_string(),
+            Value::String(self.model_id().to_string()),
+        );
         if let Some(mode) = self.mode.as_deref().and_then(non_empty_opt) {
             body.insert("mode".to_string(), Value::String(mode.to_string()));
         }
@@ -362,7 +426,19 @@ impl AnalyzeArgs {
             Value::String("fixed".to_string()),
         );
         body.insert("fixed_fps".to_string(), json!(self.fixed_fps));
-        body.insert("chunk_size".to_string(), json!(self.chunk_size));
+        if self.media == AnalyzeMediaArg::Frames {
+            body.insert("chunk_size".to_string(), json!(self.chunk_size));
+        } else {
+            body.insert(
+                "media".to_string(),
+                json!({
+                    "mode": self.media.wire_value(),
+                    "window_ms": self.media_window_ms,
+                    "resolution": self.media_resolution.wire_value(),
+                    "persist_evidence": !self.no_persist_evidence,
+                }),
+            );
+        }
         body.insert("semantic_inference".to_string(), Value::Bool(true));
         body.insert(
             "semantic_timeout_ms".to_string(),
@@ -1329,7 +1405,16 @@ async fn cmd_analyze(
             Ok(ingest_response) => {
                 let decoded_frames = u64_field(&ingest_response, "decoded_frames");
                 let source_fps = ingest_response.get("source_fps").and_then(Value::as_f64);
-                estimate_reason_chunks(decoded_frames, source_fps, args.fixed_fps, args.chunk_size)
+                if args.media == AnalyzeMediaArg::Frames {
+                    estimate_reason_chunks(
+                        decoded_frames,
+                        source_fps,
+                        args.fixed_fps,
+                        args.chunk_size,
+                    )
+                } else {
+                    None
+                }
             }
             Err(e) => {
                 best_effort_stop(&client, &run_id).await;
@@ -1366,7 +1451,7 @@ async fn cmd_analyze(
     };
     stop_polling.store(true, Ordering::Release);
     let polled_chunks = poller.await.unwrap_or(0);
-    let reason_response = match reason_result {
+    let mut reason_response = match reason_result {
         Ok(response) => response,
         Err(e) => {
             progress.clear();
@@ -1379,12 +1464,92 @@ async fn cmd_analyze(
     let generated = u64_field(&reason_response, "generated").unwrap_or(polled_chunks as u64);
     progress.finish(generated);
 
+    let moments = if args.media == AnalyzeMediaArg::Frames {
+        Vec::new()
+    } else {
+        fetch_multimodal_moments(&client, &run_id, args.index_name.as_deref())
+            .await
+            .unwrap_or_default()
+    };
     if output.json {
+        if let Some(object) = reason_response.as_object_mut() {
+            object.insert("multimodal_moments".to_string(), Value::Array(moments));
+        }
         return print_json(&reason_response);
     }
 
     print_analyze_human(&reason_response, output, generated, polled_chunks as u64);
+    print_multimodal_moments(&moments, output);
     Ok(())
+}
+
+async fn fetch_multimodal_moments(
+    client: &ApiClient,
+    run_id: &str,
+    index_name: Option<&str>,
+) -> Result<Vec<Value>, String> {
+    let mut query = Vec::new();
+    if let Some(index_name) = index_name {
+        query.push(("index", index_name.to_string()));
+    }
+    let response = client
+        .get_with_query(&format!("/v1/runs/{run_id}/events"), &query)
+        .await?;
+    let events = response
+        .get("events")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "response from events route is missing array field events".to_string())?;
+    Ok(events
+        .iter()
+        .filter(|event| string_field(event, "kind") == Some("multimodal_moment"))
+        .cloned()
+        .collect())
+}
+
+fn print_multimodal_moments(moments: &[Value], output: OutputMode) {
+    if moments.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "{}",
+        colorize("SYNCHRONIZED AUDIO + VIDEO", "green", output.color)
+    );
+    for event in moments {
+        let payload = event.get("payload").unwrap_or(&Value::Null);
+        let start_pts = u64_field(payload, "start_pts_ms")
+            .or_else(|| u64_field(event, "pts_ms"))
+            .unwrap_or(0);
+        let end_pts = u64_field(payload, "end_pts_ms").unwrap_or(start_pts);
+        let kind = string_field(payload, "kind").unwrap_or("moment");
+        let modalities = payload
+            .get("modalities")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("+")
+            })
+            .unwrap_or_else(|| "audio+video".to_string());
+        println!(
+            "{}-{}  {:<16} {:<12} {}",
+            fmt_pts(start_pts),
+            fmt_pts(end_pts),
+            truncate(kind, 16),
+            truncate(&modalities, 12),
+            truncate(string_field(payload, "description").unwrap_or("-"), 100)
+        );
+        if let Some(intent) = string_field(payload, "intent").and_then(non_empty_opt) {
+            println!("             intent: {}", truncate(intent, 100));
+        }
+        if let Some(relation) =
+            string_field(payload, "audio_visual_relation").and_then(non_empty_opt)
+        {
+            println!("             relation: {}", truncate(relation, 100));
+        }
+    }
 }
 
 fn validate_analyze_args(args: &AnalyzeArgs) -> Result<(), String> {
@@ -1404,13 +1569,20 @@ fn validate_analyze_args(args: &AnalyzeArgs) -> Result<(), String> {
     if args.fixed_fps <= 0.0 {
         return Err("--fixed-fps must be greater than 0".to_string());
     }
-    if args.chunk_size == 0 {
+    if args.media == AnalyzeMediaArg::Frames && args.chunk_size == 0 {
         return Err("--chunk-size must be greater than 0".to_string());
+    }
+    if args.media != AnalyzeMediaArg::Frames && !(100..=60_000).contains(&args.media_window_ms) {
+        return Err("--media-window-ms must be in [100, 60000]".to_string());
     }
     if !(100..=120_000).contains(&args.semantic_timeout_ms) {
         return Err("--semantic-timeout-ms must be in [100, 120000]".to_string());
     }
-    if non_empty_opt(&args.model).is_none() {
+    if args
+        .model
+        .as_deref()
+        .is_some_and(|model| non_empty_opt(model).is_none())
+    {
         return Err("--model must not be empty".to_string());
     }
     Ok(())
@@ -2414,7 +2586,7 @@ mod tests {
             source_uri: None,
             with_ingest: false,
             prompt: None,
-            model: DEFAULT_ANALYZE_MODEL.to_string(),
+            model: Some(DEFAULT_ANALYZE_MODEL.to_string()),
             mode: None,
             fixed_fps: 1.0,
             chunk_size: 25,
@@ -2423,6 +2595,10 @@ mod tests {
             index_name: None,
             sampling_policy: None,
             crop: None,
+            media: AnalyzeMediaArg::Frames,
+            media_window_ms: 8_000,
+            media_resolution: AnalyzeMediaResolutionArg::Low,
+            no_persist_evidence: false,
         }
     }
 
@@ -2517,6 +2693,39 @@ mod tests {
         assert_eq!(
             with_prompt.get("semantic_prompt").and_then(Value::as_str),
             Some("custom semantic prompt")
+        );
+    }
+
+    #[test]
+    fn native_audio_video_uses_gemini_and_a_media_window() {
+        let mut args = analyze_args();
+        args.model = None;
+        args.media = AnalyzeMediaArg::AudioVideo;
+        args.media_window_ms = 6_000;
+        args.media_resolution = AnalyzeMediaResolutionArg::Medium;
+
+        let body = args.reason_body("/tmp/uploaded.mp4");
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some(DEFAULT_MULTIMODAL_MODEL)
+        );
+        assert!(body.get("chunk_size").is_none());
+        assert_eq!(
+            body.pointer("/media/mode").and_then(Value::as_str),
+            Some("audio_video")
+        );
+        assert_eq!(
+            body.pointer("/media/window_ms").and_then(Value::as_u64),
+            Some(6_000)
+        );
+        assert_eq!(
+            body.pointer("/media/resolution").and_then(Value::as_str),
+            Some("medium")
+        );
+        assert_eq!(
+            body.pointer("/media/persist_evidence")
+                .and_then(Value::as_bool),
+            Some(true)
         );
     }
 

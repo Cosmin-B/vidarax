@@ -161,6 +161,40 @@ pub struct InferenceVideo {
     pub raw_bytes: Option<Arc<[u8]>>,
     /// Legacy representation for providers that only accept data URLs.
     pub data_base64: String,
+    /// Provider-side media sampling policy. Providers that do not expose a
+    /// native media-resolution control ignore this value.
+    pub media_resolution: Option<MediaResolution>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaResolution {
+    Low,
+    Medium,
+    High,
+}
+
+impl MediaResolution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    pub fn as_gemini_value(self) -> &'static str {
+        match self {
+            Self::Low => "MEDIA_RESOLUTION_LOW",
+            Self::Medium => "MEDIA_RESOLUTION_MEDIUM",
+            Self::High => "MEDIA_RESOLUTION_HIGH",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaTransport {
+    JsonDataUrl,
+    BinaryFile,
 }
 
 /// Provider-reported token usage for one inference. Zeroed when a provider does
@@ -263,9 +297,7 @@ impl InferenceProvider for AdmittedProvider {
                 video
                     .raw_bytes
                     .as_ref()
-                    .map_or(video.data_base64.len() as u64, |bytes| {
-                        (bytes.len() as u64).saturating_add(2) / 3 * 4 + 64
-                    })
+                    .map_or(video.data_base64.len() as u64, |bytes| bytes.len() as u64)
             }))
             .fold(0_u64, u64::saturating_add);
         let queue_budget = request
@@ -314,6 +346,10 @@ impl InferenceProvider for AdmittedProvider {
         self.inner.infer(&dispatched)
     }
 
+    fn media_transport_for_model(&self, model: &str) -> MediaTransport {
+        self.inner.media_transport_for_model(model)
+    }
+
     fn kind_for_model(&self, model: &str) -> ProviderKind {
         self.inner.kind_for_model(model)
     }
@@ -353,6 +389,14 @@ pub trait InferenceProvider: Send + Sync {
     /// when they know which model failed.
     fn kind_for_model(&self, _model: &str) -> ProviderKind {
         self.kind()
+    }
+
+    /// How media reaches the backend that serves `model`.
+    ///
+    /// Audio-video requests require `BinaryFile` so encoded media never grows
+    /// into a base64 string or a JSON data URL inside the server.
+    fn media_transport_for_model(&self, _model: &str) -> MediaTransport {
+        MediaTransport::JsonDataUrl
     }
 
     /// Provider kinds that can currently accept work.
@@ -599,6 +643,10 @@ impl<P: InferenceProvider, F: InferenceProvider> InferenceProvider for ProviderR
         self.infer_routed(request)
     }
 
+    fn media_transport_for_model(&self, model: &str) -> MediaTransport {
+        self.primary.media_transport_for_model(model)
+    }
+
     fn available_kinds(&self) -> Vec<ProviderKind> {
         let mut kinds = self.primary.available_kinds();
         for kind in self.fallback.available_kinds() {
@@ -650,6 +698,10 @@ impl InferenceProvider for Arc<dyn InferenceProvider + Send + Sync> {
     // object so a router's override actually runs.
     fn kind_for_model(&self, model: &str) -> ProviderKind {
         (**self).kind_for_model(model)
+    }
+
+    fn media_transport_for_model(&self, model: &str) -> MediaTransport {
+        (**self).media_transport_for_model(model)
     }
 
     fn available_kinds(&self) -> Vec<ProviderKind> {
@@ -729,6 +781,13 @@ impl InferenceProvider for ModelRoutingProvider {
             .get(model)
             .map(|p| p.kind())
             .unwrap_or_else(|| self.default.kind())
+    }
+
+    fn media_transport_for_model(&self, model: &str) -> MediaTransport {
+        self.routes
+            .get(model)
+            .unwrap_or(&self.default)
+            .media_transport_for_model(model)
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
@@ -1256,6 +1315,7 @@ mod tests {
             media_type: "video/mp4",
             raw_bytes: None,
             data_base64: "dmlk".to_string(),
+            media_resolution: None,
         }];
         let body = build_payload("openbmb/MiniCPM-V-4_5", &req);
         let value: Value = serde_json::from_str(&body).unwrap();
@@ -1280,6 +1340,7 @@ mod tests {
             media_type: "video/mp4",
             raw_bytes: None,
             data_base64: "dmlk".to_string(),
+            media_resolution: None,
         }];
         let body = build_payload("openbmb/MiniCPM-V-4_5", &req);
         let value: Value = serde_json::from_str(&body).unwrap();
@@ -1299,6 +1360,7 @@ mod tests {
             media_type: "video/mp4",
             raw_bytes: Some(Arc::from(&b"vid"[..])),
             data_base64: String::new(),
+            media_resolution: None,
         }];
 
         let body = build_payload("openbmb/MiniCPM-V-4_5", &req);
@@ -1635,7 +1697,7 @@ mod tests {
                 global_waiters: 1,
                 wait_timeout: Duration::from_secs(1),
                 max_in_flight_tokens: 1_000,
-                max_in_flight_bytes: 70,
+                max_in_flight_bytes: 5,
             })
             .unwrap(),
         );
@@ -1650,6 +1712,7 @@ mod tests {
             media_type: "video/mp4",
             raw_bytes: Some(Arc::from(&b"123456"[..])),
             data_base64: String::new(),
+            media_resolution: None,
         });
         req.scheduling =
             InferenceScheduling::new(Arc::from("camera-1"), LatencyClass::Live, 100, 1);

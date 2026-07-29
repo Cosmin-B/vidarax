@@ -32,6 +32,25 @@ Any other `VIDARAX_DECODE_BACKEND` value fails at startup with an unknown-backen
 
 Ingest requests control sampling: a `sampling_policy` (for example `fixed` with a `fixed_fps` value) and a `max_frames` cap bound how much of the source is decoded.
 
+### Native audio-video windows
+
+Recorded reasoning has two media paths. `media.mode: "frames"` uses the signal
+pass and sends selected JPEGs. `media.mode: "video"` and `"audio_video"` divide
+presentation time into bounded windows. Extraction happens inside the bounded
+provider task, not for the whole file up front.
+
+The A/V path requires one video stream, accepts up to eight audio streams,
+resamples to 48 kHz, and mixes them into one mono AAC track. Video is H.264
+inside a fast-start MP4. Each clip is capped at 64 MiB. Both streams use the
+same `-ss` and `-t` source window in one ffmpeg process, which keeps them
+aligned through extraction. A normalized crop changes video pixels only.
+Audio remains the full source window.
+
+Native media requires a binary provider. Gemini uploads the MP4 through File
+API, reuses its file URI for an output-headroom retry, and deletes the provider
+file after the request. The OpenAI-compatible JSON data-URL transport is not
+used by this route.
+
 ## The ffmpeg decode sidecar for live streams
 
 Live WebRTC video needs a stateful decoder that survives across frames. H.264 and H.265 use a long-lived ffmpeg sidecar process on both CPU and GPU paths so a native decoder crash cannot abort the API process. VP8 uses libvpx in-process when the `vp8` build feature is enabled. That optional path does not have process isolation.

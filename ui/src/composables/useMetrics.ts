@@ -53,6 +53,13 @@ export interface MetricsData {
   keyframeBlobsReusedTotal: number
   keyframeBlobFailuresTotal: number
   keyframeBlobBytesTotal: number
+  mediaClipsExtractedTotal: number
+  mediaClipExtractionFailuresTotal: number
+  mediaClipBytesTotal: number
+  mediaBlobsWrittenTotal: number
+  mediaBlobsReusedTotal: number
+  mediaBlobFailuresTotal: number
+  multimodalMomentsTotal: number
   restrictedZoneAssertionsTotal: number
   restrictedZoneEvidenceFailuresTotal: number
   restrictedZoneQueueDroppedTotal: number
@@ -314,6 +321,14 @@ function sseCommitPercentilesMs(
   return toPercentiles(h)
 }
 
+function mediaExtractionPercentilesMs(
+  histograms: Map<string, RawHistogram>,
+): HistogramPercentiles | null {
+  const h = histograms.get('vidarax_pipeline_media_extraction_latency_ms')
+  if (!h || h.totalCount === 0) return null
+  return toPercentiles(h)
+}
+
 function buildMetrics(
   map: Map<string, number>,
   histograms: Map<string, RawHistogram>,
@@ -329,6 +344,7 @@ function buildMetrics(
   const keyframeBlobPct = keyframeBlobPercentilesMs(histograms)
   const eventMirrorPct = eventMirrorPercentilesMs(histograms)
   const sseCommitPct = sseCommitPercentilesMs(histograms)
+  const mediaExtractionPct = mediaExtractionPercentilesMs(histograms)
 
   const decodeLatency = decodePct?.mean ?? 0
   const gateLatency = gatePct?.mean ?? 0
@@ -379,6 +395,9 @@ function buildMetrics(
   const noveltyReused = get('vidarax_pipeline_novelty_reused_total')
   const keyframeBlobsWritten = get('vidarax_pipeline_keyframe_blobs_written_total')
   const keyframeBlobFailures = get('vidarax_pipeline_keyframe_blob_failures_total')
+  const mediaClipsExtracted = get('vidarax_pipeline_media_clips_extracted_total')
+  const mediaClipExtractionFailures =
+    get('vidarax_pipeline_media_clip_extraction_failures_total')
 
   function stageStatus(
     latencyMs: number,
@@ -416,6 +435,16 @@ function buildMetrics(
       percentiles: gatePct ?? undefined,
     },
     {
+      name: 'A/V extraction',
+      itemsTotal: mediaClipsExtracted,
+      itemLabel: 'clips',
+      latencyMs: mediaExtractionPct?.mean ?? 0,
+      status: mediaClipExtractionFailures > 0
+        ? 'error'
+        : stageStatus(mediaExtractionPct?.mean ?? 0, 500, 2_000),
+      percentiles: mediaExtractionPct ?? undefined,
+    },
+    {
       name: 'VLM',
       itemsTotal: vlmInferences,
       itemLabel: 'calls',
@@ -441,6 +470,7 @@ function buildMetrics(
   if (vlmPct) histogramsOut['VLM'] = vlmPct
   if (noveltyPct) histogramsOut['Novelty'] = noveltyPct
   if (keyframeBlobPct) histogramsOut['Keyframe store'] = keyframeBlobPct
+  if (mediaExtractionPct) histogramsOut['A/V extraction'] = mediaExtractionPct
   if (eventMirrorPct) histogramsOut['Event mirror'] = eventMirrorPct
   if (sseCommitPct) histogramsOut['SSE delivery'] = sseCommitPct
 
@@ -465,6 +495,13 @@ function buildMetrics(
     keyframeBlobsReusedTotal: get('vidarax_pipeline_keyframe_blobs_reused_total'),
     keyframeBlobFailuresTotal: keyframeBlobFailures,
     keyframeBlobBytesTotal: get('vidarax_pipeline_keyframe_blob_bytes_total'),
+    mediaClipsExtractedTotal: mediaClipsExtracted,
+    mediaClipExtractionFailuresTotal: mediaClipExtractionFailures,
+    mediaClipBytesTotal: get('vidarax_pipeline_media_clip_bytes_total'),
+    mediaBlobsWrittenTotal: get('vidarax_pipeline_media_blobs_written_total'),
+    mediaBlobsReusedTotal: get('vidarax_pipeline_media_blobs_reused_total'),
+    mediaBlobFailuresTotal: get('vidarax_pipeline_media_blob_failures_total'),
+    multimodalMomentsTotal: get('vidarax_pipeline_multimodal_moments_total'),
     restrictedZoneAssertionsTotal: get('vidarax_pipeline_restricted_zone_assertions_total'),
     restrictedZoneEvidenceFailuresTotal: get('vidarax_pipeline_restricted_zone_evidence_failures_total'),
     restrictedZoneQueueDroppedTotal: get('vidarax_pipeline_restricted_zone_queue_dropped_total'),

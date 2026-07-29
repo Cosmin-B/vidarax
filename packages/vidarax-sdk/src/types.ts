@@ -55,7 +55,7 @@ export type RunStatus =
   | "expired";
 
 /** Model tier. */
-export type ModelTier = "small" | "medium";
+export type ModelTier = "small" | "medium" | "cloud";
 
 // ─── Run ─────────────────────────────────────────────────────────────────────
 
@@ -374,7 +374,59 @@ export interface RealtimeReasonRequest {
   visual_diff?: boolean;
   video_clip_mode?: boolean;
   video_clip_duration_s?: number;
+  media?: MediaAnalysisOptions;
   vlm_concurrency?: number;
+}
+
+export type MediaAnalysisMode = "frames" | "video" | "audio_video";
+export type MediaAnalysisResolution = "low" | "medium" | "high";
+
+export interface MediaAnalysisOptions {
+  mode: MediaAnalysisMode;
+  window_ms?: number;
+  resolution?: MediaAnalysisResolution;
+  persist_evidence?: boolean;
+}
+
+export type MultimodalMomentKind =
+  | "speech"
+  | "sound_effect"
+  | "music"
+  | "ambient"
+  | "interaction"
+  | "mechanical"
+  | "other";
+
+export interface MultimodalMoment {
+  start_offset_ms: number;
+  end_offset_ms: number;
+  start_pts_ms: number;
+  end_pts_ms: number;
+  modalities: Array<"audio" | "video">;
+  kind: MultimodalMomentKind;
+  description: string;
+  intent: string | null;
+  audio_visual_relation: string | null;
+  confidence: number;
+}
+
+export interface MediaEvidence {
+  media_ref: string;
+  media_type: "video/mp4";
+  media_bytes: number;
+  media_sha256: string;
+  created?: boolean;
+}
+
+export interface MultimodalMomentEventPayload extends MultimodalMoment {
+  moment_id: string;
+  request_id: string;
+  stream_id: string;
+  chunk_index: number;
+  timestamp_resolution_ms: number;
+  provider: string;
+  index_name: string | null;
+  evidence: MediaEvidence | null;
 }
 
 /** Token and model-time totals for a realtime reasoning run. */

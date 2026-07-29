@@ -10,14 +10,14 @@ typed pipeline generation supervised as a unit. Worker output commits to the
 local write-ahead log before any optional mirror or delivery path observes it.
 
 ```
- Sources          Per-session generation          Durable state       Delivery
-┌──────────┐   ┌────────────────────────────────┐   ┌─────────────────┐   ┌─────────────┐
-│ MP4/File │──>│ Decode -> Frame filter -> VLM  │──>│ WAL event log   │──>│ REST / SSE  │
-│ WebRTC   │──>│              |                 │   │                 │   │ Webhooks    │
-│ RTSP/HLS │──>│          Trigger VM            │   │ Binary media    │   │ TypeScript  │
-│ Upload   │──>│              |                 │   │ sidecar         │   │ SDK / UI    │
-│          │   │        supervised generation     │   │                 │   │ Prometheus  │
-└──────────┘   └────────────────────────────────┘   └─────────────────┘   └─────────────┘
+ Sources          Per-session work               Durable state       Delivery
+┌──────────┐   ┌──────────────────────────────┐   ┌─────────────────┐   ┌─────────────┐
+│ MP4/File │──>│ Decode -> Frame filter -> VLM│──>│ WAL event log   │──>│ REST / SSE  │
+│ WebRTC   │──>│    │                         │   │                 │   │ Webhooks    │
+│ RTSP/HLS │──>│    ├─ Trigger VM             │   │ Binary JPEG/MP4 │   │ TypeScript  │
+│ Upload   │──>│    └─ Synced A/V windows     │   │ sidecars        │   │ SDK / UI    │
+│          │   │       supervised generation  │   │                 │   │ Prometheus  │
+└──────────┘   └──────────────────────────────┘   └─────────────────┘   └─────────────┘
 
  Signed release manifest -> edge updater -> shadow -> canary -> active model
 ```
@@ -39,7 +39,16 @@ The media plane splits by workload. WebRTC ingress is async: the session event l
 
 One ordered stream uses one stateful decoder, and the analysis and VLM stages own stream-order state, so the per-stream worker count for each stage is clamped to one. Parallelism comes from running many sessions, not from splitting one ordered stream.
 
-Decoding for file and URL sources goes through a pluggable backend registry with two phases: a frame-signal pass that computes statistics for the per-frame filter, then selective JPEG extraction for only the frames the filter keeps. See [Ingest](/docs/ingest/) for the decode paths and [The per-frame filter](/docs/gate/) for what happens to each frame.
+Decoding for file and URL sources goes through a pluggable backend registry.
+Frame mode computes signals for the per-frame filter and extracts JPEGs only
+for selected frames. Native media mode divides the source presentation
+timeline into bounded windows. Each active inference task extracts one
+self-contained MP4 just before its provider call, so memory grows with bounded
+concurrency rather than file duration. Audio-video mode resamples and mixes up
+to eight input audio streams while preserving the shared source-time window.
+Gemini receives the MP4 through File API and deletes its temporary upload after
+the call. See [Ingest](/docs/ingest/) for decode paths and [The per-frame
+filter](/docs/gate/) for frame mode.
 
 ## Session generations and control
 
@@ -83,6 +92,10 @@ implementation owns storage writes for live sessions:
 
 - It bridges worker events into the API timeline, so live VLM results appear in `GET /v1/runs/{id}/events` without an external database. Appends funnel through a bounded channel into the single timeline-writer thread, which assigns sequence numbers and swaps the registry snapshot.
 - `store_keyframe_sync` writes raw JPEG bytes to the content-addressed blob sidecar before appending a `keyframe_stored` metadata event. The WAL never carries JSON-encoded or base64 image bytes.
+- Recorded audio-video inference can write its exact MP4 window under
+  `${VIDARAX_DATA_DIR}/media/blobs/` before appending the semantic event.
+  `multimodal_moment` events share that hash and remain small enough for WAL,
+  SSE, and webhooks.
 - Frame and keyframe events carry `coordinate_schema: "vidarax.image.v1"` plus source dimensions, the requested normalized crop, the exact resolved pixel region, and the analyzed extent. The contract describes image coordinates, not camera extrinsics or a robot/world transform.
 - Operator feedback, policy revisions, deployments, rollbacks, and replay
   evaluations commit to the same local WAL as media events. Immutable events
@@ -105,7 +118,10 @@ deployment](/docs/edge/).
 
 The durable store is a write-ahead log at `${VIDARAX_DATA_DIR}/timeline.wal` (data directory default: `.vidarax-data`). Its properties:
 
-- Append-only plain text, one event per line, tab-separated with escaped fields. JPEG bytes live under `${VIDARAX_DATA_DIR}/keyframes/blobs/`. The WAL stores their relative reference, media type, size, and SHA-256.
+- Append-only plain text, one event per line, tab-separated with escaped fields.
+  JPEG bytes live under `${VIDARAX_DATA_DIR}/keyframes/blobs/`. Retained A/V
+  windows live under `${VIDARAX_DATA_DIR}/media/blobs/`. The WAL stores their
+  relative reference, media type, size, and SHA-256.
 - Each event carries a monotonic sequence number, a run ID, a stream ID, a presentation timestamp, a kind, and a JSON payload.
 - The file is created with owner-only read and write permissions on Unix.
 

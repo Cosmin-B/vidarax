@@ -33,8 +33,15 @@ pub const REQUIRED_MODELS: &[&str] = &[
     "LiquidAI/LFM2.5-VL-1.6B",
 ];
 
-/// Low-cost Gemini multimodal models directly exercised by the provider path.
-pub const GEMINI_MODELS: &[&str] = &["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"];
+/// Default low-cost Gemini model for native binary media.
+pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
+
+/// Stable Gemini models supported by the native binary media path.
+pub const GEMINI_MODELS: &[&str] = &[
+    DEFAULT_GEMINI_MODEL,
+    "gemini-3.1-flash-lite",
+    "gemini-3.6-flash",
+];
 
 pub fn normalize_model_id(input: &str) -> Option<&'static str> {
     if input.len() > 64 {
@@ -59,8 +66,9 @@ pub fn normalize_model_id(input: &str) -> Option<&'static str> {
         "liquidai/lfm2-vl-450m" => Some("LiquidAI/LFM2-VL-450M"),
         "liquidai/lfm2.5-vl-1.6b" | "lfm2.5-vl-1.6b-q4_0.gguf" => Some("LiquidAI/LFM2.5-VL-1.6B"),
         "gemini-3.5-flash-lite" | "gemini-flash-lite-latest" | "gemini-flash-latest" => {
-            Some(GEMINI_MODELS[0])
+            Some(DEFAULT_GEMINI_MODEL)
         }
+        "gemini-3.6-flash" => Some(GEMINI_MODELS[2]),
         "gemini-3.1-flash-lite" | "gemini-3.1-flash-lite-preview" => Some(GEMINI_MODELS[1]),
         _ => None,
     }

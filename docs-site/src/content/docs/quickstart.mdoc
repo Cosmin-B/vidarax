@@ -82,9 +82,19 @@ target/release/vidarax doctor \
   --api-key dev-key
 
 target/release/vidarax analyze /srv/vidarax-media/demo.mp4
+target/release/vidarax analyze /srv/vidarax-media/demo.mp4 \
+  --media audio-video \
+  --model gemini-3.5-flash-lite \
+  --media-window-ms 8000 \
+  --media-resolution low
 target/release/vidarax runs list
 target/release/vidarax events <run_id>
 ```
+
+The second analysis command sends raw MP4 windows through Gemini File API and
+prints `multimodal_moment` entries with source timestamps, sound and video
+descriptions, optional speech intent, and their relationship. Retained MP4
+windows stay in the binary sidecar.
 
 Global connection values resolve in this order: command-line flags,
 `VIDARAX_API_URL` / `VIDARAX_API_KEY` / `VIDARAX_TENANT_ID`, the file selected

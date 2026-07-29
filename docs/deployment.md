@@ -130,6 +130,13 @@ Keyframe JPEGs are stored at
 `VIDARAX_DATA_DIR`. The event also records media type, byte count, and SHA-256.
 Identical JPEGs share a blob. Writes are flushed but not fsynced per keyframe.
 
+Recorded native media uses
+`media/blobs/<sha-prefix>/<sha256>.mp4`. The bounded MP4 window is written
+atomically before `semantic_chunk_inferred` and `multimodal_moment` events
+reference it. Identical windows share a blob. `GET
+/v1/runs/{id}/media/{sha256}` serves only hashes referenced by a run owned by
+the caller.
+
 ## Live semantic novelty calibration
 
 Start the bundled SigLIP2 sidecar on the embedding accelerator:

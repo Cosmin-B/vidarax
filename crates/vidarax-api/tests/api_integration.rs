@@ -13,8 +13,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tower::ServiceExt;
 use vidarax_api::{app_router, AppState};
+use vidarax_core::provider::{
+    InferenceProvider, InferenceRequest, InferenceResult, MediaResolution, MediaTransport,
+    ProviderError, ProviderKind, TokenUsage,
+};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -158,6 +163,105 @@ fn tiny_mp4_bytes(tag: &str) -> Vec<u8> {
     let bytes = fs::read(&path).expect("tiny mp4 fixture should be readable");
     let _ = fs::remove_file(&path);
     bytes
+}
+
+struct AudioVideoTestProvider;
+
+impl InferenceProvider for AudioVideoTestProvider {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Gemini
+    }
+
+    fn media_transport_for_model(&self, _model: &str) -> MediaTransport {
+        MediaTransport::BinaryFile
+    }
+
+    fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+        assert!(request.input_images.is_empty());
+        assert_eq!(request.input_videos.len(), 1);
+        let video = &request.input_videos[0];
+        assert!(video
+            .raw_bytes
+            .as_ref()
+            .is_some_and(|bytes| !bytes.is_empty()));
+        assert!(video.data_base64.is_empty());
+        assert_eq!(video.media_resolution, Some(MediaResolution::Low));
+        Ok(InferenceResult {
+            provider: ProviderKind::Gemini,
+            model: Arc::clone(&request.model),
+            output_text: r#"{
+              "event_type":"context_observation",
+              "object_label":"screen_recording",
+              "summary":"a visible action has synchronized sound",
+              "description":"The sound and visible action occur together.",
+              "confidence":0.95,
+              "moments":[{
+                "start_offset_ms":250,
+                "end_offset_ms":900,
+                "modalities":["audio","video"],
+                "kind":"interaction",
+                "description":"A tone coincides with the visible motion.",
+                "intent":"The operator is testing the control.",
+                "audio_visual_relation":"The audible tone starts during the visible motion.",
+                "confidence":0.92
+              }]
+            }"#
+            .to_string(),
+            fallback_used: false,
+            finish_reason: Some("stop".to_string()),
+            inference_latency_ms: 3,
+            usage: TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                thinking_tokens: 0,
+                total_tokens: 30,
+            },
+        })
+    }
+}
+
+fn audio_video_mp4_path(tag: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "vidarax-test-audio-video-{tag}-{}-{}.mp4",
+        std::process::id(),
+        WAL_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let ffmpeg = std::env::var("VIDARAX_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string());
+    let output = Command::new(ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x64:rate=10:duration=3",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=660:sample_rate=48000:duration=3",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            "-y",
+        ])
+        .arg(&path)
+        .output()
+        .expect("ffmpeg should create synchronized test media");
+    assert!(
+        output.status.success(),
+        "ffmpeg failed to create synchronized test media: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    path
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -535,6 +639,97 @@ async fn models_response_contains_request_id() {
         body["request_id"].is_string(),
         "response should include 'request_id'"
     );
+}
+
+#[tokio::test]
+async fn recorded_audio_video_reasoning_commits_moments_and_serves_raw_mp4() {
+    let wal = tmp_wal("audio-video-e2e");
+    let source = audio_video_mp4_path("e2e");
+    let provider: Arc<dyn InferenceProvider + Send + Sync> = Arc::new(AudioVideoTestProvider);
+    let state = AppState::with_wal_for_tests_and_endpoints(wal.clone(), Some(provider));
+    let router = app_router(state);
+
+    let create = router
+        .clone()
+        .oneshot(post_json(
+            "/v1/runs",
+            json!({ "mode": "balanced", "model": "gemini-3.5-flash-lite" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+    let create_body = collect_json(create.into_body()).await;
+    let run_id = create_body["run_id"].as_str().unwrap().to_string();
+
+    let reason = router
+        .clone()
+        .oneshot(post_json(
+            &format!("/v1/runs/{run_id}/reason"),
+            json!({
+                "source_uri": source.to_string_lossy(),
+                "model": "gemini-3.5-flash-lite",
+                "sampling_policy": "fixed",
+                "fixed_fps": 10.0,
+                "semantic_inference": true,
+                "semantic_timeout_ms": 10_000,
+                "media": {
+                    "mode": "audio_video",
+                    "window_ms": 2_000,
+                    "resolution": "low",
+                    "persist_evidence": true
+                },
+                "vlm_concurrency": 1
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        reason.status(),
+        StatusCode::OK,
+        "{}",
+        collect_json(reason.into_body()).await
+    );
+
+    let events = router
+        .clone()
+        .oneshot(get(&format!("/v1/runs/{run_id}/events")))
+        .await
+        .unwrap();
+    assert_eq!(events.status(), StatusCode::OK);
+    let events_body = collect_json(events.into_body()).await;
+    let moment = events_body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "multimodal_moment")
+        .expect("timestamped moment should commit");
+    assert_eq!(moment["payload"]["modalities"], json!(["audio", "video"]));
+    assert_eq!(moment["payload"]["timestamp_resolution_ms"], 1_000);
+    let hash = moment["payload"]["evidence"]["media_sha256"]
+        .as_str()
+        .expect("moment should reference retained MP4")
+        .to_string();
+
+    let media = router
+        .oneshot(get(&format!("/v1/runs/{run_id}/media/{hash}")))
+        .await
+        .unwrap();
+    assert_eq!(media.status(), StatusCode::OK);
+    assert_eq!(
+        media.headers().get(header::CONTENT_TYPE).unwrap(),
+        "video/mp4"
+    );
+    let bytes = media.into_body().collect().await.unwrap().to_bytes();
+    assert!(!bytes.is_empty());
+
+    let _ = fs::remove_file(source);
+    let _ = fs::remove_file(wal);
+    let blob = std::env::temp_dir()
+        .join("media")
+        .join("blobs")
+        .join(&hash[..2])
+        .join(format!("{hash}.mp4"));
+    let _ = fs::remove_file(blob);
 }
 
 // ─── Semantic search ──────────────────────────────────────────────────────────

@@ -1369,6 +1369,14 @@ impl AppState {
             .join("blobs")
     }
 
+    pub(crate) fn media_blob_root(&self) -> PathBuf {
+        self.wal_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("media")
+            .join("blobs")
+    }
+
     pub fn map_event_label(&self, tenant_id: Option<&str>, label: &str) -> LabelMapResult {
         self.tenant_label_maps.map_event(tenant_id, label)
     }

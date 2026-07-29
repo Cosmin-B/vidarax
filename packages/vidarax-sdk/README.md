@@ -33,6 +33,34 @@ for (const event of await v.getEvents(run.runId)) {
 For prompt-driven semantic analysis, use `reason(id, opts)` with a
 `semantic_prompt` field. `analyze()` runs the deterministic frame-signal path.
 
+For synchronized sound and video, use a Gemini backend and native media
+windows:
+
+```typescript
+const { run_id } = await v.createRun({ model: 'gemini-3.5-flash-lite' })
+await v.reason(run_id, {
+  source_uri: '/srv/vidarax-media/session.mp4',
+  model: 'gemini-3.5-flash-lite',
+  semantic_prompt: 'Identify speech intent, important sounds, and visible actions',
+  media: {
+    mode: 'audio_video',
+    window_ms: 8000,
+    resolution: 'low',
+    persist_evidence: true,
+  },
+})
+
+const moments = (await v.getEvents(run_id))
+  .filter(event => event.kind === 'multimodal_moment')
+const evidence = moments[0]?.payload.evidence
+if (evidence?.media_sha256) {
+  const clip = await v.getMedia(run_id, evidence.media_sha256)
+}
+```
+
+MP4 bytes use Gemini File API and the binary evidence route. They never travel
+inside JSON. Gemini reports timestamps at about one-second resolution.
+
 ## Constructor
 
 ```typescript
@@ -61,6 +89,7 @@ const v = new Vidarax(baseUrl, options?)
 | `getEvents(id, index?)` / `getMarkers(id, query?)` | Fetch one snapshot of events or markers. |
 | `getInteractions(id, index?)` | Fetch guided semantic interactions. |
 | `getKeyframe(id, sha256)` | Fetch a run-owned keyframe as a raw JPEG `Blob`. |
+| `getMedia(id, sha256)` | Fetch run-owned A/V evidence as a raw MP4 `Blob`. |
 | `streamEvents(id)` / `streamMarkers(id)` | Async-iterate a one-time compatibility snapshot. |
 | `subscribeEvents(id, options?)` | Replay and follow events over SSE with `Last-Event-ID` reconnect. |
 | `createWebhook(id, request)` / `listWebhooks(id)` / `deleteWebhook(id, webhookId)` | Manage signed action hooks and inspect dead-letter state. Save the per-hook signing secret returned only at creation. |

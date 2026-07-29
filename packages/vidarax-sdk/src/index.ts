@@ -97,6 +97,13 @@ export type {
   RealtimeReasonRequest,
   RealtimeReasonResponse,
   TokenMetrics,
+  MediaAnalysisMode,
+  MediaAnalysisResolution,
+  MediaAnalysisOptions,
+  MultimodalMomentKind,
+  MultimodalMoment,
+  MediaEvidence,
+  MultimodalMomentEventPayload,
 
   // Inference
   InferRequest,

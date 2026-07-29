@@ -3,7 +3,13 @@ title: WAL and events
 description: The write-ahead log format, event families and append ownership, the event sink, and replay checks.
 ---
 
-The local WAL is the authoritative event store. Live-session worker events and handler lifecycle events follow the same append path, even when SpacetimeDB is configured. The optional client mirrors blocking description events only after the WAL commit. Selected JPEGs live in a content-addressed binary directory, while event JSON carries their references. The format and writer live in `crates/vidarax-core/src/timeline.rs`, the append pipeline in `crates/vidarax-api/src/state.rs`, and the worker bridge and blob writer in `crates/vidarax-api/src/wal_sink.rs`.
+The local WAL is the authoritative event store. Live-session worker events and
+handler lifecycle events follow the same append path, even when SpacetimeDB is
+configured. Selected JPEGs and retained MP4 windows live in content-addressed
+binary directories while event JSON carries their references. The format and
+writer live in `crates/vidarax-core/src/timeline.rs`, the append pipeline in
+`crates/vidarax-api/src/state.rs`, and the worker bridge and blob writers in
+`crates/vidarax-api/src/wal_sink.rs`.
 
 ## File format
 
@@ -13,7 +19,7 @@ The WAL is plain text at `${VIDARAX_DATA_DIR}/timeline.wal` (data directory defa
 seq \t run_id \t stream_id \t pts_ms \t kind \t payload
 ```
 
-`TimelineEvent::encode_line` escapes `\`, tab, and newline in the string fields (`\\`, `\t`, `\n`) in a single pass. `decode_line` reverses it and returns `None` for malformed lines, which `read_all_events` silently skips. That handles the common torn-final-line case, with two limits spelled out in the [format and recovery contract](#format-and-recovery-contract) below: a line torn at a byte boundary that is not valid UTF-8 fails the whole read, and a torn line that still decodes as a well-formed record replays undetected, because there is no checksum. On Unix the file is opened with mode `0o600` (owner read and write only). Keyframe events carry blob metadata. Raw JPEG bytes are written under `${VIDARAX_DATA_DIR}/keyframes/blobs/`.
+`TimelineEvent::encode_line` escapes `\`, tab, and newline in the string fields (`\\`, `\t`, `\n`) in a single pass. `decode_line` reverses it and returns `None` for malformed lines, which `read_all_events` silently skips. That handles the common torn-final-line case, with two limits spelled out in the [format and recovery contract](#format-and-recovery-contract) below: a line torn at a byte boundary that is not valid UTF-8 fails the whole read, and a torn line that still decodes as a well-formed record replays undetected, because there is no checksum. On Unix the file is opened with mode `0o600` (owner read and write only). Blob events carry hash, type, size, and relative reference metadata. Raw JPEG bytes are written under `${VIDARAX_DATA_DIR}/keyframes/blobs/`. Raw MP4 windows are written under `${VIDARAX_DATA_DIR}/media/blobs/`.
 
 `WalWriter::append` writes one line and flushes:
 
@@ -60,6 +66,7 @@ Handler-appended kinds, by string literal in `handlers.rs` (all through `append_
 | `marker_emitted` | The gate produces a marker (one event per marker) |
 | `analysis_generated` | A deterministic analysis pass completes |
 | `semantic_chunk_inferred` | A chunk finishes tiered VLM inference |
+| `multimodal_moment` | Native A/V reasoning returns a timestamped audible, visual, or combined moment |
 | `semantic_chunk_generated` | A chunk's semantic result is recorded |
 | `semantic_fallback_activated` | The semantic path falls back (for example, no provider) |
 | `inference_completed` | `POST /v1/infer` completes |
