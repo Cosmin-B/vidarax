@@ -15,6 +15,7 @@ The complete per-session inventory, grouped by runtime and mode:
 |---|---|---|---|---|---|
 | Session event loop | tokio task | both | `tokio::spawn(session.run(...))` in `whip.rs` | Drives the rustrtc peer connection | Peer close ends the future |
 | Track receive task (per video track) | tokio task | both | `session.run` on each `Track` event | Receives depacketized samples, frames them as `RtpFrame`, lossless enqueue | Track receive error or channel close |
+| Track receive task (per audio track) | tokio task | both | `session.run` on each audio `Track` event | Drains encoded access units and records transport bytes, RTP-derived duration, and receive failures. It does not dispatch analysis | Track receive error or channel close |
 | `vx-decode-0` | OS thread | both | `spawn_decode_workers` | Decodes RTP access units to YUV, computes frame signals, runs the gate inline (keyframe mode) or PTS sampling (clip mode) | RTP channel closes |
 | ffmpeg stdout reader (unnamed) | OS thread | both | `spawn_frame_reader` per sidecar decoder | Reads YUV planes from ffmpeg stdout into pooled buffers, blocking sends into the reader channel | Sidecar exit or receiver close. `Decoder::drop` kills the child and joins the reader |
 | `vx-vlm-{i}` | OS thread | keyframe only | `spawn_vlm_workers` | Semantic-novelty check, tiered VLM inference, dedup, temporal context | VLM work channel closes |

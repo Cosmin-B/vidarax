@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { Cpu, SlidersHorizontal, Zap, Database, Send } from 'lucide-vue-next'
+import { AudioWaveform, Cpu, SlidersHorizontal, Zap, Database, Send } from 'lucide-vue-next'
 import AnimatedIcon from '@/components/icons/AnimatedIcon.vue'
 import type { MetricsData, HistogramPercentiles } from '@/composables/useMetrics'
 
@@ -59,6 +59,12 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 ** 3).toFixed(2)} GiB`
 }
 
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${fmtInt(ms)} ms`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`
+  return `${(ms / 60_000).toFixed(1)} min`
+}
+
 /** Shorthand formatter for histogram percentile rows. */
 function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99'): string {
   if (!p) return '—'
@@ -67,7 +73,7 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
 </script>
 
 <template>
-  <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-4">
+  <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
 
     <!-- Card 1: Decode Stats -->
     <div class="card-skeuo p-5 flex flex-col gap-4">
@@ -311,26 +317,6 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
           <span class="mono text-[#22c55e] text-xs">{{ fmtInt(metrics.multimodalMomentsTotal) }}</span>
         </div>
         <div class="flex items-center justify-between">
-          <span class="text-[#475569] text-xs">Local audio windows</span>
-          <span class="mono text-[#22c55e] text-xs">{{ fmtInt(metrics.localAudioWindowsTotal) }}</span>
-        </div>
-        <div class="flex items-center justify-between">
-          <span class="text-[#475569] text-xs">Local audio observations</span>
-          <span class="mono text-[#22c55e] text-xs">{{ fmtInt(metrics.localAudioObservationsTotal) }}</span>
-        </div>
-        <div class="flex items-center justify-between">
-          <span class="text-[#475569] text-xs">Local audio p95</span>
-          <span class="mono text-[#22c55e] text-xs">
-            {{ metrics.localAudioProcessingLatency ? `${Math.floor(metrics.localAudioProcessingLatency.p95)} ms` : '—' }}
-          </span>
-        </div>
-        <div class="flex items-center justify-between">
-          <span class="text-[#475569] text-xs">Local audio failures</span>
-          <span class="mono text-xs" :class="metrics.localAudioAnalysisFailuresTotal ? 'text-[#ef4444]' : 'text-[#22c55e]'">
-            {{ fmtInt(metrics.localAudioAnalysisFailuresTotal) }}
-          </span>
-        </div>
-        <div class="flex items-center justify-between">
           <span class="text-[#475569] text-xs">A/V extraction failures</span>
           <span class="mono text-xs" :class="metrics.mediaClipExtractionFailuresTotal ? 'text-[#ef4444]' : 'text-[#22c55e]'">
             {{ fmtInt(metrics.mediaClipExtractionFailuresTotal) }}
@@ -421,7 +407,118 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
       </div>
     </div>
 
-    <!-- Card 4: durable binary keyframe sidecar -->
+    <!-- Card 4: local and live audio -->
+    <div class="card-skeuo p-5 flex flex-col gap-4">
+      <div class="flex items-center gap-2">
+        <div class="w-7 h-7 rounded-lg flex items-center justify-center"
+             style="background: rgba(168,85,247,0.1); border: 1px solid rgba(168,85,247,0.2);">
+          <AnimatedIcon :icon="AudioWaveform" :size="14" :stroke-width="1.75"
+                        class="text-[#c084fc]" />
+        </div>
+        <h4 class="text-[#94a3b8] text-xs font-medium uppercase tracking-wider">Audio</h4>
+        <span class="badge ml-auto text-[9px] text-[#c084fc]">LOCAL</span>
+      </div>
+
+      <div>
+        <div class="text-[#475569] text-[10px] uppercase tracking-wider mb-1">Round-trip p95</div>
+        <div class="mono text-3xl font-semibold text-[#c084fc]">
+          {{ metrics.localAudioRoundTripLatency ? formatLatency(metrics.localAudioRoundTripLatency.p95) : '—' }}
+        </div>
+        <div class="mono text-[10px] text-[#475569] mt-1">
+          RTF {{ metrics.localAudioRealTimeFactor ? `${metrics.localAudioRealTimeFactor.p95.toFixed(2)}× p95` : '—' }}
+        </div>
+      </div>
+
+      <div class="space-y-2 border-t border-[#1e2633] pt-3">
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Windows / observations</span>
+          <span class="mono text-[#c084fc] text-xs">{{ fmtInt(metrics.localAudioWindowsTotal) }} / {{ fmtInt(metrics.localAudioObservationsTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Analyzed audio</span>
+          <span class="mono text-[#c084fc] text-xs">{{ formatDuration(metrics.localAudioDurationMsTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">WAV bytes</span>
+          <span class="mono text-[#c084fc] text-xs">{{ formatBytes(metrics.localAudioWavBytesTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Extract / decode p95</span>
+          <span class="mono text-[#c084fc] text-xs">
+            {{ metrics.localAudioWavExtractionLatency ? formatLatency(metrics.localAudioWavExtractionLatency.p95) : '—' }}
+            /
+            {{ metrics.localAudioDecodeLatency ? formatLatency(metrics.localAudioDecodeLatency.p95) : '—' }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">VAD / classifier p95</span>
+          <span class="mono text-[#c084fc] text-xs">
+            {{ metrics.localAudioVadLatency ? formatLatency(metrics.localAudioVadLatency.p95) : '—' }}
+            /
+            {{ metrics.localAudioClassifierLatency ? formatLatency(metrics.localAudioClassifierLatency.p95) : '—' }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">ASR / TTS p95</span>
+          <span class="mono text-[#c084fc] text-xs">
+            {{ metrics.localAudioAsrLatency ? formatLatency(metrics.localAudioAsrLatency.p95) : '—' }}
+            /
+            {{ metrics.localAudioTtsLatency ? formatLatency(metrics.localAudioTtsLatency.p95) : '—' }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Sidecar active / queued</span>
+          <span class="mono text-[#c084fc] text-xs">{{ fmtInt(metrics.localAudioSidecarActive) }} / {{ fmtInt(metrics.localAudioSidecarQueueDepth) }} of {{ fmtInt(metrics.localAudioSidecarCapacity) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Overload / timeout / reconnect</span>
+          <span class="mono text-xs"
+                :class="metrics.localAudioOverloadsTotal + metrics.localAudioTimeoutsTotal + metrics.localAudioReconnectFailuresTotal ? 'text-[#ef4444]' : 'text-[#22c55e]'">
+            {{ fmtInt(metrics.localAudioOverloadsTotal) }} / {{ fmtInt(metrics.localAudioTimeoutsTotal) }} / {{ fmtInt(metrics.localAudioReconnectFailuresTotal) }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Decode / model load</span>
+          <span class="mono text-xs"
+                :class="metrics.localAudioDecodeFailuresTotal + metrics.localAudioModelLoadFailuresTotal ? 'text-[#ef4444]' : 'text-[#22c55e]'">
+            {{ fmtInt(metrics.localAudioDecodeFailuresTotal) }} / {{ fmtInt(metrics.localAudioModelLoadFailuresTotal) }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Malformed / inference</span>
+          <span class="mono text-xs"
+                :class="metrics.localAudioMalformedResponseFailuresTotal + metrics.localAudioInferenceFailuresTotal ? 'text-[#ef4444]' : 'text-[#22c55e]'">
+            {{ fmtInt(metrics.localAudioMalformedResponseFailuresTotal) }} / {{ fmtInt(metrics.localAudioInferenceFailuresTotal) }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">TTS success / attempts</span>
+          <span class="mono text-xs" :class="metrics.localAudioTtsFailuresTotal ? 'text-[#f59e0b]' : 'text-[#22c55e]'">
+            {{ fmtInt(metrics.localAudioTtsSuccessesTotal) }} / {{ fmtInt(metrics.localAudioTtsAttemptsTotal) }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">TTS bytes / failures</span>
+          <span class="mono text-xs" :class="metrics.localAudioTtsFailuresTotal ? 'text-[#ef4444]' : 'text-[#c084fc]'">
+            {{ formatBytes(metrics.localAudioTtsBytesTotal) }} / {{ fmtInt(metrics.localAudioTtsFailuresTotal) }}
+          </span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Live WebRTC audio</span>
+          <span class="mono text-[#38bdf8] text-xs">{{ fmtInt(metrics.webRtcAudioTracksTotal) }} tracks · {{ fmtInt(metrics.webRtcAudioAccessUnitsTotal) }} units</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Live bytes / duration</span>
+          <span class="mono text-[#38bdf8] text-xs">{{ formatBytes(metrics.webRtcAudioBytesTotal) }} / {{ formatDuration(metrics.webRtcAudioDurationMsTotal) }}</span>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-[#475569] text-xs">Live receive errors</span>
+          <span class="mono text-xs" :class="metrics.webRtcAudioReceiveErrorsTotal ? 'text-[#ef4444]' : 'text-[#22c55e]'">{{ fmtInt(metrics.webRtcAudioReceiveErrorsTotal) }}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Card 5: durable binary keyframe sidecar -->
     <div class="card-skeuo p-5 flex flex-col gap-4">
       <div class="flex items-center gap-2">
         <div class="w-7 h-7 rounded-lg flex items-center justify-center"
@@ -518,7 +615,7 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
       </div>
     </div>
 
-    <!-- Card 5: durable event delivery -->
+    <!-- Card 6: durable event delivery -->
     <div class="card-skeuo p-5 flex flex-col gap-4">
       <div class="flex items-center gap-2">
         <div class="w-7 h-7 rounded-lg flex items-center justify-center"

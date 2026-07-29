@@ -49,8 +49,8 @@ use crate::semantic::{build_marker_lifecycle, MarkerConfig};
 use crate::semantic_infer::{
     adaptive_sample_fps, compose_frame_metadata, estimate_sample_fps,
     load_decoded_signals_from_events, percentile_ms, prepare_realtime_chunks,
-    run_semantic_dispatch, semantic_marker_to_api_marker, ChunkPrep, ChunkSemanticResult,
-    LocalAudioConfig, SemanticMediaConfig, SemanticMediaMode,
+    run_semantic_dispatch, semantic_marker_to_api_marker, AudioTraceContext, ChunkPrep,
+    ChunkSemanticResult, LocalAudioConfig, SemanticMediaConfig, SemanticMediaMode,
 };
 use crate::state::AppState;
 use crate::wal_sink::persist_media_blob;
@@ -1339,6 +1339,8 @@ fn validate_realtime_reason_params(
             min_confidence: options.min_confidence,
             max_events: options.max_events,
             voice_feedback: options.voice_feedback,
+            trace: AudioTraceContext::default(),
+            metrics: Arc::clone(state.pipeline_metrics_arc()),
         })
     } else {
         None
@@ -1470,12 +1472,52 @@ async fn append_semantic_chunk_event(
     {
         state.pipeline_metrics().inc_media_clip_extraction_failure();
     }
-    if let Some(audio) = &result.local_audio {
-        state
-            .pipeline_metrics()
-            .record_local_audio_window(audio.observations.len() as u64, audio.processing_ms);
-    } else if result.local_audio_error.is_some() {
-        state.pipeline_metrics().inc_local_audio_analysis_failure();
+    if result.local_audio_telemetry.wav_bytes > 0 {
+        let audio_span = tracing::info_span!(
+            "audio.chunk",
+            run_id,
+            request_id,
+            stream_id,
+            chunk_id = chunk_idx,
+            wav_bytes = result.local_audio_telemetry.wav_bytes,
+            requested_duration_ms = result.local_audio_telemetry.requested_duration_ms,
+        );
+        let _entered = audio_span.enter();
+        state.pipeline_metrics().record_local_audio_extraction(
+            result.local_audio_telemetry.wav_bytes,
+            result.local_audio.as_ref().map_or(
+                result.local_audio_telemetry.requested_duration_ms,
+                |audio| audio.audio_duration_ms,
+            ),
+            result.local_audio_telemetry.wav_extraction_ms,
+        );
+        if let Some(audio) = &result.local_audio {
+            state.pipeline_metrics().record_local_audio_analysis(
+                audio,
+                result
+                    .local_audio_telemetry
+                    .wav_extraction_ms
+                    .saturating_add(result.local_audio_telemetry.round_trip_ms),
+            );
+        } else if let Some(reason) = result.local_audio_telemetry.failure_reason {
+            state
+                .pipeline_metrics()
+                .record_local_audio_failure_reason(reason);
+        }
+        if result.local_audio_telemetry.tts_attempted {
+            state.pipeline_metrics().inc_local_audio_tts_attempt();
+            if let Some(feedback) = &result.feedback_audio {
+                state.pipeline_metrics().record_local_audio_tts_success(
+                    feedback.bytes.len() as u64,
+                    feedback.processing_ms,
+                    feedback.capacity,
+                );
+            } else if let Some(reason) = result.local_audio_telemetry.tts_failure_reason {
+                state
+                    .pipeline_metrics()
+                    .record_local_audio_tts_failure_reason(reason);
+            }
+        }
     }
     let mut evidence = None;
     if let Some(media) = &result.media {
@@ -1869,7 +1911,7 @@ pub async fn reason_realtime_run(
     let semantic_prompt = params.semantic_prompt;
     let tiered_config = params.tiered_config;
     let media = params.media;
-    let local_audio = params.local_audio;
+    let mut local_audio = params.local_audio;
     let fixed_fps = params.fixed_fps;
     let semantic_decode_enabled =
         (semantic_inference && state.provider().is_some()) || local_audio.is_some();
@@ -2023,6 +2065,13 @@ pub async fn reason_realtime_run(
         .trace_id
         .unwrap_or_else(|| format!("trace-{}", &request_id[4..]));
     let stream_id = payload.stream_id.unwrap_or_else(|| "stream-0".to_string());
+    if let Some(config) = local_audio.as_mut() {
+        config.trace = AudioTraceContext {
+            run_id: Arc::from(run_id.as_str()),
+            request_id: Arc::from(request_id.as_str()),
+            stream_id: Arc::from(stream_id.as_str()),
+        };
+    }
     let principal = state.security_policy().principal_key_from_headers(&headers);
     let label_map_key = label_map_key_from_principal(&principal);
     // Optional index tag — carried through all WAL events for this pass so

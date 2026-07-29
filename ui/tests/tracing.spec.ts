@@ -22,6 +22,34 @@ vidarax_pipeline_keyframe_blobs_written_total 2
 vidarax_pipeline_keyframe_blobs_reused_total 1
 vidarax_pipeline_keyframe_blob_failures_total 0
 vidarax_pipeline_keyframe_blob_bytes_total 4096
+vidarax_pipeline_local_audio_windows_total 4
+vidarax_pipeline_local_audio_analysis_failures_total 0
+vidarax_pipeline_local_audio_observations_total 7
+vidarax_pipeline_local_audio_wav_bytes_total 512000
+vidarax_pipeline_local_audio_duration_ms_total 32000
+vidarax_pipeline_local_audio_sidecar_active 1
+vidarax_pipeline_local_audio_sidecar_queue_depth 0
+vidarax_pipeline_local_audio_sidecar_capacity 2
+vidarax_pipeline_local_audio_failure_overloaded_total 0
+vidarax_pipeline_local_audio_failure_timeout_total 0
+vidarax_pipeline_local_audio_failure_reconnect_total 0
+vidarax_pipeline_local_audio_tts_attempts_total 1
+vidarax_pipeline_local_audio_tts_successes_total 1
+vidarax_pipeline_local_audio_tts_failures_total 0
+vidarax_pipeline_local_audio_tts_bytes_total 48000
+vidarax_pipeline_webrtc_audio_tracks_total 1
+vidarax_pipeline_webrtc_audio_access_units_total 50
+vidarax_pipeline_webrtc_audio_bytes_total 12000
+vidarax_pipeline_webrtc_audio_duration_ms_total 1000
+vidarax_pipeline_webrtc_audio_receive_errors_total 0
+vidarax_pipeline_local_audio_round_trip_latency_ms_bucket{le="250"} 4
+vidarax_pipeline_local_audio_round_trip_latency_ms_bucket{le="+Inf"} 4
+vidarax_pipeline_local_audio_round_trip_latency_ms_sum 800
+vidarax_pipeline_local_audio_round_trip_latency_ms_count 4
+vidarax_pipeline_local_audio_real_time_factor_milli_bucket{le="250"} 4
+vidarax_pipeline_local_audio_real_time_factor_milli_bucket{le="+Inf"} 4
+vidarax_pipeline_local_audio_real_time_factor_milli_sum 100
+vidarax_pipeline_local_audio_real_time_factor_milli_count 4
 vidarax_pipeline_restricted_zone_assertions_total 2
 vidarax_pipeline_restricted_zone_evidence_failures_total 0
 vidarax_pipeline_restricted_zone_queue_dropped_total 0
@@ -160,7 +188,7 @@ test.describe('Tracing page', () => {
     const metricsSection = page.getByRole('region', { name: 'Live pipeline metrics' })
     await expect(metricsSection).toBeVisible({ timeout: 10_000 })
 
-    for (const cardName of ['Decode', 'Per-frame filter', 'VLM Inference', 'Binary sidecars', 'Delivery']) {
+    for (const cardName of ['Decode', 'Per-frame filter', 'VLM Inference', 'Audio', 'Binary sidecars', 'Delivery']) {
       await expect(metricsSection.getByRole('heading', { name: cardName })).toBeVisible()
     }
     await expect(metricsSection.getByText('Trigger queue drops', { exact: true })).toBeVisible()
