@@ -305,7 +305,7 @@ test.describe('Upload reason settings', () => {
       semantic_timeout_ms: 30_000,
       media: {
         mode: 'audio_video',
-        window_ms: 8_000,
+        window_ms: 20_000,
         resolution: 'low',
         persist_evidence: true,
       },

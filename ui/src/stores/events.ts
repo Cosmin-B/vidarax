@@ -9,6 +9,7 @@ export type EventType =
   | 'exposure_shift'
   | 'flicker'
   | 'keyframe'
+  | 'audio_observation'
   | 'restricted_zone_activity'
   | 'trigger_assertion'
 

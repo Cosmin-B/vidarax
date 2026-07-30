@@ -79,7 +79,7 @@ The API is served over HTTP/1.1 and HTTP/2, with optional HTTP/3 behind the `h3-
 |---|---|---|---|---|
 | `POST /v1/runs/:id/ingest` | `{ source_uri, sampling_policy?, fixed_fps?, sample_fps?, max_frames?, stream_id? }`. `source_uri` is required and must resolve under an ingest root or the upload root. `sampling_policy` is `source_fps_adaptive` (default) or `fixed`. `fixed_fps` must be in [0.2, 120] and is required for `fixed`. `max_frames` is in [1, 500000], default 512. Unknown fields are rejected. | `{ request_id, run_id, status: "processing", decoded_frames, source_uri, sampling_policy, source_fps, sample_fps }` | 404, 409 terminal run, 422 (including source validation), 500 | Appends `ingest_received` and `frames_decoded` |
 | `POST /v1/runs/:id/analyze` | `{ model, mode?, stream_id?, sampling_policy?, fixed_fps?, frames?, window_size?, segment_ms?, trace_id? }`. Supply 1 to 4096 frames with normalized scores, or omit `frames` to reuse signals from the run's latest `frames_decoded` event. `window_size` is in [2, 256]. `segment_ms` is in [50, 60000]. | `{ request_id, run_id, generated, metadata[], markers[] }`. Metadata sourced from decoded video includes `coordinate_schema` and `coordinates`. Caller-supplied signal arrays do not claim image provenance. | 404, 409 terminal run, 422, 500 | Appends one `marker_emitted` per marker, then `analysis_generated` |
-| `POST /v1/runs/:id/reason` | `{ source_uri, model, ... }` with `chunk_size` in [5, 500] for frame mode, `media?: { mode, window_ms?, resolution?, persist_evidence? }`, `local_audio?: { profile?, speech_engine?, min_confidence?, max_events?, voice_feedback? }`, `window_size` in [2, 256], `segment_ms >= 1`, `max_frames` in [1, 500000], `semantic_inference?`, `semantic_frames_per_chunk` in [1, 4], `semantic_frame_max_edge` in [64, 4096], `crop?: { x, y, width, height }` as normalized fractions, `semantic_timeout_ms` in [100, 120000], `semantic_prompt` up to 4096 bytes, `output_schema?`, `first_pass_model?`, `second_pass_model?`, `second_pass_threshold?`, `index_name?`, `temporal_chain?`, `visual_diff?`, compatibility fields `video_clip_mode?` and `video_clip_duration_s`, and `vlm_concurrency?` clamped to [1, 64] | `{ request_id, run_id, generated, markers_emitted, decoded_frames, sample_fps, lag_p95_ms, lag_p99_ms, tokens, metadata[], markers[] }`. Metadata carries the `vidarax.image.v1` source/crop/analysis transform. | 404, 409 terminal run, 422, 500, 503 provider or sidecar unavailable | Appends `semantic_chunk_inferred` and `semantic_chunk_generated` per chunk, `multimodal_moment` per timestamped A/V moment, `marker_emitted` per marker, and `run_completed` |
+| `POST /v1/runs/:id/reason` | `{ source_uri, model, ... }` with `chunk_size` in [5, 500] for frame mode, `media?: { mode, window_ms?, resolution?, persist_evidence? }`, `local_audio?: { profile?, speech_engine?, min_confidence?, max_events?, voice_feedback? }`, `include_frame_metadata?`, `window_size` in [2, 256], `segment_ms >= 1`, `max_frames` in [1, 500000], `semantic_inference?`, `semantic_frames_per_chunk` in [1, 4], `semantic_frame_max_edge` in [64, 4096], `crop?: { x, y, width, height }` as normalized fractions, `semantic_timeout_ms` in [100, 120000], `semantic_prompt` up to 4096 bytes, `output_schema?`, `first_pass_model?`, `second_pass_model?`, `second_pass_threshold?`, `index_name?`, `temporal_chain?`, `visual_diff?`, compatibility fields `video_clip_mode?` and `video_clip_duration_s`, and `vlm_concurrency?` clamped to [1, 64] | `{ request_id, run_id, generated, markers_emitted, decoded_frames, sample_fps, lag_p95_ms, lag_p99_ms, tokens, frame_metadata_included, metadata[], markers[] }`. Metadata carries the `vidarax.image.v1` source/crop/analysis transform when included. | 404, 409 terminal run, 422, 500, 503 provider or sidecar unavailable | Appends `semantic_chunk_inferred` and `semantic_chunk_generated` per chunk, `multimodal_moment` per timestamped A/V moment, `marker_emitted` per marker, and `run_completed` |
 
 `media.mode` is `frames`, `video`, or `audio_video`. Native modes reject
 `chunk_size`. `semantic_inference: true` requires a provider with binary media
@@ -88,11 +88,14 @@ transport. Gemini is the current built-in provider for this route.
 sound events and selective speech only. Local audio requires
 `VIDARAX_AUDIO_SIDECAR_ADDR`. Its profile is `general`, `gameplay`,
 `screen_recording`, or `physical_world`. Its speech engine is `none`, `auto`,
-`sensevoice`, `moonshine`, `qwen3_asr`, or `lfm2_5_audio`.
+`whisper`, `sensevoice`, `moonshine`, `qwen3_asr`, or `lfm2_5_audio`.
 `min_confidence` is in [0, 1] and `max_events` is in [1, 64].
-`window_ms` defaults to 8000 and must be in [100, 60000]. `resolution` is
-`low`, `medium`, or `high`. Audio-video media retention defaults on.
-Video-only retention defaults off.
+`window_ms` defaults to 20000 when local audio is enabled and 8000 for other
+native media requests. It must be in [100, 60000]. `resolution` is `low`,
+`medium`, or `high`. Audio-video media retention defaults on. Video-only
+retention defaults off. Set `include_frame_metadata: true` to return per-frame
+rows in the synchronous response. Native media requests omit those rows by
+default because the event timeline already carries chunk results.
 
 Audio-video extraction accepts one video stream and up to eight audio streams.
 It uses one shared source-time window, resamples audio to 48 kHz, and mixes
@@ -261,8 +264,14 @@ operation.
 The offer accepts an optional `x-attach-config` header. It is size-capped,
 base64url-encoded JSON without padding. Its `prompt`,
 `max_output_tokens_per_second`, `clip_mode`, normalized `crop`, optional
-`restricted_zone`, and optional compiled `trigger_program` fields apply before
-workers start.
+`restricted_zone`, optional compiled `trigger_program`, and optional
+`local_audio` fields apply before workers start.
+
+`local_audio` accepts the same profile, speech engine, confidence, and event
+limit fields used by recorded analysis. It requires
+`VIDARAX_AUDIO_SIDECAR_ADDR`. The offer returns 503 when the sidecar is absent.
+Live Opus windows emit `semantic_chunk_inferred` and `multimodal_moment` events
+with session and track IDs.
 
 Trigger programs and restricted-zone policy are mutually exclusive. The live
 trigger path accepts motion, novelty, and confidence signals plus one keyframe

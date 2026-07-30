@@ -49,6 +49,7 @@ use rustrtc::{
     IceServer, RtcConfiguration, SdpType, SessionDescription,
 };
 
+use crate::audio_sidecar::{AudioProfile, SpeechEngine};
 use crate::crop::CropRegion;
 use crate::gate::GateConfig;
 use crate::metrics::PipelineMetrics;
@@ -75,6 +76,8 @@ pub const RTP_FRAME_QUEUE_CAPACITY: usize = 128;
 /// This turns the queue's item bound into a byte bound as well. Oversized
 /// frames are shed before the pipeline-owned copy is made.
 pub const MAX_RTP_ACCESS_UNIT_BYTES: usize = 2 * 1024 * 1024;
+pub const LIVE_AUDIO_QUEUE_CAPACITY: usize = 256;
+pub const MAX_RTP_AUDIO_ACCESS_UNIT_BYTES: usize = 64 * 1024;
 
 pub fn rtp_nal_pool_slots(decode_workers: usize) -> usize {
     RTP_FRAME_QUEUE_CAPACITY + crate::webrtc::workers::per_stream_decode_workers(decode_workers) + 1
@@ -106,6 +109,29 @@ pub struct RtpFrame {
     pub seq: u64,
     /// Codec of the video track this frame originated from.
     pub codec: VideoCodec,
+}
+
+/// One encoded Opus access unit from an inbound WebRTC audio track.
+///
+/// The payload stays binary and is decoded only by the optional live-audio
+/// worker. `track_id` distinguishes multiple negotiated audio tracks.
+#[derive(Debug, Clone)]
+pub struct LiveAudioFrame {
+    pub track_id: u64,
+    pub rtp_timestamp: u32,
+    pub clock_rate: u32,
+    pub sequence_number: Option<u16>,
+    pub data: Vec<u8>,
+}
+
+/// Generation-static local audio settings for a live session.
+#[derive(Debug, Clone, Copy)]
+pub struct LiveAudioConfig {
+    pub profile: AudioProfile,
+    pub speech_engine: SpeechEngine,
+    pub min_confidence: f32,
+    pub max_events: u16,
+    pub window_ms: u64,
 }
 
 /// TURN server credentials for ICE relay negotiation.
@@ -177,6 +203,8 @@ pub struct WebRtcConfig {
     pub restricted_zone: Option<Arc<RestrictedZonePolicy>>,
     /// Optional generation-static trigger bytecode supplied at attach time.
     pub trigger_program: Option<Arc<TriggerProgram>>,
+    /// Optional generation-static live audio analysis configuration.
+    pub live_audio: Option<LiveAudioConfig>,
 }
 
 /// Failure from [`WebRtcSession::new`].
@@ -221,6 +249,7 @@ impl Default for WebRtcConfig {
             crop: None,
             restricted_zone: None,
             trigger_program: None,
+            live_audio: None,
         }
     }
 }
@@ -271,6 +300,8 @@ pub struct WebRtcSession {
     pub restricted_zone: Option<Arc<RestrictedZonePolicy>>,
     /// Optional generation-static trigger bytecode supplied at attach time.
     pub trigger_program: Option<Arc<TriggerProgram>>,
+    /// Optional generation-static live audio analysis configuration.
+    pub live_audio: Option<LiveAudioConfig>,
     /// Video codec negotiated from the SDP offer.
     pub codec: VideoCodec,
     rtp_nal_pool_slots: usize,
@@ -334,6 +365,7 @@ impl WebRtcSession {
                 crop: None,
                 restricted_zone: None,
                 trigger_program: None,
+                live_audio: None,
                 codec: VideoCodec::H264,
                 rtp_nal_pool_slots: rtp_nal_pool_slots(1),
                 shutdown,
@@ -530,6 +562,7 @@ impl WebRtcSession {
                 crop: config.crop,
                 restricted_zone: config.restricted_zone.clone(),
                 trigger_program: config.trigger_program.clone(),
+                live_audio: config.live_audio,
                 codec,
                 rtp_nal_pool_slots: rtp_nal_pool_slots(config.decode_workers),
                 shutdown,
@@ -571,8 +604,9 @@ impl WebRtcSession {
     ///   H.265 by the in-crate HEVC RTP depacketizer. Annex B start codes
     ///   (`00 00 00 01`) are **prepended** to H.264 and H.265 / HEVC payloads
     ///   before sending. VP8 payloads are passed through.
-    /// - Audio tracks are drained and measured as transport telemetry. They are
-    ///   not yet connected to the local audio analysis path.
+    /// - Audio tracks are measured as transport telemetry. When an audio
+    ///   sender is supplied, encoded Opus access units also enter the bounded
+    ///   local analysis path.
     /// - For each video track a Tokio task is spawned; all share the same
     ///   atomic sequence counter.
     ///
@@ -600,10 +634,22 @@ impl WebRtcSession {
         frame_tx: kanal::Sender<RtpFrame>,
         metrics: Arc<PipelineMetrics>,
     ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        self.run_with_audio(frame_tx, None, metrics)
+    }
+
+    /// Drive media ingestion and optionally forward encoded Opus access units
+    /// to a bounded live-audio worker.
+    pub fn run_with_audio(
+        &self,
+        frame_tx: kanal::Sender<RtpFrame>,
+        audio_tx: Option<tokio::sync::mpsc::Sender<LiveAudioFrame>>,
+        metrics: Arc<PipelineMetrics>,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
         // Clone the PeerConnection so the returned future owns everything it
         // needs and has no lifetime dependency on `self`.
         let pc = self.pc.clone();
         let seq_counter = Arc::new(AtomicU64::new(0));
+        let audio_track_counter = Arc::new(AtomicU64::new(0));
         let codec = self.codec;
         let rtp_nal_pool_slots = self.rtp_nal_pool_slots;
         let control = self.control.clone();
@@ -668,6 +714,8 @@ impl WebRtcSession {
                                 if track.kind() == MediaKind::Audio {
                                     metrics.inc_webrtc_audio_track();
                                     let metrics = Arc::clone(&metrics);
+                                    let audio_tx = audio_tx.clone();
+                                    let track_id = audio_track_counter.fetch_add(1, Ordering::Relaxed);
                                     let mut stop = track_stop.subscribe();
                                     track_tasks.push(tokio::spawn(async move {
                                         let mut previous_timestamp: Option<u32> = None;
@@ -700,6 +748,28 @@ impl WebRtcSession {
                                                         frame.data.len() as u64,
                                                         duration_ms,
                                                     );
+                                                    if frame.data.len() > MAX_RTP_AUDIO_ACCESS_UNIT_BYTES {
+                                                        metrics.inc_webrtc_audio_queue_drop();
+                                                        tracing::warn!(
+                                                            track_id,
+                                                            payload_bytes = frame.data.len(),
+                                                            limit_bytes = MAX_RTP_AUDIO_ACCESS_UNIT_BYTES,
+                                                            "dropping oversized RTP audio access unit"
+                                                        );
+                                                        continue;
+                                                    }
+                                                    if let Some(tx) = &audio_tx {
+                                                        let live_frame = LiveAudioFrame {
+                                                            track_id,
+                                                            rtp_timestamp: frame.rtp_timestamp,
+                                                            clock_rate: frame.clock_rate,
+                                                            sequence_number: frame.sequence_number,
+                                                            data: frame.data.to_vec(),
+                                                        };
+                                                        if tx.try_send(live_frame).is_err() {
+                                                            metrics.inc_webrtc_audio_queue_drop();
+                                                        }
+                                                    }
                                                 }
                                                 Ok(MediaSample::Video(_)) => {}
                                                 Err(error) => {

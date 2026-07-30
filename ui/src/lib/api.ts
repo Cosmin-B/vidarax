@@ -206,11 +206,12 @@ export interface ReasonRequest {
   }
   local_audio?: {
     profile?: 'general' | 'gameplay' | 'screen_recording' | 'physical_world'
-    speech_engine?: 'none' | 'auto' | 'sensevoice' | 'moonshine' | 'qwen3_asr' | 'lfm2_5_audio'
+    speech_engine?: 'none' | 'auto' | 'whisper' | 'sensevoice' | 'moonshine' | 'qwen3_asr' | 'lfm2_5_audio'
     min_confidence?: number
     max_events?: number
     voice_feedback?: boolean
   }
+  include_frame_metadata?: boolean
 }
 
 export interface ReasonResponse {
@@ -228,6 +229,7 @@ export interface ReasonResponse {
     thinking_tokens: number
     total_tokens: number
   }
+  frame_metadata_included: boolean
 }
 
 export interface ModelInfo {
@@ -486,7 +488,15 @@ export const api = {
   stream: {
     async whipOffer(
       offerSdp: string,
-      attachConfig?: { prompt?: string },
+      attachConfig?: {
+        prompt?: string
+        local_audio?: {
+          profile?: 'general' | 'gameplay' | 'screen_recording' | 'physical_world'
+          speech_engine?: 'none' | 'auto' | 'whisper' | 'sensevoice' | 'moonshine' | 'qwen3_asr' | 'lfm2_5_audio'
+          min_confidence?: number
+          max_events?: number
+        }
+      },
     ): Promise<{ answer_sdp: string; session_id: string; location: string; run_id?: string }> {
       // WHIP (RFC 9725): POST raw SDP text, response is 201 + SDP body + Location header.
       const auth = useAuthStore()

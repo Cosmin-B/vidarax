@@ -22,15 +22,18 @@ function mapEvent(raw: RawRunEvent, runId: string): AgentEvent | null {
     'loop_detected',
   ])
   const isRestrictedZone = raw.kind === 'restricted_zone_activity_entered'
+  const isAudioMoment = raw.kind === 'multimodal_moment'
   const rootTrigger = objectField(payload.trigger)
   const isTriggerAssertion = typeof rootTrigger.program_id === 'string'
-  if (raw.kind !== 'marker_emitted' && !workerKinds.has(raw.kind) && !isRestrictedZone && !isTriggerAssertion) return null
+  if (raw.kind !== 'marker_emitted' && !workerKinds.has(raw.kind) && !isRestrictedZone && !isTriggerAssertion && !isAudioMoment) return null
 
   const assertion = objectField(payload.assertion)
   const trigger = objectField(assertion.trigger)
   const workerDescription = workerKinds.has(raw.kind)
   const eventType = isRestrictedZone
     ? 'restricted_zone_activity'
+    : isAudioMoment
+      ? 'audio_observation'
     : isTriggerAssertion
       ? 'trigger_assertion'
     : raw.kind === 'marker_emitted'
@@ -49,6 +52,8 @@ function mapEvent(raw: RawRunEvent, runId: string): AgentEvent | null {
     confidence: Number(payload.confidence ?? trigger.score ?? 0),
     description: isRestrictedZone
       ? zoneDescription
+      : isAudioMoment
+        ? String(payload.description ?? '')
       : isTriggerAssertion
         ? `Trigger ${String(rootTrigger.program_id)} emitted ${raw.kind}`
       : workerDescription

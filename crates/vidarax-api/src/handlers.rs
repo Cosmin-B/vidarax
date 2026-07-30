@@ -1067,6 +1067,7 @@ struct RealtimeReasonParams {
     decode_source: InputSource,
     media: SemanticMediaConfig,
     local_audio: Option<LocalAudioConfig>,
+    include_frame_metadata: bool,
     fixed_fps: f32,
 }
 
@@ -1211,6 +1212,7 @@ fn validate_realtime_reason_params(
             )],
         ));
     }
+    let has_local_audio = payload.local_audio.is_some();
     let media = if let Some(options) = payload.media {
         let mode = match options.mode {
             MediaAnalysisMode::Frames => SemanticMediaMode::Frames,
@@ -1231,6 +1233,8 @@ fn validate_realtime_reason_params(
             .window_ms
             .unwrap_or(if mode == SemanticMediaMode::Frames {
                 500
+            } else if has_local_audio {
+                20_000
             } else {
                 8_000
             });
@@ -1402,6 +1406,9 @@ fn validate_realtime_reason_params(
         ));
     }
 
+    let include_frame_metadata = payload
+        .include_frame_metadata
+        .unwrap_or(media.mode == SemanticMediaMode::Frames);
     Ok(RealtimeReasonParams {
         mode,
         model,
@@ -1420,6 +1427,7 @@ fn validate_realtime_reason_params(
         decode_source,
         media,
         local_audio,
+        include_frame_metadata,
         fixed_fps,
     })
 }
@@ -1524,7 +1532,7 @@ async fn append_semantic_chunk_event(
         state
             .pipeline_metrics()
             .record_media_clip_extracted(media.bytes.len() as u64, media.extraction_ms);
-        if media.persist_evidence {
+        if media.persist_evidence && !result.moments.is_empty() {
             let state_for_blob = state.clone();
             let bytes = Arc::clone(&media.bytes);
             let media_type = media.media_type;
@@ -1912,6 +1920,7 @@ pub async fn reason_realtime_run(
     let tiered_config = params.tiered_config;
     let media = params.media;
     let mut local_audio = params.local_audio;
+    let include_frame_metadata = params.include_frame_metadata;
     let fixed_fps = params.fixed_fps;
     let semantic_decode_enabled =
         (semantic_inference && state.provider().is_some()) || local_audio.is_some();
@@ -2264,17 +2273,24 @@ pub async fn reason_realtime_run(
         Err(error) => return error,
     };
 
+    let generated = assembled.metadata.len();
+    let response_metadata = if include_frame_metadata {
+        assembled.metadata
+    } else {
+        Vec::new()
+    };
     ok(json!(RealtimeReasonResponse {
         request_id,
         run_id,
-        generated: assembled.metadata.len(),
+        generated,
         markers_emitted: assembled.markers.len(),
         decoded_frames: decoded.frame_signals.len(),
         sample_fps,
         lag_p95_ms: assembled.lag_p95_ms,
         lag_p99_ms: assembled.lag_p99_ms,
         tokens: assembled.tokens,
-        metadata: assembled.metadata,
+        frame_metadata_included: include_frame_metadata,
+        metadata: response_metadata,
         markers: assembled.markers,
     }))
 }

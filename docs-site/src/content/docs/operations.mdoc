@@ -52,7 +52,7 @@ conversion.
 | Media capacity | `vidarax_media_capacity_memory_*`, `vidarax_media_capacity_worker_*`, `vidarax_media_capacity_rejections_total` | Compare reserved bytes and worker threads with process limits. A rejected generation never starts. |
 | Inference admission | `vidarax_infer_admission_active`, `vidarax_infer_admission_waiting`, active token and byte reservations, deadline misses, budget rejections, and acquisitions by latency class | Find provider saturation before it turns into unbounded queueing. |
 | Frame pipeline | Decode, frame-filter, novelty, embedding, binary-store, restricted-zone, and trigger counters and latency histograms | Follow work from decoded frames through assertions and durable media references. Live and recorded paths contribute to the same decode and filter series. |
-| Audio | WAV extraction bytes and latency, analyzed duration, extraction-to-result latency, real-time factor, VAD/classifier/ASR/TTS stage latency, fixed failure reasons, sidecar active/queued/capacity gauges, spoken-feedback output, and WebRTC transport counters | Distinguish media extraction, queue pressure, individual model stages, generated audio, and live receipt. WebRTC counters describe transport only until live analysis is connected. |
+| Audio | WAV extraction bytes and latency, analyzed duration, extraction-to-result latency, real-time factor, VAD/classifier/ASR/TTS stage latency, fixed failure reasons, sidecar active/queued/capacity gauges, spoken-feedback output, and WebRTC transport and queue-drop counters | Distinguish media extraction, queue pressure, individual model stages, generated audio, live receipt, and live analysis loss. |
 | Delivery | `vidarax_sse_*` and `vidarax_webhook_*` | Observe subscribers, WAL replay, queue stalls, delivery lag, attempts, retries, successes, and dead letters. Labels never include a target URL or event kind. |
 
 The Pipeline Observability page reads those metrics without synthesizing missing
@@ -61,9 +61,9 @@ seconds or a detached worker exists. It reports `saturated` when inference is
 waiting, capacity is full, or a recent admission rejection occurred. An active
 generation with neither condition is `healthy`. No active generation is
 `idle`. The pipeline strip includes A/V extraction. The Audio card reports
-recorded analysis separately from live WebRTC receipt and shows sidecar
-pressure, fixed failure causes, per-stage latency, and real-time factor. The
-binary sidecar card combines JPEG, MP4, and WAV storage. The Delivery card
+recorded and live analysis beside WebRTC receipt and shows sidecar pressure,
+live queue drops, fixed failure causes, per-stage latency, and real-time factor.
+The binary sidecar card combines JPEG, MP4, and WAV storage. The Delivery card
 shows SSE and webhook pressure.
 
 When the UI and API use different origins, include the exact UI origin in `VIDARAX_CORS_ALLOWED_ORIGINS`.

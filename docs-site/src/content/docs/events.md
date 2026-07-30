@@ -166,6 +166,13 @@ the selected profile and speech engine, and the models that ran. Optional LFM
 spoken feedback uses a nested `feedback_audio` reference. The referenced WAV
 uses the same ownership and hash checks as retained MP4 evidence.
 
+Live WHIP audio writes the same two event kinds. Its
+`semantic_chunk_inferred` payload uses `media_mode: "live_audio"` and adds the
+session, track, RTP access-unit count, decode latency, and sidecar round-trip
+latency. Each speech or sound observation becomes a `multimodal_moment`.
+Transport-only voice activity stays out of the public timeline. Live events
+carry metadata only.
+
 ## Restricted-zone activity
 
 A live session configured with `restricted_zone` may emit `restricted_zone_activity_entered`. The deterministic assertion means that perceptual-hash motion persisted inside the configured normalized image rectangle for the policy's required number of frames. It does not identify a person, vehicle, or other subject. `assertion.subject` is `null` on this path and may only be populated by a separate structured detector or semantic confirmation.

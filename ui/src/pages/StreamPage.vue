@@ -66,6 +66,7 @@ const clipLengthSec   = ref(5)
 const intervalSec     = ref(2)
 const jsonSchema      = ref('{\n  "type": "object",\n  "properties": {\n    "description": { "type": "string" },\n    "objects": { "type": "array", "items": { "type": "string" } }\n  }\n}')
 const advancedOpen    = ref(false)
+const localAudio      = ref(false)
 const availableModels = ref<ModelInfo[]>([])
 const modelsLoading   = ref(false)
 
@@ -151,6 +152,7 @@ async function handleStart() {
   livePrompt.value = analysisPrompt.value
   await startStream(selectedSource.value, {
     prompt: analysisPrompt.value.trim() || 'Describe what is happening in this video frame.',
+    localAudio: localAudio.value,
   })
 }
 
@@ -247,7 +249,7 @@ watch(
         streamVizKfIndices.value = [...streamVizKfIndices.value, event.frame_index]
       }
 
-      if (event.event_type !== 'vlm_description') continue
+      if (event.event_type !== 'vlm_description' && event.event_type !== 'audio_observation') continue
 
       const key = eventResultKey(event)
       if (seenVlmResultEvents.has(key)) continue
@@ -517,6 +519,16 @@ function modelDisplayName(id: string): string {
                   @click="outputMode = 'json'"
                 >JSON</button>
               </div>
+            </div>
+
+            <div class="sp-advanced-row">
+              <label class="sp-advanced-label" for="adv-local-audio">Local audio</label>
+              <input
+                id="adv-local-audio"
+                v-model="localAudio"
+                type="checkbox"
+                class="h-4 w-4 accent-[#2dd4bf]"
+              />
             </div>
 
             <!-- JSON Schema editor -->

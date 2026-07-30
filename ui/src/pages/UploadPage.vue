@@ -41,12 +41,12 @@ const MEDIA_MODE_OPTIONS = [
   { value: 'video', label: 'Video' },
   { value: 'audio_video', label: 'Audio + video' },
 ] as const
-const mediaWindowMs = ref(8_000)
+const mediaWindowMs = ref(20_000)
 const mediaResolution = ref<'low' | 'medium' | 'high'>('low')
 const persistEvidence = ref(true)
 const localAudio = ref(false)
 const audioProfile = ref<'general' | 'gameplay' | 'screen_recording' | 'physical_world'>('general')
-const speechEngine = ref<'none' | 'auto' | 'sensevoice' | 'moonshine' | 'qwen3_asr' | 'lfm2_5_audio'>('auto')
+const speechEngine = ref<'none' | 'auto' | 'whisper' | 'sensevoice' | 'moonshine' | 'qwen3_asr' | 'lfm2_5_audio'>('auto')
 const voiceFeedback = ref(false)
 const availableModels = ref<ModelInfo[]>([])
 const modelsLoading = ref(false)
@@ -879,6 +879,7 @@ function formatPts(ms: number) {
                   >
                     <option value="auto">Automatic</option>
                     <option value="none">No transcription</option>
+                    <option value="whisper">Whisper large-v3-turbo</option>
                     <option value="sensevoice">SenseVoice</option>
                     <option value="moonshine">Moonshine Tiny</option>
                     <option value="qwen3_asr">Qwen3-ASR 0.6B</option>

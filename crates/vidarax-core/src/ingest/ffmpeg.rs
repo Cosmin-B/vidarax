@@ -1,5 +1,8 @@
 use std::process::Command;
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+};
 
 use crate::coordinates::FrameCoordinates;
 use crate::crop::CropRegion;
@@ -11,6 +14,22 @@ use super::InputSource;
 static FFMPEG_PATH: OnceLock<String> = OnceLock::new();
 static FFPROBE_PATH: OnceLock<String> = OnceLock::new();
 static NVIDIA_SMI_PATH: OnceLock<String> = OnceLock::new();
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn unique_ffmpeg_temp_path(kind: &str, extension: &str) -> std::path::PathBuf {
+    let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "vidarax_{kind}_{}_{}_{}.{}",
+        std::process::id(),
+        nanos,
+        sequence,
+        extension
+    ))
+}
 
 /// Configured ffmpeg binary path, cached after first call.
 pub fn ffmpeg_path() -> &'static str {
@@ -1251,14 +1270,7 @@ fn extract_audio_video_clip_inner(
     let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
     let start_str = format!("{start_s:.6}");
     let duration_str = format!("{duration_s:.6}");
-    let tmp = std::env::temp_dir().join(format!(
-        "vidarax_av_clip_{}_{}.mp4",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let tmp = unique_ffmpeg_temp_path("av_clip", "mp4");
     let tmp_str = tmp.to_string_lossy().to_string();
 
     let mut command = Command::new(ffmpeg_path());
@@ -1379,14 +1391,7 @@ fn extract_video_clip_inner(
     let (use_stream_copy, crop_vf) = clip_encode_plan(source, crop);
 
     // MP4 requires seekable output, so we write to a temp file and read back.
-    let tmp = std::env::temp_dir().join(format!(
-        "vidarax_clip_{}_{}.mp4",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let tmp = unique_ffmpeg_temp_path("clip", "mp4");
     let tmp_str = tmp.to_string_lossy().to_string();
 
     let output = if use_stream_copy {
@@ -1572,11 +1577,11 @@ mod tests {
         ahash_cell_grid, ahashes_from_gray_grid, build_decode_vf, clip_encode_plan,
         extract_audio_video_clip, ffmpeg_input_options_for_source,
         ffmpeg_protocol_whitelist_for_source, longest_edge_scale_filter, parse_ffprobe_frame_rate,
-        parse_framemd5_to_signals, parse_jpeg_stream_to_frames, probe_media_info, CropRegion,
-        Mp4DecodeConfig, Timebase, TimestampNormalizer, FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST,
-        FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST, FFMPEG_HTTPS_PROTOCOL_WHITELIST,
-        FFMPEG_HTTP_PROTOCOL_WHITELIST, FFMPEG_LOCAL_PROTOCOL_WHITELIST,
-        FFMPEG_RTSPS_PROTOCOL_WHITELIST,
+        parse_framemd5_to_signals, parse_jpeg_stream_to_frames, probe_media_info,
+        unique_ffmpeg_temp_path, CropRegion, Mp4DecodeConfig, Timebase, TimestampNormalizer,
+        FFMPEG_HLS_HTTPS_PROTOCOL_WHITELIST, FFMPEG_HLS_HTTP_PROTOCOL_WHITELIST,
+        FFMPEG_HTTPS_PROTOCOL_WHITELIST, FFMPEG_HTTP_PROTOCOL_WHITELIST,
+        FFMPEG_LOCAL_PROTOCOL_WHITELIST, FFMPEG_RTSPS_PROTOCOL_WHITELIST,
     };
     use crate::ingest::InputSource;
 
@@ -1605,6 +1610,15 @@ mod tests {
             None => std::env::remove_var(key),
         }
         test()
+    }
+
+    #[test]
+    fn concurrent_ffmpeg_temp_names_are_unique() {
+        let paths = (0..32)
+            .map(|_| std::thread::spawn(|| unique_ffmpeg_temp_path("test", "mp4")))
+            .map(|thread| thread.join().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(paths.len(), 32);
     }
 
     #[test]

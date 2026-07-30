@@ -44,9 +44,13 @@ await v.reason(run_id, {
   semantic_prompt: 'Identify speech intent, important sounds, and visible actions',
   media: {
     mode: 'audio_video',
-    window_ms: 8000,
+    window_ms: 20000,
     resolution: 'low',
     persist_evidence: true,
+  },
+  local_audio: {
+    profile: 'screen_recording',
+    speech_engine: 'whisper',
   },
 })
 
@@ -59,7 +63,8 @@ if (evidence?.media_sha256) {
 ```
 
 MP4 bytes use Gemini File API and the binary evidence route. They never travel
-inside JSON. Gemini reports timestamps at about one-second resolution.
+inside JSON. Gemini reports timestamps at about one-second resolution. Local
+speech wording comes from the selective Whisper pass.
 
 ## Constructor
 

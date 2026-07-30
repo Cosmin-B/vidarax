@@ -12,6 +12,13 @@ release yet.
 - Recorded audio-video reasoning with bounded source-time windows, deterministic
   audio-track mixing, Gemini File API uploads, timestamped `multimodal_moment`
   events, and content-addressed MP4 evidence.
+- Selective Whisper large-v3-turbo transcription behind Silero VAD, grounded
+  provider output, and boundary-safe 20-second local-audio windows.
+- Live WHIP Opus analysis through bounded queues, in-memory Ogg framing,
+  ffmpeg PCM extraction, the local binary audio sidecar, durable moments, and
+  queue-drop telemetry.
+- Native media responses can omit per-frame metadata while durable chunk and
+  moment events retain the useful results.
 - Gemini 3.5 Flash-Lite and Gemini 3.6 Flash in the model catalog, with
   request-level media resolution and cleanup of temporary Gemini File API
   uploads.

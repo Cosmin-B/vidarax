@@ -44,6 +44,8 @@ function waitForIceComplete(pc: RTCPeerConnection): Promise<string> {
 export interface WhipStartOptions {
   /** Optional analysis prompt sent with the WHIP offer attach config. */
   prompt?: string
+  /** Analyze inbound audio with the local sidecar. */
+  localAudio?: boolean
 }
 
 export function useWhip() {
@@ -101,9 +103,20 @@ export function useWhip() {
       let whipResult: { answer_sdp: string; session_id: string; location: string; run_id?: string }
       try {
         const prompt = options.prompt?.trim()
+        const attachConfig = {
+          ...(prompt ? { prompt } : {}),
+          ...(options.localAudio ? {
+            local_audio: {
+              profile: sourceType === 'screen' ? 'screen_recording' as const : 'physical_world' as const,
+              speech_engine: 'whisper' as const,
+              min_confidence: 0.35,
+              max_events: 32,
+            },
+          } : {}),
+        }
         whipResult = await api.stream.whipOffer(
           offerSdp,
-          prompt ? { prompt } : undefined,
+          Object.keys(attachConfig).length > 0 ? attachConfig : undefined,
         )
       } catch (whipErr) {
         const msg = whipErr instanceof Error ? whipErr.message : 'WHIP negotiation failed'

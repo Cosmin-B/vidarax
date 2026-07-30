@@ -512,8 +512,13 @@ function fmtPct(p: HistogramPercentiles | undefined, key: 'p50' | 'p95' | 'p99')
           <span class="mono text-[#38bdf8] text-xs">{{ formatBytes(metrics.webRtcAudioBytesTotal) }} / {{ formatDuration(metrics.webRtcAudioDurationMsTotal) }}</span>
         </div>
         <div class="flex items-center justify-between">
-          <span class="text-[#475569] text-xs">Live receive errors</span>
-          <span class="mono text-xs" :class="metrics.webRtcAudioReceiveErrorsTotal ? 'text-[#ef4444]' : 'text-[#22c55e]'">{{ fmtInt(metrics.webRtcAudioReceiveErrorsTotal) }}</span>
+          <span class="text-[#475569] text-xs">Live errors / queue drops</span>
+          <span
+            class="mono text-xs"
+            :class="metrics.webRtcAudioReceiveErrorsTotal + metrics.webRtcAudioQueueDroppedTotal ? 'text-[#ef4444]' : 'text-[#22c55e]'"
+          >
+            {{ fmtInt(metrics.webRtcAudioReceiveErrorsTotal) }} / {{ fmtInt(metrics.webRtcAudioQueueDroppedTotal) }}
+          </span>
         </div>
       </div>
     </div>
