@@ -93,6 +93,7 @@ export interface MetricsData {
   webRtcAudioBytesTotal: number
   webRtcAudioDurationMsTotal: number
   webRtcAudioReceiveErrorsTotal: number
+  webRtcAudioQueueDroppedTotal: number
   restrictedZoneAssertionsTotal: number
   restrictedZoneEvidenceFailuresTotal: number
   restrictedZoneQueueDroppedTotal: number
@@ -633,6 +634,7 @@ function buildMetrics(
     webRtcAudioBytesTotal: get('vidarax_pipeline_webrtc_audio_bytes_total'),
     webRtcAudioDurationMsTotal: get('vidarax_pipeline_webrtc_audio_duration_ms_total'),
     webRtcAudioReceiveErrorsTotal: get('vidarax_pipeline_webrtc_audio_receive_errors_total'),
+    webRtcAudioQueueDroppedTotal: get('vidarax_pipeline_webrtc_audio_queue_dropped_total'),
     restrictedZoneAssertionsTotal: get('vidarax_pipeline_restricted_zone_assertions_total'),
     restrictedZoneEvidenceFailuresTotal: get('vidarax_pipeline_restricted_zone_evidence_failures_total'),
     restrictedZoneQueueDroppedTotal: get('vidarax_pipeline_restricted_zone_queue_dropped_total'),

@@ -1,42 +1,49 @@
 ---
 title: Local audio perception
-description: Event tagging, selective speech recognition, and spoken feedback for recorded audio-video windows.
+description: Event tagging, selective speech recognition, and spoken feedback for recorded files and live WebRTC audio.
 ---
 
-Recorded audio-video analysis can run a local audio pass before the VLM. Each
-source window becomes a mono 16 kHz PCM WAV. The API sends those bytes to a
-bounded TCP sidecar and receives MessagePack metadata. WAV bytes never enter
-JSON or base64.
+Recorded files and live WebRTC sessions can run local audio analysis. Recorded
+MP4 windows and live Opus windows both become mono 16 kHz PCM WAV. The API sends
+the WAV bytes to a bounded TCP sidecar and receives MessagePack metadata. WAV
+bytes never enter JSON or base64.
 
 ```
-MP4 window
-    |
-    +--> raw MP4 ------------------------------> VLM
-    |
-    +--> mono PCM WAV --> Silero VAD
-                           |
-                           +--> EfficientAT sound events
-                           |
-                           +--> speech present? --> one ASR engine
-                                                    |
-sound events + transcript hypotheses ---------------+--> timeline moments
+Recorded MP4 window                 Live WebRTC Opus window
+         |                                      |
+         +----------> mono PCM WAV <------------+
+                              |
+                    +---------+----------+
+                    |                    |
+                 Silero VAD          EfficientAT
+                    |                sound labels
+          speech intervals               |
+                    |                    |
+                 Whisper                 |
+                    +---------+----------+
+                              |
+                 timestamped WAL moments
 ```
 
 Silero VAD decides whether speech work is needed. EfficientAT labels non-speech
 sounds on every window. The selected ASR model runs only when Silero finds a
-speech interval.
+speech interval. A provider such as Gemini may inspect the synchronized MP4,
+but local transcripts remain the source of speech wording. Provider-only audio
+claims are discarded when the local pass has no matching observation.
 
 ## Model roles
 
 The default local stack uses
 [Silero VAD v6](https://github.com/snakers4/silero-vad),
 [EfficientAT](https://github.com/fschmid56/EfficientAT) `mn10_as`, and
-[SenseVoice](https://github.com/QwenAudio/SenseVoice) for selective
-transcription. The other speech models are explicit deployment choices:
+[Whisper large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo)
+for selective transcription. The other speech models are explicit deployment
+choices:
 
 | Engine | Use it for | Cost and scope |
 |---|---|---|
-| [SenseVoice](https://github.com/QwenAudio/SenseVoice) | Multilingual speech, language ID, and vocal emotion | Default selective ASR |
+| [Whisper large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo) | English speech where wording matters | Default selective ASR |
+| [SenseVoice](https://github.com/QwenAudio/SenseVoice) | Multilingual speech, language ID, and vocal emotion | Optional compact speech model |
 | [Moonshine Streaming Tiny](https://huggingface.co/UsefulSensors/moonshine-streaming-tiny) | English screen recordings on small edge hardware | 34M parameters and English only |
 | [Qwen3-ASR 0.6B](https://huggingface.co/Qwen/Qwen3-ASR-0.6B-hf) | Multilingual speech, accents, singing, and noisy audio | Larger runtime with Transformers 5.13 or newer |
 | [LFM2.5-Audio 1.5B](https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B) | English speech input and optional spoken feedback | Optional because it is much larger than the event front end |
@@ -51,7 +58,7 @@ The setup script places Python packages and model source outside the tracked
 tree:
 
 ```bash
-scripts/setup_audio_models.sh sensevoice
+scripts/setup_audio_models.sh whisper
 
 VIDARAX_EFFICIENTAT_REPO=.vidarax-models/source/EfficientAT \
   .venv-audio/bin/python scripts/audio_perception_server.py
@@ -63,8 +70,9 @@ Point the API at the sidecar:
 export VIDARAX_AUDIO_SIDECAR_ADDR=127.0.0.1:7790
 ```
 
-`core`, `moonshine`, `qwen`, `lfm`, and `all` are also valid setup profiles.
-Moonshine, Qwen, and LFM profiles require Python 3.10 or newer. Set
+`core`, `sensevoice`, `moonshine`, `qwen`, `lfm`, and `all` are also valid
+setup profiles. Whisper, Moonshine, Qwen, and LFM profiles require Python 3.10
+or newer. Set
 `VIDARAX_AUDIO_PYTHON=python3.12` when the system `python3` is older.
 The server defaults to one active inference request and eight queued requests.
 Use `--max-in-flight` and `--max-queued` to set both bounds after measuring
@@ -83,12 +91,12 @@ Local audio requires `media.mode: "audio_video"`.
   "semantic_inference": true,
   "media": {
     "mode": "audio_video",
-    "window_ms": 8000,
+    "window_ms": 20000,
     "persist_evidence": true
   },
   "local_audio": {
     "profile": "gameplay",
-    "speech_engine": "auto",
+    "speech_engine": "whisper",
     "min_confidence": 0.35,
     "max_events": 32,
     "voice_feedback": false
@@ -129,9 +137,36 @@ end
 `cognition_gate_score` are observation signals. Missing observations fail
 closed.
 
+## Live WebRTC audio
+
+Add `local_audio` to the base64url-encoded `x-attach-config` sent with the WHIP
+offer:
+
+```json
+{
+  "local_audio": {
+    "profile": "physical_world",
+    "speech_engine": "whisper",
+    "min_confidence": 0.35,
+    "max_events": 32
+  }
+}
+```
+
+The offer returns 503 when local audio is requested without
+`VIDARAX_AUDIO_SIDECAR_ADDR`. Inbound Opus access units enter a bounded queue.
+Four-second windows are Ogg-framed in memory, decoded by ffmpeg, and sent to the
+same sidecar used for recorded files. A slow sidecar can drop whole analysis
+windows. It cannot block RTP video ingest.
+
+Live timestamps are relative to each audio track's RTP clock. They are not
+cross-track RTCP wall-clock synchronization. Events carry `session_id`,
+`track_id`, and source-relative millisecond offsets so consumers can keep
+multiple audio tracks distinct.
+
 ## Telemetry
 
-`GET /v1/metrics` separates each part of the recorded-audio path:
+`GET /v1/metrics` separates each part of the audio path:
 
 - WAV extraction latency, encoded bytes, and source duration
 - extraction-to-result latency and real-time factor
@@ -140,11 +175,8 @@ closed.
 - TTS attempts, successes, failures, output bytes, and latency
 - fixed `decode`, `timeout`, `overloaded`, `model_load`,
   `malformed_response`, `reconnect`, and `inference` failure reasons
+- live WebRTC track count, Opus access units, encoded bytes, RTP duration,
+  receive failures, and bounded-queue drops
 
 Audio tracing links work to run, request, stream, and chunk IDs. Media stays
 outside span attributes.
-
-Live WHIP audio is drained and measured at the peer boundary. Track count,
-access units, bytes, RTP-derived duration, and receive errors prove that audio
-is arriving. Live audio is not sent to the analysis sidecar yet, so the
-dashboard labels these counters as transport telemetry.

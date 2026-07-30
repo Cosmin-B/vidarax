@@ -8,6 +8,7 @@ mod delivery;
 mod handlers;
 mod ids;
 mod inference_metrics;
+mod live_audio;
 mod models;
 mod policies;
 mod response;

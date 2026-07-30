@@ -10,14 +10,14 @@ EFFICIENTAT_COMMIT="${VIDARAX_EFFICIENTAT_COMMIT:-a425fdce92572e602a1d5634799bd9
 EFFICIENTAT_DIR="$MODEL_CACHE_DIR/source/EfficientAT"
 
 case "$PROFILE" in
-  core|sensevoice|moonshine|qwen|lfm|all) ;;
+  core|sensevoice|moonshine|qwen|whisper|lfm|all) ;;
   *)
-    echo "usage: $0 [core|sensevoice|moonshine|qwen|lfm|all]" >&2
+    echo "usage: $0 [core|sensevoice|moonshine|qwen|whisper|lfm|all]" >&2
     exit 2
     ;;
 esac
 
-if [[ "$PROFILE" == "moonshine" || "$PROFILE" == "qwen" || "$PROFILE" == "lfm" || "$PROFILE" == "all" ]]; then
+if [[ "$PROFILE" == "moonshine" || "$PROFILE" == "qwen" || "$PROFILE" == "whisper" || "$PROFILE" == "lfm" || "$PROFILE" == "all" ]]; then
   if ! "$PYTHON_BIN" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
     echo "$PROFILE requires Python 3.10 or newer; set VIDARAX_AUDIO_PYTHON" >&2
     exit 2
@@ -47,12 +47,12 @@ if [[ "$PROFILE" == "sensevoice" || "$PROFILE" == "all" ]]; then
   "$VENV_DIR/bin/python" -m pip install "funasr>=1.2,<2" "modelscope>=1.27,<2"
 fi
 
-if [[ "$PROFILE" == "moonshine" || "$PROFILE" == "all" ]]; then
-  "$VENV_DIR/bin/python" -m pip install "transformers>=5.7" "accelerate>=1.10"
+if [[ "$PROFILE" == "moonshine" || "$PROFILE" == "whisper" || "$PROFILE" == "all" ]]; then
+  "$VENV_DIR/bin/python" -m pip install "transformers>=5.7,<6" "accelerate>=1.10"
 fi
 
 if [[ "$PROFILE" == "qwen" || "$PROFILE" == "all" ]]; then
-  "$VENV_DIR/bin/python" -m pip install "transformers>=5.13" "accelerate>=1.10"
+  "$VENV_DIR/bin/python" -m pip install "transformers>=5.13,<6" "accelerate>=1.10"
 fi
 
 if [[ "$PROFILE" == "lfm" || "$PROFILE" == "all" ]]; then

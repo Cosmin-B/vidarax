@@ -72,7 +72,14 @@ ENGINE_NAMES = {
     3: "moonshine",
     4: "qwen3_asr",
     5: "lfm2_5_audio",
+    6: "whisper",
 }
+
+ASR_MAX_GROUP_MS = 20_000
+ASR_GROUP_GAP_MS = 1_000
+ASR_CONTEXT_MS = 300
+ASR_MIN_SEGMENT_MS = 250
+ASR_BOUNDARY_GUARD_MS = 100
 
 GAMEPLAY_LABELS = {
     "Explosion": "explosion",
@@ -93,16 +100,12 @@ GAMEPLAY_LABELS = {
     "Aircraft": "aircraft",
     "Helicopter": "aircraft",
     "Music": "music",
-    "Speech": "speech",
     "Shout": "shout",
     "Screaming": "shout",
     "Clicking": "click",
     "Computer keyboard": "typing",
 }
 SCREEN_LABELS = {
-    "Speech": "speech",
-    "Conversation": "speech",
-    "Narration, monologue": "speech",
     "Computer keyboard": "typing",
     "Typing": "typing",
     "Clicking": "click",
@@ -111,6 +114,14 @@ SCREEN_LABELS = {
     "Ding": "notification",
     "Alarm": "alarm",
     "Music": "music",
+}
+SPEECH_TAG_LABELS = {
+    "Speech",
+    "Conversation",
+    "Narration, monologue",
+    "Male speech, man speaking",
+    "Female speech, woman speaking",
+    "Child speech, kid speaking",
 }
 
 
@@ -233,7 +244,12 @@ class SileroBackend:
 
         self.model = load_silero_vad(onnx=True)
 
-    def speech_ranges(self, samples: np.ndarray, sample_rate: int) -> list[tuple[int, int, float]]:
+    def speech_ranges(
+        self,
+        samples: np.ndarray,
+        sample_rate: int,
+        threshold: float,
+    ) -> list[tuple[int, int, float]]:
         from silero_vad import get_speech_timestamps
 
         import torch
@@ -244,6 +260,7 @@ class SileroBackend:
             self.model,
             sampling_rate=16_000,
             return_seconds=True,
+            threshold=min(0.75, max(0.25, threshold)),
         )
         return [
             (
@@ -365,6 +382,8 @@ class EfficientAtBackend:
 
 
 def _profile_label(profile: str, raw_label: str) -> str | None:
+    if raw_label in SPEECH_TAG_LABELS:
+        return None
     if profile == "gameplay":
         return GAMEPLAY_LABELS.get(raw_label)
     if profile == "screen_recording":
@@ -379,6 +398,10 @@ class SpeechBackend:
         self, samples: np.ndarray, sample_rate: int
     ) -> tuple[str, str | None, str | None]:
         raise NotImplementedError
+
+
+def _speech_model_name(backend: SpeechBackend) -> str:
+    return str(getattr(backend, "model_id", backend.name))
 
 
 class SenseVoiceBackend(SpeechBackend):
@@ -441,7 +464,54 @@ class TransformersAsrBackend(SpeechBackend):
     def transcribe(
         self, samples: np.ndarray, sample_rate: int
     ) -> tuple[str, str | None, str | None]:
-        result = self.pipeline({"array": samples, "sampling_rate": sample_rate})
+        duration_seconds = samples.size / max(1, sample_rate)
+        result = self.pipeline(
+            {"array": samples, "sampling_rate": sample_rate},
+            max_new_tokens=max(16, min(256, round(duration_seconds * 6.5))),
+        )
+        return str(result["text"]).strip(), None, None
+
+
+class WhisperBackend(SpeechBackend):
+    name = "whisper"
+
+    def __init__(self) -> None:
+        import torch
+        from transformers import pipeline
+
+        self.model_id = os.environ.get(
+            "VIDARAX_WHISPER_MODEL",
+            "openai/whisper-large-v3-turbo",
+        )
+        if torch.cuda.is_available():
+            device = "cuda"
+            dtype = torch.float16
+        elif torch.backends.mps.is_available():
+            device = "mps"
+            dtype = torch.float16
+        else:
+            device = "cpu"
+            dtype = torch.float32
+        self.pipeline = pipeline(
+            "automatic-speech-recognition",
+            model=self.model_id,
+            device=device,
+            dtype=dtype,
+        )
+
+    def transcribe(
+        self, samples: np.ndarray, sample_rate: int
+    ) -> tuple[str, str | None, str | None]:
+        result = self.pipeline(
+            {"array": samples, "sampling_rate": sample_rate},
+            return_timestamps=False,
+            generate_kwargs={
+                "language": os.environ.get("VIDARAX_WHISPER_LANGUAGE", "en"),
+                "task": "transcribe",
+                "condition_on_prev_tokens": False,
+                "temperature": 0.0,
+            },
+        )
         return str(result["text"]).strip(), None, None
 
 
@@ -569,6 +639,8 @@ class PerceptionEngine:
                         backend = Qwen3AsrBackend()
                     elif name == "lfm2_5_audio":
                         backend = LfmAudioBackend()
+                    elif name == "whisper":
+                        backend = WhisperBackend()
                     else:
                         raise ValueError(f"unsupported speech engine {name}")
                 except Exception as error:
@@ -585,6 +657,7 @@ class PerceptionEngine:
         requested_engine: str,
         threshold: float,
         max_events: int,
+        source_start_ms: int = 0,
     ) -> dict[str, Any]:
         started = time.perf_counter()
         decode_started = time.perf_counter()
@@ -598,7 +671,11 @@ class PerceptionEngine:
         vad_ms = 0
         if self.vad is not None:
             vad_started = time.perf_counter()
-            speech_ranges = self.vad.speech_ranges(samples, sample_rate)
+            speech_ranges = self.vad.speech_ranges(
+                samples,
+                sample_rate,
+                threshold,
+            )
             vad_ms = _elapsed_ms(vad_started)
             models.append(self.vad.model_name)
             observations.extend(
@@ -634,29 +711,55 @@ class PerceptionEngine:
         backend = self._speech_backend(requested_engine) if speech_ranges else None
         actual_engine = backend.name if backend is not None else "none"
         if backend is not None:
-            models.append(backend.name)
-            speech_start = min(item[0] for item in speech_ranges)
-            speech_end = max(item[1] for item in speech_ranges)
-            start_sample = round(speech_start * sample_rate / 1000)
-            end_sample = round(speech_end * sample_rate / 1000)
-            transcript, language, emotion = backend.transcribe(
-                samples[start_sample:end_sample],
-                sample_rate,
+            backend_model = _speech_model_name(backend)
+            models.append(backend_model)
+            leading_speech_is_cut = (
+                source_start_ms > 0
+                and bool(speech_ranges)
+                and min(item[0] for item in speech_ranges) <= ASR_BOUNDARY_GUARD_MS
             )
-            if transcript:
-                observations.append(
-                    Observation(
-                        start_offset_ms=speech_start,
-                        end_offset_ms=speech_end,
-                        kind="speech",
-                        label="transcript",
-                        confidence=1.0,
-                        model=backend.name,
-                        transcript=transcript[:16_384],
-                        language=language,
-                        emotion=emotion,
+            for group_index, (
+                speech_start,
+                speech_end,
+                speech_confidence,
+            ) in enumerate(_group_speech_ranges(speech_ranges, duration_ms)):
+                if group_index == 0 and leading_speech_is_cut:
+                    logger.info(
+                        "deferring speech cut by a window boundary source_start_ms=%d",
+                        source_start_ms,
                     )
+                    continue
+                start_sample = round(speech_start * sample_rate / 1000)
+                end_sample = round(speech_end * sample_rate / 1000)
+                transcript, language, emotion = backend.transcribe(
+                    samples[start_sample:end_sample],
+                    sample_rate,
                 )
+                transcript = _trim_incomplete_transcript(
+                    " ".join(transcript.split())
+                )
+                segment_seconds = max(0.25, (speech_end - speech_start) / 1000)
+                if _transcript_is_unreliable(transcript, segment_seconds):
+                    logger.warning(
+                        "discarding unreliable ASR output engine=%s duration_ms=%d",
+                        backend.name,
+                        speech_end - speech_start,
+                    )
+                    continue
+                if transcript:
+                    observations.append(
+                        Observation(
+                            start_offset_ms=speech_start,
+                            end_offset_ms=speech_end,
+                            kind="speech",
+                            label="transcript",
+                            confidence=min(0.95, max(0.5, speech_confidence)),
+                            model=backend_model,
+                            transcript=transcript[:16_384],
+                            language=language,
+                            emotion=emotion,
+                        )
+                    )
         if backend is not None:
             asr_ms = _elapsed_ms(asr_started)
 
@@ -701,6 +804,31 @@ class PerceptionEngine:
         )
 
 
+def _transcript_is_unreliable(text: str, duration_seconds: float) -> bool:
+    tokens = [token.casefold() for token in text.split() if token.strip()]
+    if not tokens:
+        return False
+    if len(tokens) > max(16, round(duration_seconds * 8)):
+        return True
+    if len(tokens) < 9:
+        return False
+    trigrams = [tuple(tokens[index : index + 3]) for index in range(len(tokens) - 2)]
+    return len(set(trigrams)) / len(trigrams) < 0.45
+
+
+def _trim_incomplete_transcript(text: str) -> str:
+    if not (text.endswith("...") or text.endswith("…")):
+        return text
+    complete_end = max(
+        text.rfind(". ", 0, -3),
+        text.rfind("? ", 0, -3),
+        text.rfind("! ", 0, -3),
+    )
+    if complete_end < 0:
+        return ""
+    return text[: complete_end + 1].strip()
+
+
 def _deduplicate_observations(items: list[Observation]) -> list[Observation]:
     best: dict[tuple[int, int, str, str], Observation] = {}
     for item in items:
@@ -709,6 +837,39 @@ def _deduplicate_observations(items: list[Observation]) -> list[Observation]:
         if previous is None or item.confidence > previous.confidence:
             best[key] = item
     return list(best.values())
+
+
+def _group_speech_ranges(
+    ranges: list[tuple[int, int, float]],
+    duration_ms: int,
+) -> list[tuple[int, int, float]]:
+    grouped: list[tuple[int, int, float]] = []
+    for start, end, confidence in sorted(ranges):
+        start = max(0, min(start, duration_ms))
+        end = max(start, min(end, duration_ms))
+        if end - start < ASR_MIN_SEGMENT_MS:
+            continue
+        if (
+            grouped
+            and start - grouped[-1][1] <= ASR_GROUP_GAP_MS
+            and end - grouped[-1][0] <= ASR_MAX_GROUP_MS
+        ):
+            previous_start, _previous_end, previous_confidence = grouped[-1]
+            grouped[-1] = (
+                previous_start,
+                end,
+                max(previous_confidence, confidence),
+            )
+        else:
+            grouped.append((start, end, confidence))
+    return [
+        (
+            max(0, start - ASR_CONTEXT_MS),
+            min(duration_ms, end + ASR_CONTEXT_MS),
+            confidence,
+        )
+        for start, end, confidence in grouped
+    ]
 
 
 class Admission:
@@ -775,7 +936,7 @@ class AudioRequestHandler(socketserver.BaseRequestHandler):
                 engine_id,
                 flags,
                 reserved,
-                _source_start_ms,
+                source_start_ms,
                 audio_len,
                 text_len,
                 max_events,
@@ -843,6 +1004,7 @@ class AudioRequestHandler(socketserver.BaseRequestHandler):
                         ENGINE_NAMES[engine_id],
                         threshold / 10_000.0,
                         max_events,
+                        source_start_ms,
                     )
                     metadata["queue_wait_ms"] = queue_wait_ms
                     metadata["capacity"] = self.server.admission.snapshot()
@@ -942,8 +1104,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--efficientat-model", default="mn10_as")
     parser.add_argument(
         "--auto-asr",
-        choices=("none", "sensevoice", "moonshine", "qwen3_asr", "lfm2_5_audio"),
-        default=os.environ.get("VIDARAX_AUDIO_AUTO_ASR", "sensevoice"),
+        choices=(
+            "none",
+            "sensevoice",
+            "moonshine",
+            "qwen3_asr",
+            "lfm2_5_audio",
+            "whisper",
+        ),
+        default=os.environ.get("VIDARAX_AUDIO_AUTO_ASR", "whisper"),
     )
     parser.add_argument("--disable-vad", action="store_true")
     parser.add_argument("--disable-efficientat", action="store_true")

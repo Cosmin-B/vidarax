@@ -55,6 +55,7 @@ pub enum SpeechEngine {
     Moonshine = 3,
     Qwen3Asr = 4,
     Lfm25Audio = 5,
+    Whisper = 6,
 }
 
 impl SpeechEngine {
@@ -66,6 +67,7 @@ impl SpeechEngine {
             Self::Moonshine => "moonshine",
             Self::Qwen3Asr => "qwen3_asr",
             Self::Lfm25Audio => "lfm2_5_audio",
+            Self::Whisper => "whisper",
         }
     }
 }
@@ -575,7 +577,7 @@ fn validate_analysis(analysis: &AudioAnalysis) -> Result<(), AudioSidecarError> 
         validate_metadata_text(model, 256, "model")?;
     }
     for observation in &analysis.observations {
-        if observation.end_offset_ms < observation.start_offset_ms
+        if observation.end_offset_ms <= observation.start_offset_ms
             || observation.end_offset_ms > 60_000
             || !observation.confidence.is_finite()
             || !(0.0..=1.0).contains(&observation.confidence)
@@ -626,6 +628,7 @@ mod tests {
         assert_eq!(AudioProfile::ScreenRecording.as_str(), "screen_recording");
         assert_eq!(SpeechEngine::SenseVoice as u8, 2);
         assert_eq!(SpeechEngine::Lfm25Audio.as_str(), "lfm2_5_audio");
+        assert_eq!(SpeechEngine::Whisper as u8, 6);
     }
 
     #[test]

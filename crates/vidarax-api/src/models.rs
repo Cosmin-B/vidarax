@@ -174,6 +174,10 @@ pub struct RealtimeReasonRequest {
     /// configured sidecar before VLM inference and adds its timestamped
     /// observations to the model context and durable event stream.
     pub local_audio: Option<LocalAudioAnalysisOptions>,
+    /// Include per-frame analysis rows in the synchronous response. Native
+    /// media defaults to false because the durable event stream already carries
+    /// chunk and moment results.
+    pub include_frame_metadata: Option<bool>,
     /// Maximum number of concurrent VLM inference requests in parallel mode.
     /// Higher values increase throughput but may cause queueing on the GPU.
     /// Default: 4.
@@ -434,6 +438,7 @@ pub struct RealtimeReasonResponse {
     pub lag_p95_ms: u64,
     pub lag_p99_ms: u64,
     pub tokens: TokenMetrics,
+    pub frame_metadata_included: bool,
     pub metadata: Vec<AnalyzeFrameMetadata>,
     pub markers: Vec<AnalyzeMarker>,
 }
@@ -585,6 +590,9 @@ pub struct AttachStreamRequest {
     /// Generation-static deterministic trigger bytecode. Compile human source
     /// through `/v1/triggers/compile` before attaching it.
     pub trigger_program: Option<TriggerProgram>,
+    /// Analyze inbound Opus audio in bounded local windows. The sidecar must
+    /// be configured through `VIDARAX_AUDIO_SIDECAR_ADDR`.
+    pub local_audio: Option<LocalAudioAnalysisOptions>,
 }
 
 #[cfg(test)]
@@ -622,6 +630,24 @@ mod tests {
         let raw = r#"{}"#;
         let parsed: AttachStreamRequest = serde_json::from_str(raw).unwrap();
         assert!(parsed.prompt.is_none(), "absent 'prompt' should be None");
+    }
+
+    #[test]
+    fn attach_stream_request_parses_local_audio() {
+        let raw = r#"{
+            "local_audio": {
+                "profile": "physical_world",
+                "speech_engine": "whisper",
+                "min_confidence": 0.42,
+                "max_events": 12
+            }
+        }"#;
+        let parsed: AttachStreamRequest = serde_json::from_str(raw).unwrap();
+        let audio = parsed.local_audio.expect("local audio parsed");
+        assert_eq!(audio.profile, AudioProfile::PhysicalWorld);
+        assert_eq!(audio.speech_engine, SpeechEngine::Whisper);
+        assert!((audio.min_confidence - 0.42).abs() < f32::EPSILON);
+        assert_eq!(audio.max_events, 12);
     }
 
     #[test]

@@ -409,6 +409,14 @@ pub async fn prepare_realtime_chunks(
 ) -> Vec<ChunkPrep> {
     let mut chunk_preps: Vec<ChunkPrep> = Vec::new();
     let mut ranges = Vec::new();
+    let source_duration_ms = (media.mode != SemanticMediaMode::Frames)
+        .then(|| {
+            prepared_source
+                .media_info()
+                .ok()
+                .and_then(|info| info.duration_ms)
+        })
+        .flatten();
     if media.timestamp_windows && media.mode != SemanticMediaMode::Frames {
         let mut start = 0usize;
         while start < signals.len() {
@@ -430,6 +438,10 @@ pub async fn prepare_realtime_chunks(
 
     for (chunk_index, range) in ranges.into_iter().enumerate() {
         let chunk = &signals[range.clone()];
+        let pts_start_ms = chunk.first().map(|frame| frame.pts_ms).unwrap_or(0);
+        if source_duration_ms.is_some_and(|duration| pts_start_ms >= duration) {
+            continue;
+        }
         let started = Instant::now();
         let analyzed = pipeline.analyze_batch(chunk).to_vec();
         let frame_offset = range.start;
@@ -443,11 +455,7 @@ pub async fn prepare_realtime_chunks(
             })
             .unwrap_or_else(|| Arc::from([]));
 
-        let pts_start_ms = chunk.first().map(|frame| frame.pts_ms).unwrap_or(0);
-        let duration_ms = prepared_source
-            .media_info()
-            .ok()
-            .and_then(|info| info.duration_ms)
+        let duration_ms = source_duration_ms
             .map(|source_duration| {
                 media
                     .window_ms
@@ -940,7 +948,7 @@ pub async fn infer_chunk_semantics(
     }
 
     let multimodal_instruction = if requested_media_mode == Some(SemanticMediaMode::AudioVideo) {
-        "\nTreat sound as evidence, not as a transcript request. Analyze speech intent and vocal affect only when supported by the clip. Also analyze non-speech sounds, sound effects, music, ambient or mechanical noise, and how sound relates to visible actions. Return at most 32 moments. Moment offsets are milliseconds from the beginning of this clip. Each modalities array may contain only audio and video. Each kind must be exactly speech, sound_effect, music, ambient, interaction, mechanical, or other. Confidence must be between 0 and 1. Do not attribute a moment to an original audio track because input tracks may have been mixed."
+        "\nTreat sound as evidence, not as a transcript request. When local transcript evidence is present, it is the only allowed source for spoken words. Never invent, extend, or paraphrase speech beyond that evidence. Call the source \"the speaker\" unless identity is directly visible and stated. Do not classify speech as character dialogue, commentary, narration, or UI audio without direct evidence. An audio-only claim must overlap a matching local audio observation. If no local observation supports it, omit it. Analyze non-speech sounds and their relationship to visible actions only when the evidence overlaps in time. Return at most 32 moments. Moment offsets are milliseconds from the beginning of this clip. Each modalities array may contain only audio and video. Each kind must be exactly speech, sound_effect, music, ambient, interaction, mechanical, or other. Confidence must be between 0 and 1. Use positive-duration intervals inside the clip. Do not attribute a moment to an original audio track because input tracks may have been mixed."
     } else {
         ""
     };
@@ -1134,8 +1142,14 @@ pub async fn infer_chunk_semantics(
                 .flatten(),
         ) {
             Ok((overlay, moments)) => {
-                result.overlay = Some(overlay);
+                let moments = ground_provider_moments(moments, result.local_audio.as_ref());
                 result.moments.extend(moments);
+                deduplicate_moments(&mut result.moments);
+                result.overlay = if result.local_audio.is_some() {
+                    overlay_from_moments(&result.moments)
+                } else {
+                    Some(overlay)
+                };
                 result.used_fallback = provider_result.fallback_used;
                 maybe_generate_feedback(
                     &mut result,
@@ -1170,34 +1184,190 @@ fn audio_moments(
     analysis
         .observations
         .iter()
-        .map(|observation| {
+        .filter(|observation| observation.kind != "voice_activity")
+        .filter_map(|observation| {
             let start_offset_ms = observation.start_offset_ms.min(duration_ms);
             let end_offset_ms = observation
                 .end_offset_ms
                 .max(start_offset_ms)
                 .min(duration_ms);
+            if end_offset_ms <= start_offset_ms {
+                return None;
+            }
             let description = observation
                 .transcript
                 .as_deref()
                 .filter(|text| !text.trim().is_empty())
                 .map_or_else(
                     || observation.label.clone(),
-                    |transcript| format!("{}: {transcript}", observation.label),
+                    |transcript| format!("Speaker: {transcript}"),
                 );
-            SemanticMoment {
+            let kind = audio_moment_kind(observation);
+            Some(SemanticMoment {
                 start_offset_ms,
                 end_offset_ms,
                 start_pts_ms: source_start_ms.saturating_add(start_offset_ms),
                 end_pts_ms: source_start_ms.saturating_add(end_offset_ms),
                 modalities: vec!["audio".to_string()],
-                kind: observation.kind.clone(),
+                kind: kind.to_string(),
                 description,
                 intent: observation.transcript.clone(),
                 audio_visual_relation: None,
                 confidence: observation.confidence.clamp(0.0, 1.0),
-            }
+            })
         })
         .collect()
+}
+
+fn audio_moment_kind(observation: &vidarax_core::audio_sidecar::AudioObservation) -> &'static str {
+    if observation.kind == "speech" {
+        return "speech";
+    }
+    match observation.label.as_str() {
+        "music" => "music",
+        "silence"
+        | "inside_small_room"
+        | "outside_urban_or_manmade"
+        | "outside_rural_or_natural" => "ambient",
+        "engine" | "engine_starting" | "idling" | "mechanisms" | "tools" | "vehicle" => {
+            "mechanical"
+        }
+        _ => "sound_effect",
+    }
+}
+
+fn ground_provider_moments(
+    moments: Vec<SemanticMoment>,
+    analysis: Option<&AudioAnalysis>,
+) -> Vec<SemanticMoment> {
+    let Some(analysis) = analysis else {
+        return moments;
+    };
+    moments
+        .into_iter()
+        .filter_map(|mut moment| {
+            if !moment.modalities.iter().any(|modality| modality == "audio") {
+                return Some(moment);
+            }
+            let matching: Vec<_> = analysis
+                .observations
+                .iter()
+                .filter(|observation| {
+                    observation.kind != "voice_activity"
+                        && intervals_overlap(
+                            moment.start_offset_ms,
+                            moment.end_offset_ms,
+                            observation.start_offset_ms,
+                            observation.end_offset_ms,
+                            500,
+                        )
+                })
+                .collect();
+            let is_speech = moment.kind == "speech";
+            let supported: Vec<_> = matching
+                .into_iter()
+                .filter(|observation| {
+                    if is_speech {
+                        observation.kind == "speech"
+                            && observation
+                                .transcript
+                                .as_deref()
+                                .is_some_and(|text| !text.trim().is_empty())
+                    } else {
+                        observation.kind == "audio_event"
+                    }
+                })
+                .collect();
+            if supported.is_empty() {
+                if moment.modalities.len() == 1 {
+                    return None;
+                }
+                moment.modalities.retain(|modality| modality != "audio");
+                moment.audio_visual_relation = None;
+                return Some(moment);
+            }
+            if is_speech {
+                let transcript = supported
+                    .iter()
+                    .filter_map(|observation| observation.transcript.as_deref())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                moment.description = format!("Speaker: {}", truncate_context(&transcript, 1_000));
+                moment.intent = Some(truncate_context(&transcript, 1_000).to_string());
+                if moment.modalities.len() == 1 {
+                    moment.audio_visual_relation = None;
+                }
+            } else if moment.modalities.len() == 1 {
+                let labels = supported
+                    .iter()
+                    .map(|observation| observation.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                moment.description = format!("Local audio event: {labels}");
+                moment.intent = None;
+                moment.audio_visual_relation = None;
+            }
+            Some(moment)
+        })
+        .collect()
+}
+
+fn intervals_overlap(
+    left_start: u64,
+    left_end: u64,
+    right_start: u64,
+    right_end: u64,
+    tolerance_ms: u64,
+) -> bool {
+    left_start <= right_end.saturating_add(tolerance_ms)
+        && right_start <= left_end.saturating_add(tolerance_ms)
+}
+
+fn deduplicate_moments(moments: &mut Vec<SemanticMoment>) {
+    moments.sort_by_key(|moment| {
+        (
+            moment.start_offset_ms,
+            moment.end_offset_ms,
+            moment.kind.clone(),
+        )
+    });
+    let mut deduplicated = Vec::with_capacity(moments.len());
+    for moment in moments.drain(..) {
+        let duplicate = deduplicated.iter().position(|previous: &SemanticMoment| {
+            previous.kind == moment.kind
+                && intervals_overlap(
+                    previous.start_offset_ms,
+                    previous.end_offset_ms,
+                    moment.start_offset_ms,
+                    moment.end_offset_ms,
+                    250,
+                )
+                && (previous.description == moment.description || moment.kind == "speech")
+        });
+        if let Some(index) = duplicate {
+            if moment.modalities.len() > deduplicated[index].modalities.len() {
+                deduplicated[index] = moment;
+            }
+        } else {
+            deduplicated.push(moment);
+        }
+    }
+    *moments = deduplicated;
+}
+
+fn overlay_from_moments(moments: &[SemanticMoment]) -> Option<SemanticOverlay> {
+    moments
+        .iter()
+        .max_by(|left, right| left.confidence.total_cmp(&right.confidence))
+        .map(|moment| SemanticOverlay {
+            event_type: "context_observation".to_string(),
+            object_label: moment.kind.clone(),
+            summary: moment.description.clone(),
+            description: moment.description.clone(),
+            confidence: moment.confidence,
+        })
 }
 
 fn local_audio_prompt_context(analysis: &AudioAnalysis) -> String {
@@ -1206,13 +1376,14 @@ fn local_audio_prompt_context(analysis: &AudioAnalysis) -> String {
             .to_string();
     }
     let mut context = String::from(
-        "\nLocal audio front-end observations follow. Treat them as hypotheses with source-window offsets, not ground truth:",
+        "\nLocal audio observations follow. Transcript entries constrain spoken words. Sound labels remain classifier hypotheses:",
     );
-    for observation in analysis.observations.iter().take(32) {
+    for (index, observation) in analysis.observations.iter().take(32).enumerate() {
         use std::fmt::Write as _;
         let _ = write!(
             context,
-            "\n- {}..{}ms kind={} label={} confidence={:.3} model={}",
+            "\n- audio:{} {}..{}ms kind={} label={} confidence={:.3} model={}",
+            index,
             observation.start_offset_ms,
             observation.end_offset_ms,
             observation.kind,
@@ -1459,6 +1630,9 @@ fn parse_semantic_moments(
             .and_then(Value::as_u64)
             .ok_or(SemanticParseError::SchemaMismatch)?
             .clamp(start_offset_ms, duration_ms);
+        if end_offset_ms <= start_offset_ms {
+            continue;
+        }
         let mut modalities = Vec::with_capacity(2);
         for modality in value
             .get("modalities")
@@ -1647,6 +1821,7 @@ fn truncate_context(text: &str, max_chars: usize) -> &str {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use vidarax_core::audio_sidecar::AudioObservation;
     use vidarax_core::provider::{InferenceResult, ProviderKind, TokenUsage};
 
     struct SemanticTestProvider;
@@ -1798,7 +1973,7 @@ Ignore this trailing {not json}."#;
             overlay.summary,
             "The button is clicked as its click sound plays."
         );
-        assert_eq!(moments.len(), 2);
+        assert_eq!(moments.len(), 1);
         assert_eq!(moments[0].start_pts_ms, 21_200);
         assert_eq!(moments[0].end_pts_ms, 22_400);
         assert_eq!(moments[0].modalities, ["video", "audio"]);
@@ -1806,10 +1981,120 @@ Ignore this trailing {not json}."#;
             moments[0].intent.as_deref(),
             Some("The speaker is trying to run the build.")
         );
-        assert_eq!(moments[1].start_pts_ms, 28_000);
-        assert_eq!(moments[1].end_pts_ms, 28_000);
-        assert_eq!(moments[1].kind, "sound_effect");
-        assert_eq!(moments[1].confidence, 1.0);
+    }
+
+    #[test]
+    fn local_audio_filters_transport_activity_and_zero_duration() {
+        let analysis = AudioAnalysis {
+            profile: AudioProfile::Gameplay,
+            speech_engine: SpeechEngine::Whisper,
+            models: vec!["openai/whisper-large-v3-turbo".to_string()],
+            observations: vec![
+                AudioObservation {
+                    start_offset_ms: 0,
+                    end_offset_ms: 500,
+                    kind: "voice_activity".to_string(),
+                    label: "speech".to_string(),
+                    confidence: 0.9,
+                    model: "silero-vad-v6".to_string(),
+                    transcript: None,
+                    language: None,
+                    emotion: None,
+                },
+                AudioObservation {
+                    start_offset_ms: 100,
+                    end_offset_ms: 100,
+                    kind: "audio_event".to_string(),
+                    label: "impact".to_string(),
+                    confidence: 0.8,
+                    model: "efficientat/mn10_as".to_string(),
+                    transcript: None,
+                    language: None,
+                    emotion: None,
+                },
+                AudioObservation {
+                    start_offset_ms: 200,
+                    end_offset_ms: 800,
+                    kind: "speech".to_string(),
+                    label: "transcript".to_string(),
+                    confidence: 0.95,
+                    model: "openai/whisper-large-v3-turbo".to_string(),
+                    transcript: Some("Fuel empty.".to_string()),
+                    language: Some("en".to_string()),
+                    emotion: None,
+                },
+            ],
+            audio_duration_ms: 1_000,
+            audio_bytes: 32_044,
+            queue_wait_ms: 0,
+            stages: Default::default(),
+            capacity: Default::default(),
+            processing_ms: 10,
+        };
+
+        let moments = audio_moments(&analysis, 5_000, 6_000);
+        assert_eq!(moments.len(), 1);
+        assert_eq!(moments[0].kind, "speech");
+        assert_eq!(moments[0].description, "Speaker: Fuel empty.");
+        assert_eq!(moments[0].start_pts_ms, 5_200);
+        assert_eq!(moments[0].end_pts_ms, 5_800);
+    }
+
+    #[test]
+    fn local_transcript_replaces_provider_speech_wording() {
+        let analysis = AudioAnalysis {
+            profile: AudioProfile::Gameplay,
+            speech_engine: SpeechEngine::Whisper,
+            models: vec!["openai/whisper-large-v3-turbo".to_string()],
+            observations: vec![AudioObservation {
+                start_offset_ms: 900,
+                end_offset_ms: 3_800,
+                kind: "speech".to_string(),
+                label: "transcript".to_string(),
+                confidence: 0.95,
+                model: "openai/whisper-large-v3-turbo".to_string(),
+                transcript: Some("Fuel empty. Alright, now I'm drifting.".to_string()),
+                language: Some("en".to_string()),
+                emotion: None,
+            }],
+            audio_duration_ms: 4_000,
+            audio_bytes: 128_044,
+            queue_wait_ms: 0,
+            stages: Default::default(),
+            capacity: Default::default(),
+            processing_ms: 10,
+        };
+        let provider = SemanticMoment {
+            start_offset_ms: 1_000,
+            end_offset_ms: 3_000,
+            start_pts_ms: 1_000,
+            end_pts_ms: 3_000,
+            modalities: vec!["audio".to_string()],
+            kind: "speech".to_string(),
+            description: "A character says the water is running low.".to_string(),
+            intent: Some("Discussing the UI".to_string()),
+            audio_visual_relation: None,
+            confidence: 0.9,
+        };
+
+        let grounded = ground_provider_moments(vec![provider], Some(&analysis));
+        assert_eq!(grounded.len(), 1);
+        assert_eq!(
+            grounded[0].description,
+            "Speaker: Fuel empty. Alright, now I'm drifting."
+        );
+        assert_eq!(
+            grounded[0].intent.as_deref(),
+            Some("Fuel empty. Alright, now I'm drifting.")
+        );
+
+        let mut combined = audio_moments(&analysis, 0, 4_000);
+        let mut mixed = grounded[0].clone();
+        mixed.modalities = vec!["audio".to_string(), "video".to_string()];
+        combined.push(mixed);
+        deduplicate_moments(&mut combined);
+        assert_eq!(combined.len(), 1);
+        assert_eq!(combined[0].modalities, ["audio", "video"]);
     }
 
     #[test]

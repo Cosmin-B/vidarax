@@ -376,6 +376,8 @@ export interface RealtimeReasonRequest {
   video_clip_duration_s?: number;
   media?: MediaAnalysisOptions;
   local_audio?: LocalAudioAnalysisOptions;
+  /** Return per-frame decode metadata. Native-media requests omit it by default. */
+  include_frame_metadata?: boolean;
   vlm_concurrency?: number;
 }
 
@@ -398,6 +400,7 @@ export type AudioAnalysisProfile =
 export type SpeechEngine =
   | "none"
   | "auto"
+  | "whisper"
   | "sensevoice"
   | "moonshine"
   | "qwen3_asr"
@@ -474,6 +477,7 @@ export interface RealtimeReasonResponse {
   lag_p95_ms: number;
   lag_p99_ms: number;
   tokens: TokenMetrics;
+  frame_metadata_included: boolean;
   metadata: AnalyzeFrameMetadata[];
   markers: Marker[];
 }
@@ -939,6 +943,8 @@ export interface AttachStreamRequest {
   crop?: CropRegion;
   restricted_zone?: RestrictedZonePolicyParameters;
   trigger_program?: TriggerProgram;
+  /** Analyze inbound Opus audio with the configured local sidecar. */
+  local_audio?: LocalAudioAnalysisOptions;
 }
 
 /** Request body for PATCH /v1/stream/whip/{session}/prompt. */

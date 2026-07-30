@@ -110,13 +110,13 @@ const result = await v.reason(run_id, {
   semantic_prompt: 'Find meaningful sound, speech intent, and visible actions',
   media: {
     mode: 'audio_video',
-    window_ms: 8000,
+    window_ms: 20000,
     resolution: 'low',
     persist_evidence: true,
   },
   local_audio: {
     profile: 'screen_recording',
-    speech_engine: 'auto',
+    speech_engine: 'whisper',
     min_confidence: 0.35,
     max_events: 32,
   },
@@ -131,14 +131,15 @@ media in JSON or base64. Each `multimodal_moment` carries source-relative start
 and end timestamps, the contributing modalities, a description, optional
 speech intent, an optional audio-to-visual relationship, confidence, and an MP4
 sidecar reference when retention is enabled. Gemini timestamps resolve to about
-one second. Recorded media is supported now. WHIP audio is negotiated but is
-not yet attached to the live reasoning pipeline.
+one second. Recorded files and live WHIP Opus tracks use the same local audio
+event schema.
 
 The optional local audio sidecar runs Silero VAD and EfficientAT before the VLM.
-It invokes one selected ASR model only when speech is present. SenseVoice is the
-default selective engine. Moonshine Streaming Tiny, Qwen3-ASR 0.6B, and
-LFM2.5-Audio 1.5B are deployment choices. LFM can also store a spoken summary
-as content-addressed WAV. See [local audio](https://vidarax.cosminbararu.com/docs/audio/).
+It invokes one selected ASR model only when speech is present. Whisper
+large-v3-turbo is the default selective engine. Moonshine Streaming Tiny,
+Qwen3-ASR 0.6B, SenseVoice, and LFM2.5-Audio 1.5B remain explicit deployment
+choices. LFM can also store a spoken summary as content-addressed WAV. See
+[local audio](https://vidarax.cosminbararu.com/docs/audio/).
 
 Mage-VL is available as an experimental model and as two debug commands. One
 compares codec-native visual tokens with uniform frame sampling. The other

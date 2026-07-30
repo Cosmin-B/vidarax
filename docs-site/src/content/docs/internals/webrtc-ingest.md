@@ -3,7 +3,7 @@ title: WebRTC ingest
 description: The WHIP signalling path, how RTP becomes Annex B decoder input, and the session lifecycle from offer to teardown.
 ---
 
-The WHIP path in `crates/vidarax-api/src/whip.rs` and `vidarax-core/src/webrtc/session.rs` accepts a browser's SDP offer, negotiates one inbound video stream, and feeds its RTP into the per-session worker pipeline. The answer, depacketizer, and decoder agree on one codec. RTP ingress into the decoder stays lossless and ordered. Every visible session has a durable `run_created` event and a watcher that reclaims it. [Media plane](/docs/internals/media-plane/) describes the downstream workers. [State and cancellation](/docs/internals/state-and-cancellation/) covers ownership and cancellation.
+The WHIP path in `crates/vidarax-api/src/whip.rs` and `vidarax-core/src/webrtc/session.rs` accepts a browser's SDP offer, negotiates one inbound video stream, and feeds its RTP into the per-session worker pipeline. Optional inbound Opus tracks feed a separate bounded local-audio queue. The answer, depacketizer, and decoder agree on one video codec. RTP video ingress into the decoder stays lossless and ordered. Every visible session has a durable `run_created` event and a watcher that reclaims it. [Media plane](/docs/internals/media-plane/) describes the downstream workers. [State and cancellation](/docs/internals/state-and-cancellation/) covers ownership and cancellation.
 
 ## Endpoint contract
 
@@ -16,7 +16,7 @@ RFC 9725 signalling maps to three handlers:
 | `DELETE /v1/stream/whip/{sess_id}` | `whip_terminate` | 200 | 403, 404, 500 cleanup incomplete (retryable) |
 | `PATCH /v1/stream/whip/{sess_id}/prompt` | `whip_update_prompt` | 200 after worker acknowledgement | 403, 404, 409 closed generation, 503 acknowledgement timeout |
 
-Session IDs are `sess-` plus 16 hex characters from the OS RNG (`new_session_id`), with a timestamp fallback if the RNG is unavailable. Per-session configuration can ride the offer in the `x-attach-config` header: base64url-encoded JSON (`AttachStreamRequest`) carrying an initial prompt, a token-rate cap, an optional clip-mode config, a normalized crop, a generation-static restricted-zone activity policy, or one compiled trigger program, capped at 8 KiB encoded (`ATTACH_CONFIG_HEADER_MAX_ENCODED_LEN`). Trigger programs and restricted-zone policy are mutually exclusive. The restricted-zone region becomes the decode crop so its motion score has an explicit image-space meaning. Conflicting crop or clip-mode combinations are rejected before workers start.
+Session IDs are `sess-` plus 16 hex characters from the OS RNG (`new_session_id`), with a timestamp fallback if the RNG is unavailable. Per-session configuration can ride the offer in the `x-attach-config` header: base64url-encoded JSON (`AttachStreamRequest`) carrying an initial prompt, a token-rate cap, an optional clip-mode config, a normalized crop, a generation-static restricted-zone activity policy, one compiled trigger program, or local audio settings. The encoded header is capped at 8 KiB (`ATTACH_CONFIG_HEADER_MAX_ENCODED_LEN`). Trigger programs and restricted-zone policy are mutually exclusive. The restricted-zone region becomes the decode crop so its motion score has an explicit image-space meaning. Conflicting crop or clip-mode combinations are rejected before workers start. A local-audio request is rejected with 503 unless the sidecar address is configured before the offer.
 
 ## Offer handling
 
@@ -27,7 +27,7 @@ Session IDs are `sess-` plus 16 hex characters from the OS RNG (`new_session_id`
 - Offers with more than one video m-section are rejected with 415: a single global answer capability cannot answer multiple video sections correctly, and WHIP ingest is single-stream by design.
 - An offer that advertises video but no serveable codec is rejected with 415. This prevents rustrtc's default H.264 depacketizer from mis-parsing another codec.
 
-The session then installs the selected codec as the sole video capability, installs `VidaraxDepacketizerFactory` (rustrtc's H.264 depacketizer for H.264. In-crate depacketizers for H.265 and VP8), and pre-creates a recvonly video transceiver so the offer's video section reuses a receiver built with that factory, not rustrtc's default. One recvonly audio transceiver is pre-created per offered audio section so each is answered `recvonly` (RFC 3264 forbids answering a `sendonly` offer with `sendonly`). Vidarax never consumes the audio. After `set_remote_description`, the handler waits up to 3 seconds for a first local ICE candidate so the answer carries usable host candidates, then creates and applies the answer. Trickle ICE continues over PATCH, where each body line is parsed as a candidate (an `a=` prefix is stripped). A candidate that fails to apply still returns 204, since the connection may complete on other candidates.
+The session then installs the selected codec as the sole video capability, installs `VidaraxDepacketizerFactory` (rustrtc's H.264 depacketizer for H.264. In-crate depacketizers for H.265 and VP8), and pre-creates a recvonly video transceiver so the offer's video section reuses a receiver built with that factory, not rustrtc's default. One recvonly audio transceiver is pre-created per offered audio section so each is answered `recvonly` (RFC 3264 forbids answering a `sendonly` offer with `sendonly`). Audio is drained for transport telemetry. When local audio is attached, Opus access units also enter a bounded analysis queue. After `set_remote_description`, the handler waits up to 3 seconds for a first local ICE candidate so the answer carries usable host candidates, then creates and applies the answer. Trickle ICE continues over PATCH, where each body line is parsed as a candidate (an `a=` prefix is stripped). A candidate that fails to apply still returns 204, since the connection may complete on other candidates.
 
 `whip_setup_error_response` splits failures: unserveable video is the client's 415, everything else in negotiation is a 500.
 
@@ -40,7 +40,7 @@ let (frame_tx, frame_rx) = kanal::bounded::<RtpFrame>(RTP_FRAME_QUEUE_CAPACITY);
 let (stream_tx, stream_rx) = kanal::bounded::<StreamFrame>(STREAM_FRAME_QUEUE_CAPACITY);
 let (vlm_tx, vlm_rx) = kanal::bounded::<KeyframeWork>(VLM_WORK_QUEUE_CAPACITY);
 
-let run_future = session.run(frame_tx, Arc::clone(&metrics_arc));
+let run_future = session.run_with_audio(frame_tx, live_audio, Arc::clone(&metrics_arc));
 tokio::spawn(run_future);
 ```
 
@@ -59,7 +59,15 @@ Every session uses `WalEventSink`, so worker events are visible through the loca
 
 The enqueue is lossless while the session is active. `enqueue_rtp_frame_lossless` awaits capacity on the bounded channel. A gap in an ordered stream would corrupt the stateful decoder, so when decode falls behind, the tokio task yields and sustained overload reaches the WebRTC media layer. Jitter buffers, NACKs, and keyframe requests handle loss there. On teardown, the session sends a monotonic stop signal to every track task and joins them. An in-flight frame may be discarded at that explicit boundary so a blocked sender cannot hold the decoder open forever. [Decode sidecar](/docs/internals/decode-sidecar/#decoder-warm-up) covers the worker on the other side and its SPS/PPS/IDR warm-up.
 
-Audio samples on a video track are ignored. A receive error ends the track task.
+Inbound Opus access units are copied into a 256-item queue only when local audio
+was attached. Oversized units and full queues increment the queue-drop counter.
+The audio worker groups each track into four-second RTP windows, writes Ogg
+framing in memory, and asks ffmpeg for mono 16 kHz PCM WAV. WAV bytes go through
+the local binary sidecar protocol. Speech and sound observations become durable
+timeline events. Sidecar work uses a two-window queue, so inference overload
+drops complete audio windows without stopping video decode.
+
+A receive error ends its track task.
 
 ## Lifecycle from offer to teardown
 

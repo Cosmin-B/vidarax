@@ -320,8 +320,8 @@ struct AnalyzeArgs {
     #[arg(long, value_enum, default_value_t = AnalyzeMediaArg::Frames)]
     media: AnalyzeMediaArg,
     /// Native video window duration in milliseconds.
-    #[arg(long, value_name = "MS", default_value_t = 8_000)]
-    media_window_ms: u64,
+    #[arg(long, value_name = "MS")]
+    media_window_ms: Option<u64>,
     /// Gemini media sampling resolution.
     #[arg(long, value_enum, default_value_t = AnalyzeMediaResolutionArg::Low)]
     media_resolution: AnalyzeMediaResolutionArg,
@@ -349,6 +349,10 @@ struct AnalyzeArgs {
     /// Skip VLM inference and emit local audio observations only.
     #[arg(long, requires = "local_audio")]
     no_vlm: bool,
+    /// Include every decoded frame's metadata in the response. Native-media
+    /// requests omit it by default because it can dominate the response size.
+    #[arg(long)]
+    include_frame_metadata: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -398,6 +402,7 @@ impl AudioProfileArg {
 enum SpeechEngineArg {
     None,
     Auto,
+    Whisper,
     SenseVoice,
     Moonshine,
     Qwen3Asr,
@@ -409,6 +414,7 @@ impl SpeechEngineArg {
         match self {
             Self::None => "none",
             Self::Auto => "auto",
+            Self::Whisper => "whisper",
             Self::SenseVoice => "sensevoice",
             Self::Moonshine => "moonshine",
             Self::Qwen3Asr => "qwen3_asr",
@@ -492,17 +498,23 @@ impl AnalyzeArgs {
         if self.media == AnalyzeMediaArg::Frames {
             body.insert("chunk_size".to_string(), json!(self.chunk_size));
         } else {
+            let media_window_ms =
+                self.media_window_ms
+                    .unwrap_or(if self.local_audio { 20_000 } else { 8_000 });
             body.insert(
                 "media".to_string(),
                 json!({
                     "mode": self.media.wire_value(),
-                    "window_ms": self.media_window_ms,
+                    "window_ms": media_window_ms,
                     "resolution": self.media_resolution.wire_value(),
                     "persist_evidence": !self.no_persist_evidence,
                 }),
             );
         }
         body.insert("semantic_inference".to_string(), Value::Bool(!self.no_vlm));
+        if self.include_frame_metadata {
+            body.insert("include_frame_metadata".to_string(), Value::Bool(true));
+        }
         if self.local_audio {
             body.insert(
                 "local_audio".to_string(),
@@ -1647,7 +1659,11 @@ fn validate_analyze_args(args: &AnalyzeArgs) -> Result<(), String> {
     if args.media == AnalyzeMediaArg::Frames && args.chunk_size == 0 {
         return Err("--chunk-size must be greater than 0".to_string());
     }
-    if args.media != AnalyzeMediaArg::Frames && !(100..=60_000).contains(&args.media_window_ms) {
+    if args.media != AnalyzeMediaArg::Frames
+        && args
+            .media_window_ms
+            .is_some_and(|window_ms| !(100..=60_000).contains(&window_ms))
+    {
         return Err("--media-window-ms must be in [100, 60000]".to_string());
     }
     if !(100..=120_000).contains(&args.semantic_timeout_ms) {
@@ -2680,7 +2696,7 @@ mod tests {
             sampling_policy: None,
             crop: None,
             media: AnalyzeMediaArg::Frames,
-            media_window_ms: 8_000,
+            media_window_ms: None,
             media_resolution: AnalyzeMediaResolutionArg::Low,
             no_persist_evidence: false,
             local_audio: false,
@@ -2690,6 +2706,7 @@ mod tests {
             audio_max_events: 32,
             voice_feedback: false,
             no_vlm: false,
+            include_frame_metadata: false,
         }
     }
 
@@ -2792,7 +2809,7 @@ mod tests {
         let mut args = analyze_args();
         args.model = None;
         args.media = AnalyzeMediaArg::AudioVideo;
-        args.media_window_ms = 6_000;
+        args.media_window_ms = Some(6_000);
         args.media_resolution = AnalyzeMediaResolutionArg::Medium;
 
         let body = args.reason_body("/tmp/uploaded.mp4");
@@ -2844,6 +2861,11 @@ mod tests {
             body.get("semantic_inference").and_then(Value::as_bool),
             Some(false)
         );
+        assert_eq!(
+            body.pointer("/media/window_ms").and_then(Value::as_u64),
+            Some(20_000)
+        );
+        assert!(body.get("include_frame_metadata").is_none());
         assert!(body.get("audio").is_none());
     }
 

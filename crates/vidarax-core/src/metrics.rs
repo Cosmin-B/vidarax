@@ -158,6 +158,7 @@ pub struct PipelineMetrics {
     webrtc_audio_bytes_total: AtomicU64,
     webrtc_audio_duration_ms_total: AtomicU64,
     webrtc_audio_receive_errors_total: AtomicU64,
+    webrtc_audio_queue_dropped_total: AtomicU64,
     /// Restricted-zone assertions durably committed with their evidence.
     restricted_zone_assertions_total: AtomicU64,
     /// Restricted-zone evidence that failed before the assertion commit.
@@ -290,6 +291,7 @@ impl PipelineMetrics {
             webrtc_audio_bytes_total: AtomicU64::new(0),
             webrtc_audio_duration_ms_total: AtomicU64::new(0),
             webrtc_audio_receive_errors_total: AtomicU64::new(0),
+            webrtc_audio_queue_dropped_total: AtomicU64::new(0),
             restricted_zone_assertions_total: AtomicU64::new(0),
             restricted_zone_evidence_failures_total: AtomicU64::new(0),
             restricted_zone_queue_dropped_total: AtomicU64::new(0),
@@ -627,6 +629,12 @@ impl PipelineMetrics {
     #[inline]
     pub fn inc_webrtc_audio_receive_error(&self) {
         self.webrtc_audio_receive_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_webrtc_audio_queue_drop(&self) {
+        self.webrtc_audio_queue_dropped_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1032,6 +1040,11 @@ impl PipelineMetrics {
             (
                 "vidarax_pipeline_webrtc_audio_receive_errors_total",
                 self.webrtc_audio_receive_errors_total
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "vidarax_pipeline_webrtc_audio_queue_dropped_total",
+                self.webrtc_audio_queue_dropped_total
                     .load(Ordering::Relaxed),
             ),
         ];

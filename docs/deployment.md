@@ -19,6 +19,7 @@ come from `crates/vidarax-api/src/config.rs`.
 | `VIDARAX_VLLM_BASE_URL` | unset | vLLM OpenAI-compatible base URL. When set, it is used as priority 1. |
 | `VIDARAX_SGLANG_BASE_URL` | unset | SGLang OpenAI-compatible base URL. When set, it is used as priority 2. |
 | `VIDARAX_AUDIO_SIDECAR_ADDR` | unset | Binary TCP sidecar for local sound events, selective ASR, and optional WAV feedback. |
+| `VIDARAX_AUDIO_SIDECAR_TIMEOUT_MS` | `30000` | Recorded and live local-audio sidecar deadline. Clamped to `[100, 300000]`. |
 | `VIDARAX_INFERENCE_GLOBAL_LIMIT` | `8` | Maximum concurrent provider calls across the process. |
 | `VIDARAX_INFERENCE_PER_PRINCIPAL_LIMIT` | `4` | Maximum concurrent provider calls for one authenticated principal. |
 | `VIDARAX_INFERENCE_WAITER_LIMIT` | `128` | Maximum queued provider calls. |

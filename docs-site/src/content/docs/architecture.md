@@ -48,8 +48,9 @@ concurrency rather than file duration. Audio-video mode resamples and mixes up
 to eight input audio streams while preserving the shared source-time window.
 An optional local pass extracts a mono PCM WAV from that window. Silero VAD
 selects speech-bearing regions, EfficientAT labels sound events, and one chosen
-ASR model handles speech. The observations can stand alone or enter the VLM
-prompt as timestamped hypotheses.
+ASR model handles speech. Live WHIP Opus tracks use the same sidecar after a
+bounded four-second RTP window is decoded to WAV. The observations can stand
+alone or enter the recorded-media VLM prompt as timestamped hypotheses.
 Gemini receives the MP4 through File API and deletes its temporary upload after
 the call. See [Ingest](/docs/ingest/) for decode paths and [The per-frame
 filter](/docs/gate/) for frame mode.

@@ -44,14 +44,15 @@ use vidarax_core::webrtc::clip::ClipConfig as CoreClipConfig;
 use vidarax_core::webrtc::resources::MediaSessionResources;
 use vidarax_core::webrtc::runtime::SessionCommand;
 use vidarax_core::webrtc::session::{
-    PeerConnectionState, SessionCloseDisposition, WebRtcSession, WebRtcSetupError,
-    RTP_FRAME_QUEUE_CAPACITY,
+    LiveAudioConfig, PeerConnectionState, SessionCloseDisposition, WebRtcSession, WebRtcSetupError,
+    LIVE_AUDIO_QUEUE_CAPACITY, RTP_FRAME_QUEUE_CAPACITY,
 };
 use vidarax_core::webrtc::workers::{
     spawn_pipeline, EventSink, PipelineWiring, WorkerPoolConfig, STREAM_FRAME_QUEUE_CAPACITY,
     VLM_WORK_QUEUE_CAPACITY,
 };
 
+use crate::live_audio::{spawn_live_audio_pipeline, LiveAudioPipeline};
 use crate::models::AttachStreamRequest;
 use crate::state::AppState;
 use crate::wal_sink::WalEventSink;
@@ -203,6 +204,19 @@ pub async fn whip_offer(
         Ok(config) => config,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
+    let live_audio_runtime = match session.live_audio {
+        Some(_) => match LiveAudioRuntime::from_env() {
+            Some(runtime) => Some(runtime),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "live local audio requires VIDARAX_AUDIO_SIDECAR_ADDR",
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
 
     start_whip_session(
         state,
@@ -210,6 +224,7 @@ pub async fn whip_offer(
         Arc::new(session),
         answer_sdp,
         clip_config,
+        live_audio_runtime,
         commands,
     )
     .await
@@ -221,6 +236,7 @@ async fn start_whip_session(
     session: Arc<WebRtcSession>,
     answer_sdp: String,
     clip_config: Option<CoreClipConfig>,
+    live_audio_runtime: Option<LiveAudioRuntime>,
     commands: tokio::sync::mpsc::Receiver<SessionCommand>,
 ) -> Response {
     let sess_id = new_session_id();
@@ -244,6 +260,7 @@ async fn start_whip_session(
         session,
         answer_sdp,
         clip_config,
+        live_audio_runtime,
         commands,
     ));
 
@@ -307,6 +324,29 @@ impl WhipSessionStartError {
     }
 }
 
+struct LiveAudioRuntime {
+    sidecar_addr: Arc<str>,
+    sidecar_timeout_ms: u64,
+}
+
+impl LiveAudioRuntime {
+    fn from_env() -> Option<Self> {
+        let sidecar_addr = std::env::var("VIDARAX_AUDIO_SIDECAR_ADDR").ok()?;
+        if sidecar_addr.trim().is_empty() {
+            return None;
+        }
+        let sidecar_timeout_ms = std::env::var("VIDARAX_AUDIO_SIDECAR_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(30_000)
+            .clamp(100, 300_000);
+        Some(Self {
+            sidecar_addr: Arc::from(sidecar_addr),
+            sidecar_timeout_ms,
+        })
+    }
+}
+
 // Session startup passes distinct transaction handles and config.
 #[allow(clippy::too_many_arguments)]
 async fn start_whip_session_transaction(
@@ -319,6 +359,7 @@ async fn start_whip_session_transaction(
     session: Arc<WebRtcSession>,
     answer_sdp: String,
     clip_config: Option<CoreClipConfig>,
+    live_audio_runtime: Option<LiveAudioRuntime>,
     commands: tokio::sync::mpsc::Receiver<SessionCommand>,
 ) -> Result<WhipSessionStarted, WhipSessionStartError> {
     let now_ms = std::time::SystemTime::now()
@@ -440,7 +481,27 @@ async fn start_whip_session_transaction(
     let metrics_arc = Arc::clone(state.pipeline_metrics_arc());
 
     // ── Media ingestion task ───────────────────────────────────────────────
-    let run_future = session.run(frame_tx, Arc::clone(&metrics_arc));
+    let live_audio =
+        session
+            .live_audio
+            .zip(live_audio_runtime)
+            .map(|(config, live_audio_runtime)| {
+                let (audio_tx, audio_rx) = tokio::sync::mpsc::channel(LIVE_AUDIO_QUEUE_CAPACITY);
+                spawn_live_audio_pipeline(
+                    LiveAudioPipeline {
+                        state: state.clone(),
+                        run_id: Arc::clone(&run_id),
+                        session_id: Arc::clone(&session_id_arc),
+                        analysis: config,
+                        sidecar_addr: live_audio_runtime.sidecar_addr,
+                        sidecar_timeout_ms: live_audio_runtime.sidecar_timeout_ms,
+                        metrics: Arc::clone(&metrics_arc),
+                    },
+                    audio_rx,
+                );
+                audio_tx
+            });
+    let run_future = session.run_with_audio(frame_tx, live_audio, Arc::clone(&metrics_arc));
     tokio::spawn(run_future);
 
     // ── EventSink selection ────────────────────────────────────────────────
@@ -720,6 +781,21 @@ fn apply_attach_config(
     if let Some(program) = config.trigger_program {
         validate_live_trigger_program(&program)?;
         session.trigger_program = Some(Arc::new(program));
+    }
+    if let Some(audio) = config.local_audio {
+        if !(0.0..=1.0).contains(&audio.min_confidence) {
+            return Err("local_audio.min_confidence must be in [0,1]".to_string());
+        }
+        if audio.max_events == 0 || audio.max_events > 64 {
+            return Err("local_audio.max_events must be in [1,64]".to_string());
+        }
+        session.live_audio = Some(LiveAudioConfig {
+            profile: audio.profile,
+            speech_engine: audio.speech_engine,
+            min_confidence: audio.min_confidence,
+            max_events: audio.max_events,
+            window_ms: 4_000,
+        });
     }
 
     if let Some(prompt) = config.prompt {
@@ -1560,6 +1636,7 @@ mod tests {
             crop: None,
             restricted_zone: None,
             trigger_program: Some(trigger_program),
+            local_audio: None,
         };
 
         let error = apply_attach_config(&mut session, Some(config)).unwrap_err();
@@ -1594,6 +1671,7 @@ mod tests {
             Arc::clone(&session),
             "v=0\r\n".to_string(),
             None,
+            None,
             commands,
         )
         .await;
@@ -1617,6 +1695,7 @@ mod tests {
             HeaderMap::new(),
             Arc::clone(&session),
             "v=0\r\n".to_string(),
+            None,
             None,
             commands,
         )
@@ -1654,6 +1733,7 @@ mod tests {
                 Arc::clone(&session),
                 "v=0\r\n".to_string(),
                 None,
+                None,
                 commands,
             )
             .await;
@@ -1677,6 +1757,7 @@ mod tests {
             HeaderMap::new(),
             Arc::clone(&rejected_session),
             "v=0\r\n".to_string(),
+            None,
             None,
             commands,
         )
@@ -1747,6 +1828,7 @@ mod tests {
             HeaderMap::new(),
             Arc::clone(&rejected_session),
             "v=0\r\n".to_string(),
+            None,
             None,
             commands,
         )
