@@ -14,6 +14,8 @@ release yet.
   events, and content-addressed MP4 evidence.
 - Selective Whisper large-v3-turbo transcription behind Silero VAD, grounded
   provider output, and boundary-safe 20-second local-audio windows.
+- A locked install-on-first-use audio runtime plus a repository Agent Skill for
+  isolated recorded-media reviews.
 - Live WHIP Opus analysis through bounded queues, in-memory Ogg framing,
   ffmpeg PCM extraction, the local binary audio sidecar, durable moments, and
   queue-drop telemetry.
@@ -65,6 +67,11 @@ release yet.
 
 ### Changed
 
+- The default EfficientAT model is `dymn10_as`. Gameplay sound mapping now
+  includes engines, whooshes, hisses, wind, mechanisms, and scrape cues.
+- Provider sound wording requires a matching local sound observation whenever
+  local audio is requested. This also applies when the provider marks the
+  moment as video-only or the local sidecar fails.
 - The generation join deadline is derived from the VLM pass timeouts, the
   configured backend fallback count, the admission wait, and the novelty
   embedding timeout. Teardown during an in-flight call is no longer measured

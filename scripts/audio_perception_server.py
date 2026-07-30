@@ -22,7 +22,6 @@ import csv
 import io
 import logging
 import os
-import re
 import socket
 import socketserver
 import struct
@@ -38,6 +37,8 @@ from typing import Any, Iterator
 
 import msgpack
 import numpy as np
+
+from audio_labels import mapped_predictions, profile_label
 
 logger = logging.getLogger("vidarax.audio")
 
@@ -80,49 +81,6 @@ ASR_GROUP_GAP_MS = 1_000
 ASR_CONTEXT_MS = 300
 ASR_MIN_SEGMENT_MS = 250
 ASR_BOUNDARY_GUARD_MS = 100
-
-GAMEPLAY_LABELS = {
-    "Explosion": "explosion",
-    "Gunshot, gunfire": "gunshot",
-    "Machine gun": "gunshot",
-    "Artillery fire": "gunshot",
-    "Boom": "explosion",
-    "Impact": "impact",
-    "Thump, thud": "impact",
-    "Crash": "crash",
-    "Breaking": "breaking",
-    "Glass": "glass",
-    "Siren": "siren",
-    "Alarm": "alarm",
-    "Vehicle": "vehicle",
-    "Car": "vehicle",
-    "Race car, auto racing": "vehicle",
-    "Aircraft": "aircraft",
-    "Helicopter": "aircraft",
-    "Music": "music",
-    "Shout": "shout",
-    "Screaming": "shout",
-    "Clicking": "click",
-    "Computer keyboard": "typing",
-}
-SCREEN_LABELS = {
-    "Computer keyboard": "typing",
-    "Typing": "typing",
-    "Clicking": "click",
-    "Mouse": "click",
-    "Telephone bell ringing": "notification",
-    "Ding": "notification",
-    "Alarm": "alarm",
-    "Music": "music",
-}
-SPEECH_TAG_LABELS = {
-    "Speech",
-    "Conversation",
-    "Narration, monologue",
-    "Male speech, man speaking",
-    "Female speech, woman speaking",
-    "Child speech, kid speaking",
-}
 
 
 class DecodeError(RuntimeError):
@@ -278,7 +236,8 @@ class EfficientAtBackend:
     def __init__(self, repository: Path, model_name: str, device_name: str) -> None:
         if not repository.is_dir():
             raise RuntimeError(
-                f"EfficientAT repository not found at {repository}; run scripts/setup_audio_models.sh"
+                f"EfficientAT repository not found at {repository}; "
+                "run python3 scripts/audio_runtime.py install"
             )
         import torch
 
@@ -290,8 +249,9 @@ class EfficientAtBackend:
                 message="Don't use ConvNormActivation directly.*",
                 category=UserWarning,
             )
-            with _working_directory(repository), contextlib.redirect_stdout(
-                io.StringIO()
+            with (
+                _working_directory(repository),
+                contextlib.redirect_stdout(io.StringIO()),
             ):
                 from helpers.utils import NAME_TO_WIDTH
                 from models.dymn.model import get_model as get_dymn
@@ -358,14 +318,12 @@ class EfficientAtBackend:
                         self.torch.sigmoid(predictions.float()).squeeze().cpu().numpy()
                     )
             end = min(samples.size, start + window_samples)
-            for index in np.argsort(scores)[::-1][:12]:
-                confidence = float(scores[index])
-                if confidence < threshold:
-                    break
-                raw_label = self.labels[int(index)]
-                label = _profile_label(profile, raw_label)
-                if label is None:
-                    continue
+            for label, confidence in mapped_predictions(
+                self.labels,
+                scores,
+                profile,
+                threshold,
+            ):
                 observations.append(
                     Observation(
                         start_offset_ms=round(start * 1000 / 32_000),
@@ -379,16 +337,6 @@ class EfficientAtBackend:
                 if len(observations) >= max_events:
                     return observations
         return observations
-
-
-def _profile_label(profile: str, raw_label: str) -> str | None:
-    if raw_label in SPEECH_TAG_LABELS:
-        return None
-    if profile == "gameplay":
-        return GAMEPLAY_LABELS.get(raw_label)
-    if profile == "screen_recording":
-        return SCREEN_LABELS.get(raw_label)
-    return re.sub(r"[^a-z0-9]+", "_", raw_label.strip().lower()).strip("_")[:96]
 
 
 class SpeechBackend:
@@ -601,7 +549,9 @@ class LfmAudioBackend(SpeechBackend):
         if len(audio_tokens) < 2:
             raise RuntimeError("LFM produced no audio")
         codes = self.torch.stack(audio_tokens[:-1], 1).unsqueeze(0)
-        waveform = self.processor.decode(codes).detach().cpu().float().numpy().reshape(-1)
+        waveform = (
+            self.processor.decode(codes).detach().cpu().float().numpy().reshape(-1)
+        )
         return _encode_pcm_wav(waveform, 24_000)
 
 
@@ -735,9 +685,7 @@ class PerceptionEngine:
                     samples[start_sample:end_sample],
                     sample_rate,
                 )
-                transcript = _trim_incomplete_transcript(
-                    " ".join(transcript.split())
-                )
+                transcript = _trim_incomplete_transcript(" ".join(transcript.split()))
                 segment_seconds = max(0.25, (speech_end - speech_start) / 1000)
                 if _transcript_is_unreliable(transcript, segment_seconds):
                     logger.warning(
@@ -764,7 +712,9 @@ class PerceptionEngine:
             asr_ms = _elapsed_ms(asr_started)
 
         observations = _deduplicate_observations(observations)
-        observations.sort(key=lambda item: (item.start_offset_ms, -item.confidence, item.label))
+        observations.sort(
+            key=lambda item: (item.start_offset_ms, -item.confidence, item.label)
+        )
         observations = observations[:max_events]
         for item in observations:
             if item.start_offset_ms < 0 or item.end_offset_ms > duration_ms:
@@ -968,7 +918,9 @@ class AudioRequestHandler(socketserver.BaseRequestHandler):
                 return
             if operation == OP_ANALYZE and (audio_len == 0 or text_len != 0):
                 self._respond_error(
-                    STATUS_BAD_REQUEST, "malformed_response", "analyze requires WAV only"
+                    STATUS_BAD_REQUEST,
+                    "malformed_response",
+                    "analyze requires WAV only",
                 )
                 return
             if operation == OP_SYNTHESIZE and (audio_len != 0 or text_len == 0):
@@ -989,7 +941,9 @@ class AudioRequestHandler(socketserver.BaseRequestHandler):
             if audio is None or text is None:
                 return
             try:
-                queue_wait_ms = self.server.admission.acquire(self.server.request_timeout_s)
+                queue_wait_ms = self.server.admission.acquire(
+                    self.server.request_timeout_s
+                )
             except OverflowError as error:
                 self._respond_error(STATUS_OVERLOADED, "overloaded", str(error))
                 return
@@ -1101,7 +1055,7 @@ def _parse_args() -> argparse.Namespace:
             )
         ),
     )
-    parser.add_argument("--efficientat-model", default="mn10_as")
+    parser.add_argument("--efficientat-model", default="dymn10_as")
     parser.add_argument(
         "--auto-asr",
         choices=(

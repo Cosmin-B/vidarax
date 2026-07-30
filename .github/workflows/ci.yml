@@ -33,6 +33,21 @@ jobs:
       - name: Format check
         run: cargo fmt --all --check
 
+      - name: Audio runtime helper tests
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_audio_runtime.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_audio_perception_server.py
+          python3 - <<'PY'
+          from pathlib import Path
+          for source in (
+              "scripts/audio_labels.py",
+              "scripts/audio_runtime.py",
+              "scripts/audio_perception_server.py",
+              "scripts/test_audio_perception_server.py",
+          ):
+              compile(Path(source).read_text(encoding="utf-8"), source, "exec")
+          PY
+
       - name: Workspace tests
         run: cargo test --workspace
 
@@ -58,6 +73,34 @@ jobs:
 
       - name: Release gates
         run: ./scripts/release_gates.sh
+
+  audio-runtime-portability:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-14
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.9"
+
+      - name: Test runtime and sound-label helpers
+        run: |
+          python -B scripts/test_audio_runtime.py
+          python -B scripts/test_audio_perception_server.py
+
+      - name: Compile the sidecar entry point
+        run: python -m py_compile scripts/audio_perception_server.py
 
   vidarax-core-vp8:
     runs-on: ubuntu-latest

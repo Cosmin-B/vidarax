@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Media with Vidarax"
+  short_description: "Ground video and audio into verified moments"
+  default_prompt: "Use $vidarax-review-media to review this recording and verify the important moments."

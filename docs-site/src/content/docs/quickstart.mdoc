@@ -99,7 +99,15 @@ passes a mono PCM WAV to the optional local audio sidecar. It prints
 `multimodal_moment` entries with source timestamps, sound and video
 descriptions, optional speech intent, and their relationship. Retained MP4
 windows and optional spoken feedback stay in the binary media store. Set
-`VIDARAX_AUDIO_SIDECAR_ADDR` before using `--local-audio`. See
+`VIDARAX_AUDIO_SIDECAR_ADDR` before using `--local-audio`. Start the default
+sidecar in another terminal. Its first run provisions the locked Python
+environment automatically:
+
+```bash
+python3 scripts/audio_runtime.py run --profile whisper
+```
+
+See
 [Local audio perception](/docs/audio/) for setup and local-only analysis.
 
 Global connection values resolve in this order: command-line flags,
