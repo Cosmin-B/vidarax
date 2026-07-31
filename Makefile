@@ -1,4 +1,6 @@
-.PHONY: lint test validate bench bench-api bench-provider staging-e2e release-gates h3-check smoke smoke-mp4 provision-models dev-cert
+AUDIO_PROFILE ?= whisper
+
+.PHONY: lint test validate bench bench-api bench-provider staging-e2e release-gates h3-check smoke smoke-mp4 provision-models audio-install audio-check audio-sidecar dev-cert
 
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
@@ -35,6 +37,15 @@ smoke-mp4:
 
 provision-models:
 	./scripts/provision_models.sh
+
+audio-install:
+	python3 scripts/audio_runtime.py install --profile $(AUDIO_PROFILE)
+
+audio-check:
+	python3 scripts/audio_runtime.py check --profile $(AUDIO_PROFILE)
+
+audio-sidecar:
+	python3 scripts/audio_runtime.py run --profile $(AUDIO_PROFILE)
 
 dev-cert:
 	@mkdir -p deploy/certs

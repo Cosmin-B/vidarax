@@ -45,6 +45,7 @@ is descriptive metadata and must not be used as an authorization boundary.
 ## Where to go next
 
 - [Quickstart](/docs/quickstart/): run the server and get events from a video.
+- [Agent workflows](/docs/agents/): install on first use and review media from a compatible agent harness.
 - [Architecture](/docs/architecture/): the control plane, the media plane, and how state persists.
 - [API reference](/docs/api/): endpoints and configuration.
 - [Local audio perception](/docs/audio/): sound events, selective ASR, and spoken feedback.

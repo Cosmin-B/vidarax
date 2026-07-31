@@ -1142,14 +1142,15 @@ pub async fn infer_chunk_semantics(
                 .flatten(),
         ) {
             Ok((overlay, moments)) => {
-                let moments = ground_provider_moments(moments, result.local_audio.as_ref());
+                let moments = ground_provider_moments(
+                    moments,
+                    result.local_audio.as_ref(),
+                    local_audio_config.is_some(),
+                );
                 result.moments.extend(moments);
                 deduplicate_moments(&mut result.moments);
-                result.overlay = if result.local_audio.is_some() {
-                    overlay_from_moments(&result.moments)
-                } else {
-                    Some(overlay)
-                };
+                result.overlay =
+                    select_semantic_overlay(overlay, &result.moments, local_audio_config.is_some());
                 result.used_fallback = provider_result.fallback_used;
                 maybe_generate_feedback(
                     &mut result,
@@ -1239,14 +1240,23 @@ fn audio_moment_kind(observation: &vidarax_core::audio_sidecar::AudioObservation
 fn ground_provider_moments(
     moments: Vec<SemanticMoment>,
     analysis: Option<&AudioAnalysis>,
+    local_audio_required: bool,
 ) -> Vec<SemanticMoment> {
     let Some(analysis) = analysis else {
-        return moments;
+        return if local_audio_required {
+            moments
+                .into_iter()
+                .filter(|moment| !moment_requires_audio(moment))
+                .collect()
+        } else {
+            moments
+        };
     };
     moments
         .into_iter()
         .filter_map(|mut moment| {
-            if !moment.modalities.iter().any(|modality| modality == "audio") {
+            let declares_audio = moment.modalities.iter().any(|modality| modality == "audio");
+            if !moment_requires_audio(&moment) {
                 return Some(moment);
             }
             let matching: Vec<_> = analysis
@@ -1279,12 +1289,10 @@ fn ground_provider_moments(
                 })
                 .collect();
             if supported.is_empty() {
-                if moment.modalities.len() == 1 {
-                    return None;
-                }
-                moment.modalities.retain(|modality| modality != "audio");
-                moment.audio_visual_relation = None;
-                return Some(moment);
+                return None;
+            }
+            if !declares_audio {
+                moment.modalities.push("audio".to_string());
             }
             if is_speech {
                 let transcript = supported
@@ -1299,19 +1307,32 @@ fn ground_provider_moments(
                 if moment.modalities.len() == 1 {
                     moment.audio_visual_relation = None;
                 }
-            } else if moment.modalities.len() == 1 {
+            } else {
                 let labels = supported
                     .iter()
                     .map(|observation| observation.label.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
-                moment.description = format!("Local audio event: {labels}");
+                moment.description = if moment.modalities.iter().any(|modality| modality == "video")
+                {
+                    format!("Visible activity overlaps local audio event: {labels}")
+                } else {
+                    format!("Local audio event: {labels}")
+                };
                 moment.intent = None;
                 moment.audio_visual_relation = None;
             }
             Some(moment)
         })
         .collect()
+}
+
+fn moment_requires_audio(moment: &SemanticMoment) -> bool {
+    moment.modalities.iter().any(|modality| modality == "audio")
+        || matches!(
+            moment.kind.as_str(),
+            "speech" | "sound_effect" | "music" | "ambient" | "mechanical"
+        )
 }
 
 fn intervals_overlap(
@@ -1368,6 +1389,18 @@ fn overlay_from_moments(moments: &[SemanticMoment]) -> Option<SemanticOverlay> {
             description: moment.description.clone(),
             confidence: moment.confidence,
         })
+}
+
+fn select_semantic_overlay(
+    provider_overlay: SemanticOverlay,
+    moments: &[SemanticMoment],
+    local_audio_required: bool,
+) -> Option<SemanticOverlay> {
+    if local_audio_required {
+        overlay_from_moments(moments)
+    } else {
+        Some(provider_overlay)
+    }
 }
 
 fn local_audio_prompt_context(analysis: &AudioAnalysis) -> String {
@@ -2077,7 +2110,7 @@ Ignore this trailing {not json}."#;
             confidence: 0.9,
         };
 
-        let grounded = ground_provider_moments(vec![provider], Some(&analysis));
+        let grounded = ground_provider_moments(vec![provider], Some(&analysis), true);
         assert_eq!(grounded.len(), 1);
         assert_eq!(
             grounded[0].description,
@@ -2095,6 +2128,162 @@ Ignore this trailing {not json}."#;
         deduplicate_moments(&mut combined);
         assert_eq!(combined.len(), 1);
         assert_eq!(combined[0].modalities, ["audio", "video"]);
+    }
+
+    #[test]
+    fn provider_sound_claim_requires_local_audio_even_when_marked_video_only() {
+        let analysis = AudioAnalysis {
+            profile: AudioProfile::Gameplay,
+            speech_engine: SpeechEngine::Whisper,
+            models: Vec::new(),
+            observations: Vec::new(),
+            audio_duration_ms: 4_000,
+            audio_bytes: 128_044,
+            queue_wait_ms: 0,
+            stages: Default::default(),
+            capacity: Default::default(),
+            processing_ms: 10,
+        };
+        let provider = SemanticMoment {
+            start_offset_ms: 1_000,
+            end_offset_ms: 3_000,
+            start_pts_ms: 1_000,
+            end_pts_ms: 3_000,
+            modalities: vec!["video".to_string()],
+            kind: "sound_effect".to_string(),
+            description: "A roaring thruster sound begins.".to_string(),
+            intent: None,
+            audio_visual_relation: None,
+            confidence: 0.9,
+        };
+
+        let grounded = ground_provider_moments(vec![provider], Some(&analysis), true);
+        assert!(grounded.is_empty());
+    }
+
+    #[test]
+    fn provider_sound_wording_is_replaced_by_matching_local_event() {
+        let analysis = AudioAnalysis {
+            profile: AudioProfile::Gameplay,
+            speech_engine: SpeechEngine::Whisper,
+            models: vec!["efficientat/dymn20_as".to_string()],
+            observations: vec![AudioObservation {
+                start_offset_ms: 900,
+                end_offset_ms: 3_800,
+                kind: "audio_event".to_string(),
+                label: "whoosh".to_string(),
+                confidence: 0.72,
+                model: "efficientat/dymn20_as".to_string(),
+                transcript: None,
+                language: None,
+                emotion: None,
+            }],
+            audio_duration_ms: 4_000,
+            audio_bytes: 128_044,
+            queue_wait_ms: 0,
+            stages: Default::default(),
+            capacity: Default::default(),
+            processing_ms: 10,
+        };
+        let provider = SemanticMoment {
+            start_offset_ms: 1_000,
+            end_offset_ms: 3_000,
+            start_pts_ms: 1_000,
+            end_pts_ms: 3_000,
+            modalities: vec!["video".to_string()],
+            kind: "sound_effect".to_string(),
+            description: "A roaring thruster sound begins.".to_string(),
+            intent: Some("The player activates a jetpack.".to_string()),
+            audio_visual_relation: Some("The sound follows the visible ignition.".to_string()),
+            confidence: 0.9,
+        };
+
+        let grounded = ground_provider_moments(vec![provider], Some(&analysis), true);
+        assert_eq!(grounded.len(), 1);
+        assert_eq!(grounded[0].modalities, ["video", "audio"]);
+        assert_eq!(
+            grounded[0].description,
+            "Visible activity overlaps local audio event: whoosh"
+        );
+        assert_eq!(grounded[0].intent, None);
+        assert_eq!(grounded[0].audio_visual_relation, None);
+    }
+
+    #[test]
+    fn provider_visual_interaction_does_not_require_local_audio() {
+        let analysis = AudioAnalysis {
+            profile: AudioProfile::Gameplay,
+            speech_engine: SpeechEngine::Whisper,
+            models: Vec::new(),
+            observations: Vec::new(),
+            audio_duration_ms: 4_000,
+            audio_bytes: 128_044,
+            queue_wait_ms: 0,
+            stages: Default::default(),
+            capacity: Default::default(),
+            processing_ms: 10,
+        };
+        let provider = SemanticMoment {
+            start_offset_ms: 1_000,
+            end_offset_ms: 3_000,
+            start_pts_ms: 1_000,
+            end_pts_ms: 3_000,
+            modalities: vec!["video".to_string()],
+            kind: "interaction".to_string(),
+            description: "The player moves past a rock.".to_string(),
+            intent: None,
+            audio_visual_relation: None,
+            confidence: 0.9,
+        };
+
+        let grounded = ground_provider_moments(vec![provider.clone()], Some(&analysis), true);
+        assert_eq!(grounded.len(), 1);
+        assert_eq!(grounded[0].description, provider.description);
+    }
+
+    #[test]
+    fn provider_audio_is_removed_when_requested_local_analysis_failed() {
+        let audio = SemanticMoment {
+            start_offset_ms: 1_000,
+            end_offset_ms: 3_000,
+            start_pts_ms: 1_000,
+            end_pts_ms: 3_000,
+            modalities: vec!["video".to_string()],
+            kind: "mechanical".to_string(),
+            description: "A jetpack engine roars.".to_string(),
+            intent: None,
+            audio_visual_relation: None,
+            confidence: 0.9,
+        };
+        let visual = SemanticMoment {
+            start_offset_ms: 1_000,
+            end_offset_ms: 3_000,
+            start_pts_ms: 1_000,
+            end_pts_ms: 3_000,
+            modalities: vec!["video".to_string()],
+            kind: "interaction".to_string(),
+            description: "The player rises above the platform.".to_string(),
+            intent: None,
+            audio_visual_relation: None,
+            confidence: 0.9,
+        };
+
+        let grounded = ground_provider_moments(vec![audio, visual.clone()], None, true);
+        assert_eq!(grounded.len(), 1);
+        assert_eq!(grounded[0].description, visual.description);
+    }
+
+    #[test]
+    fn provider_overlay_is_not_used_when_local_audio_was_required() {
+        let provider_overlay = SemanticOverlay {
+            event_type: "context_observation".to_string(),
+            object_label: "mechanical".to_string(),
+            summary: "A jetpack engine roars.".to_string(),
+            description: "A jetpack engine roars.".to_string(),
+            confidence: 0.9,
+        };
+
+        assert!(select_semantic_overlay(provider_overlay, &[], true).is_none());
     }
 
     #[test]

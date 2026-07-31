@@ -26,6 +26,7 @@ export default defineConfig({
       sidebar: [
         { label: 'What is vidarax', link: '/' },
         { label: 'Quickstart', slug: 'quickstart' },
+        { label: 'Agent workflows', slug: 'agents' },
         { label: 'Architecture', slug: 'architecture' },
         { label: 'Ingest', slug: 'ingest' },
         { label: 'Local audio', slug: 'audio' },

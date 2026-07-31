@@ -35,7 +35,7 @@ claims are discarded when the local pass has no matching observation.
 
 The default local stack uses
 [Silero VAD v6](https://github.com/snakers4/silero-vad),
-[EfficientAT](https://github.com/fschmid56/EfficientAT) `mn10_as`, and
+[EfficientAT](https://github.com/fschmid56/EfficientAT) `dymn10_as`, and
 [Whisper large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo)
 for selective transcription. The other speech models are explicit deployment
 choices:
@@ -54,14 +54,25 @@ content-addressed media directory and the event carries its hash and reference.
 
 ## Install and run
 
-The setup script places Python packages and model source outside the tracked
-tree:
+The runtime manager places Python packages, model source, and downloaded weights
+in the user cache. It provisions Python 3.12 and installs `uv` into the same
+cache when neither is already available:
+
+```bash
+python3 scripts/audio_runtime.py check --profile whisper --json
+python3 scripts/audio_runtime.py run --profile whisper
+```
+
+The first `run` syncs the checked-in `audio/uv.lock`, checks out the pinned
+EfficientAT revision, and starts the sidecar. Later runs skip setup when the
+profile, lock hash, Python version, and source revision still match. Package and
+model downloads are reused across checkouts.
+
+Use the setup-only compatibility command when a service manager will start the
+sidecar:
 
 ```bash
 scripts/setup_audio_models.sh whisper
-
-VIDARAX_EFFICIENTAT_REPO=.vidarax-models/source/EfficientAT \
-  .venv-audio/bin/python scripts/audio_perception_server.py
 ```
 
 Point the API at the sidecar:
@@ -71,9 +82,12 @@ export VIDARAX_AUDIO_SIDECAR_ADDR=127.0.0.1:7790
 ```
 
 `core`, `sensevoice`, `moonshine`, `qwen`, `lfm`, and `all` are also valid
-setup profiles. Whisper, Moonshine, Qwen, and LFM profiles require Python 3.10
-or newer. Set
-`VIDARAX_AUDIO_PYTHON=python3.12` when the system `python3` is older.
+profiles. Each profile gets its own environment so switching engines cannot
+silently remove another deployment's dependencies. Set `VIDARAX_CACHE_DIR` to
+move all runtime caches. `VIDARAX_AUDIO_VENV_DIR`,
+`VIDARAX_MODEL_CACHE_DIR`, and `VIDARAX_UV` remain explicit overrides. Use
+`--offline` only after the selected profile and pinned source have been cached.
+
 The server defaults to one active inference request and eight queued requests.
 Use `--max-in-flight` and `--max-queued` to set both bounds after measuring
 memory and latency on the target device. A full queue returns a typed
@@ -109,14 +123,20 @@ moments without making a VLM call.
 
 The profile controls label normalization:
 
-- `gameplay` keeps explosions, gunfire, impacts, alarms, vehicles, music,
-  speech, typing, and similar game cues.
+- `gameplay` keeps explosions, gunfire, impacts, alarms, vehicles, engines,
+  whooshes, hisses, scrapes, music, speech, typing, and similar game cues.
 - `screen_recording` favors speech, typing, clicks, notifications, and music.
 - `physical_world` and `general` retain normalized AudioSet labels.
 
 The sidecar limits each request to 4 MiB of WAV, 64 observations, and one
 minute of source time. A model error stays on its chunk. Decode continues and
 an MP4 window already retained remains available.
+
+Sound descriptions remain conservative. A provider moment classified as
+speech, sound effect, music, ambience, or machinery must overlap a compatible
+local observation, even when the provider labels its own moment as video-only.
+Unsupported moments are removed. Supported sound wording is replaced by the
+local label before the event is written.
 
 ## Triggers
 

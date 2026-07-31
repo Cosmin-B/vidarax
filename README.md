@@ -91,7 +91,7 @@ import { Vidarax } from 'vidarax'
 
 const v = new Vidarax('http://localhost:8080', { apiKey: 'your-key' })
 
-// analyze() runs the deterministic frame-signal pipeline; it takes no prompt.
+// analyze() runs the deterministic frame-signal pipeline. It takes no prompt.
 const run = await v.analyze('/srv/vidarax-media/video.mp4', { mode: 'balanced' })
 
 for (const event of await v.getEvents(run.runId)) {
@@ -141,6 +141,18 @@ Qwen3-ASR 0.6B, SenseVoice, and LFM2.5-Audio 1.5B remain explicit deployment
 choices. LFM can also store a spoken summary as content-addressed WAV. See
 [local audio](https://vidarax.cosminbararu.com/docs/audio/).
 
+Start the default local audio path with one command:
+
+```bash
+python3 scripts/audio_runtime.py run --profile whisper
+```
+
+On first use, this provisions Python 3.12, syncs the locked dependency set, and
+checks out the pinned sound-classifier source. Later runs reuse the environment,
+package cache, and model cache. Nothing is written to tracked source paths. Run
+`python3 scripts/audio_runtime.py check --profile whisper --json` to inspect the
+resolved paths and readiness.
+
 Mage-VL is available as an experimental model and as two debug commands. One
 compares codec-native visual tokens with uniform frame sampling. The other
 prints each proactive streaming decision and its `p(respond)`. See
@@ -154,6 +166,16 @@ text. See [Gate engine](https://vidarax.cosminbararu.com/docs/gate/).
 The SDK also supports WHIP/WebRTC video, batch inference, structured JSON
 output via `output_schema`, interactions, and snapshot reads of events and
 markers.
+
+## Agent Skill
+
+The repository ships the platform-neutral
+[`vidarax-review-media`](.agents/skills/vidarax-review-media/SKILL.md) Agent
+Skill. Compatible agent harnesses can use it to create an isolated current-build
+runtime, install the local audio path on first use, review a recording, and
+separate verified moments from uncertain candidates. Its reporting rules keep
+binary media out of JSON and treat local transcripts as the source for exact
+speech wording.
 
 ## API endpoints
 
