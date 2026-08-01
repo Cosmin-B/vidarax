@@ -32,6 +32,7 @@ EFFICIENTAT_COMMIT = os.environ.get(
 )
 UV_REQUIREMENT = "uv>=0.10.0,<0.11"
 PYTHON_VERSION = "3.12"
+DEFAULT_CLASSIFIER = "dymn10_as"
 PROFILES = ("core", "whisper", "moonshine", "qwen", "sensevoice", "lfm", "all")
 PROFILE_ENGINE = {
     "core": "none",
@@ -42,6 +43,13 @@ PROFILE_ENGINE = {
     "lfm": "lfm2_5_audio",
     "all": "whisper",
 }
+UNSAFE_CHILD_ENVIRONMENT = (
+    "SSLKEYLOGFILE",
+    "OPENSSL_CONF",
+    "OPENSSL_MODULES",
+    "PYTHONHOME",
+    "PYTHONPATH",
+)
 
 
 def _default_cache_dir() -> Path:
@@ -95,11 +103,18 @@ def _run(
     return subprocess.run(
         rendered,
         check=True,
-        env=env,
+        env=_child_environment() if env is None else env,
         text=True,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
     )
+
+
+def _child_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    for name in UNSAFE_CHILD_ENVIRONMENT:
+        env.pop(name, None)
+    return env
 
 
 def _sha256(path: Path) -> str:
@@ -111,7 +126,7 @@ def _sha256(path: Path) -> str:
 
 
 def _environment(profile: str, paths: dict[str, Path]) -> dict[str, str]:
-    env = os.environ.copy()
+    env = _child_environment()
     env.update(
         {
             "HF_HOME": os.fspath(paths["hf"]),
@@ -122,7 +137,16 @@ def _environment(profile: str, paths: dict[str, Path]) -> dict[str, str]:
             "VIDARAX_AUDIO_AUTO_ASR": PROFILE_ENGINE[profile],
         }
     )
+    # uv 0.10 calls this native TLS. It uses the Windows and macOS trust stores,
+    # including enterprise roots, while keeping certificate validation enabled.
+    env.setdefault("UV_NATIVE_TLS", "true")
     return env
+
+
+def _python_request() -> str:
+    if (3, 12) <= tuple(sys.version_info[:2]) < (3, 14):
+        return sys.executable
+    return PYTHON_VERSION
 
 
 def _uv_version(uv: Path) -> str:
@@ -221,12 +245,17 @@ def _marker_path(paths: dict[str, Path]) -> Path:
     return paths["venv"] / ".vidarax-audio-runtime.json"
 
 
+def _classifier_weights_path(paths: dict[str, Path]) -> Path:
+    return paths["efficientat"] / "resources" / f"{DEFAULT_CLASSIFIER}.pt"
+
+
 def _expected_marker(profile: str) -> dict[str, Any]:
     return {
         "profile": profile,
         "lock_sha256": _sha256(LOCK_FILE),
         "python": PYTHON_VERSION,
         "efficientat_commit": EFFICIENTAT_COMMIT,
+        "classifier": DEFAULT_CLASSIFIER,
     }
 
 
@@ -245,6 +274,34 @@ def _ready(profile: str, paths: dict[str, Path]) -> bool:
         python.is_file()
         and all(marker.get(key) == value for key, value in expected.items())
         and _git_head(paths["efficientat"]) == EFFICIENTAT_COMMIT
+        and _classifier_weights_path(paths).is_file()
+    )
+
+
+def _warm_default_models(
+    profile: str,
+    paths: dict[str, Path],
+    *,
+    offline: bool,
+) -> None:
+    if offline and not _classifier_weights_path(paths).is_file():
+        raise RuntimeError(
+            f"{DEFAULT_CLASSIFIER} is not cached. Run once without --offline."
+        )
+    python = _venv_executable(paths["venv"], "python")
+    _run(
+        (
+            python,
+            SERVER_SCRIPT,
+            "--warmup",
+            "--efficientat-repo",
+            paths["efficientat"],
+            "--efficientat-model",
+            DEFAULT_CLASSIFIER,
+            "--auto-asr",
+            "none",
+        ),
+        env=_environment(profile, paths),
     )
 
 
@@ -291,7 +348,7 @@ def install(profile: str, *, force: bool, offline: bool) -> dict[str, Any]:
         "--locked",
         "--no-dev",
         "--python",
-        PYTHON_VERSION,
+        _python_request(),
     ]
     if profile == "all":
         command.append("--all-extras")
@@ -307,6 +364,7 @@ def install(profile: str, *, force: bool, offline: bool) -> dict[str, Any]:
     )
     _run(command, env=env)
     _ensure_efficientat(paths, offline)
+    _warm_default_models(profile, paths, offline=offline)
     elapsed = time.perf_counter() - started
     _write_marker(profile, paths, elapsed)
     return {

@@ -38,7 +38,12 @@ from typing import Any, Iterator
 import msgpack
 import numpy as np
 
-from audio_labels import mapped_predictions, profile_label
+from audio_labels import (
+    mapped_predictions,
+    profile_label,
+    timestamped_transcript_chunks,
+    transcript_text_is_unreliable,
+)
 
 logger = logging.getLogger("vidarax.audio")
 
@@ -79,6 +84,7 @@ ENGINE_NAMES = {
 ASR_MAX_GROUP_MS = 20_000
 ASR_GROUP_GAP_MS = 1_000
 ASR_CONTEXT_MS = 300
+ASR_RETRY_CONTEXT_MS = 4_000
 ASR_MIN_SEGMENT_MS = 250
 ASR_BOUNDARY_GUARD_MS = 100
 
@@ -347,6 +353,19 @@ class SpeechBackend:
     ) -> tuple[str, str | None, str | None]:
         raise NotImplementedError
 
+    def transcribe_segments(
+        self, samples: np.ndarray, sample_rate: int
+    ) -> list[tuple[int, int, str, str | None, str | None]]:
+        text, language, emotion = self.transcribe(samples, sample_rate)
+        duration_ms = round(samples.size * 1000 / max(1, sample_rate))
+        return [
+            (start, end, chunk, language, emotion)
+            for start, end, chunk in timestamped_transcript_chunks(
+                {"text": text},
+                duration_ms,
+            )
+        ]
+
 
 def _speech_model_name(backend: SpeechBackend) -> str:
     return str(getattr(backend, "model_id", backend.name))
@@ -450,9 +469,15 @@ class WhisperBackend(SpeechBackend):
     def transcribe(
         self, samples: np.ndarray, sample_rate: int
     ) -> tuple[str, str | None, str | None]:
+        segments = self.transcribe_segments(samples, sample_rate)
+        return " ".join(segment[2] for segment in segments), None, None
+
+    def transcribe_segments(
+        self, samples: np.ndarray, sample_rate: int
+    ) -> list[tuple[int, int, str, str | None, str | None]]:
         result = self.pipeline(
             {"array": samples, "sampling_rate": sample_rate},
-            return_timestamps=False,
+            return_timestamps="word",
             generate_kwargs={
                 "language": os.environ.get("VIDARAX_WHISPER_LANGUAGE", "en"),
                 "task": "transcribe",
@@ -460,7 +485,14 @@ class WhisperBackend(SpeechBackend):
                 "temperature": 0.0,
             },
         )
-        return str(result["text"]).strip(), None, None
+        duration_ms = round(samples.size * 1000 / max(1, sample_rate))
+        return [
+            (start, end, text, None, None)
+            for start, end, text in timestamped_transcript_chunks(
+                result,
+                duration_ms,
+            )
+        ]
 
 
 class Qwen3AsrBackend(SpeechBackend):
@@ -681,33 +713,97 @@ class PerceptionEngine:
                     continue
                 start_sample = round(speech_start * sample_rate / 1000)
                 end_sample = round(speech_end * sample_rate / 1000)
-                transcript, language, emotion = backend.transcribe(
+                transcript_segments = backend.transcribe_segments(
                     samples[start_sample:end_sample],
                     sample_rate,
                 )
-                transcript = _trim_incomplete_transcript(" ".join(transcript.split()))
-                segment_seconds = max(0.25, (speech_end - speech_start) / 1000)
-                if _transcript_is_unreliable(transcript, segment_seconds):
-                    logger.warning(
-                        "discarding unreliable ASR output engine=%s duration_ms=%d",
-                        backend.name,
-                        speech_end - speech_start,
-                    )
-                    continue
-                if transcript:
-                    observations.append(
-                        Observation(
-                            start_offset_ms=speech_start,
-                            end_offset_ms=speech_end,
-                            kind="speech",
-                            label="transcript",
-                            confidence=min(0.95, max(0.5, speech_confidence)),
-                            model=backend_model,
-                            transcript=transcript[:16_384],
-                            language=language,
-                            emotion=emotion,
+                transcript_bound_end = speech_end
+                combined_transcript = " ".join(
+                    segment[2] for segment in transcript_segments
+                )
+                group_seconds = max(0.25, (speech_end - speech_start) / 1000)
+                if isinstance(backend, WhisperBackend) and transcript_text_is_unreliable(
+                    combined_transcript,
+                    group_seconds,
+                ):
+                    if speech_end < duration_ms:
+                        transcript_bound_end = min(
+                            duration_ms,
+                            speech_end + ASR_RETRY_CONTEXT_MS,
                         )
+                        retry_end_sample = round(
+                            transcript_bound_end * sample_rate / 1000
+                        )
+                        logger.info(
+                            "retrying unreliable Whisper segment with trailing context "
+                            "duration_ms=%d retry_duration_ms=%d",
+                            speech_end - speech_start,
+                            transcript_bound_end - speech_start,
+                        )
+                        transcript_segments = backend.transcribe_segments(
+                            samples[start_sample:retry_end_sample],
+                            sample_rate,
+                        )
+                        combined_transcript = " ".join(
+                            segment[2] for segment in transcript_segments
+                        )
+                        group_seconds = max(
+                            0.25,
+                            (transcript_bound_end - speech_start) / 1000,
+                        )
+                    if transcript_text_is_unreliable(
+                        combined_transcript,
+                        group_seconds,
+                    ):
+                        logger.warning(
+                            "discarding unreliable ASR group engine=%s duration_ms=%d",
+                            backend.name,
+                            transcript_bound_end - speech_start,
+                        )
+                        transcript_segments = []
+                for (
+                    transcript_start,
+                    transcript_end,
+                    transcript,
+                    language,
+                    emotion,
+                ) in transcript_segments:
+                    transcript = _trim_incomplete_transcript(
+                        " ".join(transcript.split())
                     )
+                    absolute_start = max(
+                        speech_start,
+                        min(speech_start + transcript_start, transcript_bound_end),
+                    )
+                    absolute_end = max(
+                        absolute_start,
+                        min(speech_start + transcript_end, transcript_bound_end),
+                    )
+                    segment_seconds = max(
+                        0.25,
+                        (absolute_end - absolute_start) / 1000,
+                    )
+                    if transcript_text_is_unreliable(transcript, segment_seconds):
+                        logger.warning(
+                            "discarding unreliable ASR output engine=%s duration_ms=%d",
+                            backend.name,
+                            absolute_end - absolute_start,
+                        )
+                        continue
+                    if transcript and absolute_end > absolute_start:
+                        observations.append(
+                            Observation(
+                                start_offset_ms=absolute_start,
+                                end_offset_ms=absolute_end,
+                                kind="speech",
+                                label="transcript",
+                                confidence=min(0.95, max(0.5, speech_confidence)),
+                                model=backend_model,
+                                transcript=transcript[:16_384],
+                                language=language,
+                                emotion=emotion,
+                            )
+                        )
         if backend is not None:
             asr_ms = _elapsed_ms(asr_started)
 
@@ -752,18 +848,6 @@ class PerceptionEngine:
             },
             wav,
         )
-
-
-def _transcript_is_unreliable(text: str, duration_seconds: float) -> bool:
-    tokens = [token.casefold() for token in text.split() if token.strip()]
-    if not tokens:
-        return False
-    if len(tokens) > max(16, round(duration_seconds * 8)):
-        return True
-    if len(tokens) < 9:
-        return False
-    trigrams = [tuple(tokens[index : index + 3]) for index in range(len(tokens) - 2)]
-    return len(set(trigrams)) / len(trigrams) < 0.45
 
 
 def _trim_incomplete_transcript(text: str) -> str:
@@ -1070,6 +1154,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--disable-vad", action="store_true")
     parser.add_argument("--disable-efficientat", action="store_true")
+    parser.add_argument("--warmup", action="store_true")
     parser.add_argument("--max-in-flight", type=int, default=1)
     parser.add_argument("--max-queued", type=int, default=8)
     parser.add_argument("--request-timeout-seconds", type=float, default=120.0)
@@ -1088,6 +1173,13 @@ def main() -> None:
     if args.max_queued < 0 or args.max_queued > 256:
         raise SystemExit("--max-queued must be in [0, 256]")
     engine = PerceptionEngine(args)
+    if args.warmup:
+        logger.info(
+            "audio models ready efficientat=%s vad=%s",
+            engine.tagger.model_name if engine.tagger is not None else "disabled",
+            engine.vad.model_name if engine.vad is not None else "disabled",
+        )
+        return
     with AudioTcpServer(
         (args.host, args.port),
         engine,
