@@ -43,6 +43,13 @@ PROFILE_ENGINE = {
     "lfm": "lfm2_5_audio",
     "all": "whisper",
 }
+UNSAFE_CHILD_ENVIRONMENT = (
+    "SSLKEYLOGFILE",
+    "OPENSSL_CONF",
+    "OPENSSL_MODULES",
+    "PYTHONHOME",
+    "PYTHONPATH",
+)
 
 
 def _default_cache_dir() -> Path:
@@ -96,11 +103,18 @@ def _run(
     return subprocess.run(
         rendered,
         check=True,
-        env=env,
+        env=_child_environment() if env is None else env,
         text=True,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
     )
+
+
+def _child_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    for name in UNSAFE_CHILD_ENVIRONMENT:
+        env.pop(name, None)
+    return env
 
 
 def _sha256(path: Path) -> str:
@@ -112,15 +126,7 @@ def _sha256(path: Path) -> str:
 
 
 def _environment(profile: str, paths: dict[str, Path]) -> dict[str, str]:
-    env = os.environ.copy()
-    for name in (
-        "SSLKEYLOGFILE",
-        "OPENSSL_CONF",
-        "OPENSSL_MODULES",
-        "PYTHONHOME",
-        "PYTHONPATH",
-    ):
-        env.pop(name, None)
+    env = _child_environment()
     env.update(
         {
             "HF_HOME": os.fspath(paths["hf"]),

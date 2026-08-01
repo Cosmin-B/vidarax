@@ -10,6 +10,25 @@ from audio_labels import timestamped_transcript_chunks, transcript_text_is_unrel
 
 
 class AudioRuntimeTests(unittest.TestCase):
+    def test_all_child_processes_drop_foreign_python_and_openssl_state(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SSLKEYLOGFILE": "C:/captures/tls.keys",
+                "OPENSSL_CONF": "C:/foreign/openssl.cnf",
+                "OPENSSL_MODULES": "C:/foreign/providers",
+                "PYTHONHOME": "C:/foreign/python",
+                "PYTHONPATH": "C:/foreign/site-packages",
+            },
+            clear=False,
+        ), mock.patch.object(audio_runtime.subprocess, "run") as run:
+            run.return_value = audio_runtime.subprocess.CompletedProcess([], 0)
+            audio_runtime._run(("python", "-m", "venv", "target"))
+
+        environment = run.call_args.kwargs["env"]
+        for name in audio_runtime.UNSAFE_CHILD_ENVIRONMENT:
+            self.assertNotIn(name, environment)
+
     def test_cache_override_controls_all_default_runtime_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with mock.patch.dict(
