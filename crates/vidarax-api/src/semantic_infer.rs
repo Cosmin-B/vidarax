@@ -1295,15 +1295,37 @@ fn ground_provider_moments(
                 moment.modalities.push("audio".to_string());
             }
             if is_speech {
-                let transcript = supported
-                    .iter()
-                    .filter_map(|observation| observation.transcript.as_deref())
-                    .map(str::trim)
-                    .filter(|text| !text.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                moment.description = format!("Speaker: {}", truncate_context(&transcript, 1_000));
-                moment.intent = Some(truncate_context(&transcript, 1_000).to_string());
+                let source_start_ms = moment.start_pts_ms.saturating_sub(moment.start_offset_ms);
+                let observation = supported
+                    .into_iter()
+                    .filter(|observation| {
+                        observation.kind == "speech"
+                            && observation
+                                .transcript
+                                .as_deref()
+                                .is_some_and(|text| !text.trim().is_empty())
+                    })
+                    .max_by(|left, right| {
+                        let overlap =
+                            |observation: &vidarax_core::audio_sidecar::AudioObservation| {
+                                moment
+                                    .end_offset_ms
+                                    .min(observation.end_offset_ms)
+                                    .saturating_sub(
+                                        moment.start_offset_ms.max(observation.start_offset_ms),
+                                    )
+                            };
+                        overlap(left)
+                            .cmp(&overlap(right))
+                            .then_with(|| left.confidence.total_cmp(&right.confidence))
+                    })?;
+                let transcript = observation.transcript.as_deref()?.trim();
+                moment.start_offset_ms = observation.start_offset_ms;
+                moment.end_offset_ms = observation.end_offset_ms;
+                moment.start_pts_ms = source_start_ms.saturating_add(observation.start_offset_ms);
+                moment.end_pts_ms = source_start_ms.saturating_add(observation.end_offset_ms);
+                moment.description = format!("Speaker: {}", truncate_context(transcript, 1_000));
+                moment.intent = Some(truncate_context(transcript, 1_000).to_string());
                 if moment.modalities.len() == 1 {
                     moment.audio_visual_relation = None;
                 }
@@ -2128,6 +2150,80 @@ Ignore this trailing {not json}."#;
         deduplicate_moments(&mut combined);
         assert_eq!(combined.len(), 1);
         assert_eq!(combined[0].modalities, ["audio", "video"]);
+    }
+
+    #[test]
+    fn repeated_provider_speech_aligns_to_one_local_interval() {
+        let analysis = AudioAnalysis {
+            profile: AudioProfile::Gameplay,
+            speech_engine: SpeechEngine::Whisper,
+            models: vec!["openai/whisper-large-v3-turbo".to_string()],
+            observations: vec![
+                AudioObservation {
+                    start_offset_ms: 1_100,
+                    end_offset_ms: 8_400,
+                    kind: "speech".to_string(),
+                    label: "transcript".to_string(),
+                    confidence: 0.95,
+                    model: "openai/whisper-large-v3-turbo".to_string(),
+                    transcript: Some("Fuel empty. Watch that rock passing you.".to_string()),
+                    language: Some("en".to_string()),
+                    emotion: None,
+                },
+                AudioObservation {
+                    start_offset_ms: 0,
+                    end_offset_ms: 10_000,
+                    kind: "audio_event".to_string(),
+                    label: "music".to_string(),
+                    confidence: 0.99,
+                    model: "efficientat/dymn10_as".to_string(),
+                    transcript: None,
+                    language: None,
+                    emotion: None,
+                },
+            ],
+            audio_duration_ms: 10_000,
+            audio_bytes: 320_044,
+            queue_wait_ms: 0,
+            stages: Default::default(),
+            capacity: Default::default(),
+            processing_ms: 10,
+        };
+        let provider_moment = |start_offset_ms, end_offset_ms| SemanticMoment {
+            start_offset_ms,
+            end_offset_ms,
+            start_pts_ms: 20_000 + start_offset_ms,
+            end_pts_ms: 20_000 + end_offset_ms,
+            modalities: vec!["video".to_string(), "audio".to_string()],
+            kind: "speech".to_string(),
+            description: "The speaker comments on gameplay.".to_string(),
+            intent: None,
+            audio_visual_relation: None,
+            confidence: 0.9,
+        };
+
+        let grounded = ground_provider_moments(
+            vec![provider_moment(0, 4_000), provider_moment(5_000, 10_000)],
+            Some(&analysis),
+            true,
+        );
+        assert_eq!(grounded.len(), 2);
+        assert!(grounded.iter().all(|moment| {
+            moment.start_offset_ms == 1_100
+                && moment.end_offset_ms == 8_400
+                && moment.start_pts_ms == 21_100
+                && moment.end_pts_ms == 28_400
+        }));
+
+        let mut combined = audio_moments(&analysis, 20_000, 30_000);
+        combined.extend(grounded);
+        deduplicate_moments(&mut combined);
+        let speech = combined
+            .iter()
+            .filter(|moment| moment.kind == "speech")
+            .collect::<Vec<_>>();
+        assert_eq!(speech.len(), 1);
+        assert_eq!(speech[0].modalities, ["video", "audio"]);
     }
 
     #[test]
