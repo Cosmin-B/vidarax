@@ -3,6 +3,8 @@ title: Events and SDK
 description: Event shapes and kinds, per-kind payloads, markers, query and search, and the TypeScript SDK.
 ---
 
+<!-- status: draft, needs Cosmin's rewrite pass before publication -->
+
 Everything Vidarax learns about a video becomes an event on a run's timeline.
 The local WAL is authoritative, and the API serves its current state. A
 configured SpacetimeDB service receives blocking WHIP descriptions after the
@@ -65,6 +67,23 @@ remain binary. `data` carries their sidecar reference, hash, media type, and
 byte count. Save the per-webhook `signing_secret` from the creation response.
 It is returned once and must be hex-decoded before HMAC verification.
 
+## Retained media contract
+
+The timeline stores metadata and references. Selected JPEGs, requested MP4
+windows, and generated WAV files live in content-addressed stores under
+`VIDARAX_DATA_DIR`. Vidarax writes a blob before appending the event that
+references it. Events carry a relative reference, media type, byte count, and
+SHA-256. Binary bytes do not enter the WAL, JSON responses, SSE, or webhooks.
+
+The full source is not copied into this store automatically. The caller must
+retain it separately when later replay requires the original recording.
+Vidarax also has no automatic blob retention or garbage collector. A crash
+between blob creation and event append can leave an unreferenced blob.
+
+Timeline appends are flushed but not fsynced. They survive an ordinary process
+crash, but recent events can be lost after sudden power loss or a kernel
+failure.
+
 ## Event kinds and payloads
 
 Run lifecycle and analysis kinds written by the API handlers, with the payload fields each one carries:
@@ -113,7 +132,7 @@ Live sessions add streaming kinds through the event sink. The worker's `event_ty
 | `clip_vlm` / `clip_vlm_tiered` | Clip VLM worker |
 | `state_transition` | VLM worker, when consecutive descriptions diverge past the word-overlap threshold |
 | `loop_detected` | Per-frame filter or analysis worker, once per loop entry |
-| `keyframe_stored` | The sink's keyframe path. The payload includes `frame_index`, `pts_ms`, `coordinate_schema`, `coordinates`, `event_type`, `description`, `image_ref`, `image_media_type`, `image_bytes`, and `image_sha256`. Raw JPEG bytes live in the content-addressed sidecar, not in JSON or the WAL. |
+| `keyframe_stored` | The sink's keyframe path. The payload includes `frame_index`, `pts_ms`, `coordinate_schema`, `coordinates`, `event_type`, `description`, `image_ref`, `image_media_type`, `image_bytes`, and `image_sha256`. Raw JPEG bytes live in the content-addressed store, not in JSON or the WAL. |
 | `restricted_zone_activity_entered` | Restricted-zone state machine after its binary JPEG write succeeds |
 | `trigger.<event_type>` | A live trigger program after its binary JPEG write succeeds |
 
@@ -164,7 +183,7 @@ body, webhook body, or JSON API response.
 With `local_audio`, the chunk also carries sound events, transcript hypotheses,
 the selected profile and speech engine, and the models that ran. Optional LFM
 spoken feedback uses a nested `feedback_audio` reference. The referenced WAV
-uses the same ownership and hash checks as retained MP4 evidence.
+uses the same ownership and hash checks as retained MP4 media.
 
 Live WHIP audio writes the same two event kinds. Its
 `semantic_chunk_inferred` payload uses `media_mode: "live_audio"` and adds the
@@ -208,12 +227,6 @@ Each marker has a `status` with three values:
 
 The filters compose as range overlap: `from_frame` matches markers whose `end_frame` is at or past it, `to_frame` matches markers whose `start_frame` is at or before it, and `status` and `event_type` are exact matches. Results are sorted by `start_frame`, then `end_frame`, then `marker_id`.
 
-The replay release check validates reference fixtures against
-`schemas/frame-metadata.schema.json` and
-`schemas/processing-config.schema.json`. The checked-in fixtures are covered by
-`scripts/validate_replay_and_schema.sh`. Live response validation is outside
-that test.
-
 ## Query and search
 
 Two endpoints read across runs:
@@ -254,7 +267,7 @@ The full public surface:
 | `getRunState(id)` | Derived run state as a string. |
 | `ingestRun(id, opts)` | Attach a source and decode frames. |
 | `analyzeRun(id, opts)` | Run analysis on ingested frames. |
-| `reason(id, opts)` | Realtime semantic reasoning over a source, including `semantic_prompt`. |
+| `reason(id, opts)` | Prompt-driven semantic analysis over a source, including `semantic_prompt`. |
 | `getEvents(id, index?)` / `getMarkers(id, query?)` | Fetch the current event list or filtered marker list. |
 | `getInteractions(id, index?)` | Fetch guided semantic interactions derived from chunk events. |
 | `getKeyframe(id, sha256)` | Fetch a referenced keyframe as a raw JPEG `Blob`. |

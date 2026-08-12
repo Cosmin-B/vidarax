@@ -34,8 +34,8 @@ source-time windows. `run_semantic_dispatch` admits only
 `vlm_concurrency` windows at once, and each task extracts its MP4 immediately
 before inference. Raw clip memory is therefore bounded by active tasks and the
 process-wide inference byte budget. Audio-video extraction runs in one ffmpeg
-process per active window and caps output at 64 MiB. Evidence persistence uses
-the timeline writer only after the MP4 sidecar write finishes.
+process per active window and caps output at 64 MiB. Retained-media persistence uses
+the timeline writer only after the MP4 store write finishes.
 
 `PipelineGeneration`, `PipelineStage`, and `PipelineHealth` make lifecycle state
 explicit and typed. Live prompt/schema changes travel over an eight-slot

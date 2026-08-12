@@ -1,5 +1,7 @@
 # vidarax
 
+<!-- status: draft, needs Cosmin's rewrite pass before publication -->
+
 TypeScript SDK for the Vidarax video analysis API.
 
 ## Installation
@@ -23,7 +25,7 @@ Requires Node.js 18+ or any modern browser.
 ```typescript
 import { Vidarax } from 'vidarax'
 const v = new Vidarax('http://localhost:8080', { apiKey: 'dev-key' })
-// analyze() runs the deterministic frame-signal pipeline; it takes no prompt.
+// analyze() runs the deterministic frame-signal pipeline and takes no prompt.
 const run = await v.analyze('/srv/vidarax-media/video.mp4')
 for (const event of await v.getEvents(run.runId)) {
   console.log(event.kind, event.payload)
@@ -62,7 +64,7 @@ if (evidence?.media_sha256) {
 }
 ```
 
-MP4 bytes use Gemini File API and the binary evidence route. They never travel
+MP4 bytes use Gemini File API and the binary media route. They never travel
 inside JSON. Gemini reports timestamps at about one-second resolution. Local
 speech wording comes from the selective Whisper pass.
 
@@ -90,11 +92,11 @@ const v = new Vidarax(baseUrl, options?)
 | `getRunState(id)` | Read the state derived from the run timeline. |
 | `ingestRun(id, opts)` | Attach a source and decode frames. |
 | `analyzeRun(id, opts)` | Run analysis on ingested frames. |
-| `reason(id, opts)` | Realtime inference over a stream. |
+| `reason(id, opts)` | Prompt-driven analysis over a recorded or live source. |
 | `getEvents(id, index?)` / `getMarkers(id, query?)` | Fetch one snapshot of events or markers. |
 | `getInteractions(id, index?)` | Fetch guided semantic interactions. |
 | `getKeyframe(id, sha256)` | Fetch a run-owned keyframe as a raw JPEG `Blob`. |
-| `getMedia(id, sha256)` | Fetch run-owned A/V evidence as a raw MP4 `Blob`. |
+| `getMedia(id, sha256)` | Fetch run-owned MP4 or WAV media as a raw `Blob`. |
 | `streamEvents(id)` / `streamMarkers(id)` | Async-iterate a one-time compatibility snapshot. |
 | `subscribeEvents(id, options?)` | Replay and follow events over SSE with `Last-Event-ID` reconnect. |
 | `createWebhook(id, request)` / `listWebhooks(id)` / `deleteWebhook(id, webhookId)` | Manage signed action hooks and inspect dead-letter state. Save the per-hook signing secret returned only at creation. |

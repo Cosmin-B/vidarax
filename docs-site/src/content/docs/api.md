@@ -23,7 +23,7 @@ The API is served over HTTP/1.1 and HTTP/2, with optional HTTP/3 behind the `h3-
 | `DELETE` | `/v1/runs/:id` | Delete a run |
 | `POST` | `/v1/runs/:id/ingest` | Ingest and decode a video source |
 | `POST` | `/v1/runs/:id/analyze` | Deterministic frame analysis |
-| `POST` | `/v1/runs/:id/reason` | Real-time semantic analysis (tiered VLM) |
+| `POST` | `/v1/runs/:id/reason` | Prompt-driven semantic analysis (tiered VLM) |
 | `POST` | `/v1/runs/:id/stop` | Stop a run |
 | `POST` | `/v1/runs/:id/keepalive` | Refresh active run TTL |
 | `GET` | `/v1/runs/:id/events` | Read run events |
@@ -146,7 +146,7 @@ Requests use `Content-Type: application/cloudevents+json`,
 `x-vidarax-event-id: <run_id>:<seq>`, and
 `x-vidarax-signature: v1=<HMAC-SHA256(body)>`. The HMAC key is the hex-decoded
 `signing_secret` returned once when the hook is created. Binary media remains in the
-content-addressed sidecar. Event bodies carry only its existing reference and
+content-addressed store. Event bodies carry only its existing reference and
 hash. `VIDARAX_WEBHOOK_SECRET` must contain at least 32 bytes and acts only as a
 server-side derivation root. Each hook receives a distinct key, so one tenant's
 receiver cannot forge another hook's deliveries.

@@ -159,7 +159,7 @@ The `replay_schema` integration test (`crates/vidarax-core/tests/replay_schema.r
 - Schema acceptance. `schemas/processing-config.schema.json` and `schemas/frame-metadata.schema.json` must accept their reference fixtures.
 - Schema rejection. A frame-metadata instance missing required fields must fail validation, proving the schema actually constrains.
 
-The same script is the first step of `scripts/release_gates.sh`, so no release ships with drifted gate behavior or schemas. See [Allocation discipline](/docs/internals/allocation-discipline/#the-release-gate-scripts) for the rest of that pipeline.
+The same script is the first step of `scripts/release_gates.sh`, so no release ships with drifted gate behavior or schemas. See [Allocation discipline](/docs/internals/allocation-discipline/#the-release-check-scripts) for the rest of that pipeline.
 
 ## Edge cases and limits
 

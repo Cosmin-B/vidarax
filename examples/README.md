@@ -1,14 +1,18 @@
 # Examples
 
+<!-- status: draft, needs Cosmin's rewrite pass before publication -->
+
 TypeScript demos that run against a local server with `npx tsx`. Each one
 imports the SDK straight from `packages/vidarax-sdk/src`, so no build step is
 needed. Start the server first, then:
 
 ```bash
-VIDARAX_API_KEY=your-key npx tsx examples/<name>.ts
+VIDARAX_API_URL=http://127.0.0.1:8080 \
+VIDARAX_API_KEY=dev-key \
+npx tsx examples/<name>.ts
 ```
 
-- `sdk-demo.ts`: the happy path, from health check through analysis, events, markers, inference, and search.
+- `sdk-demo.ts`: health check, analysis, events, markers, inference, and search.
 - `whip-live-demo.ts`: the WHIP live-session signalling flow (offer, trickle ICE, live prompt update, terminate), with marked placeholders where a browser or GStreamer attaches real media and handling for the prompt update's 409/503 outcomes.
 - `error-handling-demo.ts`: the typed error surface, catching a real 404 as `HttpError` and an unreachable server as `RetryExhaustedError` wrapping a `NetworkError`.
 
@@ -17,6 +21,9 @@ VIDARAX_API_KEY=your-key npx tsx examples/<name>.ts
 The same flows are available from the `vidarax` CLI:
 
 ```bash
+export VIDARAX_API_URL=http://127.0.0.1:8080
+export VIDARAX_API_KEY=dev-key
+
 # Check local config and API readiness before anything else.
 vidarax doctor
 
@@ -25,9 +32,10 @@ vidarax doctor
 # unless you add --with-ingest.
 vidarax analyze video.mp4
 
-# Analyze a source the server can reach directly (http(s), rtsp, hls, or a
-# server-local path) and skip the upload step.
-vidarax analyze --source-uri rtsp://camera.local/stream
+# Analyze a source the server can reach directly and skip the upload step.
+# Local paths need an allowed ingest root. Remote HLS and unencrypted HTTP or
+# RTSP remain disabled until the corresponding server setting enables them.
+vidarax analyze --source-uri rtsps://camera.example.com/stream
 
 # Stop a run without deleting its history. This also closes the run's live
 # WHIP session, if it has one.

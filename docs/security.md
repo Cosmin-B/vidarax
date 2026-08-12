@@ -40,9 +40,8 @@ still restrict process egress to expected receiver networks as defense in
 depth.
 
 Webhook bodies are CloudEvents-compatible event metadata. Binary keyframes and
-recorded A/V evidence clips are never embedded or base64-encoded. The existing
-content-addressed
-sidecar reference remains in `data`. Receivers must fetch media through the
+recorded A/V clips are never embedded or base64-encoded. The existing
+content-addressed store reference remains in `data`. Receivers must fetch media through the
 authenticated blob route when needed.
 
 ## Ingest File Ownership

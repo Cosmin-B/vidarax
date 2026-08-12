@@ -1,62 +1,103 @@
+<!-- status: draft, needs Cosmin's rewrite pass before publication -->
+
 # vidarax
 
-Self-hosted media intelligence for live streams and recorded files.
+Vidarax is a self-hosted media runtime for applications that need ordered,
+timestamped records from live video or recorded media. It accepts a stream or
+file, narrows the media before inference, and gives the application an event
+cursor plus references to the selected binary media.
 
-Vidarax turns continuous video and synchronized sound into actionable,
-replayable assertions. It decodes each stream, runs a deterministic per-frame
-filter, and spends model calls when visual or semantic change warrants them.
-Bounded trigger programs turn perception signals into namespaced events, signed
-webhooks, or metadata-only local outputs.
+It is built for developers operating camera, fleet, facility, or robotics
+software who want to run their own media plane and choose where inference
+runs.
 
-Events commit to a local write-ahead log. Selected JPEGs live in a
-content-addressed binary store and event metadata carries their references.
-For fixed cameras, a restricted-zone policy can turn sustained motion inside a
-normalized image region into a durable assertion. A signed edge updater moves
-model releases through shadow and canary checks while the last active model
-keeps running through network loss or a rejected candidate.
+[Product site](https://vidarax.cosminbararu.com/) ·
+[Documentation](https://vidarax.cosminbararu.com/docs/) ·
+[System tour](https://cosminbararu.com/blog/video-stream-through-vidarax)
 
-## Architecture
+## The system model
 
 ```
- Sources          Per-session work               Durable state       Delivery
-┌──────────┐   ┌──────────────────────────────┐   ┌─────────────────┐   ┌─────────────┐
-│ MP4/File │──>│ Decode -> Frame filter -> VLM│──>│ WAL event log   │──>│ REST / SSE  │
-│ WebRTC   │──>│    │                         │   │                 │   │ Webhooks    │
-│ RTSP/HLS │──>│    ├─ Trigger VM             │   │ JPEG/MP4/WAV    │   │ TypeScript  │
-│ Upload   │──>│    ├─ Synced A/V windows     │   │ binary sidecars │   │ SDK / UI    │
-│          │   │    └─ Local audio sidecar    │   │                 │   │ Prometheus  │
-└──────────┘   └──────────────────────────────┘   └─────────────────┘   └─────────────┘
-
- Signed release manifest -> edge updater -> shadow -> canary -> active model
+ source                bounded media work                 ordered commit           consumers
+┌────────────┐    ┌──────────────────────────────┐    ┌──────────────────┐    ┌──────────────┐
+│ file/upload│───>│ decode -> frame filter       │───>│ timeline writer  │───>│ REST / SSE   │
+│ RTSP / HLS │    │             -> novelty -> VLM│    │ WAL + blob refs  │    │ webhooks     │
+│ WHIP video │    │ audio windows -> local audio │    │ JPEG / MP4 / WAV │    │ SDK / UI     │
+└────────────┘    └──────────────────────────────┘    └──────────────────┘    └──────────────┘
 ```
 
-Each live session is admitted as one typed pipeline generation. The process
-reserves that generation's bounded memory and worker-thread envelope before it
-creates a durable run. A supervisor then owns every stage handle: if one
-stateful worker exits unexpectedly, Vidarax stops and joins the sibling stages,
-closes the peer, and reports the fixed stage and reason through metrics. It never
-restarts one worker underneath older temporal state. Live prompt and schema
-changes use a bounded, generation-tagged command and return only after the VLM
-worker acknowledges the new configuration.
+One timeline writer assigns a monotonic sequence number before an event becomes
+visible to readers. That sequence is global to one data directory and is the
+cursor used by REST, SSE, and webhook delivery. The envelope timestamp records
+when the writer appended the event. Frame, clip, and audio timestamps remain in
+the payload as source-relative media time.
 
-Provider calls from all streams pass through one deadline-aware scheduler. It
-fair-queues principals and streams across urgent live, normal live, and offline
-classes while enforcing process-wide concurrency, output-token, and encoded
-media-byte reservations. Per-stream temporal order remains owned by that
-stream's single VLM worker. Provider runtimes remain responsible for
-token-level batching.
+Live work stays ordered inside one stream. A live session reserves its queue,
+buffer-pool, scratch-space, sidecar, and worker allowance before `run_created`
+commits. Bounded queues connect the stages. Provider calls from every stream go
+through a second process-wide scheduler with concurrency, token, encoded-media,
+waiter, and deadline limits. Parallelism comes from separate streams, while one
+stateful decoder and one stateful VLM worker preserve order within a stream.
 
-## Performance
+## Inputs and inference
 
-Throughput depends on your hardware, the models you run, and the input video, so
-there is no single headline number worth quoting. Measure on your own setup: the
-Python harnesses in `benchmarks/`, the bench binaries under `crates/*/src/bin`,
-and the scripts in `scripts/` cover the per-frame filter, provider transport,
-and the end-to-end API path. The deterministic filter is the cheap per-frame
-stage. The optional semantic novelty filter reduces repeat model calls, while
-bounded tiering can escalate an uncertain first pass to a second model.
-Calibration and provider/hardware measurements are deployment-specific. See
-[deployment and calibration](docs/deployment.md#live-semantic-novelty-calibration).
+| Input | Analysis path | Provider boundary |
+|---|---|---|
+| Local file, upload, HTTP(S), HLS, or RTSP | Deterministic frame signals, selected JPEGs, optional clip windows | OpenAI-compatible vLLM, SGLang, or MLX endpoints, with optional Gemini routing |
+| Recorded `video` or `audio_video` mode | Bounded source-time MP4 windows with synchronized audio | Gemini File API |
+| WHIP/WebRTC video | Ordered live keyframes or clips | The configured image provider chain |
+| WHIP Opus audio | Bounded four-second windows | Optional local audio sidecar |
+
+File and URL decoding supports CPU ffmpeg, NVIDIA NVDEC, and an Apple
+VideoToolbox selective-JPEG path. WHIP video accepts H.264 and H.265. VP8 is
+available only in builds that enable the `vp8` feature.
+
+The first decision is deterministic and runs on decoded frame signals. It
+selects scene changes, keepalives, and suspected visual artifacts before JPEG
+encoding. Live WHIP capture can add an opt-in SigLIP2 novelty sidecar after
+that filter. The live novelty gate compares each selected JPEG with the last
+frame that produced a usable description. Reuse is bounded by capture time and
+cumulative drift. Timeouts, malformed embeddings, and reconnect backoff run the
+VLM. A shadow sample checks some reuse decisions without changing state or
+emitting an event.
+
+The shipped novelty threshold is a conservative starting value. It must be
+calibrated on ordered examples from the deployment. File analysis does not pass
+through this live gate. The reusable novelty library also contains OCR and
+perceptual-hash signals, but the live image path uses embeddings only.
+
+## Retention and delivery
+
+Metadata commits to `${VIDARAX_DATA_DIR}/timeline.wal`. Selected JPEGs,
+retained MP4 windows, and generated WAV files are written to content-addressed
+stores before an event references them. JSON, SSE, webhooks, and the WAL carry
+the reference, media type, byte count, and SHA-256 instead of binary bytes.
+Vidarax does not retain the full source automatically.
+
+The WAL is flushed after each append but is not fsynced. It is designed to
+survive a process crash, not sudden power loss or a kernel failure. A crash
+after a blob write and before its event append can leave an unreferenced blob,
+and automatic orphan cleanup is not implemented. Older run reads can also fall
+back to a WAL scan once their in-memory tail has been evicted.
+
+## Current boundary
+
+- Vidarax is self-hosted. The operator supplies storage, ffmpeg, and each model
+  service or API credential.
+- Capacity and semantic reuse depend on codec, resolution, scene content,
+  provider, and hardware. The repository includes probes instead of a universal
+  throughput claim.
+- Native synchronized audio-video reasoning currently uses Gemini. The
+  OpenAI-compatible path handles selected images, but it is not the recorded
+  native-media route.
+- The event log has one writer per process and no built-in retention policy or
+  blob garbage collector.
+- The TypeScript SDK is built from this checkout until its first registry
+  release.
+
+For deployment settings and calibration commands, see
+[docs/deployment.md](docs/deployment.md). For the complete event contract, see
+[Events and SDK](https://vidarax.cosminbararu.com/docs/events/).
 
 ## Quick start
 
@@ -65,8 +106,15 @@ Calibration and provider/hardware measurements are deployment-specific. See
 ```bash
 git clone https://github.com/Cosmin-B/vidarax && cd vidarax
 cargo build --release -p vidarax-api
-VIDARAX_API_KEYS=dev-key VIDARAX_VLLM_BASE_URL=http://localhost:8000 cargo run --release -p vidarax-api
+VIDARAX_API_KEYS=dev-key \
+VIDARAX_VLLM_BASE_URL=http://localhost:8000 \
+VIDARAX_INGEST_FILE_ROOTS=/srv/vidarax-media \
+cargo run --release -p vidarax-api
 ```
+
+The example expects a video under `/srv/vidarax-media` and an
+OpenAI-compatible VLM at `http://localhost:8000`. API keys are enabled by
+default.
 
 Frontend (separate terminal):
 
@@ -89,7 +137,7 @@ into your application with `npm link vidarax`.
 ```typescript
 import { Vidarax } from 'vidarax'
 
-const v = new Vidarax('http://localhost:8080', { apiKey: 'your-key' })
+const v = new Vidarax('http://localhost:8080', { apiKey: 'dev-key' })
 
 // analyze() runs the deterministic frame-signal pipeline. It takes no prompt.
 const run = await v.analyze('/srv/vidarax-media/video.mp4', { mode: 'balanced' })
@@ -99,222 +147,34 @@ for (const event of await v.getEvents(run.runId)) {
 }
 ```
 
-For prompt-driven semantic analysis, create a run and call `reason()` with a
-`semantic_prompt`:
+This example runs the deterministic frame path. Prompt-driven analysis,
+synchronized audio/video windows, live WHIP, and the full CLI flow are in the
+[quickstart](https://vidarax.cosminbararu.com/docs/quickstart/). The
+[TypeScript SDK reference](packages/vidarax-sdk/README.md) documents the public
+client surface.
 
-```typescript
-const { run_id } = await v.createRun()
-const result = await v.reason(run_id, {
-  source_uri: '/srv/vidarax-media/session.mp4',
-  model: 'gemini-3.5-flash-lite',
-  semantic_prompt: 'Find meaningful sound, speech intent, and visible actions',
-  media: {
-    mode: 'audio_video',
-    window_ms: 20000,
-    resolution: 'low',
-    persist_evidence: true,
-  },
-  local_audio: {
-    profile: 'screen_recording',
-    speech_engine: 'whisper',
-    min_confidence: 0.35,
-    max_events: 32,
-  },
-})
-
-const moments = (await v.getEvents(run_id))
-  .filter(event => event.kind === 'multimodal_moment')
-```
-
-Native media modes send raw MP4 bytes through Gemini File API. They do not place
-media in JSON or base64. Each `multimodal_moment` carries source-relative start
-and end timestamps, the contributing modalities, a description, optional
-speech intent, an optional audio-to-visual relationship, confidence, and an MP4
-sidecar reference when retention is enabled. Gemini timestamps resolve to about
-one second. Recorded files and live WHIP Opus tracks use the same local audio
-event schema.
-
-The optional local audio sidecar runs Silero VAD and EfficientAT before the VLM.
-It invokes one selected ASR model only when speech is present. Whisper
-large-v3-turbo is the default selective engine. Moonshine Streaming Tiny,
-Qwen3-ASR 0.6B, SenseVoice, and LFM2.5-Audio 1.5B remain explicit deployment
-choices. LFM can also store a spoken summary as content-addressed WAV. See
-[local audio](https://vidarax.cosminbararu.com/docs/audio/).
-
-Start the default local audio path with one command:
-
-```bash
-python3 scripts/audio_runtime.py run --profile whisper
-```
-
-On first use, this provisions Python 3.12, syncs the locked dependency set, and
-checks out the pinned sound-classifier source. Later runs reuse the environment,
-package cache, and model cache. Nothing is written to tracked source paths. Run
-`python3 scripts/audio_runtime.py check --profile whisper --json` to inspect the
-resolved paths and readiness.
-
-Mage-VL is available as an experimental model and as two debug commands. One
-compares codec-native visual tokens with uniform frame sampling. The other
-prints each proactive streaming decision and its `p(respond)`. See
-[Mage-VL debug modes](https://vidarax.cosminbararu.com/docs/mage-vl/).
-
-The semantic-novelty tools can also compare LFM2.5 Encoder 230M and 350M on
-labelled transcript or event-description pairs. These base encoders stay out
-of the live image gate until the probe shows useful separation on deployment
-text. See [Gate engine](https://vidarax.cosminbararu.com/docs/gate/).
-
-The SDK also supports WHIP/WebRTC video, batch inference, structured JSON
-output via `output_schema`, interactions, and snapshot reads of events and
-markers.
-
-## Agent Skill
+## Agent skill
 
 The repository ships the platform-neutral
 [`vidarax-review-media`](.agents/skills/vidarax-review-media/SKILL.md) Agent
 Skill. Compatible agent harnesses can use it to create an isolated current-build
 runtime, install the local audio path on first use, review a recording, and
-separate verified moments from uncertain candidates. Its reporting rules keep
+separate supported moments from uncertain candidates. Its reporting rules keep
 binary media out of JSON and treat local transcripts as the source for exact
 speech wording.
 
-## API endpoints
+## Where to go next
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/runs` | Create a new analysis run |
-| `GET` | `/v1/runs` | List runs |
-| `GET` | `/v1/runs/:id` | Get run details |
-| `DELETE` | `/v1/runs/:id` | Delete a run |
-| `POST` | `/v1/runs/:id/ingest` | Ingest and decode a video source |
-| `POST` | `/v1/runs/:id/analyze` | Deterministic frame analysis |
-| `POST` | `/v1/runs/:id/reason` | Real-time semantic analysis (tiered VLM) |
-| `POST` | `/v1/runs/:id/stop` | Stop a run |
-| `POST` | `/v1/runs/:id/keepalive` | Refresh active run TTL |
-| `GET` | `/v1/runs/:id/events` | List the current run-event snapshot |
-| `GET` | `/v1/runs/:id/events/stream` | Replay and follow run events over cursor-based SSE |
-| `GET`, `POST` | `/v1/runs/:id/webhooks` | List or register signed event webhooks |
-| `DELETE` | `/v1/runs/:id/webhooks/:webhook_id` | Remove a webhook |
-| `GET` | `/v1/runs/:id/markers` | Marker timeline (filterable) |
-| `GET` | `/v1/runs/:id/state` | Derived run state |
-| `GET` | `/v1/runs/:id/interactions` | Interaction timeline |
-| `POST` | `/v1/runs/:id/feedback` | Submit feedback for a run |
-| `GET` | `/v1/feedback` | List feedback |
-| `GET/POST` | `/v1/runs/:id/policies` | List or create immutable policy revisions |
-| `GET` | `/v1/runs/:id/policies/:revision` | Read reconstructed policy state |
-| `POST` | `/v1/runs/:id/policies/:revision/activate` | Promote through shadow, canary, and active |
-| `POST` | `/v1/runs/:id/policies/:revision/rollback` | Restore a previously active revision |
-| `POST` | `/v1/runs/:id/policies/:revision/replay` | Re-evaluate persisted restricted-zone candidates |
-| `POST` | `/v1/triggers/compile` | Compile bounded trigger source into the current ISA |
-| `POST` | `/v1/triggers/validate` | Validate a compiled trigger program |
-| `POST` | `/v1/triggers/evaluate` | Deterministically replay trigger samples |
-| `POST` | `/v1/query` | Query events across runs |
-| `POST` | `/v1/search` | Search VLM descriptions |
-| `POST` | `/v1/infer` | Single VLM inference |
-| `POST` | `/v1/infer/batch` | Batch inference (bounded parallelism) |
-| `GET` | `/v1/models` | Model catalog with availability |
-| `POST` | `/v1/stream/whip` | WHIP WebRTC offer (RFC 9725) |
-| `PATCH` | `/v1/stream/whip/:sess` | ICE trickle candidate |
-| `DELETE` | `/v1/stream/whip/:sess` | Terminate WebRTC session |
-| `PATCH` | `/v1/stream/whip/:sess/prompt` | Update live-session prompt |
-| `POST` | `/v1/upload` | Upload a file for processing |
-| `GET` | `/v1/files/:filename` | Serve an uploaded or allowed-root file |
-| `GET` | `/v1/runs/:id/keyframes/:sha256` | Serve a run-owned keyframe as raw JPEG |
-| `GET` | `/v1/runs/:id/media/:sha256` | Serve run-owned MP4 or WAV media by hash |
-| `GET` | `/v1/health` | Health check |
-| `GET` | `/v1/metrics` | Prometheus-compatible metrics |
-
-## Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VIDARAX_VLLM_BASE_URL` | — | vLLM inference endpoint |
-| `VIDARAX_SGLANG_BASE_URL` | — | SGLang inference endpoint (fallback) |
-| `VIDARAX_BIND_ADDR` | `127.0.0.1:8080` | HTTP bind address |
-| `VIDARAX_REQUIRE_API_KEY` | `true` | Require `x-api-key` header |
-| `VIDARAX_API_KEYS` | — | Comma-separated accepted API keys |
-| `VIDARAX_TRANSPORT` | `h1h2` | Transport mode (`h1h2` or `h3`) |
-| `VIDARAX_DATA_DIR` | `.vidarax-data` | WAL and runtime data directory |
-| `VIDARAX_ACTIVE_STREAM_LIMIT` | `5` | Max active runs per resolved principal |
-| `VIDARAX_MEDIA_MEMORY_BUDGET_BYTES` | `8589934592` | Process-wide reservation budget for live media payloads |
-| `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` | `64` | Process-wide reservation budget for live pipeline OS threads |
-| `VIDARAX_INFERENCE_TOKEN_BUDGET` | `32768` | Aggregate output-token reservation across active provider calls |
-| `VIDARAX_INFERENCE_BYTE_BUDGET` | `268435456` | Aggregate encoded-media byte reservation across active provider calls |
-| `VIDARAX_AUDIO_SIDECAR_ADDR` | — | TCP address for local audio perception, for example `127.0.0.1:7790` |
-| `VIDARAX_STREAM_TTL_SECS` | `3600` | Run idle TTL |
-| `VIDARAX_WEBHOOK_SECRET` | — | Server-side root for per-webhook signing keys. 32 bytes minimum |
-| `VIDARAX_TRIGGER_LOCAL_OUTPUT_SOCKET` | — | Absolute Unix datagram socket for metadata-only local trigger actions |
-| `VIDARAX_CONFIG` | `vidarax.toml` | Backend configuration and optional device-level restricted-zone policy |
-
-Full configuration reference in [docs/deployment.md](docs/deployment.md).
-
-Trigger programs are bounded, forward-only bytecode. Compile and replay a
-source file before attaching the resulting program to a WHIP session:
-
-```bash
-vidarax triggers compile loading-bay.vxt --output loading-bay.json
-vidarax triggers validate loading-bay.json
-vidarax triggers evaluate loading-bay.json samples.json
-```
-
-The first edge package verifies signed binary model artifacts and advances a
-candidate through shadow and canary health checks without placing model bytes
-in JSON. See [edge deployment](docs/edge-deployment.md).
-
-### Local first-pass VLM on Apple Silicon (mlx-vlm)
-
-[mlx-vlm](https://github.com/Blaizzy/mlx-vlm) runs a Vision Language Model on-device
-on Apple Silicon and serves it behind the same OpenAI-compatible
-`/v1/chat/completions` API as vLLM/SGLang, so it plugs into vidarax as an
-ordinary `openai_compat` backend, with no new provider code needed on the
-vidarax side:
-
-```bash
-pip install mlx-vlm
-# Serve a supported VL family. vidarax accepts only its curated model ids, so the
-# id you hand back to vidarax has to be one of them (see the note below).
-mlx_vlm.server --model mlx-community/Qwen3-VL-4B-Instruct-4bit --port 8080
-```
-
-Point a backend at it with `openai_kind = "mlx"`. Its telemetry
-(`/v1/metrics`) and tiering role are then labelled `mlx`:
-
-```toml
-[[backends]]
-name = "mlx"
-type = "openai_compat"
-openai_kind = "mlx"
-base_url = "http://127.0.0.1:8080"
-model = "Qwen/Qwen3-VL-4B-Instruct"
-upstream_model = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
-priority = 1
-```
-
-To escalate uncertain first-pass results to a hosted Gemini second pass, add a
-`gemini` backend (see the commented example in `vidarax.toml`) and set the
-`reason()`/WHIP second-pass model to that backend's exact `model` id: the
-model-routing provider dispatches on that id, so nothing else needs to change.
-
-vidarax checks every request's `model` id against its supported-model contract
-and rejects unknown ids before it opens a connection, so the first-pass and
-second-pass models you configure must be supported ids, for example
-`Qwen/Qwen3-VL-4B-Instruct`, not a raw `mlx-community/...-4bit` conversion name.
-`model` declares the curated Vidarax id this backend serves, while
-`upstream_model` maps it to the conversion id mlx-vlm actually loads. The model
-catalog reports only that curated id as available on this backend.
-
-## Tech stack
-
-| Layer | Technology |
-|-------|------------|
-| Backend | Rust, Axum, Hyper (HTTP/1.1 + H2, optional H3) |
-| Frame filter | Deterministic frame analysis on a single-threaded hot path |
-| Inference | vLLM and SGLang through OpenAI-compatible backends with fallback |
-| Decode | ffmpeg CPU, NVDEC, and Apple VideoToolbox. VideoToolbox may fall back to software decode inside ffmpeg when the input or host cannot initialise hardware |
-| Persistence | Local WAL plus content-addressed JPEG blobs. Optional SpacetimeDB mirror for blocking WHIP description events |
-| Frontend | Vue 3, dark command-center UI |
-| Streaming | WebRTC via WHIP (RFC 9725) |
-| SDK | TypeScript workspace package (`vidarax`, pending its first npm release) |
-| Observability | OpenTelemetry, Prometheus metrics |
+- [Quickstart](https://vidarax.cosminbararu.com/docs/quickstart/) covers the
+  server, SDK, CLI, and raw HTTP path.
+- [Architecture](https://vidarax.cosminbararu.com/docs/architecture/) explains
+  queue ownership, ordering, cancellation, and persistence.
+- [API reference](https://vidarax.cosminbararu.com/docs/api/) is the complete
+  route contract. [Deployment](docs/deployment.md) is the complete environment
+  and backend configuration reference.
+- [Local audio](docs-site/src/content/docs/audio.md), [trigger
+  programs](https://vidarax.cosminbararu.com/docs/triggers/), and [edge
+  deployment](docs/edge-deployment.md) cover the optional paths.
 
 ## Workspace layout
 

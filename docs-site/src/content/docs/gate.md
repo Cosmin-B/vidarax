@@ -3,6 +3,8 @@ title: The per-frame filter
 description: The deterministic per-frame filter, semantic novelty reuse, and tiered model escalation.
 ---
 
+<!-- status: draft, needs Cosmin's rewrite pass before publication -->
+
 Most adjacent video frames carry no new operational meaning. Vidarax first applies a deterministic filter built from image statistics. Selected frames become inference candidates, and a second model can handle cases where the first returns a low schema confidence score.
 
 ## The deterministic filter
@@ -51,7 +53,9 @@ The reusable library maps the fused score to three outcomes:
 
 Live capture deliberately uses a narrower binary policy: a SigLIP2 embedding either reuses the last successful description or runs the VLM. It does not call a second model to settle ambiguity. Reuse is bounded by a capture-time TTL and cumulative embedding drift. Shadow sampling sends a configurable fraction of reuse decisions through the VLM to measure disagreement. Sidecar timeouts and malformed embeddings fail open by running the VLM.
 
-The shipped reuse threshold is deliberately conservative. It is a safe starting point, not a universal calibration: operators should select a threshold against labelled, representative streams and the latency of the provider they actually run.
+The shipped reuse threshold is conservative. Select a threshold against
+labelled streams from the deployment and the latency of the provider that will
+serve them.
 
 The novelty anchor advances only after a successful, non-empty VLM description. Reused frames and failed inference do not change it. The embedding sidecar receives raw JPEG bytes over a length-prefixed TCP protocol and returns 768 little-endian `f32` values. Images never pass through a JSON or base64 transform. See [Operations](/docs/operations/) and the repository's `docs/deployment.md` for calibration and provider/hardware measurement commands.
 

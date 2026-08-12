@@ -1,8 +1,26 @@
+<!-- status: draft, needs Cosmin's rewrite pass before publication -->
+
 # Deployment
 
 Vidarax reads server configuration from environment variables and model backend
 configuration from either explicit URLs or `vidarax.toml`. The defaults below
 come from `crates/vidarax-api/src/config.rs`.
+
+The deployable unit is a Rust API process with ffmpeg and one or more model
+services. It needs a writable `VIDARAX_DATA_DIR` for the timeline WAL and
+content-addressed media. The default bind address is loopback, API-key checks
+are enabled, and local file ingest has no trusted roots until the operator adds
+them.
+
+`deploy/docker-compose.local.yml` is the local container starting point.
+`deploy/edge/vidarax-api.service` and `deploy/edge/vidarax-update.service` are
+the systemd units for the signed edge update path. Neither setup provisions a
+model server, durable volume policy, TLS termination, or backups on the
+operator's behalf.
+
+[Public repository](https://github.com/Cosmin-B/vidarax) ·
+[Product site](https://vidarax.cosminbararu.com/) ·
+[Hosted docs](https://vidarax.cosminbararu.com/docs/)
 
 ## Configuration
 
@@ -295,9 +313,10 @@ the current input. The server records that fallback in logs.
 
 A useful deployment needs:
 
-- An OpenAI-compatible VLM backend, usually vLLM or SGLang, reachable at the
-  configured base URL. Without a backend, inference routes fail and WHIP uses a
-  no-provider fallback path for live sessions.
+- A configured VLM backend. OpenAI-compatible vLLM, SGLang, and MLX services
+  use the common chat-completions transport. Gemini uses its native backend
+  entry and is required for recorded native-media analysis. Without a backend,
+  inference routes fail and WHIP uses a no-provider fallback path.
 - `ffmpeg` and `ffprobe` on `PATH`, or paths set through `VIDARAX_FFMPEG_PATH`
   and `VIDARAX_FFPROBE_PATH`.
 - Network egress controls for untrusted remote media. Application-level SSRF

@@ -3,7 +3,11 @@ title: Policy rollouts
 description: Durable feedback, candidate replay, and generation-safe policy promotion.
 ---
 
-Vidarax keeps the operator control loop beside the observations that informed it. Feedback, immutable policy revisions, replay results, promotions, and rollbacks are timeline events in the local WAL. A standalone node retains its review and rollout history without SpacetimeDB or another control-plane database.
+<!-- status: draft, needs Cosmin's rewrite pass before publication -->
+
+Feedback, immutable policy revisions, replay results, promotions, and rollbacks
+are timeline events in the local WAL. A standalone node retains this history
+without SpacetimeDB or another control-plane database.
 
 ## The lifecycle
 

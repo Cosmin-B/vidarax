@@ -11,7 +11,7 @@ release yet.
 
 - Recorded audio-video reasoning with bounded source-time windows, deterministic
   audio-track mixing, Gemini File API uploads, timestamped `multimodal_moment`
-  events, and content-addressed MP4 evidence.
+  events, and retained MP4 windows.
 - Selective Whisper large-v3-turbo transcription behind Silero VAD, grounded
   provider output, and boundary-safe 20-second local-audio windows.
 - A locked install-on-first-use audio runtime plus a repository Agent Skill for
