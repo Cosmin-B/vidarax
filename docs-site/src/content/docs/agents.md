@@ -3,7 +3,6 @@ title: Agent workflows
 description: Run grounded media reviews from a compatible agent harness without hand-building the local audio environment.
 ---
 
-<!-- status: draft, needs Cosmin's rewrite pass before publication -->
 
 Vidarax includes the platform-neutral `vidarax-review-media` Agent Skill under
 `.agents/skills/`. It gives a compatible harness one workflow for recorded

@@ -1,6 +1,5 @@
 # Examples
 
-<!-- status: draft, needs Cosmin's rewrite pass before publication -->
 
 TypeScript demos that run against a local server with `npx tsx`. Each one
 imports the SDK straight from `packages/vidarax-sdk/src`, so no build step is

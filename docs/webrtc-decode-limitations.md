@@ -1,6 +1,5 @@
 # WebRTC decode limitations
 
-<!-- status: draft, needs Cosmin's rewrite pass before publication -->
 
 ## Supported live decode
 

@@ -1,6 +1,5 @@
 # Frame-exact PTS findings
 
-<!-- status: draft, needs Cosmin's rewrite pass before publication -->
 
 ## Current state
 

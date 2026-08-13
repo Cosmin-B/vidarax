@@ -3,7 +3,6 @@ title: Events and SDK
 description: Event shapes and kinds, per-kind payloads, markers, query and search, and the TypeScript SDK.
 ---
 
-<!-- status: draft, needs Cosmin's rewrite pass before publication -->
 
 Everything Vidarax learns about a video becomes an event on a run's timeline.
 The local WAL is authoritative, and the API serves its current state. A

@@ -1,4 +1,3 @@
-<!-- status: draft, needs Cosmin's rewrite pass before publication -->
 
 # vidarax
 

@@ -3,7 +3,6 @@ title: What is vidarax
 description: A self-hosted media runtime that turns live streams and recordings into an ordered event timeline.
 ---
 
-<!-- status: draft, needs Cosmin's rewrite pass before publication -->
 
 [Product site](/) ·
 [GitHub](https://github.com/Cosmin-B/vidarax) ·

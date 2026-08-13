@@ -3,7 +3,6 @@ title: Trigger programs
 description: A bounded instruction set for turning perception signals into durable actions.
 ---
 
-<!-- status: draft, needs Cosmin's rewrite pass before publication -->
 
 Trigger programs define when a live stream emits an operational assertion. The
 v1 instruction set is deliberately small: load a signal, compare values,

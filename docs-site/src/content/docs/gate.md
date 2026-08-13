@@ -3,7 +3,6 @@ title: The per-frame filter
 description: The deterministic per-frame filter, semantic novelty reuse, and tiered model escalation.
 ---
 
-<!-- status: draft, needs Cosmin's rewrite pass before publication -->
 
 Most adjacent video frames carry no new operational meaning. Vidarax first applies a deterministic filter built from image statistics. Selected frames become inference candidates, and a second model can handle cases where the first returns a low schema confidence score.
 

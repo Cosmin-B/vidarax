@@ -1,6 +1,5 @@
 # vidarax
 
-<!-- status: draft, needs Cosmin's rewrite pass before publication -->
 
 TypeScript SDK for the Vidarax video analysis API.
 

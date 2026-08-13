@@ -3,7 +3,6 @@ title: Architecture
 description: How Vidarax keeps ordered media work bounded and commits it to one recoverable event timeline.
 ---
 
-<!-- status: draft, needs Cosmin's rewrite pass before publication -->
 
 Vidarax turns several media paths into one ordered event model. HTTP and
 control logic run on the tokio async runtime. Blocking decode, frame analysis,

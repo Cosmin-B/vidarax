@@ -3,7 +3,6 @@ title: Policy rollouts
 description: Durable feedback, candidate replay, and generation-safe policy promotion.
 ---
 
-<!-- status: draft, needs Cosmin's rewrite pass before publication -->
 
 Feedback, immutable policy revisions, replay results, promotions, and rollbacks
 are timeline events in the local WAL. A standalone node retains this history
