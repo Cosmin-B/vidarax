@@ -3,6 +3,7 @@ title: Trigger programs
 description: A bounded instruction set for turning perception signals into durable actions.
 ---
 
+
 Trigger programs define when a live stream emits an operational assertion. The
 v1 instruction set is deliberately small: load a signal, compare values,
 combine booleans, require persistence, detect a rising edge, apply a cooldown,
@@ -61,8 +62,8 @@ An `emit loading_bay_entry` instruction commits the event as
 events. `notify webhook` opts that assertion into the run's registered webhook
 deliveries. `notify local_output` sends a metadata-only Unix datagram to the
 absolute path in `VIDARAX_TRIGGER_LOCAL_OUTPUT_SOCKET`. It carries the stable
-event ID, run, stream, sequence, timestamp, kind, and pipeline generation—never
-image bytes. The receiving process must bind the socket before the stream is
+event ID, run, stream, sequence, timestamp, kind, and pipeline generation. It
+never carries image bytes. The receiving process must bind the socket before the stream is
 attached.
 
 Missing signals fail closed. A slow binary writer or consumer cannot block

@@ -90,7 +90,7 @@ source. Add a configured native-media provider only when the user needs visual
 description or cross-modal verification. Keep `--include-frame-metadata` off
 unless frame-level debugging is the task.
 
-## 5. Verify before reporting
+## 5. Check before reporting
 
 Apply these rules to the returned moments:
 
@@ -107,7 +107,7 @@ Apply these rules to the returned moments:
 - Preserve event IDs, source-relative timestamps, model IDs, and media hashes.
 - Return media references. Never put image, clip, or WAV bytes in JSON or base64.
 
-Report verified moments first. Follow with uncertain candidates and the exact
+Report supported moments first. Follow with uncertain candidates and the exact
 reason each remains uncertain. Include runtime, response size, retained media
 bytes, moment count, and failure count when the API exposes them.
 

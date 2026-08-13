@@ -3,6 +3,7 @@ title: Quickstart
 description: Build the server, analyze a video, and read its events.
 ---
 
+
 Build the API server, analyze a local video, and read the resulting event snapshot.
 
 ## Prerequisites
@@ -10,7 +11,7 @@ Build the API server, analyze a local video, and read the resulting event snapsh
 - A Rust toolchain.
 - `ffmpeg` and `ffprobe` on `PATH` (or paths set through `VIDARAX_FFMPEG_PATH` and `VIDARAX_FFPROBE_PATH`).
 - `jq`, used below to pull the run ID out of JSON responses.
-- An OpenAI-compatible VLM backend, usually vLLM or SGLang, reachable at a URL you control (Gemini can be configured through the TOML backend file instead). Without a backend, inference routes fail.
+- An OpenAI-compatible VLM backend, such as vLLM, SGLang, or MLX, reachable at a URL you control. Gemini is configured through the TOML backend file. Without a backend, inference routes fail.
 - A video file to analyze. The examples below assume `demo.mp4` in a directory the server is allowed to read.
 
 ## Run the server
@@ -77,11 +78,39 @@ trigger compilation, edge updates, models, health, and diagnostics.
 
 ```bash
 cargo build --release -p vidarax-cli
+export VIDARAX_API_URL=http://127.0.0.1:8080
+export VIDARAX_API_KEY=dev-key
+
 target/release/vidarax doctor \
-  --url http://127.0.0.1:8080 \
-  --api-key dev-key
+  --url "$VIDARAX_API_URL" \
+  --api-key "$VIDARAX_API_KEY"
 
 target/release/vidarax analyze /srv/vidarax-media/demo.mp4
+target/release/vidarax runs list
+target/release/vidarax events <run_id>
+```
+
+The commands above use the OpenAI-compatible backend configured when the server
+started.
+
+## Optional synchronized audio and video
+
+Native `audio-video` analysis requires a configured Gemini backend. Uncomment
+the Gemini entry in `vidarax.toml`, set `GEMINI_API_KEY`, and restart the server
+without `VIDARAX_VLLM_BASE_URL` or `VIDARAX_SGLANG_BASE_URL`. Either explicit
+URL causes the server to skip the TOML backend list.
+
+For local sound events and selective speech, start the audio process in another
+terminal and restart the API with
+`VIDARAX_AUDIO_SIDECAR_ADDR=127.0.0.1:7790`:
+
+```bash
+python3 scripts/audio_runtime.py run --profile whisper
+```
+
+Then run:
+
+```bash
 target/release/vidarax analyze /srv/vidarax-media/demo.mp4 \
   --media audio-video \
   --model gemini-3.5-flash-lite \
@@ -90,22 +119,14 @@ target/release/vidarax analyze /srv/vidarax-media/demo.mp4 \
   --local-audio \
   --audio-profile screen-recording \
   --speech-engine whisper
-target/release/vidarax runs list
-target/release/vidarax events <run_id>
 ```
 
-The second analysis command sends raw MP4 windows through Gemini File API and
-passes a mono PCM WAV to the optional local audio sidecar. It prints
+This sends raw MP4 windows through Gemini File API and passes a mono PCM WAV to
+the local audio sidecar. It prints
 `multimodal_moment` entries with source timestamps, sound and video
 descriptions, optional speech intent, and their relationship. Retained MP4
-windows and optional spoken feedback stay in the binary media store. Set
-`VIDARAX_AUDIO_SIDECAR_ADDR` before using `--local-audio`. Start the default
-sidecar in another terminal. Its first run provisions the locked Python
-environment automatically:
-
-```bash
-python3 scripts/audio_runtime.py run --profile whisper
-```
+windows and optional spoken feedback stay in the binary media store. The first
+audio process start provisions the locked Python environment automatically.
 
 See
 [Local audio perception](/docs/audio/) for setup and local-only analysis.

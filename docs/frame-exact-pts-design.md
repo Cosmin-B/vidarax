@@ -1,4 +1,5 @@
-# Frame-exact PTS Findings
+# Frame-exact PTS findings
+
 
 ## Current state
 
@@ -31,7 +32,7 @@ problem from input to the subprocess boundary.
 ## Decision
 
 Native crash containment wins over frame-exact labels for the default H.264
-path. Both CPU and GPU H.264 use the supervised ffmpeg child, and their labels
+and H.265 paths. Both codecs use the supervised ffmpeg child on CPU and GPU, and their labels
 remain best-effort. A broken sidecar faults the whole session generation. It is
 not restarted underneath temporal workers.
 
@@ -43,3 +44,6 @@ feature reject VP8 during codec selection.
 True frame-exact labels across a process boundary require an output protocol
 that carries decoded-frame PTS alongside pixels without the long-lived
 container buffering observed here. Rawvideo stdout does not provide it.
+
+See [WebRTC decode limitations](webrtc-decode-limitations.md) for the current
+operator-facing codec and queue constraints.

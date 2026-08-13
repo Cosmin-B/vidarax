@@ -3,6 +3,7 @@ title: Agent workflows
 description: Run grounded media reviews from a compatible agent harness without hand-building the local audio environment.
 ---
 
+
 Vidarax includes the platform-neutral `vidarax-review-media` Agent Skill under
 `.agents/skills/`. It gives a compatible harness one workflow for recorded
 media, camera footage, gameplay review, and development-session review.
@@ -30,9 +31,9 @@ python3 scripts/audio_runtime.py check --profile whisper --json
 Set `VIDARAX_CACHE_DIR` to choose a cache root. Once a profile is cached, add
 `--offline` to require a network-free start.
 
-## Review contract
+## How the skill handles model output
 
-The skill applies a strict split between observation and interpretation:
+The skill assigns each claim to the component that can support it:
 
 - Local ASR supplies exact spoken wording.
 - Local sound observations support claims about audible events.
@@ -41,7 +42,7 @@ The skill applies a strict split between observation and interpretation:
 - Event IDs, source timestamps, model IDs, and media hashes remain attached.
 - JPEG, MP4, and WAV payloads remain in the binary store. Events carry references.
 
-The result separates verified moments from uncertain candidates. If a matching
+The result separates supported moments from uncertain candidates. If a matching
 console log, output log, calibration, or labelled reference was not supplied,
 the report says so directly.
 

@@ -1,15 +1,16 @@
-# WebRTC Decode Limitations
+# WebRTC decode limitations
+
 
 ## Supported live decode
 
 H.264 and H.265 use a long-lived ffmpeg sidecar on both CPU and GPU paths. The
 GPU path adds `-hwaccel auto`. The CPU path leaves acceleration unset. Both
-feeds raw Annex B H.264 into ffmpeg stdin and reads raw YUV420 frames from
+feed raw Annex B H.264 or H.265 into ffmpeg stdin and read raw YUV420 frames from
 stdout. That raw pipe carries no output PTS or frame index, and inputs do not
 map 1:1 to output frames. Parameter sets, pre-sync input, undecodable
 inter-frames, and decoder reorder can all shift when a decoded frame appears.
 
-For both H.264 paths, decoded frames are labeled by the decode worker with the
+For both codecs on the CPU and GPU paths, decoded frames are labeled by the decode worker with the
 current RTP access unit's `seq` and `pts_ms` as a best-effort approximation. The
 pixels and perceptual signals are computed from the decoded output. Only the
 timestamp/index label is approximate.
@@ -32,6 +33,9 @@ build.
 
 The feature exists for deployments that accept the native in-process fault
 boundary. Selection must be explicit.
+
+The rejected timestamp-carrying container design is recorded in [Frame-exact
+PTS findings](frame-exact-pts-design.md).
 
 ## ffmpeg YUV reader behavior
 
