@@ -188,7 +188,7 @@ packages/vidarax-sdk/   TypeScript SDK
 spacetime-module/       SpacetimeDB server module
 docs/                   Architecture docs, runbooks, specs
 deploy/                 Docker, compose, certificates
-scripts/                Benchmarks, smoke tests, release gates
+scripts/                Benchmarks, smoke tests, release checks
 ```
 
 ## License

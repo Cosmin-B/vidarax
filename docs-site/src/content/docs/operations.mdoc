@@ -74,7 +74,7 @@ An OpenTelemetry layer exports tracing spans over OTLP gRPC when `VIDARAX_TRACES
 
 ## Security and hardening
 
-Read `docs/security.md` in the repository before exposing a deployment to untrusted callers or untrusted media. The main knobs:
+Read the [security guidance](https://github.com/Cosmin-B/vidarax/blob/main/docs/security.md) before exposing a deployment to untrusted callers or untrusted media. The main knobs:
 
 - Keep `VIDARAX_REQUIRE_API_KEY=true` and issue separate API keys per isolated principal. Ownership of runs and uploaded files derives from the authenticated principal. `x-tenant-id` is metadata, not an authorization boundary.
 - Set `VIDARAX_CORS_ALLOWED_ORIGINS` to exact browser origins. `*` is rejected when API keys are required.

@@ -588,6 +588,13 @@ export class Vidarax {
    *
    * This runs the deterministic frame-signal pipeline and takes no prompt —
    * for prompt-driven semantic analysis use `reason()` with `semantic_prompt`.
+   * If upload, ingest, or analysis fails after run creation, the durable run is
+   * left on the server for inspection or explicit deletion. The SDK retries
+   * network errors, HTTP 429, and HTTP 5xx responses according to `maxRetries`.
+   * This method does not accept an `AbortSignal` and does not expose the run ID
+   * until every step succeeds. If the caller needs cancellation while ingest or
+   * analysis is running, use `createRun()`, `ingestRun()`, and `analyzeRun()`
+   * directly, then pass the run ID to `stopRun()`.
    *
    * @param source  A file path / URI understood by the Vidarax server
    *                (e.g. `"file:///data/video.mp4"` or an HTTP URL), or a

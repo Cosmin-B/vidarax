@@ -17,7 +17,12 @@ export type IsoTimestamp = string;
 /** Sampling strategy for frame extraction. */
 export type SamplingPolicy = "source_fps_adaptive" | "fixed";
 
-/** Fractional region of interest within a video frame. */
+/**
+ * Fractional region of interest with a top-left origin.
+ *
+ * Each value must be finite and in `[0, 1]`, `width` and `height` must be
+ * greater than zero, and `x + width` and `y + height` must not exceed `1`.
+ */
 export interface CropRegion {
   x: number;
   y: number;
@@ -982,12 +987,19 @@ export interface WhipSession {
  * use `Vidarax.reason()` and its `semantic_prompt` field instead.
  */
 export interface AnalyzeOptions {
+  /** Supported model ID. Defaults to `Qwen/Qwen3-VL-2B-Instruct`. */
   model?: string;
+  /** Server-defined analysis mode. */
   mode?: string;
+  /** Frame sampling strategy. Defaults to `source_fps_adaptive`. */
   samplingPolicy?: SamplingPolicy;
+  /** Frames per second when `samplingPolicy` is `fixed`; accepted range is `[0.1, 240]`. */
   fixedFps?: number;
+  /** Rolling analysis-window size in frames. Values below `2` are clamped to `2`; default is `16`. */
   windowSize?: number;
+  /** Segment duration in milliseconds. Values below `1` are clamped to `1`; default is `250`. */
   segmentMs?: number;
+  /** Maximum number of decoded frames. Must be a positive integer. */
   maxFrames?: number;
 }
 
@@ -1073,15 +1085,15 @@ export interface VidaraxOptions {
    * VIDARAX_REQUIRE_TENANT_ID reject requests without it.
    */
   tenantId?: string;
-  /** Maximum number of automatic retries on transient failures (default: 3). */
+  /** Number of retries after the first attempt for network errors, HTTP 429, and HTTP 5xx (default: 3). */
   maxRetries?: number;
-  /** Base delay in ms for exponential back-off (default: 200). */
+  /** Base delay in milliseconds for exponential back-off with jitter (default: 200; each delay is capped at 30 seconds). */
   retryBaseDelayMs?: number;
   /** Request timeout in ms (default: 30 000). */
   timeoutMs?: number;
 }
 
-/** Progress callback signature used by `Vidarax.uploadFile()`. */
+/** Upload progress callback. Calls are synchronous and ordered; `loaded` and `total` are bytes. */
 export type ProgressCallback = (loaded: number, total: number) => void;
 
 /**

@@ -1,6 +1,5 @@
 # Frame-exact PTS findings
 
-
 ## Current state
 
 The WebRTC input path receives `RtpFrame` values with access unit bytes,
