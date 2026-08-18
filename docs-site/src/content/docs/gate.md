@@ -56,7 +56,7 @@ The shipped reuse threshold is conservative. Select a threshold against
 labelled streams from the deployment and the latency of the provider that will
 serve them.
 
-The novelty anchor advances only after a successful, non-empty VLM description. Reused frames and failed inference do not change it. The embedding sidecar receives raw JPEG bytes over a length-prefixed TCP protocol and returns 768 little-endian `f32` values. Images never pass through a JSON or base64 transform. See [Operations](/docs/operations/) and the repository's `docs/deployment.md` for calibration and provider/hardware measurement commands.
+The novelty anchor advances only after a successful, non-empty VLM description. Reused frames and failed inference do not change it. The embedding sidecar receives raw JPEG bytes over a length-prefixed TCP protocol and returns 768 little-endian `f32` values. Images never pass through a JSON or base64 transform. See [Operations](/docs/operations/) for deployment guidance and [deployment calibration](https://github.com/Cosmin-B/vidarax/blob/main/docs/deployment.md#calibrate-live-semantic-novelty) for calibration and provider-specific measurement commands.
 
 ## Text-encoder probe
 

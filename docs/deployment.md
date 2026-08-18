@@ -157,7 +157,7 @@ reference it. Identical objects share a blob. `GET
 /v1/runs/{id}/media/{sha256}` serves only hashes referenced by a run owned by
 the caller.
 
-## Live semantic novelty calibration
+## Calibrate live semantic novelty
 
 Start the bundled SigLIP2 sidecar on the embedding accelerator:
 

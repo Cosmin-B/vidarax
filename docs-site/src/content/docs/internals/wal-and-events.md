@@ -155,11 +155,11 @@ cargo test -p vidarax-core --test replay_schema
 
 The `replay_schema` integration test (`crates/vidarax-core/tests/replay_schema.rs`) enforces three properties:
 
-- Deterministic replay. It feeds `fixtures/replay/frame-signals.json` through the gate twice and requires identical event streams, then hashes event types, reason codes, and frame indexes with FNV and compares against a pinned fingerprint constant. Any change to gate semantics fails the gate until the fixture and fingerprint are updated deliberately.
+- Deterministic replay. It feeds `fixtures/replay/frame-signals.json` through the frame gate twice and requires identical event streams, then hashes event types, reason codes, and frame indexes with FNV and compares against a pinned fingerprint constant. A deliberate change to frame-gate semantics also requires updating the fixture and fingerprint.
 - Schema acceptance. `schemas/processing-config.schema.json` and `schemas/frame-metadata.schema.json` must accept their reference fixtures.
 - Schema rejection. A frame-metadata instance missing required fields must fail validation, proving the schema actually constrains.
 
-The same script is the first step of `scripts/release_gates.sh`, so no release ships with drifted gate behavior or schemas. See [Allocation discipline](/docs/internals/allocation-discipline/#the-release-check-scripts) for the rest of that pipeline.
+The same script is the first step of `scripts/release_gates.sh`, so no release ships with drifted frame-gate behavior or schemas; see [Allocation discipline](/docs/internals/allocation-discipline/#the-release-check-scripts) for the rest of that pipeline.
 
 ## Edge cases and limits
 

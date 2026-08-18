@@ -1,6 +1,5 @@
 # WebRTC decode limitations
 
-
 ## Supported live decode
 
 H.264 and H.265 use a long-lived ffmpeg sidecar on both CPU and GPU paths. The

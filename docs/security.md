@@ -1,6 +1,6 @@
-# Security Notes
+# Security notes
 
-## Principal-Based Ownership
+## Principal-based ownership
 
 This release introduces principal-based ownership for runs and uploaded files.
 Authenticated API-key callers own data as `api-key:<sha256(api_key)>`.
@@ -44,7 +44,7 @@ recorded A/V clips are never embedded or base64-encoded. The existing
 content-addressed store reference remains in `data`. Receivers must fetch media through the
 authenticated blob route when needed.
 
-## Ingest File Ownership
+## Ingest file ownership
 
 Files uploaded through `POST /v1/upload` are owned by the authenticated
 principal that uploaded them. The server encodes that owner in the stored
@@ -75,7 +75,7 @@ operator-configured shared root. If a deployment intentionally depended on
 direct temp-dir media, migrate those files into a dedicated directory and list
 that directory in `VIDARAX_INGEST_FILE_ROOTS`.
 
-## Remote Media SSRF Residual
+## Remaining remote-media SSRF risk
 
 For downloadable `http://` and `https://` media, VidaraX does not let ffmpeg
 perform remote network I/O. The API first validates the original URL, fetches it
