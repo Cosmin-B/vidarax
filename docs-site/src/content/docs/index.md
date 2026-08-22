@@ -70,7 +70,7 @@ tail is evicted.
 Run ownership derives from the authenticated API-key principal. `x-tenant-id`
 is descriptive metadata and is not an authorization boundary.
 
-## Where to go next
+## Documentation
 
 - [Quickstart](/docs/quickstart/): run the server and get events from a video.
 - [Agent workflows](/docs/agents/): install on first use and review media from a compatible agent harness.

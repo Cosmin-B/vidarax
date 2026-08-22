@@ -340,10 +340,10 @@ VIDARAX_DATA_DIR=/var/lib/vidarax
 `deploy/docker-compose.local.yml` builds that Dockerfile, exposes the API on
 `127.0.0.1:8080`, mounts a named volume for `/var/lib/vidarax`, and starts
 VictoriaMetrics, VictoriaLogs, and VictoriaTraces. The compose file sets an
-OTLP traces endpoint and a local-dev placeholder API key (the same value the
-metrics scrape sends as its `x-api-key` header), but it does not configure an
+OTLP traces endpoint and the local development API key `dev-key`. The metrics
+scrape sends the same value as its `x-api-key` header. Compose does not configure an
 inference backend. Point `VIDARAX_VLLM_BASE_URL`/`VIDARAX_SGLANG_BASE_URL` at a
-running backend, and replace the placeholder key, before using the API anywhere
+running backend, and replace `dev-key`, before using the API anywhere
 reachable by anyone but you.
 
 Check readiness with:

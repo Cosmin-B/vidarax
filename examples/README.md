@@ -1,7 +1,7 @@
 # Examples
 
 
-TypeScript demos that run against a local server with `npx tsx`. Each one
+These TypeScript examples run against a local server with `npx tsx`. Each one
 imports the SDK straight from `packages/vidarax-sdk/src`, so no build step is
 needed. Start the server first, then:
 
@@ -11,9 +11,12 @@ VIDARAX_API_KEY=dev-key \
 npx tsx examples/<name>.ts
 ```
 
-- `sdk-demo.ts`: health check, analysis, events, markers, inference, and search.
-- `whip-live-demo.ts`: the WHIP live-session signalling flow (offer, trickle ICE, live prompt update, terminate), with marked placeholders where a browser or GStreamer attaches real media and handling for the prompt update's 409/503 outcomes.
-- `error-handling-demo.ts`: the typed error surface, catching a real 404 as `HttpError` and an unreachable server as `RetryExhaustedError` wrapping a `NetworkError`.
+- `sdk-demo.ts` checks health, starts analysis, and reads events, markers, inference results, and search results from the server.
+- `whip-live-demo.ts` sends an SDP offer, trickles ICE, updates the live prompt,
+  and terminates the session. A browser or GStreamer must attach the media track
+  where the file marks that integration point. The example handles 409 and 503
+  prompt-update responses.
+- `error-handling-demo.ts` catches a server 404 as `HttpError` and an unreachable server as `RetryExhaustedError` wrapping a `NetworkError`.
 
 ## CLI walkthrough
 

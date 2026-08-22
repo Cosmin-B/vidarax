@@ -162,7 +162,7 @@ separate supported moments from uncertain candidates. Its reporting rules keep
 binary media out of JSON and treat local transcripts as the source for exact
 speech wording.
 
-## Where to go next
+## Documentation
 
 - [Quickstart](https://vidarax.cosminbararu.com/docs/quickstart/) covers the
   server, SDK, CLI, and raw HTTP path.
