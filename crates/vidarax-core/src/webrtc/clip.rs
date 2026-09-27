@@ -509,7 +509,7 @@ where
                         continue;
                     };
 
-                    let _ = stdb.emit_event_sync(
+                    if let Err(error) = stdb.emit_event_sync(
                         &work.run_id,
                         &work.session_id,
                         last_signal.frame_index,
@@ -518,8 +518,11 @@ where
                         event_type,
                         0.9,
                         &description,
-                    );
-                    let _ = stdb.store_keyframe_sync(KeyframeEvent {
+                    ) {
+                        tracing::error!(%error, "confirmed clip event write failed; exiting worker");
+                        break;
+                    }
+                    if let Err(error) = stdb.store_keyframe_sync(KeyframeEvent {
                         run_id: &work.run_id,
                         frame_index: last_signal.frame_index,
                         pts_ms: work.pts_end,
@@ -527,7 +530,10 @@ where
                         event_type,
                         description: &description,
                         jpeg_data: &last_jpeg,
-                    });
+                    }) {
+                        tracing::error!(%error, "confirmed clip keyframe write failed; exiting worker");
+                        break;
+                    }
                 }
             })?;
         handles.push(StageHandle::new(PipelineStage::Vlm, handle));
@@ -597,6 +603,10 @@ fn downsample_clip_buffer(
 mod tests {
     use super::*;
     use crate::gate::FrameSignal;
+    use crate::provider::{InferenceResult, ProviderError, ProviderKind, TokenUsage};
+    use crate::webrtc::runtime::{
+        PipelineFault, PipelineFaultReason, PipelineRuntime, PipelineShutdown,
+    };
     use crate::webrtc::workers::StreamFrame;
 
     fn make_frame(seq: u64, pts_ms: u64) -> StreamFrame {
@@ -614,6 +624,129 @@ mod tests {
             pts_ms,
             seq,
             coordinates: FrameCoordinates::full_frame(640, 480),
+        }
+    }
+
+    struct StaticProvider;
+
+    impl InferenceProvider for StaticProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Vllm
+        }
+
+        fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+            Ok(InferenceResult {
+                provider: ProviderKind::Vllm,
+                model: Arc::clone(&request.model),
+                output_text: "a person enters".to_owned(),
+                fallback_used: false,
+                finish_reason: None,
+                inference_latency_ms: 0,
+                usage: TokenUsage::default(),
+            })
+        }
+    }
+
+    struct FailingSink {
+        fail_keyframe: bool,
+    }
+
+    impl EventSink for FailingSink {
+        fn emit_event_sync(
+            &self,
+            _run_id: &str,
+            _session_id: &str,
+            _frame_index: u64,
+            _pts_ms: u64,
+            _coordinates: FrameCoordinates,
+            _event_type: &str,
+            _confidence: f32,
+            _description: &str,
+        ) -> Result<(), String> {
+            if self.fail_keyframe {
+                Ok(())
+            } else {
+                Err("event admission rejected".to_owned())
+            }
+        }
+
+        fn store_keyframe_sync(&self, _event: KeyframeEvent<'_>) -> Result<(), String> {
+            if self.fail_keyframe {
+                Err("keyframe admission rejected".to_owned())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn store_restricted_zone_sync(
+            &self,
+            _event: crate::webrtc::workers::RestrictedZoneEvidenceEvent<'_>,
+        ) -> Result<(), String> {
+            Err("unexpected restricted-zone write in clip test".to_owned())
+        }
+    }
+
+    #[test]
+    fn clip_confirmed_sink_failures_fault_vlm_stage() {
+        for fail_keyframe in [false, true] {
+            let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (_command_tx, command_rx) = tokio::sync::mpsc::channel(1);
+            let (work_tx, work_rx) = kanal::bounded(1);
+            let handles = spawn_clip_vlm_workers(
+                1,
+                work_rx,
+                Arc::new(StaticProvider),
+                Arc::new(FailingSink { fail_keyframe }),
+                TieredVlmConfig::default(),
+                Arc::new(PipelineMetrics::new()),
+                tracing::Span::none(),
+                0,
+                Arc::from(""),
+                None,
+                PipelineGeneration::INITIAL,
+                command_rx,
+                Arc::clone(&stopping),
+                None,
+            )
+            .unwrap();
+            let mut runtime =
+                PipelineRuntime::new(PipelineGeneration::INITIAL, Arc::clone(&stopping));
+            runtime.extend(handles);
+
+            let mut frame = make_frame(1, 33);
+            let mut frames = VecDeque::new();
+            frames.push_back((frame.signal, frame.jpeg.take().unwrap(), frame.coordinates));
+            work_tx
+                .send(ClipWork {
+                    run_id: Arc::from("run"),
+                    session_id: Arc::from("session"),
+                    frames,
+                    pts_start: 33,
+                    pts_end: 33,
+                })
+                .unwrap();
+
+            let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+            let supervisor = std::thread::spawn(move || {
+                let result = runtime.supervise(std::time::Duration::from_secs(1), |_| {});
+                outcome_tx.send(result).unwrap();
+            });
+            let outcome = match outcome_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    stopping.store(true, Ordering::Release);
+                    supervisor.join().unwrap();
+                    panic!("clip worker failed to fault on rejected write: {error}");
+                }
+            };
+            supervisor.join().unwrap();
+            assert_eq!(
+                outcome,
+                PipelineShutdown::Faulted(PipelineFault {
+                    stage: PipelineStage::Vlm,
+                    reason: PipelineFaultReason::UnexpectedExit,
+                })
+            );
         }
     }
 

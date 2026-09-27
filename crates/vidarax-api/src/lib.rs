@@ -676,9 +676,11 @@ mod tests {
 
     #[cfg(feature = "h3-experimental")]
     fn ensure_test_tls_assets(
-        workspace_root: &std::path::Path,
+        test_dir: &std::path::Path,
     ) -> (std::path::PathBuf, std::path::PathBuf) {
-        let cert_dir = workspace_root.join("deploy/certs");
+        // Each test has its own files so another test cannot overwrite the key
+        // while the server loads its certificate.
+        let cert_dir = test_dir.join("certs");
         std::fs::create_dir_all(&cert_dir).expect("cert dir");
         let cert_path = cert_dir.join("dev.crt");
         let key_path = cert_dir.join("dev.key");
@@ -3260,11 +3262,7 @@ mod tests {
             .as_nanos();
         let data_dir = std::env::temp_dir().join(format!("vidarax-h3-test-{nanos}"));
         std::fs::create_dir_all(&data_dir).unwrap();
-        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("workspace root");
-        let (cert_path, key_path) = ensure_test_tls_assets(workspace_root);
+        let (cert_path, key_path) = ensure_test_tls_assets(&data_dir);
 
         let config = ServerConfig {
             bind_addr: format!("127.0.0.1:{bind_port}"),
@@ -3408,11 +3406,7 @@ mod tests {
             .as_nanos();
         let data_dir = std::env::temp_dir().join(format!("vidarax-h3-metrics-test-{nanos}"));
         std::fs::create_dir_all(&data_dir).unwrap();
-        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("workspace root");
-        let (cert_path, key_path) = ensure_test_tls_assets(workspace_root);
+        let (cert_path, key_path) = ensure_test_tls_assets(&data_dir);
 
         let config = ServerConfig {
             bind_addr: format!("127.0.0.1:{bind_port}"),

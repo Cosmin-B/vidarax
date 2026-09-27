@@ -4,6 +4,7 @@ members = [
   "crates/vidarax-contracts",
   "crates/vidarax-cli",
   "crates/vidarax-api",
+  "crates/vidarax-archive",
 ]
 resolver = "2"
 

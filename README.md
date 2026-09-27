@@ -73,11 +73,16 @@ stores before an event references them. JSON, SSE, webhooks, and the WAL carry
 the reference, media type, byte count, and SHA-256 instead of binary bytes.
 Vidarax does not retain the full source automatically.
 
-The WAL is flushed after each append but is not fsynced. It is designed to
-survive a process crash, not sudden power loss or a kernel failure. A crash
-after a blob write and before its event append can leave an unreferenced blob,
-and automatic orphan cleanup is not implemented. Older run reads can also fall
-back to a WAL scan once their in-memory tail has been evicted.
+The writer syncs the WAL before making confirmed events readable and reporting
+success. Referenced keyframe JPEGs and their directory entries are synced
+before the event is written. A crash after a blob write and before its event
+append can leave an unreferenced blob, and automatic orphan cleanup is not
+implemented. Older run reads can also fall back to a WAL scan once their
+in-memory tail has been evicted.
+
+With the API stopped, `vidarax-archive` can back up the WAL and its referenced
+JPEGs to S3-compatible storage and restore them into a new data directory.
+See [Offline archive and restore](docs/deployment.md#offline-archive-and-restore).
 
 ## Current boundary
 
@@ -89,7 +94,7 @@ back to a WAL scan once their in-memory tail has been evicted.
 - Native synchronized audio-video reasoning currently uses Gemini. The
   OpenAI-compatible path handles selected images, but it is not the recorded
   native-media route.
-- The event log has one writer per process and no built-in retention policy or
+- The event log allows one writer per data directory and has no built-in retention policy or
   blob garbage collector.
 - The TypeScript SDK is built from this checkout until its first registry
   release.
