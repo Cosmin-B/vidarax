@@ -1,6 +1,7 @@
 ---
 title: Events and SDK
 description: Event shapes and kinds, per-kind payloads, markers, query and search, and the TypeScript SDK.
+slug: events
 ---
 
 

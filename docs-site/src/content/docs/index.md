@@ -4,7 +4,7 @@ description: A self-hosted media runtime that turns live streams and recordings 
 ---
 
 
-[Product site](/) ·
+[Product site](https://vidarax.cosminbararu.com/) ·
 [GitHub](https://github.com/Cosmin-B/vidarax) ·
 [A video stream through Vidarax](https://cosminbararu.com/blog/video-stream-through-vidarax)
 
@@ -72,12 +72,12 @@ is descriptive metadata and is not an authorization boundary.
 
 ## Documentation
 
-- [Quickstart](/docs/quickstart/): run the server and get events from a video.
-- [Agent workflows](/docs/agents/): install on first use and review media from a compatible agent harness.
-- [Architecture](/docs/architecture/): ordering, bounded media work, persistence, and delivery.
-- [Ingest](/docs/ingest/): accepted sources, codecs, and decode backends.
-- [The per-frame filter](/docs/gate/): deterministic selection and live semantic novelty.
-- [Events and SDK](/docs/events/): cursor semantics, media references, SSE, and webhooks.
-- [API reference](/docs/api/): endpoints and configuration.
-- [Local audio perception](/docs/audio/): sound events, selective ASR, and spoken feedback.
-- [Deployment](/docs/operations/): process configuration and operational checks.
+- [Quickstart](/quickstart/): run the server and get events from a video.
+- [Agent workflows](/agents/): install on first use and review media from a compatible agent harness.
+- [Architecture](/architecture/): ordering, bounded media work, persistence, and delivery.
+- [Ingest](/ingest/): accepted sources, codecs, and decode backends.
+- [The per-frame filter](/gate/): deterministic selection and live semantic novelty.
+- [Events and SDK](/events/): cursor semantics, media references, SSE, and webhooks.
+- [API reference](/api/): endpoints and configuration.
+- [Local audio perception](/audio/): sound events, selective ASR, and spoken feedback.
+- [Deployment](/operations/): process configuration and operational checks.

@@ -1,0 +1,115 @@
+{
+  "revision": "abb1464e1ac62b313aa5d698b3b13083e23a7038",
+  "files": [
+    {
+      "path": "docs-site/src/content/docs/agents.md",
+      "route": "agents",
+      "sha256": "39e5847ba269cbfd58e3e751d90592f398522d190fab2c37d7c4569dbe043e5b"
+    },
+    {
+      "path": "docs-site/src/content/docs/api.md",
+      "route": "api",
+      "sha256": "22a13dde31eecc87a76d93a03f4de40a06c5f33c8ecfe6fa33360bd067655a6b"
+    },
+    {
+      "path": "docs-site/src/content/docs/architecture.md",
+      "route": "architecture",
+      "sha256": "25d6e169c0b626c1c183d56b17c26bb625c49b0147cb46fd67469752f6b4995d"
+    },
+    {
+      "path": "docs-site/src/content/docs/audio.md",
+      "route": "audio",
+      "sha256": "94ed3f6d70d7bff14020036ad6084b890a6f08817bbee708acd896dd07b05f7a"
+    },
+    {
+      "path": "docs-site/src/content/docs/development.md",
+      "route": "development",
+      "sha256": "1ebee5c6930ca95688630561cd9c256f5ed8b09ed7a59e3fd21e97db721cfd79"
+    },
+    {
+      "path": "docs-site/src/content/docs/edge.md",
+      "route": "edge",
+      "sha256": "302d45cd4bb9a0b4628c4e134bba391c34752bbe2eb125a8acb14cf9f275315c"
+    },
+    {
+      "path": "docs-site/src/content/docs/events.md",
+      "route": "events",
+      "sha256": "6386594eea424c85c97695c84d5954c4bf41fac7fe8c8cd127249d05ff0d3db0"
+    },
+    {
+      "path": "docs-site/src/content/docs/gate.md",
+      "route": "gate",
+      "sha256": "40e6b953cfec01a226933667d0b7203216be1ea3e62ad73568494bfe1b6601bb"
+    },
+    {
+      "path": "docs-site/src/content/docs/index.md",
+      "route": "",
+      "sha256": "1912fd3b43acfa18572e86d156ec81ea08e5e1a195e992bfccd891ede526a896"
+    },
+    {
+      "path": "docs-site/src/content/docs/ingest.md",
+      "route": "ingest",
+      "sha256": "70e13a02457c10271c30e19985d64f0bfb80dcd350a2d5926e5c6506151cee3a"
+    },
+    {
+      "path": "docs-site/src/content/docs/internals/allocation-discipline.md",
+      "route": "internals/allocation-discipline",
+      "sha256": "bd582c508b82db8cfc408ca28ce8f803da81cb61627d5df12a2e450a6fa3a0f3"
+    },
+    {
+      "path": "docs-site/src/content/docs/internals/decode-sidecar.md",
+      "route": "internals/decode-sidecar",
+      "sha256": "8cd64731035d731e78ee85b004482a7f6b6dd752b7ae6982ea5ea1a4725c321c"
+    },
+    {
+      "path": "docs-site/src/content/docs/internals/gate-internals.md",
+      "route": "internals/gate-internals",
+      "sha256": "6442b90983c918c3613f6d96b0d27296cd00a0a73cf1f0584194971b452eaae6"
+    },
+    {
+      "path": "docs-site/src/content/docs/internals/media-plane.md",
+      "route": "internals/media-plane",
+      "sha256": "0b9282293cb2669c2ae74d503f1af1f32b982f670ef11834066bd0d50b52a0a6"
+    },
+    {
+      "path": "docs-site/src/content/docs/internals/state-and-cancellation.md",
+      "route": "internals/state-and-cancellation",
+      "sha256": "d2264fa0bc324e187cdb64fa9f1d5f308d7715f5f7de2dcddf0863eff5871b28"
+    },
+    {
+      "path": "docs-site/src/content/docs/internals/wal-and-events.md",
+      "route": "internals/wal-and-events",
+      "sha256": "9180a2d36def8ecfcead0b2873a7ca91b342ff0e88a2ffcc9b5c2085396f7f88"
+    },
+    {
+      "path": "docs-site/src/content/docs/internals/webrtc-ingest.md",
+      "route": "internals/webrtc-ingest",
+      "sha256": "db8e97332b55a50ad4f9dbed06cf0cc86f5994f15a4d44701234c69272561fd3"
+    },
+    {
+      "path": "docs-site/src/content/docs/mage-vl.md",
+      "route": "mage-vl",
+      "sha256": "b82b13607cfd96dae1a34cb2000c6627abf4d33553c3859a30c43bf846f83809"
+    },
+    {
+      "path": "docs-site/src/content/docs/operations.mdoc",
+      "route": "operations",
+      "sha256": "58c38dce55c2dc97d420d8de8e502820048f0e630ed77373352ef019f109d9a8"
+    },
+    {
+      "path": "docs-site/src/content/docs/policy-rollouts.md",
+      "route": "policy-rollouts",
+      "sha256": "3a36c999edb74dcb71d7d3bfb9876553ef4ed575b4711fcee296c35f99073b70"
+    },
+    {
+      "path": "docs-site/src/content/docs/quickstart.mdoc",
+      "route": "quickstart",
+      "sha256": "3c76359b64dc1514e3a6e498b1b63146850baf743c1178fdd155f51548f7745d"
+    },
+    {
+      "path": "docs-site/src/content/docs/triggers.md",
+      "route": "triggers",
+      "sha256": "73f9ca7bf9f2701d3d1e3fa2acaf791003693a1fab1213d7224e95875e5761c8"
+    }
+  ]
+}

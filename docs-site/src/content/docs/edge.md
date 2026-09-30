@@ -1,6 +1,7 @@
 ---
 title: Edge deployment
 description: Signed binary model releases with shadow, canary, activation, and rollback.
+slug: edge
 ---
 
 The edge package runs the normal Vidarax API beside a local model server and a

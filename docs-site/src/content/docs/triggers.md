@@ -1,6 +1,7 @@
 ---
 title: Trigger programs
 description: A bounded instruction set for turning perception signals into durable actions.
+slug: triggers
 ---
 
 

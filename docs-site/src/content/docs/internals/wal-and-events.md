@@ -1,6 +1,7 @@
 ---
 title: WAL and events
 description: The write-ahead log format, event families and append ownership, the event sink, and replay checks.
+slug: internals/wal-and-events
 ---
 
 The local WAL is the authoritative event store. Live-session worker events and
@@ -137,7 +138,7 @@ Three append flavors, one contract table:
 | `append_run_event` | worker threads | blocks on ack | yield-and-retry | yes, via the idempotent claim |
 | `append_run_event_nonblocking` | hot paths | no | drops event | refused with an error |
 
-`run_deleted` is special-cased on every path: it routes through the single-winner claim described in [State and cancellation](/docs/internals/state-and-cancellation/#single-winner-deletion), so the deletion event is appended exactly once per run while the deletion claim is retained, and only through a confirmed append. The retention is bounded: deleted-run records live in a FIFO capped at 4,096 entries, and once a record is evicted, a later DELETE of the same run takes the unknown-run path and appends another `run_deleted`.
+`run_deleted` is special-cased on every path: it routes through the single-winner claim described in [State and cancellation](/internals/state-and-cancellation/#single-winner-deletion), so the deletion event is appended exactly once per run while the deletion claim is retained, and only through a confirmed append. The retention is bounded: deleted-run records live in a FIFO capped at 4,096 entries, and once a record is evicted, a later DELETE of the same run takes the unknown-run path and appends another `run_deleted`.
 
 ## Replay and reads
 
@@ -159,7 +160,7 @@ The `replay_schema` integration test (`crates/vidarax-core/tests/replay_schema.r
 - Schema acceptance. `schemas/processing-config.schema.json` and `schemas/frame-metadata.schema.json` must accept their reference fixtures.
 - Schema rejection. A frame-metadata instance missing required fields must fail validation, proving the schema actually constrains.
 
-The same script is the first step of `scripts/release_gates.sh`, so no release ships with drifted frame-gate behavior or schemas; see [Allocation discipline](/docs/internals/allocation-discipline/#the-release-check-scripts) for the rest of that pipeline.
+The same script is the first step of `scripts/release_gates.sh`, so no release ships with drifted frame-gate behavior or schemas; see [Allocation discipline](/internals/allocation-discipline/#the-release-check-scripts) for the rest of that pipeline.
 
 ## Edge cases and limits
 

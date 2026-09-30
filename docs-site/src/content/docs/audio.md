@@ -1,6 +1,7 @@
 ---
 title: Local audio perception
 description: Event tagging, selective speech recognition, and spoken feedback for recorded files and live WebRTC audio.
+slug: audio
 ---
 
 Recorded files and live WebRTC sessions can run local audio analysis. Recorded

@@ -1,6 +1,7 @@
 ---
 title: Development
 description: Workspace layout, how to build and test, and contributing basics.
+slug: development
 ---
 
 Vidarax is a Rust workspace with a TypeScript SDK, a Vue 3 UI, and a SpacetimeDB module beside it.
@@ -61,7 +62,7 @@ Live tests need the matching local services. Inference tests need a VLM backend
 such as vLLM or SGLang. Decode tests need `ffmpeg` and `ffprobe` on `PATH`.
 SpacetimeDB is required only for its module and mirror parity tests.
 
-Before shipping, run the [release checks](/docs/operations/#release-checks).
+Before shipping, run the [release checks](/operations/#release-checks).
 
 ## Contributing basics
 

@@ -1,9 +1,10 @@
 ---
 title: Decode sidecar
 description: The long-lived ffmpeg subprocess, its reader thread and bounded handoff, and the limits of the drain-before-write rule.
+slug: internals/decode-sidecar
 ---
 
-The decode sidecar is the long-lived ffmpeg subprocess that turns encoded live video into raw YUV frames. Its implementation lives in `crates/vidarax-core/src/webrtc/decode.rs`. A dedicated reader and a drain-before-write rule reduce the classic two-pipe deadlock window between parent and child. The decoded-frame handoff is lossless, and the steady-state decode loop draws from bounded pools without allocating a fresh buffer per frame. [Media plane](/docs/internals/media-plane/) follows the frames downstream. [Ingest](/docs/ingest/) shows the higher-level source paths.
+The decode sidecar is the long-lived ffmpeg subprocess that turns encoded live video into raw YUV frames. Its implementation lives in `crates/vidarax-core/src/webrtc/decode.rs`. A dedicated reader and a drain-before-write rule reduce the classic two-pipe deadlock window between parent and child. The decoded-frame handoff is lossless, and the steady-state decode loop draws from bounded pools without allocating a fresh buffer per frame. [Media plane](/internals/media-plane/) follows the frames downstream. [Ingest](/ingest/) shows the higher-level source paths.
 
 ## Backend selection
 
@@ -46,7 +47,7 @@ The input format comes from `VideoCodec::ffmpeg_input_format`, which returns `So
 
 ## Decoder warm-up
 
-An H.264 decoder commonly cannot emit a frame from its first input. Before any output exists, it needs the SPS and PPS parameter sets (which describe resolution, profile, and reference structure) and an IDR frame to decode against, and those usually arrive across several access units. A first access unit that already carries all three can produce output immediately, though the pipeline may still buffer it. On the WHIP path these arrive as ordinary access units at the head of the stream, forwarded with Annex B framing like everything else (see [WebRTC ingest](/docs/internals/webrtc-ingest/)). The sidecar needs no special casing for them, only tolerance for input that produces no output yet.
+An H.264 decoder commonly cannot emit a frame from its first input. Before any output exists, it needs the SPS and PPS parameter sets (which describe resolution, profile, and reference structure) and an IDR frame to decode against, and those usually arrive across several access units. A first access unit that already carries all three can produce output immediately, though the pipeline may still buffer it. On the WHIP path these arrive as ordinary access units at the head of the stream, forwarded with Annex B framing like everything else (see [WebRTC ingest](/internals/webrtc-ingest/)). The sidecar needs no special casing for them, only tolerance for input that produces no output yet.
 
 Warm-up is exactly the phase that breaks a naive write-then-read loop: the parent must keep writing input while nothing is coming back, and a blocking read after each write would stall forever on the SPS. The sidecar handles this two ways at once. First, output reading happens on a dedicated thread, so writes never wait for reads. Second, "no frame yet" is a first-class result: `decode()` returns `DecodeError::Buffered`, and the decode worker just moves to the next access unit.
 
@@ -111,7 +112,7 @@ Buffered and per-frame native decode errors remain recoverable. A broken pipe or
 
 ## Frame pool interaction
 
-Plane buffers come from `YuvPlanePools`, three `VecPool` free-lists (Y, U, V) sized together. The reader-path pool minimum is `FFMPEG_YUV_READER_POOL_MIN_SLOTS` (22): a full reader channel (16), the steady-state pending allowance (4), one frame under construction, one held by the consumer. This is the same sum `decode_output_pool_slots` computes in `workers.rs`. See [Media plane](/docs/internals/media-plane/#the-yuv-decode-output-pool) for the derivation.
+Plane buffers come from `YuvPlanePools`, three `VecPool` free-lists (Y, U, V) sized together. The reader-path pool minimum is `FFMPEG_YUV_READER_POOL_MIN_SLOTS` (22): a full reader channel (16), the steady-state pending allowance (4), one frame under construction, one held by the consumer. This is the same sum `decode_output_pool_slots` computes in `workers.rs`. See [Media plane](/internals/media-plane/#the-yuv-decode-output-pool) for the derivation.
 
 Capacity per slot is bucketed, not exact. `required_y_capacity(width, height)` takes the larger of the luma requirement and the chroma requirement expressed in luma terms. This covers odd dimensions where truncated `(w/2)*(h/2)` math would under-provision. It clamps to `MAX_POOL_Y_CAPACITY` and rounds up to a power of two. A sender that ramps or oscillates resolution rebuilds the free-lists once per bucket crossing, not once per distinct size. The cap prevents an enormous declared resolution from forcing a giant speculative pre-allocation. A genuinely larger frame still decodes, and the copy path grows that one buffer.
 

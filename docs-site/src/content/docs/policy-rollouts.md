@@ -1,6 +1,7 @@
 ---
 title: Policy rollouts
 description: Durable feedback, candidate replay, and generation-safe policy promotion.
+slug: policy-rollouts
 ---
 
 
@@ -32,4 +33,4 @@ Replay shows how a revised threshold treats candidates that the original pipelin
 
 `POST /v1/runs/:id/feedback` commits `operator_feedback_submitted` before returning success. `GET /v1/feedback` reconstructs entries from the local WAL and filters them to caller-owned runs. When SpacetimeDB is configured, it receives a best-effort mirror after the local commit. Collection and review still use the local WAL.
 
-See the [API reference](/docs/api/#policy-revisions-and-replay) for request and response fields.
+See the [API reference](/api/#policy-revisions-and-replay) for request and response fields.

@@ -1,6 +1,7 @@
 ---
 title: Ingest
 description: Supported sources, the ffmpeg decode sidecar, the drain-before-write rule, and decoder warm-up.
+slug: ingest
 ---
 
 Ingest turns a source into decoded frames the per-frame filter can score. There are two decode paths: an ffmpeg subprocess path for files and URLs, and a long-lived decoder pipeline for live WebRTC streams.
@@ -14,7 +15,7 @@ Ingest turns a source into decoded frames the per-frame filter can score. There 
 - RTSP cameras: `rtsps://` is accepted. Unencrypted `rtsp://` requires `VIDARAX_ALLOW_UNENCRYPTED_RTSP=true`.
 - WebRTC: live streams over WHIP (RFC 9725), processed through per-session worker pools. This path bypasses ffmpeg's demuxer.
 
-Remote sources pass application-level SSRF checks before decode: embedded credentials, localhost names, private and link-local IP literals, blocked DNS resolutions, and unsafe redirects are rejected. On the downloadable HTTP(S) path, a response that content-sniffs as an HLS playlist is also rejected. An explicitly selected HLS source is accepted when remote HLS is enabled. Each source kind also gets the narrowest useful ffmpeg protocol whitelist. See the [security notes](/docs/operations/#security-and-hardening) for the residual that remains and the recommended egress control.
+Remote sources pass application-level SSRF checks before decode: embedded credentials, localhost names, private and link-local IP literals, blocked DNS resolutions, and unsafe redirects are rejected. On the downloadable HTTP(S) path, a response that content-sniffs as an HLS playlist is also rejected. An explicitly selected HLS source is accepted when remote HLS is enabled. Each source kind also gets the narrowest useful ffmpeg protocol whitelist. See the [security notes](/operations/#security-and-hardening) for the residual that remains and the recommended egress control.
 
 ## Decode backends for files and URLs
 

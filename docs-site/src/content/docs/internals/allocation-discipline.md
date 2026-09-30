@@ -1,9 +1,10 @@
 ---
 title: Allocation discipline
 description: The counting allocator in the perf probe, pointer-identity tests for pool reuse, and executable release checks.
+slug: internals/allocation-discipline
 ---
 
-The hot paths in Vidarax follow a stated policy: no selected-global-allocator calls per frame after warmup in the core ingest and filter loops, with reusable pools wherever buffers cross threads (see [Development](/docs/development/#contributing-basics)). The repository checks the policy three ways: a counting allocator in a probe binary, unit tests that assert pool reuse by pointer identity, and release scripts that turn the probe into a pass-or-fail check. Pointer-identity tests run in the ordinary workspace test suite. The release scripts do not run them.
+The hot paths in Vidarax follow a stated policy: no selected-global-allocator calls per frame after warmup in the core ingest and filter loops, with reusable pools wherever buffers cross threads (see [Development](/development/#contributing-basics)). The repository checks the policy three ways: a counting allocator in a probe binary, unit tests that assert pool reuse by pointer identity, and release scripts that turn the probe into a pass-or-fail check. Pointer-identity tests run in the ordinary workspace test suite. The release scripts do not run them.
 
 ## The counting allocator
 
@@ -56,7 +57,7 @@ The same technique pins reuse at other layers:
 - `yuv_plane_pools_ensure_dims_rebuilds_on_resolution_change` in `webrtc/decode.rs` drains a plane pool's free-list and proves that a later acquire can only be pool-served after a deliberate rebuild, pinning the first-frame-then-grow policy.
 - In `crates/vidarax-api/src/state.rs`, `registry_keeps_same_map_snapshot_for_existing_run_event` asserts with `Arc::ptr_eq` that a non-structural run event updates per-run atomics in place without replacing the registry entry. `publishing_append_reuses_unchanged_run_tail_arc` asserts that timeline publication shares untouched runs' tails through `Arc` and never clones them.
 
-The complementary sizing tests, such as the one deriving the 484-slot JPEG pool bound, are described in [Media plane](/docs/internals/media-plane/#pool-sizing-as-a-sum-over-in-flight-positions).
+The complementary sizing tests, such as the one deriving the 484-slot JPEG pool bound, are described in [Media plane](/internals/media-plane/#pool-sizing-as-a-sum-over-in-flight-positions).
 
 ## The release-check scripts
 
@@ -64,11 +65,11 @@ Three scripts under `scripts/` turn the probe and replay tests into release chec
 
 | Script | What it checks |
 |---|---|
-| `validate_replay_and_schema.sh` | Runs the `replay_schema` integration test: gate decisions replay deterministically to a pinned fingerprint, and the published JSON Schemas accept their reference fixtures and reject invalid ones. See [WAL and events](/docs/internals/wal-and-events/#validation-replay-and-schema-gates). |
+| `validate_replay_and_schema.sh` | Runs the `replay_schema` integration test: gate decisions replay deterministically to a pinned fingerprint, and the published JSON Schemas accept their reference fixtures and reject invalid ones. See [WAL and events](/internals/wal-and-events/#validation-replay-and-schema-gates). |
 | `bench_regression.sh` | Builds and runs `perf_probe` in release mode and compares integer `allocations.total` against `VIDARAX_MAX_ALLOC_TOTAL` (default 0). A first counted allocation inside the measured loop fails the script. |
 | `release_gates.sh` | Runs both of the above, then builds release binaries for `vidarax-cli` and `vidarax-api` and compares their file sizes against `VIDARAX_MAX_CLI_SIZE_BYTES` and `VIDARAX_MAX_API_SIZE_BYTES`, then runs the probe's timing regression gate against its configured ceiling. |
 
-The ceilings guard four different regressions: semantic drift in the filter (replay fingerprint), counted allocation creep on the per-frame path, dependency and code-size creep in shipped artifacts, and timing regressions in the filter decision. The operational procedure is in [Operations](/docs/operations/#release-checks).
+The ceilings guard four different regressions: semantic drift in the filter (replay fingerprint), counted allocation creep on the per-frame path, dependency and code-size creep in shipped artifacts, and timing regressions in the filter decision. The operational procedure is in [Operations](/operations/#release-checks).
 
 ## Edge cases and limits
 

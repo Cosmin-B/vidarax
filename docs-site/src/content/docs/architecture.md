@@ -1,6 +1,7 @@
 ---
 title: Architecture
 description: How Vidarax keeps ordered media work bounded and commits it to one recoverable event timeline.
+slug: architecture
 ---
 
 
@@ -57,8 +58,8 @@ ASR model handles speech. Live WHIP Opus tracks use the same sidecar after a
 bounded four-second RTP window is decoded to WAV. The observations can stand
 alone or enter the recorded-media VLM prompt as timestamped hypotheses.
 Gemini receives the MP4 through File API and deletes its temporary upload after
-the call. See [Ingest](/docs/ingest/) for decode paths and [The per-frame
-filter](/docs/gate/) for frame mode.
+the call. See [Ingest](/ingest/) for decode paths and [The per-frame
+filter](/gate/) for frame mode.
 
 ## Session generations and control
 
@@ -92,8 +93,8 @@ H.264 and H.265 use an ffmpeg child process so a native decoder crash cannot
 abort the API process. The supervisor owns the Rust stages and decoder teardown.
 An OS thread cannot safely force-kill another OS thread. A native child that
 outlives normal teardown becomes a measured join-deadline fault. See [Media
-plane](/docs/internals/media-plane/) and [Decode
-sidecar](/docs/internals/decode-sidecar/) for the detailed behavior.
+plane](/internals/media-plane/) and [Decode
+sidecar](/internals/decode-sidecar/) for the detailed behavior.
 
 ## Event sinks
 
@@ -122,7 +123,7 @@ changes the current model only after the serving hook acknowledges that exact
 release. Each staged transition is journaled and acknowledged, and a failed
 candidate is removed only after the hook acknowledges rollback. Network loss
 stops updates while the active pipeline keeps running. See [Edge
-deployment](/docs/edge/).
+deployment](/edge/).
 
 ## How state is persisted
 

@@ -1,9 +1,10 @@
 ---
 title: Media plane
 description: The per-session worker threads, the bounded channels between them, and how every buffer pool is sized as a sum over in-flight positions.
+slug: internals/media-plane
 ---
 
-The media plane is the execution graph that turns RTP frames into VLM events for one live session. It lives in `crates/vidarax-core/src/webrtc/workers.rs`. Decode, filtering, and inference run on blocking OS threads outside the tokio async runtime. WebRTC ingress stays async. Every stage handoff is a bounded queue with a defined full-queue behavior, and every byte buffer that crosses a stage boundary comes from a pool with a computed slot count. The decoder is covered in [Decode sidecar](/docs/internals/decode-sidecar/). The keyframe decision is covered in [Filter internals](/docs/internals/gate-internals/).
+The media plane is the execution graph that turns RTP frames into VLM events for one live session. It lives in `crates/vidarax-core/src/webrtc/workers.rs`. Decode, filtering, and inference run on blocking OS threads outside the tokio async runtime. WebRTC ingress stays async. Every stage handoff is a bounded queue with a defined full-queue behavior, and every byte buffer that crosses a stage boundary comes from a pool with a computed slot count. The decoder is covered in [Decode sidecar](/internals/decode-sidecar/). The keyframe decision is covered in [Filter internals](/internals/gate-internals/).
 
 ## The task and thread topology
 
@@ -25,7 +26,7 @@ The complete per-session inventory, grouped by runtime and mode:
 | `vx-clip-acc` | OS thread | clip only | `spawn_clip_accumulator` | Batches sampled frames into `ClipWork` windows | Clip frame channel closes |
 | `vx-clip-vlm-{i}` | OS thread | clip only | `spawn_clip_vlm_workers` | Multi-image VLM inference over a clip window, calls the sink directly | Clip work channel closes |
 
-One process-wide thread sits behind all sessions: `vidarax-timeline-writer`, which owns the WAL writer and is described in [WAL and events](/docs/internals/wal-and-events/#who-appends-each-event-family).
+One process-wide thread sits behind all sessions: `vidarax-timeline-writer`, which owns the WAL writer and is described in [WAL and events](/internals/wal-and-events/#who-appends-each-event-family).
 
 Recorded native media uses the async request path plus bounded blocking tasks,
 not the live generation worker set. `prepare_source_for_reuse` downloads an
@@ -121,7 +122,7 @@ decode_to_analysis + normal_path + clip_path
 
 With the per-stream clamps applied, the doc comment at `workers.rs:40` itemizes the result: 484 slots total, as 66 on the decode-to-analysis leg (a full stream-frame queue, one frame in the analysis worker, one in the sender), 162 on the normal VLM path (a full VLM queue, one in the worker, the 128-slot sink backlog allowance, one in the sender), 64 in the clip-frame queue, 64 held by the accumulator's current window, and 128 for clip work in flight (one active worker plus one blocked sender, each holding a full 64-frame clip. The queued term is zero because the queue has no capacity). A unit test, `jpeg_pool_covers_full_clip_path_and_bounded_sink_backlog_without_heap_growth`, re-derives the sum and pins it to 484 and to `JPEG_POOL_SLOT_CEILING` (512), so a change to any capacity constant fails the test until the derivation is updated deliberately.
 
-Undersizing a pool affects allocation behavior, not correctness. `VecPool::acquire` returns a fresh `Vec` when the free-list is empty. `RecycledBytes::drop` frees a buffer when the free-list is full. The sizing keeps pool-covered positions allocation-free in steady state. Clip inference still allocates outside the pool. The clip VLM worker clones the window's last frame for its metadata event, `RecycledBytes::clone` deep-copies into an unpooled `Vec`, and the multi-image request encodes each JPEG into a fresh string. See [Allocation discipline](/docs/internals/allocation-discipline/) for the checks that enforce the pooled-path property.
+Undersizing a pool affects allocation behavior, not correctness. `VecPool::acquire` returns a fresh `Vec` when the free-list is empty. `RecycledBytes::drop` frees a buffer when the free-list is full. The sizing keeps pool-covered positions allocation-free in steady state. Clip inference still allocates outside the pool. The clip VLM worker clones the window's last frame for its metadata event, `RecycledBytes::clone` deep-copies into an unpooled `Vec`, and the multi-image request encodes each JPEG into a fresh string. See [Allocation discipline](/internals/allocation-discipline/) for the checks that enforce the pooled-path property.
 
 ### The sink backlog permit counter
 
@@ -129,7 +130,7 @@ The `vx-event-writer` channel holds 512 events, but only `JPEG_SINK_EVENT_POOL_A
 
 ## The event sink boundary
 
-Workers report results only through the `EventSink` trait (`emit_event_sync`, `emit_event_nonblocking`, `store_keyframe_sync`), never by touching storage directly. The trait is `Send + Sync` because worker threads share one `Arc<dyn EventSink>`. Keyframe-mode VLM workers enqueue `SinkEvent`s and let the dedicated writer thread absorb storage latency. Clip VLM workers call the blocking sink methods directly, which is acceptable because clip cadence is bounded by the accumulator's window and delay settings. The WAL-backed sink and its optional SpacetimeDB mirror are described in [WAL and events](/docs/internals/wal-and-events/).
+Workers report results only through the `EventSink` trait (`emit_event_sync`, `emit_event_nonblocking`, `store_keyframe_sync`), never by touching storage directly. The trait is `Send + Sync` because worker threads share one `Arc<dyn EventSink>`. Keyframe-mode VLM workers enqueue `SinkEvent`s and let the dedicated writer thread absorb storage latency. Clip VLM workers call the blocking sink methods directly, which is acceptable because clip cadence is bounded by the accumulator's window and delay settings. The WAL-backed sink and its optional SpacetimeDB mirror are described in [WAL and events](/internals/wal-and-events/).
 
 ## Edge cases and limits
 

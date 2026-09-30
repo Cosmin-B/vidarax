@@ -1,9 +1,10 @@
 ---
 title: Filter internals
 description: Per-frame signals, branchless decision dispatch, deferred commit, and tiered escalation.
+slug: internals/gate-internals
 ---
 
-The deterministic filter decides whether each decoded frame justifies a VLM call. `crates/vidarax-core/src/gate.rs` owns the decision. `webrtc/signals.rs` computes its inputs, `pipeline.rs` adds windowed context, and `tiered_vlm.rs` decides model escalation. The same frames in the same order produce the same decisions. The replay checks in [Allocation discipline](/docs/internals/allocation-discipline/) pin that behavior. The per-frame decision path allocates no heap memory and emits exactly one decision per frame. This page is the code-level companion to [The per-frame filter](/docs/gate/).
+The deterministic filter decides whether each decoded frame justifies a VLM call. `crates/vidarax-core/src/gate.rs` owns the decision. `webrtc/signals.rs` computes its inputs, `pipeline.rs` adds windowed context, and `tiered_vlm.rs` decides model escalation. The same frames in the same order produce the same decisions. The replay checks in [Allocation discipline](/internals/allocation-discipline/) pin that behavior. The per-frame decision path allocates no heap memory and emits exactly one decision per frame. This page is the code-level companion to [The per-frame filter](/gate/).
 
 ## What is computed per frame
 

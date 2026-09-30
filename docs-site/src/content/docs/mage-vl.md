@@ -1,6 +1,7 @@
 ---
 title: Mage-VL debug modes
 description: Compare codec-native video tokens with frame sampling and inspect proactive streaming decisions.
+slug: mage-vl
 ---
 
 [Mage-VL](https://huggingface.co/microsoft/Mage-VL) can read H.264 and HEVC

@@ -1,9 +1,10 @@
 ---
 title: State and cancellation
 description: AppState layout, RAII slot reservation, the single-winner delete protocol, and how request cancellation is kept away from session ownership.
+slug: internals/state-and-cancellation
 ---
 
-`AppState` in `crates/vidarax-api/src/state.rs` coordinates the run registry, timeline writer, session maps, and their concurrency guards. RAII guards release reservations on ordinary returns, cancellation, and unwinding panics. Compare-and-swap claims admit one winner. Lock-free snapshots let readers proceed without blocking writers. Release builds use `panic = "abort"`, so an abort does not run destructors. The sections below trace reservation, the insert-to-spawn window, single-winner deletion, and snapshot publication. Event persistence is covered in [WAL and events](/docs/internals/wal-and-events/).
+`AppState` in `crates/vidarax-api/src/state.rs` coordinates the run registry, timeline writer, session maps, and their concurrency guards. RAII guards release reservations on ordinary returns, cancellation, and unwinding panics. Compare-and-swap claims admit one winner. Lock-free snapshots let readers proceed without blocking writers. Release builds use `panic = "abort"`, so an abort does not run destructors. The sections below trace reservation, the insert-to-spawn window, single-winner deletion, and snapshot publication. Event persistence is covered in [WAL and events](/internals/wal-and-events/).
 
 ## AppState layout
 
@@ -123,7 +124,7 @@ Both commit and rollback call `notify_waiters`, so blocked concurrent deleters a
 
 Readers of recent events never take a lock. The timeline writer thread owns a map of per-run event tails (`VecDeque<TimelineEvent>` capped at `RUN_EVENT_TAIL_CAP`, 256 events) and, after each append, publishes an immutable `RingSnapshot` of all tails through `ArcSwap::store`. Publication is copy-on-write at run granularity: only the appended run's tail is rebuilt. Every other run's tail is shared by `Arc` with the previous snapshot (a test pins the pointer equality). Subscribers, meaning `GET /v1/runs/{id}/events` pollers via `read_run_events_from`, do `timeline_snapshot.load()` and serve any cursor the tail still covers. A cursor older than the tail's front falls back to a WAL scan with identical ordering, so a warm hit and a cold miss are indistinguishable to the client. The tails map itself is bounded by `WARM_RUN_TAIL_CAP` (1024) runs with least-recently-appended eviction. Eviction only removes the read accelerator, never durable data.
 
-Sequence counters differ by level. `run_seq` and `request_seq` on `AppState` are atomics (`fetch_add` with `AcqRel`), and per-session frame sequence numbers in the media path are one shared `Arc<AtomicU64>` across a session's track tasks (see [WebRTC ingest](/docs/internals/webrtc-ingest/)). The WAL `seq` is not an atomic: it is ordinary state owned by the single timeline-writer thread, and its safety comes from serialization through the writer's bounded channel. That channel serialization is also what makes the WAL sink safe to call from worker OS threads without an async runtime or a lock.
+Sequence counters differ by level. `run_seq` and `request_seq` on `AppState` are atomics (`fetch_add` with `AcqRel`), and per-session frame sequence numbers in the media path are one shared `Arc<AtomicU64>` across a session's track tasks (see [WebRTC ingest](/internals/webrtc-ingest/)). The WAL `seq` is not an atomic: it is ordinary state owned by the single timeline-writer thread, and its safety comes from serialization through the writer's bounded channel. That channel serialization is also what makes the WAL sink safe to call from worker OS threads without an async runtime or a lock.
 
 ## Edge cases and limits
 

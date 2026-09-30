@@ -1,6 +1,7 @@
 ---
 title: Quickstart
 description: Build the server, analyze a video, and read its events.
+slug: quickstart
 ---
 
 
@@ -38,9 +39,9 @@ The server binds `127.0.0.1:8080` by default. Check readiness:
 curl -fsS http://127.0.0.1:8080/v1/health
 ```
 
-{% aside type="note" title="API keys are on by default" %}
+:::note[API keys are on by default]
 `VIDARAX_REQUIRE_API_KEY` defaults to `true`, so `VIDARAX_API_KEYS` must contain at least one key and every request except `/v1/health` needs an `x-api-key` header. For local open-mode development you can disable checks explicitly with `VIDARAX_REQUIRE_API_KEY=false` and `VIDARAX_METRICS_REQUIRE_API_KEY=false`.
-{% /aside %}
+:::
 
 To run the Vue 3 frontend in a separate terminal:
 
@@ -69,7 +70,7 @@ for (const event of await v.getEvents(run.runId)) {
 }
 ```
 
-The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via `output_schema`, interactions, and snapshot reads of events and markers. See [Events and SDK](/docs/events/#the-typescript-sdk) for the method list.
+The SDK also supports WHIP/WebRTC, batch inference, structured JSON output via `output_schema`, interactions, and snapshot reads of events and markers. See [Events and SDK](/events/#the-typescript-sdk) for the method list.
 
 ## Use the CLI
 
@@ -129,7 +130,7 @@ windows and optional spoken feedback stay in the binary media store. The first
 audio process start provisions the locked Python environment automatically.
 
 See
-[Local audio perception](/docs/audio/) for setup and local-only analysis.
+[Local audio perception](/audio/) for setup and local-only analysis.
 
 Global connection values resolve in this order: command-line flags,
 `VIDARAX_API_URL` / `VIDARAX_API_KEY` / `VIDARAX_TENANT_ID`, the file selected
@@ -182,4 +183,4 @@ Markers (frame-range annotations derived from the analysis pass) have their own 
 curl -s "http://127.0.0.1:8080/v1/runs/$RUN_ID/markers?event_type=scene_cut" -H 'x-api-key: dev-key'
 ```
 
-See [Events and SDK](/docs/events/) for the event shapes and kinds, and [API reference](/docs/api/) for the route contracts and selected configuration variables.
+See [Events and SDK](/events/) for the event shapes and kinds, and [API reference](/api/) for the route contracts and selected configuration variables.

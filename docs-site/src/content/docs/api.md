@@ -1,6 +1,7 @@
 ---
 title: API reference
 description: Per-route contracts, the error envelope, and server configuration reference.
+slug: api
 ---
 
 The API is served over HTTP/1.1 and HTTP/2, with optional HTTP/3 behind the `h3-experimental` build feature. All routes sit under `/v1`.
@@ -168,7 +169,7 @@ receiver cannot forge another hook's deliveries.
 | `POST /v1/triggers/evaluate` | `{ program, samples }`, 1 to 10,000 timestamp-ordered samples | `{ request_id, program_id, program_version, results[] }` | 422 |
 
 The v1 program is bounded to 64 forward-only instructions, 16 stack values, 16
-state slots, and 8 actions. See [Trigger programs](/docs/triggers/) for the
+state slots, and 8 actions. See [Trigger programs](/triggers/) for the
 source format and current live-signal support.
 
 ### Feedback
@@ -253,7 +254,7 @@ checks, and structured errors as the keyframe route.
 ### WebRTC (WHIP)
 
 Success and failure statuses for the four WHIP routes are covered in [WebRTC
-ingest](/docs/internals/webrtc-ingest/#endpoint-contract). `POST
+ingest](/internals/webrtc-ingest/#endpoint-contract). `POST
 /v1/stream/whip` answers with raw SDP plus `Location` and `x-vidarax-run-id`
 headers. WHIP failures return bare status codes or plain-text bodies.
 
@@ -363,4 +364,4 @@ Not everything uses the envelope. WHIP routes return raw SDP on success and bare
 
 When neither backend URL is set, the server reads a TOML config file (`VIDARAX_CONFIG`, default `vidarax.toml`) that declares backends in priority order. The parser supports `openai_compat` and `gemini` backend types, and string fields interpolate `${ENV_VAR}` references. When either explicit URL is set, the TOML file is not read.
 
-The full configuration reference, including decode backend selection, CORS, rate limits, WebRTC and TURN settings, and SpacetimeDB, lives in `docs/deployment.md` in the repository. The hardening-relevant variables are summarized in [Operations](/docs/operations/#security-and-hardening).
+The full configuration reference, including decode backend selection, CORS, rate limits, WebRTC and TURN settings, and SpacetimeDB, lives in `docs/deployment.md` in the repository. The hardening-relevant variables are summarized in [Operations](/operations/#security-and-hardening).

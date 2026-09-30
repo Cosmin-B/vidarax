@@ -1,6 +1,7 @@
 ---
 title: Operations
 description: Deployment, observability, hardening, and release checks.
+slug: operations
 ---
 
 A Vidarax deployment combines the API server, a reachable model backend, local durable storage, and the media tools selected for that host. The same server exports the signals needed to operate that pipeline under load.
@@ -25,9 +26,9 @@ The `deploy/` directory contains:
 | `vm-scrape.yml` | The VictoriaMetrics scrape configuration mounted into the metrics container. |
 | `certs/` | Development TLS certificate and key used by the experimental HTTP/3 transport defaults. |
 
-{% aside type="caution" title="Local compose boundaries" %}
+:::warning[Local compose boundaries]
 `docker-compose.local.yml` includes a local-only API key, authenticated metric scraping, ffmpeg in the runtime image, and persistent WAL storage. It still expects an inference service reachable from the API container. Set the backend URL or edit `vidarax.toml` for that network. VictoriaLogs is present but no log shipper is configured, so structured logs remain on container stderr until you add one.
-{% /aside %}
+:::
 
 Check readiness with:
 

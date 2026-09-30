@@ -1,6 +1,7 @@
 ---
 title: Agent workflows
 description: Run grounded media reviews from a compatible agent harness without hand-building the local audio environment.
+slug: agents
 ---
 
 
