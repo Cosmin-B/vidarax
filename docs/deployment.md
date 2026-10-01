@@ -143,11 +143,12 @@ at `timeline.wal`. Uploaded files are stored under a dedicated upload directory
 below the process temp directory. Shared local media paths are not enabled by
 default. Set `VIDARAX_INGEST_FILE_ROOTS` to the directories operators trust.
 
-Keyframe JPEGs are stored at
-`keyframes/blobs/<sha-prefix>/<sha256>.jpg` through an atomic rename before the
-`keyframe_stored` event is appended. `image_ref` is relative to
-`VIDARAX_DATA_DIR`. The event also records media type, byte count, and SHA-256.
-Identical JPEGs share a blob. Writes are flushed but not fsynced per keyframe.
+Keyframe JPEGs are stored at `keyframes/blobs/<sha-prefix>/<sha256>.jpg`.
+Before appending `keyframe_stored`, the writer syncs the JPEG and its directory
+entries. It creates the final filename only if no file already uses that name.
+Identical JPEGs share a file, and the writer checks and syncs an existing file
+before reusing it. The event records a file reference relative to
+`VIDARAX_DATA_DIR`, plus the media type, byte count, and SHA-256.
 
 Recorded native media uses
 `media/blobs/<sha-prefix>/<sha256>.mp4`. Optional spoken feedback uses the same
@@ -156,6 +157,45 @@ atomically before `semantic_chunk_inferred` and `multimodal_moment` events
 reference it. Identical objects share a blob. `GET
 /v1/runs/{id}/media/{sha256}` serves only hashes referenced by a run owned by
 the caller.
+
+## Offline archive and restore
+
+`vidarax-archive` backs up the WAL and its referenced JPEGs to an S3-compatible
+bucket. Retained MP4 and WAV files and webhook delivery state are stored
+separately and are not included in this snapshot.
+
+Stop the API before archiving. The command takes the same exclusive WAL lock
+as the server and refuses to run while the server owns it. Configure AWS
+credentials using the usual environment or workload identity for the selected
+bucket, then run:
+
+```bash
+cargo run --release -p vidarax-archive -- archive \
+  --data-dir .vidarax-data \
+  --bucket YOUR_BUCKET \
+  --region YOUR_REGION
+```
+
+The command prints JSON containing a `manifest_key`. Keep that value with your
+backup records because restore needs it. For another S3-compatible service,
+also pass `--endpoint`. Use `--allow-http` only for a trusted local test endpoint.
+
+Restore into a directory that does not exist yet, while the API is stopped:
+
+```bash
+cargo run --release -p vidarax-archive -- restore \
+  --target-dir .vidarax-restored \
+  --manifest-key YOUR_MANIFEST_KEY \
+  --bucket YOUR_BUCKET \
+  --region YOUR_REGION
+```
+
+Restore checks the manifest, WAL chunks, and JPEG hashes before moving the
+completed data directory into place. Point `VIDARAX_DATA_DIR` at it only after
+the command succeeds. Archives keep local data and must be run manually.
+Events written after the latest archive stay on the original machine until
+you archive again. Test your backup by restoring it to a separate new data
+directory.
 
 ## Calibrate live semantic novelty
 

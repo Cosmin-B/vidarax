@@ -27,7 +27,7 @@ use sha2::Sha256;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use vidarax_core::ingest::validate_public_https_url;
-use vidarax_core::timeline::{read_events_after_from, TimelineEvent};
+use vidarax_core::timeline::{read_events_after_from_up_to, TimelineEvent};
 
 use crate::handlers::load_run_snapshot;
 use crate::ids::validate_run_id;
@@ -148,11 +148,18 @@ pub(crate) struct DeliveryHub {
     webhooks_enabled: bool,
 }
 
+#[derive(Clone)]
+struct DeliveryWal {
+    path: PathBuf,
+    committed_end: Arc<AtomicU64>,
+}
+
 impl DeliveryHub {
     pub(crate) fn spawn(
         wal_path: PathBuf,
         existing_events: &[TimelineEvent],
         signing_secret: Option<String>,
+        committed_end: Arc<AtomicU64>,
     ) -> Self {
         let (events, event_rx) = broadcast::channel(TIMELINE_BROADCAST_CAP);
         let (commands, command_rx) = mpsc::channel(WEBHOOK_COMMAND_CAP);
@@ -172,7 +179,10 @@ impl DeliveryHub {
                     .build()
                     .expect("delivery runtime should build");
                 runtime.block_on(run_coordinator(
-                    wal_path,
+                    DeliveryWal {
+                        path: wal_path,
+                        committed_end,
+                    },
                     delivery_log_path,
                     configs,
                     thread_secret,
@@ -695,7 +705,7 @@ struct HookEntry {
 }
 
 async fn run_coordinator(
-    wal_path: PathBuf,
+    wal: DeliveryWal,
     delivery_log_path: PathBuf,
     configs: Vec<WebhookConfig>,
     secret: Option<String>,
@@ -720,7 +730,7 @@ async fn run_coordinator(
             let entry = spawn_hook_worker(
                 config.clone(),
                 restored,
-                wal_path.clone(),
+                wal.clone(),
                 Arc::clone(delivery_log),
                 Arc::<[u8]>::from(hook_secret),
                 Arc::clone(&metrics),
@@ -773,7 +783,7 @@ async fn run_coordinator(
                                 let activated = spawn_hook_worker(
                                     entry.config.clone(),
                                     WorkerStatus { last_terminal_seq: registered_seq, ..WorkerStatus::default() },
-                                    wal_path.clone(),
+                                    wal.clone(),
                                     Arc::clone(delivery_log.as_ref().expect("reservation required delivery log")),
                                     Arc::<[u8]>::from(hook_secret),
                                     Arc::clone(&metrics),
@@ -864,7 +874,7 @@ fn wake_hook(hook: &HookEntry, metrics: &DeliveryMetrics) {
 fn spawn_hook_worker(
     config: WebhookConfig,
     restored: WorkerStatus,
-    wal_path: PathBuf,
+    wal: DeliveryWal,
     delivery_log: Arc<Mutex<File>>,
     secret: Arc<[u8]>,
     metrics: Arc<DeliveryMetrics>,
@@ -879,7 +889,7 @@ fn spawn_hook_worker(
         loop {
             let failed = if let Err(err) = replay_hook(
                 &worker_config,
-                &wal_path,
+                &wal,
                 &delivery_log,
                 &secret,
                 &worker_status,
@@ -920,7 +930,7 @@ fn spawn_hook_worker(
 
 async fn replay_hook(
     config: &WebhookConfig,
-    wal_path: &Path,
+    wal: &DeliveryWal,
     delivery_log: &Arc<Mutex<File>>,
     secret: &[u8],
     status: &Arc<Mutex<WorkerStatus>>,
@@ -933,16 +943,19 @@ async fn replay_hook(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .last_terminal_seq
             .max(config.registered_seq);
-        let path = wal_path.to_path_buf();
+        let path = wal.path.clone();
         let offset = *wal_offset;
+        // The file can contain a batch whose disk sync has not finished yet.
+        // Only read through the byte limit published after a successful sync.
+        let committed_end = wal.committed_end.load(Ordering::Acquire);
         let (batch, next_offset) = tokio::task::spawn_blocking(move || {
-            read_events_after_from(path, cursor, REPLAY_BATCH, offset)
+            read_events_after_from_up_to(path, cursor, REPLAY_BATCH, offset, Some(committed_end))
         })
         .await
         .map_err(|err| format!("webhook WAL replay worker failed: {err}"))?
         .map_err(|err| format!("webhook WAL replay failed: {err}"))?;
-        *wal_offset = next_offset;
         if batch.is_empty() {
+            *wal_offset = next_offset;
             return Ok(());
         }
         let full = batch.len() == REPLAY_BATCH;
@@ -1025,6 +1038,8 @@ async fn replay_hook(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .last_terminal_seq = scanned_to;
+        // Retry this batch from its old offset if saving delivery state fails.
+        *wal_offset = next_offset;
         if !full {
             return Ok(());
         }
@@ -1314,6 +1329,74 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("vidarax-delivery-{name}-{nanos}.wal"))
+    }
+
+    #[tokio::test]
+    async fn webhook_replay_cursor_waits_for_the_published_disk_sync() {
+        use vidarax_core::timeline::WalWriter;
+
+        let path = test_path("committed-cursor");
+        let mut writer = WalWriter::open(&path).unwrap();
+        let mut event = TimelineEvent {
+            seq: 1,
+            run_id: "another-run".to_string(),
+            stream_id: "stream-0".to_string(),
+            pts_ms: 1,
+            kind: "note".to_string(),
+            payload: "{}".to_string(),
+        };
+        writer.append(&event).unwrap();
+        let committed_end = Arc::new(AtomicU64::new(writer.committed_end()));
+        let wal = DeliveryWal {
+            path: path.clone(),
+            committed_end: Arc::clone(&committed_end),
+        };
+        event.seq = 2;
+        writer.stage(&event).unwrap();
+
+        let config = WebhookConfig {
+            webhook_id: "wh-test".to_string(),
+            run_id: "hook-run".to_string(),
+            url: "https://unused.invalid".to_string(),
+            event_kinds: vec![],
+            registered_seq: 0,
+        };
+        let log_path = path.with_extension("delivery");
+        let log = Arc::new(Mutex::new(File::create(&log_path).unwrap()));
+        let status = Arc::new(Mutex::new(WorkerStatus::default()));
+        let metrics = DeliveryMetrics::default();
+        let mut offset = 0;
+        replay_hook(&config, &wal, &log, &[], &status, &metrics, &mut offset)
+            .await
+            .unwrap();
+        assert_eq!(status.lock().unwrap().last_terminal_seq, 1);
+        assert_eq!(offset, writer.committed_end());
+
+        writer.sync_pending().unwrap();
+        committed_end.store(writer.committed_end(), Ordering::Release);
+        let saved_offset = offset;
+        *log.lock().unwrap() = File::open(&log_path).unwrap();
+        let error = replay_hook(&config, &wal, &log, &[], &status, &metrics, &mut offset)
+            .await
+            .unwrap_err();
+        assert!(error.contains("append webhook delivery state"), "{error}");
+        assert_eq!(
+            offset, saved_offset,
+            "a failed checkpoint must not skip records"
+        );
+        assert_eq!(status.lock().unwrap().last_terminal_seq, 1);
+
+        *log.lock().unwrap() = OpenOptions::new().append(true).open(&log_path).unwrap();
+        replay_hook(&config, &wal, &log, &[], &status, &metrics, &mut offset)
+            .await
+            .unwrap();
+        assert_eq!(status.lock().unwrap().last_terminal_seq, 2);
+        assert_eq!(offset, writer.committed_end());
+        assert_eq!(metrics.webhook_attempts.load(Ordering::Relaxed), 0);
+        drop(writer);
+        drop(log);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(log_path).unwrap();
     }
 
     #[test]

@@ -4,8 +4,8 @@
 //! content-addressed blob directory and referenced from event metadata.
 
 use std::fmt::Write as _;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use std::sync::Arc;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use vidarax_core::coordinates::{FrameCoordinates, IMAGE_COORDINATE_SCHEMA};
+use vidarax_core::timeline::sync_file_durable;
 use vidarax_core::webrtc::workers::{
     EventSink, KeyframeEvent, RestrictedZoneEvidenceEvent, TriggerAssertionEvent,
 };
@@ -48,7 +49,7 @@ impl WalEventSink {
     fn persist_keyframe_blob(&self, jpeg_data: &[u8]) -> Result<KeyframeBlob, String> {
         let digest = Sha256::digest(jpeg_data);
         let mut sha256 = String::with_capacity(64);
-        for byte in digest {
+        for byte in &digest {
             let _ = write!(sha256, "{byte:02x}");
         }
         let shard = &sha256[..2];
@@ -59,12 +60,16 @@ impl WalEventSink {
                 directory.display()
             )
         })?;
+        sync_blob_parent_directories(&self.keyframe_blob_root)?;
         let final_path = directory.join(format!("{sha256}.jpg"));
         let created = if final_path.exists() {
             false
         } else {
             write_blob_atomically(&final_path, jpeg_data)?
         };
+        if !created {
+            verify_existing_blob(&final_path, jpeg_data, &digest)?;
+        }
         Ok(KeyframeBlob {
             image_ref: format!("keyframes/blobs/{shard}/{sha256}.jpg"),
             sha256,
@@ -88,7 +93,7 @@ pub(crate) struct MediaBlob {
     pub created: bool,
 }
 
-/// Persist an encoded MP4 before any event publishes its reference.
+/// Persist encoded MP4 or WAV bytes before any event publishes their reference.
 ///
 /// The caller keeps binary bytes out of the WAL and delivery payloads. A
 /// repeated clip reuses the same immutable content-addressed object.
@@ -104,23 +109,28 @@ pub(crate) fn persist_media_blob(
     };
     let digest = Sha256::digest(data);
     let mut sha256 = String::with_capacity(64);
-    for byte in digest {
+    for byte in &digest {
         let _ = write!(sha256, "{byte:02x}");
     }
     let shard = &sha256[..2];
-    let directory = state.media_blob_root().join(shard);
+    let blob_root = state.media_blob_root();
+    let directory = blob_root.join(shard);
     std::fs::create_dir_all(&directory).map_err(|error| {
         format!(
             "create media sidecar directory {}: {error}",
             directory.display()
         )
     })?;
+    sync_blob_parent_directories(&blob_root)?;
     let final_path = directory.join(format!("{sha256}.{extension}"));
     let created = if final_path.exists() {
         false
     } else {
         write_blob_atomically(&final_path, data)?
     };
+    if !created {
+        verify_existing_blob(&final_path, data, &digest)?;
+    }
     Ok(MediaBlob {
         media_ref: format!("media/blobs/{shard}/{sha256}.{extension}"),
         sha256,
@@ -131,12 +141,81 @@ pub(crate) fn persist_media_blob(
 
 static NEXT_BLOB_TEMP: AtomicU64 = AtomicU64::new(0);
 
+fn sync_blob_parent_directories(blob_root: &Path) -> Result<(), String> {
+    // Persist every parent entry before an event can reference a new blob.
+    let media_dir = blob_root
+        .parent()
+        .ok_or_else(|| "blob root has no parent".to_owned())?;
+    let wal_dir = media_dir
+        .parent()
+        .ok_or_else(|| "media directory has no parent".to_owned())?;
+    sync_blob_directory(wal_dir)?;
+    sync_blob_directory(media_dir)?;
+    sync_blob_directory(blob_root)
+}
+
+fn sync_blob_directory(directory: &Path) -> Result<(), String> {
+    File::open(directory)
+        .and_then(|file| sync_file_durable(&file))
+        .map_err(|err| {
+            format!(
+                "sync media sidecar directory {}: {err}",
+                directory.display()
+            )
+        })
+}
+
+fn verify_existing_blob(path: &Path, data: &[u8], expected_digest: &[u8]) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|err| format!("inspect existing media sidecar {}: {err}", path.display()))?;
+    if !metadata.file_type().is_file() || metadata.len() != data.len() as u64 {
+        return Err(format!(
+            "existing media sidecar {} is not a matching regular file",
+            path.display()
+        ));
+    }
+
+    let mut file = File::open(path)
+        .map_err(|err| format!("open existing media sidecar {}: {err}", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buf = [0_u8; 64 * 1024];
+    let mut offset = 0;
+    loop {
+        let count = file
+            .read(&mut buf)
+            .map_err(|err| format!("read existing media sidecar {}: {err}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        if data.get(offset..offset + count) != Some(&buf[..count]) {
+            return Err(format!(
+                "existing media sidecar {} has different bytes",
+                path.display()
+            ));
+        }
+        digest.update(&buf[..count]);
+        offset += count;
+    }
+    if offset != data.len() || digest.finalize()[..] != *expected_digest {
+        return Err(format!(
+            "existing media sidecar {} has an invalid hash",
+            path.display()
+        ));
+    }
+    sync_file_durable(&file)
+        .map_err(|err| format!("sync existing media sidecar {}: {err}", path.display()))?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| format!("media sidecar {} has no parent directory", path.display()))?;
+    sync_blob_directory(directory)
+}
+
 fn write_blob_atomically(final_path: &Path, data: &[u8]) -> Result<bool, String> {
     let sequence = NEXT_BLOB_TEMP.fetch_add(1, Ordering::Relaxed);
     let file_name = final_path
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("invalid keyframe sidecar path {}", final_path.display()))?;
+        .ok_or_else(|| format!("invalid media sidecar path {}", final_path.display()))?;
     let temp_path = final_path.with_file_name(format!(
         ".{file_name}.{}.{}.tmp",
         std::process::id(),
@@ -148,26 +227,37 @@ fn write_blob_atomically(final_path: &Path, data: &[u8]) -> Result<bool, String>
         apply_blob_permissions(&mut options);
         let mut file = options
             .open(&temp_path)
-            .map_err(|err| format!("create keyframe sidecar {}: {err}", temp_path.display()))?;
+            .map_err(|err| format!("create media sidecar {}: {err}", temp_path.display()))?;
         file.write_all(data)
-            .map_err(|err| format!("write keyframe sidecar {}: {err}", temp_path.display()))?;
-        // Match the WAL policy: flush, but do not fsync each keyframe.
-        file.flush()
-            .map_err(|err| format!("flush keyframe sidecar {}: {err}", temp_path.display()))?;
+            .map_err(|err| format!("write media sidecar {}: {err}", temp_path.display()))?;
+        sync_file_durable(&file)
+            .map_err(|err| format!("sync media sidecar {}: {err}", temp_path.display()))?;
         drop(file);
-        if let Err(err) = std::fs::rename(&temp_path, final_path) {
-            // Another writer may have committed the same hash first.
-            if final_path.exists() {
-                let _ = std::fs::remove_file(&temp_path);
-                return Ok(false);
+        // A normal rename could replace a blob published by another writer.
+        // Linking a synced temp file installs the final name only if absent.
+        let created = match std::fs::hard_link(&temp_path, final_path) {
+            Ok(()) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(err) => {
+                return Err(format!(
+                    "commit media sidecar {} -> {}: {err}",
+                    temp_path.display(),
+                    final_path.display()
+                ));
             }
-            return Err(format!(
-                "commit keyframe sidecar {} -> {}: {err}",
-                temp_path.display(),
-                final_path.display()
-            ));
+        };
+        std::fs::remove_file(&temp_path)
+            .map_err(|err| format!("remove media sidecar temp {}: {err}", temp_path.display()))?;
+        if created {
+            let directory = final_path.parent().ok_or_else(|| {
+                format!(
+                    "media sidecar {} has no parent directory",
+                    final_path.display()
+                )
+            })?;
+            sync_blob_directory(directory)?;
         }
-        Ok(true)
+        Ok(created)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp_path);
@@ -490,7 +580,7 @@ fn send_trigger_local_output(
 
 #[cfg(test)]
 mod tests {
-    use super::WalEventSink;
+    use super::{persist_media_blob, write_blob_atomically, WalEventSink};
     use crate::state::AppState;
     use std::sync::Arc;
     use vidarax_contracts::triggers::compile_trigger;
@@ -532,6 +622,78 @@ mod tests {
         let path = temp_wal();
         let state = AppState::with_wal_for_tests(path.clone());
         (state, path)
+    }
+
+    #[test]
+    fn existing_blob_with_wrong_bytes_is_rejected_before_event_append() {
+        let test_dir = temp_wal().with_extension("dir");
+        std::fs::create_dir_all(&test_dir).expect("create isolated test directory");
+        let wal_path = test_dir.join("timeline.wal");
+        let state = AppState::with_wal_for_tests(wal_path.clone());
+        let sink = WalEventSink::new(state.clone());
+        let jpeg = b"\xff\xd8original\xff\xd9";
+        let blob = sink
+            .persist_keyframe_blob(jpeg)
+            .expect("create original blob");
+        let blob_path = wal_path.parent().unwrap().join(&blob.image_ref);
+        std::fs::write(&blob_path, b"\xff\xd8corrupt!\xff\xd9")
+            .expect("corrupt existing blob without changing its size");
+
+        let result = sink.store_keyframe_sync(KeyframeEvent {
+            run_id: "run-corruptblob0001",
+            frame_index: 1,
+            pts_ms: 33,
+            coordinates: FrameCoordinates::full_frame(320, 240),
+            event_type: "scene_cut",
+            description: "corrupt existing blob",
+            jpeg_data: jpeg,
+        });
+
+        assert!(result.is_err(), "corrupt content must not be referenced");
+        assert!(state
+            .read_run_events("run-corruptblob0001")
+            .expect("read events")
+            .is_empty());
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn media_blob_reuse_checks_the_existing_bytes_for_mp4_and_wav() {
+        let test_dir = temp_wal().with_extension("dir");
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let state = AppState::with_wal_for_tests(test_dir.join("timeline.wal"));
+        for (media_type, extension) in [("video/mp4", "mp4"), ("audio/wav", "wav")] {
+            let original = b"encoded-media";
+            let blob = persist_media_blob(&state, original, media_type).unwrap();
+            assert!(blob.created);
+            assert!(blob.media_ref.ends_with(extension));
+            let blob_path = test_dir.join(&blob.media_ref);
+            assert_eq!(std::fs::read(&blob_path).unwrap(), original);
+            let reused = persist_media_blob(&state, original, media_type).unwrap();
+            assert!(!reused.created);
+            assert_eq!(reused.media_ref, blob.media_ref);
+
+            std::fs::write(&blob_path, b"corrupt-media").unwrap();
+            let error = persist_media_blob(&state, original, media_type)
+                .err()
+                .expect("same-length corruption must reject reuse");
+            assert!(error.contains("different bytes"), "{error}");
+        }
+        drop(state);
+        std::fs::remove_dir_all(test_dir).ok();
+    }
+
+    #[test]
+    fn publishing_a_blob_never_replaces_an_existing_destination() {
+        let final_path = temp_wal().with_extension("jpg");
+        std::fs::write(&final_path, b"winner").expect("create winner");
+
+        let created = write_blob_atomically(&final_path, b"loser")
+            .expect("an existing destination is not an I/O failure");
+
+        assert!(!created, "the existing blob must be reused");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"winner");
+        let _ = std::fs::remove_file(final_path);
     }
 
     #[test]

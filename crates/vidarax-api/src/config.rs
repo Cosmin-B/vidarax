@@ -364,6 +364,9 @@ fn parse_ingest_roots_env(var: &str) -> Result<Vec<PathBuf>, String> {
 pub fn resolve_wal_path(config: &ServerConfig) -> Result<PathBuf, String> {
     let data_dir = PathBuf::from(&config.data_dir);
     std::fs::create_dir_all(&data_dir).map_err(|err| err.to_string())?;
+    // Keep the writer, WAL readers, and blob sink in the same directory
+    // even if the process working directory changes after startup.
+    let data_dir = data_dir.canonicalize().map_err(|err| err.to_string())?;
     Ok(data_dir.join("timeline.wal"))
 }
 

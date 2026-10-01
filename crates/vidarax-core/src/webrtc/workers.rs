@@ -505,7 +505,7 @@ impl GateStreamState {
         encode: impl FnOnce() -> Option<RecycledBytes>,
     ) -> GateFrameOutcome {
         if let Some(event) = self.observe_loop(&signal, pts_ms, ctx.metrics) {
-            let _ = ctx.stdb.emit_event_nonblocking(
+            if let Err(error) = ctx.stdb.emit_event_nonblocking(
                 ctx.run_id,
                 ctx.session_id,
                 event.frame_index,
@@ -514,7 +514,9 @@ impl GateStreamState {
                 "loop_detected",
                 event.confidence,
                 event.description,
-            );
+            ) {
+                tracing::warn!(%error, "nonblocking loop notice was not admitted");
+            }
         }
 
         let gate_start = std::time::Instant::now();
@@ -1247,7 +1249,7 @@ pub fn spawn_analysis_workers(params: AnalysisWorkerParams) -> std::io::Result<V
                     };
 
                     if let Some(event) = gate.observe_loop(&sf.signal, sf.pts_ms, ctx.metrics) {
-                        let _ = ctx.stdb.emit_event_nonblocking(
+                        if let Err(error) = ctx.stdb.emit_event_nonblocking(
                             ctx.run_id,
                             ctx.session_id,
                             event.frame_index,
@@ -1256,7 +1258,9 @@ pub fn spawn_analysis_workers(params: AnalysisWorkerParams) -> std::io::Result<V
                             "loop_detected",
                             event.confidence,
                             event.description,
-                        );
+                        ) {
+                            tracing::warn!(%error, "nonblocking loop notice was not admitted");
+                        }
                     }
                     let _ = clip_tx.try_send(sf);
                 }
@@ -1416,7 +1420,8 @@ fn spawn_zone_evidence_writer(
                 jpeg_data: &zone.work.jpeg_bytes,
             }) {
                 metrics.inc_restricted_zone_evidence_failure();
-                tracing::warn!(%err, "restricted-zone evidence commit failed");
+                tracing::error!(%err, "restricted-zone evidence commit failed; exiting writer");
+                break;
             } else {
                 metrics.inc_restricted_zone_assertion();
             }
@@ -1471,7 +1476,8 @@ fn spawn_trigger_binary_writer(
                 jpeg_data: &trigger.work.jpeg_bytes,
             }) {
                 metrics.inc_trigger_binary_write_failure();
-                tracing::warn!(%err, "trigger evidence commit failed");
+                tracing::error!(%err, "trigger evidence commit failed; exiting writer");
+                break;
             } else {
                 metrics.inc_trigger_assertion();
             }
@@ -1924,7 +1930,7 @@ where
                 ) => break,
             };
             let emit_start = std::time::Instant::now();
-            match event {
+            let write_result = match event {
                 SinkEvent::Emit {
                     run_id,
                     session_id,
@@ -1934,18 +1940,16 @@ where
                     event_type,
                     confidence,
                     description,
-                } => {
-                    let _ = stdb.emit_event_sync(
-                        &run_id,
-                        &session_id,
-                        frame_index,
-                        pts_ms,
-                        coordinates,
-                        event_type,
-                        confidence,
-                        &description,
-                    );
-                }
+                } => stdb.emit_event_sync(
+                    &run_id,
+                    &session_id,
+                    frame_index,
+                    pts_ms,
+                    coordinates,
+                    event_type,
+                    confidence,
+                    &description,
+                ),
                 SinkEvent::StoreKeyframe {
                     run_id,
                     frame_index,
@@ -1955,20 +1959,22 @@ where
                     description,
                     jpeg_bytes,
                     ..
-                } => {
-                    let _ = stdb.store_keyframe_sync(KeyframeEvent {
-                        run_id: &run_id,
-                        frame_index,
-                        pts_ms,
-                        coordinates,
-                        event_type,
-                        description: &description,
-                        jpeg_data: &jpeg_bytes,
-                    });
-                }
-            }
+                } => stdb.store_keyframe_sync(KeyframeEvent {
+                    run_id: &run_id,
+                    frame_index,
+                    pts_ms,
+                    coordinates,
+                    event_type,
+                    description: &description,
+                    jpeg_data: &jpeg_bytes,
+                }),
+            };
             let emit_ms = emit_start.elapsed().as_millis() as u64;
             writer_metrics.stdb_emit_latency_ms.record(emit_ms);
+            if let Err(error) = write_result {
+                tracing::error!(%error, "confirmed event sink write failed; exiting writer");
+                break;
+            }
         })
         .map_err(|source| StageSpawnError::new(PipelineStage::EventWriter, source))?;
     let mut handles = vec![StageHandle::new(PipelineStage::EventWriter, writer_handle)];
@@ -2505,6 +2511,10 @@ mod tests {
     };
     use crate::coordinates::{FrameCoordinates, NormalizedRect};
     use crate::gate::FrameSignal;
+    use crate::provider::{
+        InferenceProvider, InferenceRequest, InferenceResult, ProviderError, ProviderKind,
+        TokenUsage,
+    };
     use crate::webrtc::clip::ClipRateGate;
     use crate::webrtc::clip::MAX_CLIP_FRAMES_PER_REQUEST;
     #[cfg(feature = "vp8")]
@@ -2513,6 +2523,10 @@ mod tests {
         VideoCodec, YuvFrame, FFMPEG_YUV_PENDING_POOL_ALLOWANCE, FFMPEG_YUV_READER_POOL_MIN_SLOTS,
     };
     use crate::webrtc::recycle::VecPool;
+    use crate::webrtc::runtime::{
+        PipelineFault, PipelineFaultReason, PipelineGeneration, PipelineRuntime, PipelineShutdown,
+        PipelineStage,
+    };
     use crate::zone::RestrictedZonePolicy;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -2565,6 +2579,249 @@ mod tests {
                 .unwrap()
                 .push(crate::zone::RESTRICTED_ZONE_ACTIVITY_EVENT.to_string());
             Ok(())
+        }
+    }
+
+    struct StaticProvider;
+
+    impl InferenceProvider for StaticProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Vllm
+        }
+
+        fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+            Ok(InferenceResult {
+                provider: ProviderKind::Vllm,
+                model: Arc::clone(&request.model),
+                output_text: "a person enters".to_owned(),
+                fallback_used: false,
+                finish_reason: None,
+                inference_latency_ms: 0,
+                usage: TokenUsage::default(),
+            })
+        }
+    }
+
+    struct FailingSink {
+        fail_keyframe: bool,
+    }
+
+    impl EventSink for FailingSink {
+        fn emit_event_sync(
+            &self,
+            _run_id: &str,
+            _session_id: &str,
+            _frame_index: u64,
+            _pts_ms: u64,
+            _coordinates: FrameCoordinates,
+            _event_type: &str,
+            _confidence: f32,
+            _description: &str,
+        ) -> Result<(), String> {
+            if self.fail_keyframe {
+                Ok(())
+            } else {
+                Err("event admission rejected".to_owned())
+            }
+        }
+
+        fn store_keyframe_sync(&self, _event: KeyframeEvent<'_>) -> Result<(), String> {
+            if self.fail_keyframe {
+                Err("keyframe admission rejected".to_owned())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn store_restricted_zone_sync(
+            &self,
+            _event: RestrictedZoneEvidenceEvent<'_>,
+        ) -> Result<(), String> {
+            Err("zone assertion admission rejected".to_owned())
+        }
+    }
+
+    fn assert_event_writer_faults(
+        runtime: PipelineRuntime,
+        stopping: &Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        let supervisor = std::thread::spawn(move || {
+            let result = runtime.supervise(Duration::from_secs(1), |_| {});
+            outcome_tx.send(result).unwrap();
+        });
+        let outcome = match outcome_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                stopping.store(true, std::sync::atomic::Ordering::Release);
+                supervisor.join().unwrap();
+                panic!("event writer failed to fault on rejected write: {error}");
+            }
+        };
+        supervisor.join().unwrap();
+        assert_eq!(
+            outcome,
+            PipelineShutdown::Faulted(PipelineFault {
+                stage: PipelineStage::EventWriter,
+                reason: PipelineFaultReason::UnexpectedExit,
+            })
+        );
+    }
+
+    #[test]
+    fn confirmed_sink_failures_fault_event_writer_stage() {
+        for fail_keyframe in [false, true] {
+            let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (_command_tx, command_rx) = tokio::sync::mpsc::channel(1);
+            let (work_tx, work_rx) = kanal::bounded(1);
+            let handles = super::spawn_vlm_workers(super::VlmWorkerParams {
+                workers: 1,
+                vlm_rx: work_rx,
+                provider: Arc::new(StaticProvider),
+                stdb: Arc::new(FailingSink { fail_keyframe }),
+                config: crate::tiered_vlm::TieredVlmConfig::default(),
+                metrics: Arc::new(crate::metrics::PipelineMetrics::new()),
+                session_span: tracing::Span::none(),
+                max_output_tokens_per_second: 0,
+                initial_prompt: Arc::from(""),
+                initial_guided_json: None,
+                generation: PipelineGeneration::INITIAL,
+                commands: command_rx,
+                stopping: Arc::clone(&stopping),
+                novelty: crate::novelty::LiveNoveltyConfig::default(),
+                observer: None,
+            })
+            .unwrap();
+            let mut runtime =
+                PipelineRuntime::new(PipelineGeneration::INITIAL, Arc::clone(&stopping));
+            runtime.extend(handles);
+            work_tx
+                .send(KeyframeWork {
+                    run_id: Arc::from("run"),
+                    session_id: Arc::from("session"),
+                    frame_index: 1,
+                    pts_ms: 33,
+                    coordinates: FrameCoordinates::full_frame(640, 480),
+                    event_type: "scene_cut",
+                    confidence: 0.9,
+                    novelty_score: 1.0,
+                    motion_score: 0.0,
+                    jpeg_bytes: [0xff_u8, 0xd8, 0xff, 0xd9].into(),
+                    loop_active: false,
+                })
+                .unwrap();
+
+            assert_event_writer_faults(runtime, &stopping);
+        }
+    }
+
+    #[test]
+    fn confirmed_binary_sink_failures_fault_writer_before_forwarding_to_vlm() {
+        for is_trigger in [false, true] {
+            let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let metrics = Arc::new(crate::metrics::PipelineMetrics::new());
+            let sink: Arc<dyn EventSink> = Arc::new(FailingSink {
+                fail_keyframe: true,
+            });
+            let (vlm_tx, vlm_rx) = kanal::bounded(1);
+            let (zone_tx, zone_rx) = kanal::bounded(1);
+            let (trigger_tx, trigger_rx) = kanal::bounded(1);
+            let work = KeyframeWork {
+                run_id: Arc::from("run"),
+                session_id: Arc::from("session"),
+                frame_index: 1,
+                pts_ms: 33,
+                coordinates: FrameCoordinates::full_frame(640, 480),
+                event_type: "scene_cut",
+                confidence: 0.9,
+                novelty_score: 1.0,
+                motion_score: 0.5,
+                jpeg_bytes: [0xff_u8, 0xd8, 0xff, 0xd9].into(),
+                loop_active: false,
+            };
+            let handle = if is_trigger {
+                let handle = super::spawn_trigger_binary_writer(
+                    trigger_rx,
+                    vlm_tx,
+                    sink,
+                    Arc::clone(&metrics),
+                    Arc::clone(&stopping),
+                )
+                .unwrap();
+                trigger_tx
+                    .send(super::TriggerAssertionWork {
+                        work,
+                        fire: super::TriggerFire {
+                            program: Arc::new(super::TriggerProgram {
+                                isa_version: vidarax_contracts::triggers::TRIGGER_ISA_VERSION,
+                                program_id: "test-trigger".to_owned(),
+                                version: 1,
+                                instructions: vec![
+                                    super::TriggerInstruction::Emit {
+                                        event_type: "motion".to_owned(),
+                                    },
+                                    super::TriggerInstruction::Halt,
+                                ],
+                            }),
+                            event_type: "motion".to_owned(),
+                            notify_webhook: false,
+                            notify_local_output: false,
+                        },
+                        generation: PipelineGeneration::INITIAL,
+                    })
+                    .unwrap();
+                handle
+            } else {
+                let handle = super::spawn_zone_evidence_writer(
+                    zone_rx,
+                    vlm_tx,
+                    sink,
+                    Arc::clone(&metrics),
+                    Arc::clone(&stopping),
+                )
+                .unwrap();
+                zone_tx
+                    .send(super::ZoneEvidenceWork {
+                        work,
+                        policy: Arc::new(RestrictedZonePolicy {
+                            policy_id: "zone".to_owned(),
+                            policy_version: 1,
+                            device_id: "camera".to_owned(),
+                            region: NormalizedRect {
+                                x: 0.0,
+                                y: 0.0,
+                                width: 1.0,
+                                height: 1.0,
+                            },
+                            enter_motion_score: 0.4,
+                            exit_motion_score: 0.1,
+                            enter_after_frames: 1,
+                            exit_after_frames: 1,
+                        }),
+                        observation: crate::zone::ZoneActivityObservation {
+                            transition: crate::zone::ZoneActivityTransition::Entered,
+                            motion_score: 0.5,
+                            threshold: 0.4,
+                            consecutive_frames: 1,
+                        },
+                        generation: PipelineGeneration::INITIAL,
+                        subject: None,
+                    })
+                    .unwrap();
+                handle
+            };
+            let mut runtime =
+                PipelineRuntime::new(PipelineGeneration::INITIAL, Arc::clone(&stopping));
+            runtime.push(handle);
+            assert_event_writer_faults(runtime, &stopping);
+            assert!(!matches!(vlm_rx.try_recv(), Ok(Some(_))));
+            let failure_counter = if is_trigger {
+                "vidarax_pipeline_trigger_binary_write_failures_total 1"
+            } else {
+                "vidarax_pipeline_restricted_zone_evidence_failures_total 1"
+            };
+            assert!(metrics.render_prometheus().contains(failure_counter));
+            drop((zone_tx, trigger_tx));
         }
     }
 

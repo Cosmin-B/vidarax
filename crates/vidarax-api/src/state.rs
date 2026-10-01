@@ -2,6 +2,7 @@ use arc_swap::ArcSwap;
 use dashmap::mapref::entry::Entry;
 use dashmap::{DashMap, DashSet};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, Write};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -25,8 +26,11 @@ use vidarax_core::ingest::pipeline::{create_pipeline, DecodePipeline, PipelineBa
 use vidarax_core::novelty::LiveNoveltyConfig;
 use vidarax_core::provider::{AdmittedProvider, InferenceProvider};
 #[cfg(test)]
-use vidarax_core::timeline::append_event;
-use vidarax_core::timeline::{read_all_events, read_events_after, TimelineEvent, WalWriter};
+use vidarax_core::timeline::{append_event, read_all_events};
+use vidarax_core::timeline::{
+    framed_len_fields, read_all_events_up_to, read_events_after_up_to, TimelineEvent, WalWriter,
+    MAX_RECORD_BYTES,
+};
 use vidarax_core::webrtc::resources::MediaSessionResources;
 use vidarax_core::webrtc::session::WebRtcSession;
 
@@ -84,6 +88,15 @@ const DELETED_RUN_RETENTION_CAP: usize = 4096;
 /// operation never evicts.
 const WARM_RUN_TAIL_CAP: usize = 1024;
 const TIMELINE_WRITER_QUEUE_CAP: usize = 1024;
+// Queued and staged commands may hold at most one maximum-size WAL record
+// worth of strings. The command count limit also bounds their fixed fields.
+const TIMELINE_WRITER_QUEUE_BYTES: usize = MAX_RECORD_BYTES;
+const TIMELINE_BYTE_BUDGET_FULL: &str = "timeline writer byte budget full; retry";
+// Tune these batch limits after measuring burst latency.
+// Check the byte target after staging each record. A large record may share
+// the batch with earlier records, but no later record joins that batch.
+const TIMELINE_BATCH_MAX_COMMANDS: usize = 32;
+const TIMELINE_BATCH_TARGET_BYTES: usize = 256 * 1024;
 
 #[derive(Default)]
 struct ReclaimedSessions {
@@ -278,6 +291,7 @@ pub struct AppStateInner {
     request_seq: AtomicU64,
     pipeline_generation_seq: AtomicU64,
     wal_path: Arc<PathBuf>,
+    wal_committed_end: Arc<AtomicU64>,
     ingest_file_roots: Vec<PathBuf>,
     provider: Option<Arc<dyn InferenceProvider + Send + Sync>>,
     decode_pipeline: Arc<dyn DecodePipeline>,
@@ -294,6 +308,7 @@ pub struct AppStateInner {
     novelty_config: LiveNoveltyConfig,
     run_registry: Arc<RunRegistry>,
     timeline_tx: mpsc::Sender<TimelineCommand>,
+    timeline_byte_budget: Arc<Semaphore>,
     timeline_snapshot: Arc<ArcSwap<RingSnapshot>>,
     delivery: DeliveryHub,
     #[cfg(test)]
@@ -388,12 +403,17 @@ impl AppStateConfig {
     }
 
     fn build(self) -> AppState {
-        let wal_path = Arc::new(self.wal_path);
-        let wal = WalWriter::open(wal_path.as_ref()).expect("timeline WAL should open");
+        let wal = WalWriter::open(&self.wal_path).expect("timeline WAL should open");
+        let wal_path = Arc::new(wal.path().to_path_buf());
+        let wal_committed_end = Arc::new(AtomicU64::new(wal.committed_end()));
         let run_registry = Arc::new(RunRegistry::default());
         let timeline_snapshot = Arc::new(ArcSwap::from_pointee(RingSnapshot::default()));
-        let delivery =
-            DeliveryHub::spawn(wal_path.as_ref().clone(), &[], self.webhook_signing_secret);
+        let delivery = DeliveryHub::spawn(
+            wal_path.as_ref().clone(),
+            &[],
+            self.webhook_signing_secret,
+            Arc::clone(&wal_committed_end),
+        );
         #[cfg(test)]
         let timeline_test_control = Arc::new(TimelineWriterTestControl::default());
         let timeline_tx = spawn_timeline_writer(
@@ -401,6 +421,7 @@ impl AppStateConfig {
             Arc::clone(&run_registry),
             Arc::clone(&timeline_snapshot),
             delivery.event_sender(),
+            Arc::clone(&wal_committed_end),
             0,
             HashMap::new(),
             #[cfg(test)]
@@ -412,6 +433,7 @@ impl AppStateConfig {
                 request_seq: AtomicU64::new(0),
                 pipeline_generation_seq: AtomicU64::new(0),
                 wal_path,
+                wal_committed_end,
                 ingest_file_roots: default_test_ingest_roots(),
                 provider: self.provider,
                 decode_pipeline: default_test_decode_pipeline(),
@@ -430,6 +452,7 @@ impl AppStateConfig {
                 novelty_config: LiveNoveltyConfig::default(),
                 run_registry,
                 timeline_tx,
+                timeline_byte_budget: Arc::new(Semaphore::new(TIMELINE_WRITER_QUEUE_BYTES)),
                 timeline_snapshot,
                 delivery,
                 #[cfg(test)]
@@ -482,21 +505,23 @@ impl AppState {
     ) -> Result<Self, String> {
         let novelty_embedding_timeout_ms = novelty.embedding_timeout_ms;
         let admission_wait_ms = inference_admission_limits.wait_timeout.as_millis() as u64;
-        let existing_events = read_all_events(&wal_path).map_err(|err| err.to_string())?;
+        // Hold the WAL lock before reading any records and throughout replay.
+        let wal = WalWriter::open(&wal_path).map_err(|err| err.to_string())?;
+        let wal_path = wal.path().to_path_buf();
+        let wal_committed_end = Arc::new(AtomicU64::new(wal.committed_end()));
+        let existing_events = wal.read_all().map_err(|err| err.to_string())?;
+        let max_seq = validate_replay_sequence(&existing_events)?;
         let delivery = DeliveryHub::spawn(
             wal_path.clone(),
             &existing_events,
             std::env::var("VIDARAX_WEBHOOK_SECRET").ok(),
+            Arc::clone(&wal_committed_end),
         );
         let run_registry = build_run_registry(&existing_events);
         let initial_tails = build_event_tails(&existing_events);
         let timeline_snapshot = Arc::new(ArcSwap::from_pointee(RingSnapshot::from_tails(
             &initial_tails,
-            existing_events
-                .iter()
-                .map(|event| event.seq)
-                .max()
-                .unwrap_or(0),
+            max_seq,
         )));
         let tenant_label_maps = TenantLabelMaps::from_env()?;
         let max_run_seq = existing_events.iter().fold(0u64, |acc, event| {
@@ -507,13 +532,7 @@ impl AppState {
             .iter()
             .filter(|event| event.kind == "run_created")
             .count() as u64;
-        let max_seq = existing_events
-            .iter()
-            .map(|event| event.seq)
-            .max()
-            .unwrap_or(0);
         let wal_path = Arc::new(wal_path);
-        let wal = WalWriter::open(wal_path.as_ref()).map_err(|err| err.to_string())?;
         #[cfg(test)]
         let timeline_test_control = Arc::new(TimelineWriterTestControl::default());
         let timeline_tx = spawn_timeline_writer(
@@ -521,6 +540,7 @@ impl AppState {
             Arc::clone(&run_registry),
             Arc::clone(&timeline_snapshot),
             delivery.event_sender(),
+            Arc::clone(&wal_committed_end),
             max_seq,
             initial_tails,
             #[cfg(test)]
@@ -533,6 +553,7 @@ impl AppState {
                 request_seq: AtomicU64::new(0),
                 pipeline_generation_seq: AtomicU64::new(0),
                 wal_path,
+                wal_committed_end,
                 ingest_file_roots,
                 provider,
                 decode_pipeline,
@@ -551,6 +572,7 @@ impl AppState {
                 novelty_config: novelty,
                 run_registry,
                 timeline_tx,
+                timeline_byte_budget: Arc::new(Semaphore::new(TIMELINE_WRITER_QUEUE_BYTES)),
                 timeline_snapshot,
                 delivery,
                 #[cfg(test)]
@@ -936,9 +958,14 @@ impl AppState {
                 .map(|result| result.event);
         }
 
-        self.append_timeline_sync(TimelineAppendRequest::new(
-            run_id, stream_id, kind, payload, None,
-        ))
+        self.append_timeline_sync(TimelineAppendRequest::try_new(
+            run_id,
+            stream_id,
+            kind,
+            payload,
+            None,
+            &self.timeline_byte_budget,
+        )?)
     }
 
     pub fn append_run_event_for_stream_nonblocking(
@@ -952,9 +979,22 @@ impl AppState {
             return Err("run_deleted requires confirmed append".to_string());
         }
 
-        self.append_timeline_nonblocking(TimelineAppendRequest::new(
-            run_id, stream_id, kind, payload, None,
-        ))
+        let request = match TimelineAppendRequest::try_new(
+            run_id,
+            stream_id,
+            kind,
+            payload,
+            None,
+            &self.timeline_byte_budget,
+        ) {
+            Ok(request) => request,
+            Err(err) if err == TIMELINE_BYTE_BUDGET_FULL => {
+                Self::record_detached_drop("byte budget full");
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
+        self.append_timeline_nonblocking(request)
     }
 
     pub async fn append_run_event_async(
@@ -981,9 +1021,14 @@ impl AppState {
                 .map(|result| result.event);
         }
 
-        self.append_timeline_async(TimelineAppendRequest::new(
-            run_id, stream_id, kind, payload, None,
-        ))
+        self.append_timeline_async(TimelineAppendRequest::try_new(
+            run_id,
+            stream_id,
+            kind,
+            payload,
+            None,
+            &self.timeline_byte_budget,
+        )?)
         .await
     }
 
@@ -1007,13 +1052,14 @@ impl AppState {
             match self.begin_run_deleted_append(run_id) {
                 RunDeleteClaim::Claimed(run) => {
                     let guard = RunDeleteAppendGuard::new(run);
-                    let event = self.append_timeline_sync(TimelineAppendRequest::new(
+                    let event = self.append_timeline_sync(TimelineAppendRequest::try_new(
                         run_id,
                         stream_id,
                         "run_deleted",
                         payload,
                         Some(guard),
-                    ))?;
+                        &self.timeline_byte_budget,
+                    )?)?;
                     return Ok(RunDeletedAppend {
                         event,
                         appended: true,
@@ -1027,13 +1073,14 @@ impl AppState {
                 }
                 RunDeleteClaim::InFlight(run) => run.wait_delete_append_blocking(),
                 RunDeleteClaim::Missing => {
-                    let event = self.append_timeline_sync(TimelineAppendRequest::new(
+                    let event = self.append_timeline_sync(TimelineAppendRequest::try_new(
                         run_id,
                         stream_id,
                         "run_deleted",
                         payload,
                         None,
-                    ))?;
+                        &self.timeline_byte_budget,
+                    )?)?;
                     return Ok(RunDeletedAppend {
                         event,
                         appended: true,
@@ -1054,13 +1101,14 @@ impl AppState {
                 RunDeleteClaim::Claimed(run) => {
                     let guard = RunDeleteAppendGuard::new(run);
                     let event = self
-                        .append_timeline_async(TimelineAppendRequest::new(
+                        .append_timeline_async(TimelineAppendRequest::try_new(
                             run_id,
                             stream_id,
                             "run_deleted",
                             payload,
                             Some(guard),
-                        ))
+                            &self.timeline_byte_budget,
+                        )?)
                         .await?;
                     return Ok(RunDeletedAppend {
                         event,
@@ -1076,13 +1124,14 @@ impl AppState {
                 RunDeleteClaim::InFlight(run) => run.wait_delete_append().await,
                 RunDeleteClaim::Missing => {
                     let event = self
-                        .append_timeline_async(TimelineAppendRequest::new(
+                        .append_timeline_async(TimelineAppendRequest::try_new(
                             run_id,
                             stream_id,
                             "run_deleted",
                             payload,
                             None,
-                        ))
+                            &self.timeline_byte_budget,
+                        )?)
                         .await?;
                     return Ok(RunDeletedAppend {
                         event,
@@ -1119,20 +1168,17 @@ impl AppState {
             return Err(format!("run {} is deleted", request.run_id));
         }
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        let mut command = TimelineCommand::Append {
+        let command = TimelineCommand::Append {
             request: Some(request),
             reply: TimelineReply::Sync(reply_tx),
         };
-        loop {
-            match self.timeline_tx.try_send(command) {
-                Ok(()) => break,
-                Err(mpsc::error::TrySendError::Full(returned)) => {
-                    command = returned;
-                    std::thread::yield_now();
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    return Err("timeline writer is closed".to_string());
-                }
+        match self.timeline_tx.try_send(command) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                return Err("timeline writer queue full; retry".to_string());
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err("timeline writer is closed".to_string());
             }
         }
         reply_rx
@@ -1147,11 +1193,7 @@ impl AppState {
         {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                let dropped = DROPPED_DETACHED_TIMELINE_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::warn!(
-                    dropped_total = dropped,
-                    "timeline writer queue full; dropping detached event"
-                );
+                Self::record_detached_drop("command queue full");
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -1160,24 +1202,34 @@ impl AppState {
         }
     }
 
+    fn record_detached_drop(reason: &'static str) {
+        let dropped = DROPPED_DETACHED_TIMELINE_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(
+            dropped_total = dropped,
+            reason,
+            "dropping detached timeline event"
+        );
+    }
+
     async fn append_timeline_async(
         &self,
         request: TimelineAppendRequest,
     ) -> Result<TimelineEvent, String> {
-        // Cancellation boundary: before `send` completes, the command remains
-        // owned by this future and is not appended. After `send` completes, the
-        // single-owner writer owns the command and will finish it even if the
-        // caller disappears while waiting for the reply. Callers that may retry
-        // a state transition need their own idempotency rule; run deletion uses
-        // `append_run_deleted_for_stream_idempotent_async` for exactly that.
+        // A full queue returns an error so the caller can retry. Once queued,
+        // the writer finishes the command even if the caller cancels while
+        // waiting for the reply.
         let (reply_tx, reply_rx) = oneshot::channel();
         self.timeline_tx
-            .send(TimelineCommand::Append {
+            .try_send(TimelineCommand::Append {
                 request: Some(request),
                 reply: TimelineReply::Async(reply_tx),
             })
-            .await
-            .map_err(|_| "timeline writer is closed".to_string())?;
+            .map_err(|err| match err {
+                mpsc::error::TrySendError::Full(_) => {
+                    "timeline writer queue full; retry".to_string()
+                }
+                mpsc::error::TrySendError::Closed(_) => "timeline writer is closed".to_string(),
+            })?;
         reply_rx
             .await
             .map_err(|err| format!("timeline writer reply failure: {err}"))?
@@ -1202,7 +1254,9 @@ impl AppState {
     pub fn read_run_events(&self, run_id: &str) -> Result<Vec<TimelineEvent>, String> {
         // This is a full WAL scan per request. A per-run index from run id to
         // file offsets would make it O(1) seek instead of O(total events).
-        let events = read_all_events(self.wal_path.as_ref()).map_err(|err| err.to_string())?;
+        let end = self.wal_committed_end.load(Ordering::Acquire);
+        let events = read_all_events_up_to(self.wal_path.as_ref(), Some(end))
+            .map_err(|err| err.to_string())?;
         Ok(events
             .into_iter()
             .filter(|event| event.run_id == run_id)
@@ -1211,9 +1265,11 @@ impl AppState {
 
     pub async fn read_run_events_async(&self, run_id: &str) -> Result<Vec<TimelineEvent>, String> {
         let wal_path = Arc::clone(&self.wal_path);
+        let end = self.wal_committed_end.load(Ordering::Acquire);
         let run_id = run_id.to_string();
         tokio::task::spawn_blocking(move || {
-            let events = read_all_events(wal_path.as_ref()).map_err(|err| err.to_string())?;
+            let events = read_all_events_up_to(wal_path.as_ref(), Some(end))
+                .map_err(|err| err.to_string())?;
             Ok(events
                 .into_iter()
                 .filter(|event| event.run_id == run_id)
@@ -1224,13 +1280,15 @@ impl AppState {
     }
 
     pub fn read_all_events(&self) -> Result<Vec<TimelineEvent>, String> {
-        read_all_events(self.wal_path.as_ref()).map_err(|err| err.to_string())
+        let end = self.wal_committed_end.load(Ordering::Acquire);
+        read_all_events_up_to(self.wal_path.as_ref(), Some(end)).map_err(|err| err.to_string())
     }
 
     pub async fn read_all_events_async(&self) -> Result<Vec<TimelineEvent>, String> {
         let wal_path = Arc::clone(&self.wal_path);
+        let end = self.wal_committed_end.load(Ordering::Acquire);
         tokio::task::spawn_blocking(move || {
-            read_all_events(wal_path.as_ref()).map_err(|err| err.to_string())
+            read_all_events_up_to(wal_path.as_ref(), Some(end)).map_err(|err| err.to_string())
         })
         .await
         .map_err(|err| format!("timeline read worker join failure: {err}"))?
@@ -1244,8 +1302,10 @@ impl AppState {
         limit: usize,
     ) -> Result<Vec<TimelineEvent>, String> {
         let wal_path = Arc::clone(&self.wal_path);
+        let end = self.wal_committed_end.load(Ordering::Acquire);
         tokio::task::spawn_blocking(move || {
-            read_events_after(wal_path.as_ref(), after_seq, limit).map_err(|err| err.to_string())
+            read_events_after_up_to(wal_path.as_ref(), after_seq, limit, Some(end))
+                .map_err(|err| err.to_string())
         })
         .await
         .map_err(|err| format!("timeline delivery read worker join failure: {err}"))?
@@ -1486,6 +1546,27 @@ fn now_epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Reject duplicate, missing, or reordered sequence numbers before rebuilding
+/// the registry and in-memory event tails. Otherwise memory and WAL reads
+/// can return different histories.
+fn validate_replay_sequence(events: &[TimelineEvent]) -> Result<u64, String> {
+    let mut expected = 1u64;
+    for (index, event) in events.iter().enumerate() {
+        if event.seq != expected {
+            return Err(format!(
+                "timeline WAL sequence invalid at record {}: expected {}, found {}; startup will not rewrite this WAL; non-contiguous legacy WALs require offline migration",
+                index + 1,
+                expected,
+                event.seq
+            ));
+        }
+        expected = expected
+            .checked_add(1)
+            .ok_or_else(|| "timeline WAL sequence exhausted".to_string())?;
+    }
+    Ok(expected - 1)
+}
+
 fn default_test_ingest_roots() -> Vec<PathBuf> {
     let tmp = std::env::temp_dir();
     vec![tmp.canonicalize().unwrap_or(tmp)]
@@ -1525,14 +1606,76 @@ impl RingSnapshot {
 }
 
 struct TimelineAppendRequest {
-    run_id: String,
-    stream_id: String,
-    kind: String,
-    payload: Value,
+    run_id: Box<str>,
+    stream_id: Box<str>,
+    kind: Box<str>,
+    payload: Box<str>,
     delete_guard: Option<RunDeleteAppendGuard>,
+    byte_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl TimelineAppendRequest {
+    fn try_new(
+        run_id: &str,
+        stream_id: &str,
+        kind: &str,
+        payload: Value,
+        delete_guard: Option<RunDeleteAppendGuard>,
+        byte_budget: &Arc<Semaphore>,
+    ) -> Result<Self, String> {
+        // Count the JSON bytes before allocating the output buffer, then reserve
+        // that space in the byte budget. Drop the Value before queuing the command.
+        let mut counter = BoundedJsonCounter::default();
+        serde_json::to_writer(&mut counter, &payload)
+            .map_err(|_| "timeline event exceeds maximum record size".to_string())?;
+        let owned_bytes = counter
+            .len
+            .checked_add(run_id.len())
+            .and_then(|n| n.checked_add(stream_id.len()))
+            .and_then(|n| n.checked_add(kind.len()))
+            .ok_or_else(|| "timeline event exceeds maximum record size".to_string())?;
+        if owned_bytes > TIMELINE_WRITER_QUEUE_BYTES {
+            return Err("timeline event exceeds maximum record size".to_string());
+        }
+        let count = u32::try_from(owned_bytes)
+            .map_err(|_| "timeline event exceeds maximum record size".to_string())?;
+        let byte_permit = Arc::clone(byte_budget)
+            .try_acquire_many_owned(count)
+            .map_err(|_| TIMELINE_BYTE_BUDGET_FULL.to_string())?;
+
+        let mut writer = ExactJsonWriter::new(counter.len);
+        serde_json::to_writer(&mut writer, &payload)
+            .map_err(|err| format!("timeline payload serialization failed: {err}"))?;
+        if writer.used != counter.len {
+            return Err("timeline payload changed during serialization".to_string());
+        }
+        let payload = String::from_utf8(writer.bytes.into_vec())
+            .map_err(|err| format!("timeline payload is not UTF-8: {err}"))?
+            .into_boxed_str();
+        let request = Self {
+            run_id: run_id.to_owned().into_boxed_str(),
+            stream_id: stream_id.to_owned().into_boxed_str(),
+            kind: kind.to_owned().into_boxed_str(),
+            payload,
+            delete_guard,
+            byte_permit: Some(byte_permit),
+        };
+        // The writer assigns the sequence number and timestamp later. Use their
+        // shortest decimal forms here to reject records that cannot fit, then
+        // check their exact values before encoding or writing.
+        framed_len_fields(
+            1,
+            &request.run_id,
+            &request.stream_id,
+            0,
+            &request.kind,
+            &request.payload,
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(request)
+    }
+
+    #[cfg(test)]
     fn new(
         run_id: &str,
         stream_id: &str,
@@ -1541,12 +1684,64 @@ impl TimelineAppendRequest {
         delete_guard: Option<RunDeleteAppendGuard>,
     ) -> Self {
         Self {
-            run_id: run_id.to_owned(),
-            stream_id: stream_id.to_owned(),
-            kind: kind.to_owned(),
-            payload,
+            run_id: run_id.to_owned().into_boxed_str(),
+            stream_id: stream_id.to_owned().into_boxed_str(),
+            kind: kind.to_owned().into_boxed_str(),
+            payload: payload.to_string().into_boxed_str(),
             delete_guard,
+            byte_permit: None,
         }
+    }
+}
+
+#[derive(Default)]
+struct BoundedJsonCounter {
+    len: usize,
+}
+
+impl Write for BoundedJsonCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.len = self
+            .len
+            .checked_add(bytes.len())
+            .filter(|next| *next <= MAX_RECORD_BYTES)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "payload too large"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct ExactJsonWriter {
+    bytes: Box<[u8]>,
+    used: usize,
+}
+
+impl ExactJsonWriter {
+    fn new(len: usize) -> Self {
+        Self {
+            bytes: vec![0; len].into_boxed_slice(),
+            used: 0,
+        }
+    }
+}
+
+impl Write for ExactJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let end = self
+            .used
+            .checked_add(bytes.len())
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "payload changed"))?;
+        self.bytes[self.used..end].copy_from_slice(bytes);
+        self.used = end;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -1578,6 +1773,17 @@ enum TimelineCommand {
     },
 }
 
+impl TimelineCommand {
+    fn is_delete(&self) -> bool {
+        match self {
+            Self::Append { request, .. } => request
+                .as_ref()
+                .is_some_and(|request| request.kind.as_ref() == "run_deleted"),
+            Self::AppendDetached { request } => request.kind.as_ref() == "run_deleted",
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Default)]
 struct TimelineWriterTestState {
@@ -1591,10 +1797,19 @@ struct TimelineWriterTestState {
 struct TimelineWriterTestControl {
     state: std::sync::Mutex<TimelineWriterTestState>,
     changed: std::sync::Condvar,
+    wal_sync_attempts: AtomicUsize,
 }
 
 #[cfg(test)]
 impl TimelineWriterTestControl {
+    fn record_wal_sync_attempt(&self) {
+        self.wal_sync_attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn wal_sync_attempts(&self) -> usize {
+        self.wal_sync_attempts.load(Ordering::Relaxed)
+    }
+
     fn before_append(&self) -> Result<(), String> {
         let mut state = self.state.lock().expect("timeline test control lock");
         while state.pause_appends {
@@ -1650,6 +1865,7 @@ struct TimelineWriter {
     registry: Arc<RunRegistry>,
     snapshot: Arc<ArcSwap<RingSnapshot>>,
     delivery_events: broadcast::Sender<TimelineNotification>,
+    committed_end: Arc<AtomicU64>,
     next_seq: u64,
     tails: HashMap<String, Arc<VecDeque<TimelineEvent>>>,
     tail_recency: HashMap<String, u64>,
@@ -1658,52 +1874,179 @@ struct TimelineWriter {
     test_control: Arc<TimelineWriterTestControl>,
 }
 
+struct StagedTimelineAppend {
+    event: TimelineEvent,
+    reply: Option<TimelineReply>,
+    delete_guard: Option<RunDeleteAppendGuard>,
+    _byte_permit: Option<OwnedSemaphorePermit>,
+}
+
 impl TimelineWriter {
     fn run(mut self, mut rx: mpsc::Receiver<TimelineCommand>) {
-        while let Some(command) = rx.blocking_recv() {
-            match command {
-                TimelineCommand::Append { request, reply } => {
-                    let result = self.append(request.expect("timeline append request present"));
-                    reply.send(result);
+        let mut deferred = None;
+        loop {
+            let first = match deferred.take() {
+                Some(command) => command,
+                None => match rx.blocking_recv() {
+                    Some(command) => command,
+                    None => break,
+                },
+            };
+            let mut staged = Vec::with_capacity(TIMELINE_BATCH_MAX_COMMANDS);
+            let mut bytes = 0usize;
+            let mut command = first;
+            for index in 0..TIMELINE_BATCH_MAX_COMMANDS {
+                // Commit the deletion to the registry before a later command checks
+                // whether it can append another event for that run.
+                if command.is_delete() && !staged.is_empty() {
+                    deferred = Some(command);
+                    break;
                 }
-                TimelineCommand::AppendDetached { request } => {
-                    if let Err(err) = self.append(request) {
-                        tracing::warn!(%err, "detached timeline append failed");
-                    }
+                let is_delete = command.is_delete();
+                self.stage_command(command, &mut staged, &mut bytes);
+                if is_delete || bytes >= TIMELINE_BATCH_TARGET_BYTES {
+                    break;
                 }
+                if index + 1 == TIMELINE_BATCH_MAX_COMMANDS {
+                    break;
+                }
+                command = match rx.try_recv() {
+                    Ok(next) => next,
+                    Err(_) => break,
+                };
+            }
+            self.sync_and_publish(staged);
+        }
+    }
+
+    #[cfg(test)]
+    fn append(&mut self, request: TimelineAppendRequest) -> Result<TimelineEvent, String> {
+        let (reply, result) = std::sync::mpsc::channel();
+        let mut staged = Vec::new();
+        let mut bytes = 0;
+        self.stage_command(
+            TimelineCommand::Append {
+                request: Some(request),
+                reply: TimelineReply::Sync(reply),
+            },
+            &mut staged,
+            &mut bytes,
+        );
+        self.sync_and_publish(staged);
+        result
+            .recv()
+            .map_err(|err| format!("timeline writer reply failure: {err}"))?
+    }
+
+    fn stage_command(
+        &mut self,
+        command: TimelineCommand,
+        staged: &mut Vec<StagedTimelineAppend>,
+        bytes: &mut usize,
+    ) {
+        let (request, reply) = match command {
+            TimelineCommand::Append { request, reply } => (
+                request.expect("timeline append request present"),
+                Some(reply),
+            ),
+            TimelineCommand::AppendDetached { request } => (request, None),
+        };
+        // Checked here, at dequeue time, because an ordinary event can sit in
+        // the queue behind a run_deleted for the same run. The API-level check
+        // cannot see that ordering, this one can.
+        if request.kind.as_ref() != "run_deleted"
+            && self
+                .registry
+                .runs
+                .get(request.run_id.as_ref())
+                .map(|summary| summary.snapshot().deleted)
+                .unwrap_or(false)
+        {
+            Self::send_stage_error(reply, format!("run {} is deleted", request.run_id));
+            return;
+        }
+        let Some(seq) = self.next_seq.checked_add(staged.len() as u64 + 1) else {
+            Self::send_stage_error(reply, "timeline sequence exhausted".to_string());
+            return;
+        };
+        let event = TimelineEvent {
+            seq,
+            run_id: String::from(request.run_id),
+            stream_id: String::from(request.stream_id),
+            pts_ms: now_epoch_ms(),
+            kind: String::from(request.kind),
+            payload: String::from(request.payload),
+        };
+        // Tests inject failures and pauses before any bytes are staged.
+        #[cfg(test)]
+        if let Err(err) = self.test_control.before_append() {
+            Self::send_stage_error(reply, err);
+            return;
+        }
+        match self.wal.stage(&event) {
+            Ok(written) => {
+                *bytes = bytes.saturating_add(written);
+                staged.push(StagedTimelineAppend {
+                    event,
+                    reply,
+                    delete_guard: request.delete_guard,
+                    _byte_permit: request.byte_permit,
+                });
+            }
+            Err(err) => Self::send_stage_error(reply, err.to_string()),
+        }
+    }
+
+    fn send_stage_error(reply: Option<TimelineReply>, err: String) {
+        if let Some(reply) = reply {
+            reply.send(Err(err));
+        } else {
+            tracing::warn!(%err, "detached timeline append failed");
+        }
+    }
+
+    fn sync_and_publish(&mut self, staged: Vec<StagedTimelineAppend>) {
+        if staged.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        self.test_control.record_wal_sync_attempt();
+        if let Err(err) = self.wal.sync_pending() {
+            let err = err.to_string();
+            for append in staged {
+                Self::send_stage_error(append.reply, err.clone());
+            }
+            return;
+        }
+        // After a reader sees the updated run state, its WAL read must also
+        // include the record that produced that state.
+        self.committed_end
+            .store(self.wal.committed_end(), Ordering::Release);
+        let mut replies = Vec::with_capacity(staged.len());
+        for mut append in staged {
+            self.next_seq = append.event.seq;
+            self.apply_committed_event(&append.event);
+            if let Some(guard) = append.delete_guard.take() {
+                guard.commit();
+            }
+            replies.push((append.reply, append.event));
+        }
+        self.publish();
+        for (reply, event) in replies {
+            // Missed notifications are recovered from the WAL by sequence.
+            // Send only after sync and publication so consumers see committed state.
+            let _ = self.delivery_events.send(TimelineNotification {
+                event: event.clone(),
+                committed_at: std::time::Instant::now(),
+            });
+            if let Some(reply) = reply {
+                reply.send(Ok(event));
             }
         }
     }
 
-    fn append(&mut self, mut request: TimelineAppendRequest) -> Result<TimelineEvent, String> {
-        // Checked here, at dequeue time, because an ordinary event can sit in
-        // the queue behind a run_deleted for the same run. The API-level check
-        // cannot see that ordering, this one can.
-        if request.kind != "run_deleted"
-            && self
-                .registry
-                .runs
-                .get(&request.run_id)
-                .map(|summary| summary.snapshot().deleted)
-                .unwrap_or(false)
-        {
-            return Err(format!("run {} is deleted", request.run_id));
-        }
-        self.next_seq = self.next_seq.saturating_add(1);
-        let event = TimelineEvent {
-            seq: self.next_seq,
-            run_id: request.run_id,
-            stream_id: request.stream_id,
-            pts_ms: now_epoch_ms(),
-            kind: request.kind,
-            payload: request.payload.to_string(),
-        };
-        if let Err(err) = self.append_wal(&event) {
-            self.next_seq = self.next_seq.saturating_sub(1);
-            return Err(err);
-        }
-
-        self.registry.apply_appended_event(&event);
+    fn apply_committed_event(&mut self, event: &TimelineEvent) {
+        self.registry.apply_appended_event(event);
         match event.kind.as_str() {
             "run_deleted" => {
                 self.tails.remove(&event.run_id);
@@ -1721,32 +2064,12 @@ impl TimelineWriter {
                     .get(&event.run_id)
                     .map(|existing| existing.as_ref().clone())
                     .unwrap_or_default();
-                insert_event_by_seq(&mut tail, &event);
+                insert_event_by_seq(&mut tail, event);
                 self.tails.insert(event.run_id.clone(), Arc::new(tail));
                 self.tail_touch_tick = self.tail_touch_tick.saturating_add(1);
                 record_tail_touch(&mut self.tail_recency, &event.run_id, self.tail_touch_tick);
             }
         }
-        if let Some(guard) = request.delete_guard.take() {
-            guard.commit();
-        }
-        self.publish();
-        // This notification is deliberately best effort. Every consumer owns
-        // a durable sequence cursor and recovers a missed notification from the
-        // WAL, so sending never waits for network delivery or subscriber space.
-        let _ = self.delivery_events.send(TimelineNotification {
-            event: event.clone(),
-            committed_at: std::time::Instant::now(),
-        });
-        Ok(event)
-    }
-
-    fn append_wal(&mut self, event: &TimelineEvent) -> Result<(), String> {
-        // Tests inject failures and pauses here so rollback and cancellation
-        // behavior can be exercised without changing the persistent file path.
-        #[cfg(test)]
-        self.test_control.before_append()?;
-        self.wal.append(event).map_err(|err| err.to_string())
     }
 
     fn publish(&self) {
@@ -1757,11 +2080,14 @@ impl TimelineWriter {
     }
 }
 
+// Tests also pass controls for pausing the writer and injecting failures.
+#[cfg_attr(test, allow(clippy::too_many_arguments))]
 fn spawn_timeline_writer(
     wal: WalWriter,
     registry: Arc<RunRegistry>,
     snapshot: Arc<ArcSwap<RingSnapshot>>,
     delivery_events: broadcast::Sender<TimelineNotification>,
+    committed_end: Arc<AtomicU64>,
     next_seq: u64,
     tails: HashMap<String, Arc<VecDeque<TimelineEvent>>>,
     #[cfg(test)] test_control: Arc<TimelineWriterTestControl>,
@@ -1776,6 +2102,7 @@ fn spawn_timeline_writer(
         registry,
         snapshot,
         delivery_events,
+        committed_end,
         next_seq,
         tails,
         tail_recency,
@@ -2242,6 +2569,494 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::thread;
 
+    fn restore_for_tests(wal_path: PathBuf) -> Result<AppState, String> {
+        AppState::from_wal(
+            wal_path,
+            default_test_ingest_roots(),
+            None,
+            default_test_decode_pipeline(),
+            SecurityPolicy::from_config_for_tests(),
+            3600,
+            5,
+            WebRtcConfig::default(),
+            LiveNoveltyConfig::default(),
+            AdmissionLimits {
+                global_in_flight: 8,
+                per_principal_in_flight: 4,
+                global_waiters: 128,
+                wait_timeout: std::time::Duration::from_secs(5),
+                max_in_flight_tokens: 1_000_000,
+                max_in_flight_bytes: 1024 * 1024 * 1024,
+            },
+            u64::MAX,
+            usize::MAX,
+            1,
+        )
+    }
+
+    #[test]
+    fn startup_rejects_complete_checksums_with_invalid_sequence() {
+        for (case, sequence) in [
+            ("duplicate", vec![1, 2, 2]),
+            ("gap", vec![1, 3]),
+            ("out-of-order", vec![1, 3, 2]),
+            ("non-one-start", vec![2]),
+        ] {
+            let wal_path = std::env::temp_dir().join(format!(
+                "vidarax-state-replay-seq-{case}-{}-{}.wal",
+                std::process::id(),
+                now_epoch_ms()
+            ));
+            for seq in sequence {
+                append_event(
+                    &wal_path,
+                    &event_for_run(seq, "run-seq", "analysis_generated", seq, json!({})),
+                )
+                .unwrap();
+            }
+            let before = std::fs::read(&wal_path).unwrap();
+            let error = restore_for_tests(wal_path.clone())
+                .err()
+                .expect("invalid sequence must reject production startup");
+            assert!(error.contains("sequence"), "{case}: {error}");
+            assert_eq!(std::fs::read(&wal_path).unwrap(), before);
+            std::fs::remove_file(wal_path).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn contiguous_legacy_wal_replays_without_warm_cold_divergence() {
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-state-legacy-seq-{}-{}.wal",
+            std::process::id(),
+            now_epoch_ms()
+        ));
+        std::fs::write(
+            &wal_path,
+            b"1\trun-legacy\tstream-0\t1\trun_created\t{}\n2\trun-legacy\tstream-0\t2\tanalysis_generated\t{}\n",
+        )
+        .unwrap();
+        let state = restore_for_tests(wal_path.clone()).expect("contiguous legacy WAL accepted");
+        let warm = state.read_run_events_from("run-legacy", 1).await.unwrap();
+        let cold = state.read_run_events("run-legacy").unwrap();
+        assert_eq!(warm, cold);
+        assert_eq!(
+            state
+                .append_run_event("run-legacy", "note", json!({}))
+                .unwrap()
+                .seq,
+            3
+        );
+        drop(state);
+        std::fs::remove_file(wal_path).ok();
+    }
+
+    #[test]
+    fn non_contiguous_legacy_wal_requires_explicit_migration() {
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-state-legacy-gap-{}-{}.wal",
+            std::process::id(),
+            now_epoch_ms()
+        ));
+        let legacy = b"1\trun-legacy\tstream-0\t1\trun_created\t{}\n3\trun-legacy\tstream-0\t2\tanalysis_generated\t{}\n";
+        std::fs::write(&wal_path, legacy).unwrap();
+        let error = restore_for_tests(wal_path.clone())
+            .err()
+            .expect("legacy sequence gap must reject production startup");
+        assert!(error.contains("migration"), "{error}");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), legacy);
+        std::fs::remove_file(wal_path).ok();
+    }
+
+    #[test]
+    fn request_byte_permit_covers_exact_owned_string_bytes_until_drop() {
+        let budget = Arc::new(Semaphore::new(256));
+        let request = TimelineAppendRequest::try_new(
+            "run-budget",
+            "stream-0",
+            "note",
+            json!({"text": "some \t escaped payload"}),
+            None,
+            &budget,
+        )
+        .unwrap();
+        let owned = request.run_id.len()
+            + request.stream_id.len()
+            + request.kind.len()
+            + request.payload.len();
+        assert_eq!(budget.available_permits(), 256 - owned);
+        assert_eq!(
+            request.payload.as_ref(),
+            "{\"text\":\"some \\t escaped payload\"}"
+        );
+        drop(request);
+        assert_eq!(budget.available_permits(), 256);
+    }
+
+    #[test]
+    fn byte_budget_rejects_before_enqueue_and_releases_after_closed_sender() {
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-state-byte-cap-{}-{}.wal",
+            std::process::id(),
+            now_epoch_ms()
+        ));
+        let mut state = AppState::with_wal_for_tests(wal_path.clone());
+        let held = Arc::clone(&state.timeline_byte_budget)
+            .try_acquire_many_owned((TIMELINE_WRITER_QUEUE_BYTES - 32) as u32)
+            .unwrap();
+        let before = std::fs::read(&wal_path).unwrap();
+        let error = state
+            .append_run_event(
+                "run-byte-cap",
+                "note",
+                json!({"text": "more than 32 bytes"}),
+            )
+            .unwrap_err();
+        assert!(error.contains("byte budget full; retry"), "{error}");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), before);
+        drop(held);
+
+        let (closed_tx, closed_rx) = mpsc::channel(1);
+        drop(closed_rx);
+        Arc::get_mut(&mut state.inner).unwrap().timeline_tx = closed_tx;
+        let error = state
+            .append_run_event("run-byte-cap", "note", json!({}))
+            .unwrap_err();
+        assert!(error.contains("writer is closed"), "{error}");
+        assert_eq!(
+            state.timeline_byte_budget.available_permits(),
+            TIMELINE_WRITER_QUEUE_BYTES,
+            "failed admission must release the byte permit"
+        );
+        std::fs::remove_file(wal_path).ok();
+    }
+
+    #[test]
+    fn full_command_queue_returns_retryable_error_without_waiting_for_writer() {
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-state-command-cap-{}-{}.wal",
+            std::process::id(),
+            now_epoch_ms()
+        ));
+        let state = AppState::with_wal_for_tests(wal_path.clone());
+        state.pause_timeline_appends_for_tests();
+        let first_state = state.clone();
+        let first =
+            thread::spawn(move || first_state.append_run_event("run-first", "note", json!({})));
+        state.wait_until_timeline_writer_paused_for_tests();
+        for i in 0..TIMELINE_WRITER_QUEUE_CAP {
+            assert!(state
+                .timeline_tx
+                .try_send(TimelineCommand::AppendDetached {
+                    request: TimelineAppendRequest::new(
+                        "run-filler",
+                        DEFAULT_STREAM_ID,
+                        "note",
+                        json!({"i": i}),
+                        None,
+                    ),
+                })
+                .is_ok());
+        }
+        let before = std::fs::read(&wal_path).unwrap();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let full_state = state.clone();
+        let attempted = thread::spawn(move || {
+            result_tx
+                .send(full_state.append_run_event("run-rejected", "note", json!({})))
+                .unwrap();
+        });
+        let result = result_rx.recv_timeout(std::time::Duration::from_secs(1));
+        let unchanged_before_resume = std::fs::read(&wal_path).unwrap() == before;
+        state.resume_timeline_appends_for_tests();
+        let error = result
+            .expect("full queue must reject before writer resumes")
+            .unwrap_err();
+        assert!(error.contains("queue full; retry"), "{error}");
+        assert!(unchanged_before_resume);
+        attempted.join().unwrap();
+        first.join().unwrap().unwrap();
+        std::fs::remove_file(wal_path).ok();
+    }
+
+    #[tokio::test]
+    async fn async_full_command_queue_releases_byte_permit_without_waiting() {
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-state-async-command-cap-{}-{}.wal",
+            std::process::id(),
+            now_epoch_ms()
+        ));
+        let mut state = AppState::with_wal_for_tests(wal_path.clone());
+        let (full_tx, full_rx) = mpsc::channel(1);
+        full_tx
+            .try_send(TimelineCommand::AppendDetached {
+                request: TimelineAppendRequest::new(
+                    "run-filler",
+                    DEFAULT_STREAM_ID,
+                    "note",
+                    json!({}),
+                    None,
+                ),
+            })
+            .unwrap_or_else(|_| panic!("empty test queue must accept filler"));
+        Arc::get_mut(&mut state.inner).unwrap().timeline_tx = full_tx;
+        let before = std::fs::read(&wal_path).unwrap();
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.append_run_event_async("run-rejected", "note", json!({"text": "reject"})),
+        )
+        .await
+        .expect("full queue must reject without a receiver making progress")
+        .unwrap_err();
+        assert!(error.contains("queue full; retry"), "{error}");
+        assert_eq!(
+            state.timeline_byte_budget.available_permits(),
+            TIMELINE_WRITER_QUEUE_BYTES
+        );
+        assert_eq!(std::fs::read(&wal_path).unwrap(), before);
+        drop(full_rx);
+        drop(state);
+        std::fs::remove_file(wal_path).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_admitted_append_holds_byte_permit_until_writer_completion() {
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-state-cancelled-byte-permit-{}-{}.wal",
+            std::process::id(),
+            now_epoch_ms()
+        ));
+        let state = AppState::with_wal_for_tests(wal_path.clone());
+        state.pause_timeline_appends_for_tests();
+        let append_state = state.clone();
+        let append = tokio::spawn(async move {
+            append_state
+                .append_run_event_async("run-cancelled", "note", json!({"text": "retain"}))
+                .await
+        });
+        state.wait_until_timeline_writer_paused_for_tests();
+        let held = state.timeline_byte_budget.available_permits();
+        append.abort();
+        assert!(append.await.unwrap_err().is_cancelled());
+        let held_after_cancellation = state.timeline_byte_budget.available_permits();
+        state.resume_timeline_appends_for_tests();
+
+        assert!(held < TIMELINE_WRITER_QUEUE_BYTES);
+        assert_eq!(
+            held_after_cancellation, held,
+            "writer ownership survives caller cancellation"
+        );
+        state
+            .append_run_event_async("run-barrier", "note", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.timeline_byte_budget.available_permits(),
+            TIMELINE_WRITER_QUEUE_BYTES
+        );
+        let events = state.read_run_events("run-cancelled").unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "admitted append commits despite cancellation"
+        );
+        assert_eq!(events[0].seq, 1);
+        drop(state);
+        std::fs::remove_file(wal_path).ok();
+    }
+
+    fn byte_budget_test_writer(wal_path: &std::path::Path) -> TimelineWriter {
+        let (delivery_events, _) = broadcast::channel(16);
+        TimelineWriter {
+            wal: WalWriter::open(wal_path).unwrap(),
+            registry: Arc::new(RunRegistry::default()),
+            snapshot: Arc::new(ArcSwap::from_pointee(RingSnapshot::default())),
+            delivery_events,
+            committed_end: Arc::new(AtomicU64::new(0)),
+            next_seq: 0,
+            tails: HashMap::new(),
+            tail_recency: HashMap::new(),
+            tail_touch_tick: 0,
+            test_control: Arc::new(TimelineWriterTestControl::default()),
+        }
+    }
+
+    #[test]
+    fn delivery_notifications_wait_for_group_sync_and_state_publication() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let wal_path = std::env::temp_dir().join(format!("vidarax-delivery-group-{unique}.wal"));
+        let mut writer = byte_budget_test_writer(&wal_path);
+        let mut notifications = writer.delivery_events.subscribe();
+        let mut staged = Vec::new();
+        let mut bytes = 0;
+        for index in 0..2 {
+            writer.stage_command(
+                TimelineCommand::AppendDetached {
+                    request: TimelineAppendRequest::new(
+                        "run-delivery",
+                        DEFAULT_STREAM_ID,
+                        "note",
+                        json!({"index": index}),
+                        None,
+                    ),
+                },
+                &mut staged,
+                &mut bytes,
+            );
+        }
+        assert_eq!(staged.len(), 2);
+        assert!(matches!(
+            notifications.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(writer.committed_end.load(Ordering::Acquire), 0);
+        assert_eq!(writer.snapshot.load().max_seq, 0);
+
+        writer.sync_and_publish(staged);
+
+        assert_eq!(writer.snapshot.load().max_seq, 2);
+        let committed = read_all_events_up_to(
+            &wal_path,
+            Some(writer.committed_end.load(Ordering::Acquire)),
+        )
+        .unwrap();
+        assert_eq!(committed.len(), 2);
+        for event in committed {
+            assert_eq!(notifications.try_recv().unwrap().event, event);
+        }
+        writer.test_control.set_failure(true);
+        assert!(writer
+            .append(TimelineAppendRequest::new(
+                "run-delivery",
+                DEFAULT_STREAM_ID,
+                "note",
+                json!({}),
+                None,
+            ))
+            .is_err());
+        assert!(matches!(
+            notifications.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        drop(writer);
+        std::fs::remove_file(wal_path).ok();
+    }
+
+    #[test]
+    fn closed_command_channel_drains_admitted_events_and_releases_byte_permits() {
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-state-drain-byte-permits-{}-{}.wal",
+            std::process::id(),
+            now_epoch_ms()
+        ));
+        let writer = byte_budget_test_writer(&wal_path);
+        let budget = Arc::new(Semaphore::new(256));
+        let (tx, rx) = mpsc::channel(3);
+        let mut replies = Vec::new();
+        for i in 0..3 {
+            let request = TimelineAppendRequest::try_new(
+                "run-drain",
+                DEFAULT_STREAM_ID,
+                "note",
+                json!({"i": i}),
+                None,
+                &budget,
+            )
+            .unwrap();
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+            tx.try_send(TimelineCommand::Append {
+                request: Some(request),
+                reply: TimelineReply::Sync(reply_tx),
+            })
+            .unwrap_or_else(|_| panic!("test queue must accept all admitted commands"));
+            replies.push(reply_rx);
+        }
+        assert!(budget.available_permits() < 256);
+        drop(tx);
+        writer.run(rx);
+        assert_eq!(
+            budget.available_permits(),
+            256,
+            "channel shutdown must finish and release every admission"
+        );
+        for (index, reply) in replies.into_iter().enumerate() {
+            assert_eq!(reply.recv().unwrap().unwrap().seq, index as u64 + 1);
+        }
+        assert_eq!(read_all_events(&wal_path).unwrap().len(), 3);
+        std::fs::remove_file(wal_path).ok();
+    }
+
+    #[test]
+    fn stage_failure_releases_byte_permit_and_delete_claim_for_retry() {
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-state-stage-failure-byte-permit-{}-{}.wal",
+            std::process::id(),
+            now_epoch_ms()
+        ));
+        let mut writer = byte_budget_test_writer(&wal_path);
+        let budget = Arc::new(Semaphore::new(256));
+        writer
+            .append(
+                TimelineAppendRequest::try_new(
+                    "run-retry",
+                    DEFAULT_STREAM_ID,
+                    "run_created",
+                    json!({}),
+                    None,
+                    &budget,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let run = Arc::clone(writer.registry.runs.get("run-retry").unwrap().value());
+        assert!(matches!(run.begin_delete_append(), RunDeleteState::Claimed));
+        let request = TimelineAppendRequest::try_new(
+            "run-retry",
+            DEFAULT_STREAM_ID,
+            "run_deleted",
+            json!({}),
+            Some(RunDeleteAppendGuard::new(Arc::clone(&run))),
+            &budget,
+        )
+        .unwrap();
+        assert!(budget.available_permits() < 256);
+        writer.test_control.set_failure(true);
+        let error = writer.append(request).unwrap_err();
+        assert!(
+            error.contains("injected timeline WAL append failure"),
+            "{error}"
+        );
+        assert_eq!(budget.available_permits(), 256);
+        assert!(matches!(run.begin_delete_append(), RunDeleteState::Claimed));
+        writer.test_control.set_failure(false);
+        let event = writer
+            .append(
+                TimelineAppendRequest::try_new(
+                    "run-retry",
+                    DEFAULT_STREAM_ID,
+                    "run_deleted",
+                    json!({}),
+                    Some(RunDeleteAppendGuard::new(Arc::clone(&run))),
+                    &budget,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            event.seq, 2,
+            "failed staging must not consume sequence identity"
+        );
+        assert!(run.snapshot().deleted);
+        assert_eq!(budget.available_permits(), 256);
+        assert_eq!(read_all_events(&wal_path).unwrap().len(), 2);
+        drop(writer);
+        std::fs::remove_file(wal_path).ok();
+    }
+
     fn media_resources(bytes: u64, threads: usize) -> MediaSessionResources {
         MediaSessionResources {
             worker_threads: threads,
@@ -2318,6 +3133,71 @@ mod tests {
 
     fn event(seq: u64, kind: &str, pts_ms: u64, payload: Value) -> TimelineEvent {
         event_for_run(seq, "run-1", kind, pts_ms, payload)
+    }
+
+    #[test]
+    fn bare_relative_wal_path_is_stored_as_absolute_for_reads_and_blobs() {
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+                if let Some(name) = self.0.file_name() {
+                    let lock = self
+                        .0
+                        .with_file_name(format!("{}.lock", name.to_string_lossy()));
+                    let _ = std::fs::remove_file(lock);
+                }
+            }
+        }
+        let relative = PathBuf::from(format!(
+            "vidarax-relative-state-{}-{}.wal",
+            std::process::id(),
+            now_epoch_ms()
+        ));
+        let _cleanup = Cleanup(relative.clone());
+        let state = AppState::with_wal_for_tests(relative);
+        assert!(state.wal_path.is_absolute());
+        assert!(state.keyframe_blob_root().is_absolute());
+        state
+            .append_run_event("run-relative", "run_created", json!({}))
+            .unwrap();
+        assert_eq!(state.read_run_events("run-relative").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cold_reads_hide_records_beyond_the_published_wal_boundary() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let wal_path = std::env::temp_dir().join(format!("vidarax-cold-boundary-{unique}.wal"));
+        let scratch_path =
+            std::env::temp_dir().join(format!("vidarax-cold-boundary-scratch-{unique}.wal"));
+        let state = AppState::with_wal_for_tests(wal_path.clone());
+        state
+            .append_run_event("run-1", "run_created", json!({}))
+            .unwrap();
+
+        let mut scratch = WalWriter::open(&scratch_path).unwrap();
+        scratch
+            .append(&event(2, "analysis_generated", 2, json!({})))
+            .unwrap();
+        drop(scratch);
+        let bytes = std::fs::read(&scratch_path).unwrap();
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        assert_eq!(read_all_events(&wal_path).unwrap().len(), 2);
+        assert_eq!(state.read_all_events().unwrap().len(), 1);
+        assert_eq!(state.read_run_events("run-1").unwrap().len(), 1);
+        assert_eq!(state.read_timeline_after(0, 10).await.unwrap().len(), 1);
+        assert!(state.read_timeline_after(1, 10).await.unwrap().is_empty());
+        let _ = std::fs::remove_file(wal_path);
+        let _ = std::fs::remove_file(scratch_path);
     }
 
     fn event_for_run(
@@ -2446,6 +3326,7 @@ mod tests {
             registry: Arc::new(RunRegistry::default()),
             snapshot: Arc::clone(&snapshot),
             delivery_events,
+            committed_end: Arc::new(AtomicU64::new(0)),
             next_seq: 0,
             tails: HashMap::new(),
             tail_recency: HashMap::new(),
@@ -2559,6 +3440,7 @@ mod tests {
             registry: Arc::new(RunRegistry::default()),
             snapshot,
             delivery_events,
+            committed_end: Arc::new(AtomicU64::new(0)),
             next_seq: 0,
             tails: HashMap::new(),
             tail_recency: HashMap::new(),
@@ -2776,17 +3658,15 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_filters_and_sorts_wal_events() {
-        let state = AppState::with_wal_for_tests(std::env::temp_dir().join(format!(
+        let wal_path = std::env::temp_dir().join(format!(
             "vidarax-state-fallback-sort-{}.wal",
             std::process::id()
-        )));
+        ));
+        std::fs::remove_file(&wal_path).ok();
         for seq in [4, 2, 3, 1] {
-            append_event(
-                state.wal_path.as_ref(),
-                &event(seq, "analysis_generated", seq, json!({})),
-            )
-            .unwrap();
+            append_event(&wal_path, &event(seq, "analysis_generated", seq, json!({}))).unwrap();
         }
+        let state = AppState::with_wal_for_tests(wal_path);
 
         let served = state.read_run_events_from("run-1", 3).await.unwrap();
         assert_eq!(served.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4]);
@@ -2839,6 +3719,56 @@ mod tests {
         assert!(state.try_reserve_stream_slot(principal, now_ms).is_some());
         drop(guards);
         assert!(state.try_reserve_stream_slot(principal, now_ms).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_confirmed_burst_uses_one_sync_for_the_drained_group() {
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-state-group-commit-{}.wal",
+            std::process::id()
+        ));
+        std::fs::remove_file(&wal_path).ok();
+        let state = AppState::with_wal_for_tests(wal_path.clone());
+
+        state.pause_timeline_appends_for_tests();
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            first_state
+                .append_run_event_async("run-burst", "analysis_generated", json!({ "i": 0 }))
+                .await
+        });
+        state.wait_until_timeline_writer_paused_for_tests();
+
+        let mut replies = Vec::new();
+        for i in 1..32 {
+            let (tx, rx) = oneshot::channel();
+            assert!(
+                state
+                    .timeline_tx
+                    .try_send(TimelineCommand::Append {
+                        request: Some(TimelineAppendRequest::new(
+                            "run-burst",
+                            DEFAULT_STREAM_ID,
+                            "analysis_generated",
+                            json!({ "i": i }),
+                            None,
+                        )),
+                        reply: TimelineReply::Async(tx),
+                    })
+                    .is_ok(),
+                "burst command should fit in writer queue"
+            );
+            replies.push(rx);
+        }
+        state.resume_timeline_appends_for_tests();
+
+        assert_eq!(first.await.unwrap().unwrap().seq, 1);
+        for (i, reply) in replies.into_iter().enumerate() {
+            assert_eq!(reply.await.unwrap().unwrap().seq, i as u64 + 2);
+        }
+        assert_eq!(state.timeline_test_control.wal_sync_attempts(), 1);
+        assert_eq!(state.read_run_events("run-burst").unwrap().len(), 32);
+        std::fs::remove_file(wal_path).ok();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3421,5 +4351,72 @@ mod tests {
         let per = start.elapsed().as_nanos() as f64 / iters as f64;
         println!("end-to-end sync append (200 runs live): {per:.0} ns/append");
         std::fs::remove_file(state.wal_path.as_ref()).ok();
+    }
+
+    // Measure a ready burst separately from sequential confirmed appends.
+    // Run explicitly: cargo test -p vidarax-api --lib measure_confirmed_burst -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn measure_confirmed_burst_with_200_live_runs() {
+        use std::time::Instant;
+
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-bench-burst-{}-{}.wal",
+            std::process::id(),
+            now_epoch_ms()
+        ));
+        let state = AppState::with_wal_for_tests(wal_path.clone());
+        for i in 0..200u64 {
+            state
+                .append_run_event(&format!("run-{i}"), "run_created", json!({}))
+                .unwrap();
+        }
+
+        let syncs_before = state.timeline_test_control.wal_sync_attempts();
+        state.pause_timeline_appends_for_tests();
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            first_state
+                .append_run_event_async("run-0", "analysis_generated", json!({ "i": 0 }))
+                .await
+        });
+        state.wait_until_timeline_writer_paused_for_tests();
+        let mut replies = Vec::new();
+        for i in 1..200u64 {
+            let (tx, rx) = oneshot::channel();
+            assert!(state
+                .timeline_tx
+                .try_send(TimelineCommand::Append {
+                    request: Some(
+                        TimelineAppendRequest::try_new(
+                            &format!("run-{i}"),
+                            DEFAULT_STREAM_ID,
+                            "analysis_generated",
+                            json!({ "i": i }),
+                            None,
+                            &state.timeline_byte_budget,
+                        )
+                        .unwrap()
+                    ),
+                    reply: TimelineReply::Async(tx),
+                })
+                .is_ok());
+            replies.push(rx);
+        }
+
+        let start = Instant::now();
+        state.resume_timeline_appends_for_tests();
+        first.await.unwrap().unwrap();
+        for reply in replies {
+            reply.await.unwrap().unwrap();
+        }
+        let elapsed = start.elapsed();
+        let syncs = state.timeline_test_control.wal_sync_attempts() - syncs_before;
+        println!(
+            "confirmed burst (200 live runs, 200 events): {:.2} ms total, {:.3} ms/event, {syncs} WAL syncs",
+            elapsed.as_secs_f64() * 1000.0,
+            elapsed.as_secs_f64() * 5.0
+        );
+        std::fs::remove_file(wal_path).ok();
     }
 }
