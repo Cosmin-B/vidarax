@@ -40,6 +40,10 @@ stateful decoder and one stateful VLM worker preserve order within a stream.
 
 ## Inputs and inference
 
+For the latest stable full Flash model, select `gemini-3.8-flash` and configure
+its Gemini backend. See [Gemini Flash media review](docs/gemini-flash.md) for
+aliases, image/video support, configuration, and validation limits.
+
 | Input | Analysis path | Provider boundary |
 |---|---|---|
 | Local file, upload, HTTP(S), HLS, or RTSP | Deterministic frame signals, selected JPEGs, optional clip windows | OpenAI-compatible vLLM, SGLang, or MLX endpoints, with optional Gemini routing |

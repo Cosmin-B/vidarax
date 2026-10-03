@@ -119,6 +119,11 @@ pub struct RealtimeReasonRequest {
     pub marker_correction_window_frames: Option<u64>,
     pub semantic_inference: Option<bool>,
     pub semantic_frames_per_chunk: Option<usize>,
+    /// Extra decoded frames on each side of a frame review chunk.
+    pub semantic_context_frames: Option<usize>,
+    /// Targeted half-open source-time interval; timestamps stay source-relative.
+    pub source_start_ms: Option<u64>,
+    pub source_end_ms: Option<u64>,
     /// Optional cap on the longest edge (px) of each frame sent to the VLM.
     /// The "fewer pixels" lever: smaller frames occupy fewer Gemini image tiles,
     /// cutting per-image prompt tokens. `None` keeps source resolution.
@@ -249,6 +254,10 @@ pub struct MediaAnalysisOptions {
     pub mode: MediaAnalysisMode,
     /// Duration of the source-time window sent to the model.
     pub window_ms: Option<u64>,
+    /// Repeated source context between native video windows.
+    pub overlap_ms: Option<u64>,
+    /// Explicit provider static video FPS; independent of local fixed_fps.
+    pub video_fps: Option<f32>,
     pub resolution: Option<MediaAnalysisResolution>,
     /// Store the encoded MP4 in the content-addressed binary sidecar.
     pub persist_evidence: Option<bool>,

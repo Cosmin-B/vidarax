@@ -97,7 +97,7 @@ Policy lifecycle handlers append these kinds:
 | `policy_rollback_rejected` | Rollback is rejected |
 | `policy_replay_evaluated` | Candidate replay completes for a revision |
 
-Concurrent semantic workers publish `semantic_chunk_inferred` as each chunk finishes, so WAL sequence captures completion order. Consumers that reconstruct source order must sort by `chunk_index`.
+The `gemini-3-8-flash` review branch buffers completed recorded-review chunks and journals them in source order. Earlier versions publish `semantic_chunk_inferred` as each chunk finishes. WAL sequence always captures append order; `chunk_index` identifies source order. See [Gemini Flash review](/gemini-flash/) for the pending implementation status.
 
 Worker-emitted kinds arrive through the `EventSink` trait. The sink writes the worker's `event_type` string straight through as the WAL `kind`:
 
@@ -147,7 +147,7 @@ On startup, `AppState::from_wal` reads the whole file and validates global seque
 
 `read_run_events_from` uses the in-memory snapshot when it still contains the requested events. Otherwise it scans the WAL and filters by run, using `spawn_blocking` for async calls. The scan stops at the last published byte limit even if the file contains newer bytes that have not been acknowledged. Each scan reads all events up to that limit. An index of file offsets per run would reduce this work if these scans become frequent.
 
-For backups, run `vidarax-archive` while the API is stopped. Opening the WAL runs recovery and removes an incomplete final record. The command checks the complete manifest and its 16 MiB size limit before uploading any object. It then uploads WAL chunks and referenced JPEGs under names derived from their hashes and writes the manifest last. Restore checks every object before moving the restored data directory into place. Retained MP4 and WAV files and webhook delivery state are stored separately and are not included in this snapshot. See [Offline archive and restore](/docs/deployment/#offline-archive-and-restore).
+For backups, run `vidarax-archive` while the API is stopped. Opening the WAL runs recovery and removes an incomplete final record. The command checks the complete manifest and its 16 MiB size limit before uploading any object. It then uploads WAL chunks and referenced JPEGs under names derived from their hashes and writes the manifest last. Restore checks every object before moving the restored data directory into place. Retained MP4 and WAV files and webhook delivery state are stored separately and are not included in this snapshot. See [Offline archive and restore](https://github.com/Cosmin-B/vidarax/blob/main/docs/deployment.md#offline-archive-and-restore).
 
 ## Validation: replay and schema gates
 

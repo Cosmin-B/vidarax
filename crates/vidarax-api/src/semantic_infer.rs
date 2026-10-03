@@ -14,7 +14,8 @@ use vidarax_core::crop::CropRegion;
 use vidarax_core::gate::{FrameSignal, GateEventType};
 use vidarax_core::ingest::pipeline::DecodePipeline;
 use vidarax_core::ingest::{
-    extract_audio_video_clip, extract_audio_wav, DecodedJpegFrame, MediaInfo, PreparedSource,
+    extract_audio_video_clip, extract_audio_wav, extract_video_clip_exact, DecodedJpegFrame,
+    MediaInfo, PreparedSource,
 };
 use vidarax_core::metrics::PipelineMetrics;
 use vidarax_core::pipeline::{FrameMetadata, TwoPassPipeline};
@@ -132,12 +133,17 @@ pub struct SemanticMediaConfig {
     pub resolution: MediaResolution,
     pub persist_evidence: bool,
     pub timestamp_windows: bool,
+    pub overlap_ms: u64,
+    pub video_fps: Option<f32>,
+    pub context_frames: usize,
+    pub source_start_ms: Option<u64>,
+    pub source_end_ms: Option<u64>,
 }
 
 #[derive(Clone)]
 pub struct ClipSpec {
+    pub evidence_bytes: Arc<std::sync::atomic::AtomicUsize>,
     pub source: Arc<PreparedSource>,
-    pub decode_pipeline: Arc<dyn DecodePipeline>,
     pub source_start_ms: u64,
     pub duration_ms: u64,
     pub crop: Option<CropRegion>,
@@ -146,6 +152,7 @@ pub struct ClipSpec {
     pub persist_evidence: bool,
     pub local_audio: Option<LocalAudioConfig>,
     pub chunk_index: usize,
+    pub video_fps: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -180,6 +187,7 @@ pub struct SemanticMediaEvidence {
     pub extraction_ms: u64,
     pub resolution: MediaResolution,
     pub persist_evidence: bool,
+    pub video_fps: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -225,6 +233,7 @@ pub struct ChunkSemanticResult {
     /// Wall-clock inference latency for this chunk (summed across passes).
     pub inference_latency_ms: u64,
     pub moments: Vec<SemanticMoment>,
+    pub input_image_timestamps: Vec<Value>,
     pub media: Option<SemanticMediaEvidence>,
     pub local_audio: Option<AudioAnalysis>,
     pub local_audio_error: Option<String>,
@@ -256,6 +265,7 @@ impl ChunkSemanticResult {
                 "description": self.overlay.as_ref().map(|o| o.description.clone()),
                 "confidence": self.overlay.as_ref().map(|o| o.confidence),
                 "raw_output": self.raw_output,
+                "input_image_timestamps": self.input_image_timestamps,
                 "prompt_tokens": self.usage.prompt_tokens,
                 "completion_tokens": self.usage.completion_tokens,
                 "thinking_tokens": self.usage.thinking_tokens,
@@ -393,14 +403,70 @@ pub fn load_decoded_signals_from_events(
     })
 }
 
+fn selected_review_indices(
+    signals: &[FrameSignal],
+    range: std::ops::Range<usize>,
+    count: usize,
+    context: usize,
+) -> Vec<u64> {
+    let start = range.start.saturating_sub(context);
+    let end = range.end.saturating_add(context).min(signals.len());
+    vidarax_core::ingest::compute_semantic_frame_indices(end - start, end - start, count)
+        .into_iter()
+        .map(|index| signals[start + index as usize].frame_index)
+        .collect()
+}
+
+pub fn review_frame_indices(
+    signals: &[FrameSignal],
+    chunk_size: usize,
+    count: usize,
+    context: usize,
+) -> Vec<u64> {
+    let mut indices = std::collections::BTreeSet::new();
+    for start in (0..signals.len()).step_by(chunk_size) {
+        indices.extend(selected_review_indices(
+            signals,
+            start..(start + chunk_size).min(signals.len()),
+            count,
+            context,
+        ));
+    }
+    indices.into_iter().collect()
+}
+
+/// Count submitted images, including repeated context and a possible second tier.
+pub fn review_submission_count(
+    signals: &[FrameSignal],
+    chunk_size: usize,
+    count: usize,
+    context: usize,
+    previous_image: bool,
+) -> usize {
+    (0..signals.len())
+        .step_by(chunk_size)
+        .map(|start| {
+            let selected = selected_review_indices(
+                signals,
+                start..(start + chunk_size).min(signals.len()),
+                count,
+                context,
+            )
+            .len();
+            (selected + usize::from(previous_image && start > 0)) * 2
+        })
+        .sum()
+}
+
 // Realtime chunk preparation receives distinct decode controls and borrowed pipeline state.
 #[allow(clippy::too_many_arguments)]
 pub async fn prepare_realtime_chunks(
     signals: &[FrameSignal],
     chunk_size: usize,
+    frames_per_chunk: usize,
     decoded_jpegs: Option<&std::collections::HashMap<u64, DecodedJpegFrame>>,
     pipeline: &mut TwoPassPipeline,
-    decode_pipeline: &Arc<dyn DecodePipeline>,
+    _decode_pipeline: &Arc<dyn DecodePipeline>,
     prepared_source: &Arc<PreparedSource>,
     media: SemanticMediaConfig,
     semantic_decode_enabled: bool,
@@ -408,7 +474,7 @@ pub async fn prepare_realtime_chunks(
     local_audio: Option<LocalAudioConfig>,
 ) -> Vec<ChunkPrep> {
     let mut chunk_preps: Vec<ChunkPrep> = Vec::new();
-    let mut ranges = Vec::new();
+    let evidence_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let source_duration_ms = (media.mode != SemanticMediaMode::Frames)
         .then(|| {
             prepared_source
@@ -417,56 +483,84 @@ pub async fn prepare_realtime_chunks(
                 .and_then(|info| info.duration_ms)
         })
         .flatten();
+    // Frame ownership never overlaps: stateful analysis and metadata see each
+    // signal once. Only the semantic evidence window repeats context.
+    let mut ranges = Vec::new();
     if media.timestamp_windows && media.mode != SemanticMediaMode::Frames {
+        let mut pts = media
+            .source_start_ms
+            .unwrap_or_else(|| signals.first().map_or(0, |frame| frame.pts_ms));
+        let end = media
+            .source_end_ms
+            .or(source_duration_ms)
+            .unwrap_or_else(|| {
+                signals
+                    .last()
+                    .map_or(pts, |frame| frame.pts_ms)
+                    .saturating_add(media.window_ms)
+            });
+        let stride = media.window_ms - media.overlap_ms;
         let mut start = 0usize;
-        while start < signals.len() {
-            let window_end = signals[start].pts_ms.saturating_add(media.window_ms);
-            let mut end = start + 1;
-            while end < signals.len() && signals[end].pts_ms < window_end {
-                end += 1;
+        while pts < end {
+            let owned_end = pts.saturating_add(stride).min(end);
+            let next = if pts.saturating_add(media.window_ms) >= end {
+                signals.len()
+            } else {
+                signals.partition_point(|frame| frame.pts_ms < owned_end)
+            };
+            ranges.push((
+                start..next,
+                pts,
+                pts.saturating_add(media.window_ms).min(end),
+            ));
+            start = next;
+            if pts.saturating_add(media.window_ms) >= end {
+                break;
             }
-            ranges.push(start..end);
-            start = end;
+            pts = owned_end;
         }
     } else {
-        ranges.extend(
-            (0..signals.len())
-                .step_by(chunk_size)
-                .map(|start| start..(start + chunk_size).min(signals.len())),
-        );
+        for start in (0..signals.len()).step_by(chunk_size) {
+            let end = (start + chunk_size).min(signals.len());
+            let pts = signals[start].pts_ms;
+            ranges.push((start..end, pts, signals[end - 1].pts_ms));
+        }
     }
 
-    for (chunk_index, range) in ranges.into_iter().enumerate() {
+    for (chunk_index, (range, pts_start_ms, pts_end_ms)) in ranges.into_iter().enumerate() {
         let chunk = &signals[range.clone()];
-        let pts_start_ms = chunk.first().map(|frame| frame.pts_ms).unwrap_or(0);
+
         if source_duration_ms.is_some_and(|duration| pts_start_ms >= duration) {
             continue;
         }
         let started = Instant::now();
         let analyzed = pipeline.analyze_batch(chunk).to_vec();
-        let frame_offset = range.start;
+        let frame_offset = chunk
+            .first()
+            .map_or(range.start, |frame| frame.frame_index as usize);
         let chunk_jpegs: Arc<[DecodedJpegFrame]> = decoded_jpegs
             .map(|lookup| {
-                let mut jpegs: Vec<DecodedJpegFrame> = (frame_offset..frame_offset + chunk.len())
-                    .filter_map(|idx| lookup.get(&(idx as u64)).cloned())
-                    .collect();
-                jpegs.sort_by_key(|f| f.frame_index);
-                Arc::from(jpegs)
+                selected_review_indices(
+                    signals,
+                    range.clone(),
+                    frames_per_chunk,
+                    media.context_frames,
+                )
+                .into_iter()
+                .filter_map(|index| lookup.get(&index).cloned())
+                .collect::<Vec<_>>()
+                .into()
             })
             .unwrap_or_else(|| Arc::from([]));
-
-        let duration_ms = source_duration_ms
-            .map(|source_duration| {
-                media
-                    .window_ms
-                    .min(source_duration.saturating_sub(pts_start_ms))
-            })
-            .unwrap_or(media.window_ms)
-            .max(1);
+        let duration_ms = if media.timestamp_windows {
+            pts_end_ms.saturating_sub(pts_start_ms).max(1)
+        } else {
+            media.window_ms
+        };
         let clip_spec = if media.mode != SemanticMediaMode::Frames && semantic_decode_enabled {
             Some(ClipSpec {
+                evidence_bytes: Arc::clone(&evidence_bytes),
                 source: Arc::clone(prepared_source),
-                decode_pipeline: Arc::clone(decode_pipeline),
                 source_start_ms: pts_start_ms,
                 duration_ms,
                 crop,
@@ -475,6 +569,7 @@ pub async fn prepare_realtime_chunks(
                 persist_evidence: media.persist_evidence,
                 local_audio: local_audio.clone(),
                 chunk_index,
+                video_fps: media.video_fps,
             })
         } else {
             None
@@ -487,7 +582,7 @@ pub async fn prepare_realtime_chunks(
             chunk_jpegs,
             clip_spec,
             pts_start_ms,
-            pts_end_ms: chunk.last().map(|f| f.pts_ms).unwrap_or(0),
+            pts_end_ms,
             chunk_len: chunk.len(),
         });
     }
@@ -791,6 +886,7 @@ pub async fn infer_chunk_semantics(
         ..ChunkSemanticResult::default()
     };
 
+    let video_fps = clip_spec.as_ref().and_then(|spec| spec.video_fps);
     let requested_media_mode = clip_spec.as_ref().map(|spec| spec.mode);
     let requested_audio_duration_ms = clip_spec.as_ref().map_or(0, |spec| spec.duration_ms);
     let audio_chunk_index = clip_spec.as_ref().map_or(0, |spec| spec.chunk_index);
@@ -818,8 +914,7 @@ pub async fn infer_chunk_semantics(
             let media = match spec.mode {
                 SemanticMediaMode::Video => {
                     let started = Instant::now();
-                    spec.decode_pipeline
-                        .extract_clip(spec.source.source(), start_s, duration_s, spec.crop)
+                    extract_video_clip_exact(spec.source.source(), start_s, duration_s, spec.crop)
                         .map(|bytes| SemanticMediaEvidence {
                             bytes: Arc::from(bytes),
                             media_type: "video/mp4",
@@ -832,6 +927,7 @@ pub async fn infer_chunk_semantics(
                             extraction_ms: started.elapsed().as_millis() as u64,
                             resolution: spec.resolution,
                             persist_evidence: spec.persist_evidence,
+                            video_fps: spec.video_fps,
                         })
                 }
                 SemanticMediaMode::AudioVideo => {
@@ -855,6 +951,7 @@ pub async fn infer_chunk_semantics(
                         extraction_ms: clip.extraction_ms,
                         resolution: spec.resolution,
                         persist_evidence: spec.persist_evidence,
+                        video_fps: spec.video_fps,
                     })
                 }
                 SemanticMediaMode::Frames => unreachable!("frame mode has no clip spec"),
@@ -870,6 +967,20 @@ pub async fn infer_chunk_semantics(
             } else {
                 None
             };
+            if spec
+                .evidence_bytes
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |used| {
+                        used.checked_add(media.bytes.len())
+                            .filter(|total| *total <= 256 * 1024 * 1024)
+                    },
+                )
+                .is_err()
+            {
+                return Err("native review evidence exceeds 256 MiB; split the request".into());
+            }
             Ok::<_, String>((media, wav))
         })
         .await;
@@ -957,16 +1068,34 @@ pub async fn infer_chunk_semantics(
         .as_ref()
         .map(local_audio_prompt_context)
         .unwrap_or_default();
+    let (pts_start_ms, pts_end_ms) = extracted_media
+        .as_ref()
+        .map_or((pts_start_ms, pts_end_ms), |media| {
+            (media.source_start_ms, media.source_end_ms)
+        });
     let prompt = if use_video_clip {
         format!(
             "{semantic_prompt}{multimodal_instruction}{audio_context}\nchunk_pts_start_ms={pts_start_ms}\nchunk_pts_end_ms={pts_end_ms}"
         )
     } else {
         format!(
-            "{semantic_prompt}{multimodal_instruction}{audio_context}\nchunk_frame_start={frame_start_index}\nchunk_frame_end={}\nchunk_pts_start_ms={pts_start_ms}\nchunk_pts_end_ms={pts_end_ms}",
-            frame_start_index
-                .saturating_add(chunk_jpegs.len() as u64)
-                .saturating_sub(1)
+            "{semantic_prompt}{multimodal_instruction}{audio_context}\nowned_frame_start={frame_start_index}\nowned_pts_start_ms={pts_start_ms}\nowned_pts_end_ms={pts_end_ms}\nevidence_frame_start={}\nevidence_frame_end={}",
+            selected.first().map_or(frame_start_index, |frame| frame.frame_index),
+            selected.last().map_or(frame_start_index, |frame| frame.frame_index)
+        )
+    };
+
+    let prompt = if use_video_clip {
+        prompt
+    } else {
+        let timestamps: Vec<_> = selected
+            .iter()
+            .map(|frame| json!({"frame_index": frame.frame_index, "pts_ms": frame.pts_ms}))
+            .collect();
+        format!(
+            "{prompt}\nordered_image_timestamps={}; previous_context_image={}",
+            json!(timestamps),
+            prev_jpeg.is_some()
         )
     };
 
@@ -982,12 +1111,14 @@ pub async fn infer_chunk_semantics(
         return result;
     };
 
+    result.input_image_timestamps = selected.iter().enumerate().map(|(index, frame)| json!({"image_position": index + usize::from(prev_jpeg.is_some()), "frame_index": frame.frame_index, "pts_ms": frame.pts_ms})).collect();
     let (images, videos) = if let Some(media) = extracted_media.as_ref() {
         let vids = vec![InferenceVideo {
             media_type: media.media_type,
             raw_bytes: Some(Arc::clone(&media.bytes)),
             data_base64: String::new(),
             media_resolution: Some(media.resolution),
+            sampling_fps: video_fps,
         }];
         (Vec::new(), vids)
     } else {
@@ -1005,6 +1136,16 @@ pub async fn infer_chunk_semantics(
         (imgs, Vec::new())
     };
 
+    if images
+        .iter()
+        .map(|image| image.data_base64.len())
+        .sum::<usize>()
+        > 32 * 1024 * 1024
+    {
+        result.error = Some("review_image_bytes_exceed_32_mib".into());
+        result.used_fallback = true;
+        return result;
+    }
     let has_custom_output_schema = guided_json.is_some();
     let multimodal = extracted_media
         .as_ref()
@@ -1023,13 +1164,7 @@ pub async fn infer_chunk_semantics(
             SEMANTIC_OVERLAY_SCHEMA
         }))
     });
-    let second_pass_guided_json = (!has_custom_output_schema).then(|| {
-        Arc::from(if multimodal {
-            MULTIMODAL_OVERLAY_SCHEMA
-        } else {
-            SEMANTIC_OVERLAY_SCHEMA
-        })
-    });
+    let second_pass_guided_json = request_guided_json.clone();
     let request = InferenceRequest {
         model: tiered_config.first_pass_model.clone(),
         prompt: Arc::from(prompt),
@@ -1038,7 +1173,7 @@ pub async fn infer_chunk_semantics(
         max_tokens: first_pass_max_tokens,
         temperature: 0.0,
         timeout_ms,
-        allow_fallback: true,
+        allow_fallback: !use_video_clip && semantic_frames_per_chunk <= 4,
         guided_json: request_guided_json,
         scheduling: vidarax_core::provider::InferenceScheduling::new(
             Arc::from(format!("offline:{frame_start_index}")),
@@ -1366,6 +1501,27 @@ fn intervals_overlap(
 ) -> bool {
     left_start <= right_end.saturating_add(tolerance_ms)
         && right_start <= left_end.saturating_add(tolerance_ms)
+}
+
+/// Only suppress the same description/kind over an overlapping absolute source
+/// interval. Different findings and adjacent repeated actions remain separate.
+pub fn deduplicate_source_moments(
+    moments: &mut Vec<SemanticMoment>,
+    seen: &mut Vec<SemanticMoment>,
+) {
+    moments.retain(|moment| {
+        let duplicate = seen.iter().any(|previous| {
+            previous.kind == moment.kind
+                && previous.description == moment.description
+                && previous.modalities == moment.modalities
+                && previous.start_pts_ms < moment.end_pts_ms
+                && moment.start_pts_ms < previous.end_pts_ms
+        });
+        if !duplicate {
+            seen.push(moment.clone());
+        }
+        !duplicate
+    });
 }
 
 fn deduplicate_moments(moments: &mut Vec<SemanticMoment>) {
@@ -1875,6 +2031,27 @@ fn truncate_context(text: &str, max_chars: usize) -> &str {
 // Helper functions below the test module are intentionally left in place.
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    #[test]
+    fn overlap_dedup_uses_absolute_time_and_keeps_adjacent_actions() {
+        let make = |start, end| SemanticMoment {
+            start_offset_ms: 0,
+            end_offset_ms: 100,
+            start_pts_ms: start,
+            end_pts_ms: end,
+            modalities: vec!["visual".into()],
+            kind: "action".into(),
+            description: "pulse".into(),
+            intent: None,
+            audio_visual_relation: None,
+            confidence: 0.9,
+        };
+        let mut seen = vec![make(900, 1100)];
+        let mut incoming = vec![make(950, 1100), make(1100, 1300), make(2000, 2100)];
+        deduplicate_source_moments(&mut incoming, &mut seen);
+        assert_eq!(incoming.len(), 2);
+        assert_eq!(incoming[0].start_pts_ms, 1100);
+    }
+
     use super::*;
     use vidarax_core::audio_sidecar::AudioObservation;
     use vidarax_core::provider::{InferenceResult, ProviderKind, TokenUsage};
@@ -2424,10 +2601,104 @@ Ignore this trailing {not json}."#;
     }
 
     #[tokio::test]
+    async fn failed_wav_preparation_does_not_consume_retained_media_budget() {
+        let path =
+            std::env::temp_dir().join(format!("vidarax-wav-budget-{}.mp4", std::process::id()));
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:r=4:d=1",
+                "-c:v",
+                "libx264",
+                "-y",
+            ])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let source =
+            vidarax_core::ingest::InputSource::FilePath(path.to_string_lossy().into_owned());
+        let prepared = Arc::new(vidarax_core::ingest::prepare_source_for_reuse(&source).unwrap());
+        let budget = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut spec = ClipSpec {
+            evidence_bytes: Arc::clone(&budget),
+            source: prepared,
+            source_start_ms: 0,
+            duration_ms: 500,
+            crop: None,
+            mode: SemanticMediaMode::Video,
+            resolution: MediaResolution::Medium,
+            persist_evidence: false,
+            chunk_index: 0,
+            video_fps: None,
+            local_audio: Some(LocalAudioConfig {
+                sidecar_addr: Arc::from("127.0.0.1:1"),
+                profile: AudioProfile::General,
+                speech_engine: SpeechEngine::None,
+                min_confidence: 0.5,
+                max_events: 4,
+                voice_feedback: false,
+                trace: AudioTraceContext::default(),
+                metrics: Arc::new(PipelineMetrics::default()),
+            }),
+        };
+        let failed = infer_chunk_semantics(
+            None,
+            true,
+            "inspect",
+            1000,
+            1,
+            &[],
+            0,
+            0,
+            500,
+            TieredVlmConfig::single_model("gemini-3.8-flash"),
+            None,
+            None,
+            Some(spec.clone()),
+            None,
+            None,
+        )
+        .await;
+        assert!(failed.error.unwrap().contains("requires an audio stream"));
+        assert_eq!(budget.load(std::sync::atomic::Ordering::Relaxed), 0);
+        spec.local_audio = None;
+        let valid = infer_chunk_semantics(
+            None,
+            true,
+            "inspect",
+            1000,
+            1,
+            &[],
+            0,
+            0,
+            500,
+            TieredVlmConfig::single_model("gemini-3.8-flash"),
+            None,
+            None,
+            Some(spec),
+            None,
+            None,
+        )
+        .await;
+        assert!(valid.error.is_none());
+        assert_eq!(
+            budget.load(std::sync::atomic::Ordering::Relaxed),
+            valid.media.unwrap().bytes.len()
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn custom_output_schema_preserves_raw_output_and_larger_token_cap() {
         let provider: Arc<dyn InferenceProvider + Send + Sync> = Arc::new(CustomSchemaTestProvider);
         let jpeg = DecodedJpegFrame {
             frame_index: 0,
+            pts_ms: 0,
             jpeg_bytes: Arc::from(vec![0xff, 0xd8, 0xff, 0xd9]),
         };
         let result = infer_chunk_semantics(
@@ -2458,6 +2729,95 @@ Ignore this trailing {not json}."#;
     async fn parallel_semantic_dispatch_bounds_live_spawned_tasks() {
         let max_live = super::bounded_task_spawn_probe_for_tests(100, 4).await;
         assert_eq!(max_live, 4);
+    }
+
+    #[tokio::test]
+    async fn cancelled_dispatch_holds_permit_until_blocking_provider_exits() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Mutex};
+        use std::time::Duration;
+
+        struct BlockingProvider {
+            started: tokio::sync::Notify,
+            release: Mutex<mpsc::Receiver<()>>,
+            finished: AtomicBool,
+        }
+
+        impl InferenceProvider for BlockingProvider {
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::Vllm
+            }
+
+            fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+                self.started.notify_one();
+                // A dropped sender also releases this wait if an assertion fails.
+                let released = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5));
+                self.finished.store(true, Ordering::Release);
+                released.map_err(|error| ProviderError::Transport(error.to_string()))?;
+                SemanticTestProvider.infer(request)
+            }
+        }
+
+        let (release_tx, release_rx) = mpsc::channel();
+        let provider = Arc::new(BlockingProvider {
+            started: tokio::sync::Notify::new(),
+            release: Mutex::new(release_rx),
+            finished: AtomicBool::new(false),
+        });
+        let dispatch_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let permits_for_task = Arc::clone(&dispatch_permits);
+        let provider_for_task = Arc::clone(&provider);
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(1);
+        let dispatch = tokio::spawn(async move {
+            run_semantic_dispatch(
+                &[test_chunk_prep(0)],
+                Some(provider_for_task),
+                true,
+                "classify",
+                1_000,
+                1,
+                TieredVlmConfig::single_model("test-model"),
+                None,
+                false,
+                false,
+                1,
+                None,
+                Some(permits_for_task),
+                Some(completion_tx),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), provider.started.notified())
+            .await
+            .expect("mock provider should start");
+
+        dispatch.abort();
+        assert!(dispatch.await.unwrap_err().is_cancelled());
+        assert_eq!(dispatch_permits.available_permits(), 0);
+        assert!(!provider.finished.load(Ordering::Acquire));
+        // Dispatch cancellation closes the journal channel even though the
+        // blocking provider is still running: its eventual result is discarded.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), completion_rx.recv())
+                .await
+                .expect("cancelled dispatcher must drop its completion sender")
+                .is_none()
+        );
+
+        release_tx.send(()).unwrap();
+        let _permit = tokio::time::timeout(
+            Duration::from_secs(1),
+            Arc::clone(&dispatch_permits).acquire_owned(),
+        )
+        .await
+        .expect("provider exit must return dispatch capacity")
+        .unwrap();
+        assert!(provider.finished.load(Ordering::Acquire));
+        assert!(completion_rx.recv().await.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2536,6 +2896,7 @@ Ignore this trailing {not json}."#;
             frame_offset: 0,
             chunk_jpegs: Arc::from([DecodedJpegFrame {
                 frame_index: 0,
+                pts_ms: 0,
                 jpeg_bytes: Arc::clone(&jpeg_bytes),
             }]),
             clip_spec: None,
@@ -2565,6 +2926,7 @@ Ignore this trailing {not json}."#;
             frame_offset: idx,
             chunk_jpegs: Arc::from([DecodedJpegFrame {
                 frame_index: idx as u64,
+                pts_ms: 0,
                 jpeg_bytes: Arc::from(vec![0xff, 0xd8, 0xff, idx as u8]),
             }]),
             clip_spec: None,

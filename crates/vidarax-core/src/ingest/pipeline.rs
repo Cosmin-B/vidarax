@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::{Arc, OnceLock};
 
+use super::ffmpeg::BoundedJpegOutput;
 use crate::crop::CropRegion;
 use crate::ingest::{
     decode_mp4_to_frame_signals, decode_selective_jpeg_frames, extract_video_clip,
@@ -346,7 +347,7 @@ fn decode_selective_jpeg_frames_nvdec_inner(
             "mjpeg",
             "-",
         ])
-        .output()
+        .bounded_jpeg_output()
         .map_err(|_| "failed to run ffmpeg with NVDEC".to_string())?;
 
     if !output.status.success() {
@@ -362,6 +363,7 @@ fn decode_selective_jpeg_frames_nvdec_inner(
     parsed.truncate(usable);
     for (frame, &idx) in parsed.iter_mut().zip(indices.iter()) {
         frame.frame_index = idx;
+        frame.pts_ms = ((idx as f64 / sample_fps as f64) * 1000.0).round() as u64;
     }
     Ok(parsed)
 }
@@ -511,7 +513,7 @@ fn decode_selective_jpeg_frames_videotoolbox_inner(
             "mjpeg",
             "-",
         ])
-        .output()
+        .bounded_jpeg_output()
         .map_err(|_| "failed to run ffmpeg with VideoToolbox".to_string())?;
 
     if !output.status.success() {
@@ -543,6 +545,7 @@ fn decode_selective_jpeg_frames_videotoolbox_inner(
     parsed.truncate(usable);
     for (frame, &idx) in parsed.iter_mut().zip(indices.iter()) {
         frame.frame_index = idx;
+        frame.pts_ms = ((idx as f64 / sample_fps as f64) * 1000.0).round() as u64;
     }
     Ok(parsed)
 }

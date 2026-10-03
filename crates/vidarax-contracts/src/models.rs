@@ -41,11 +41,15 @@ pub const REQUIRED_MODELS: &[&str] = &[
 /// Default low-cost Gemini model for native binary media.
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3.5-flash-lite";
 
+/// Latest stable full Flash model, verified against Google documentation on 2026-10-03.
+pub const LATEST_GEMINI_FLASH_MODEL: &str = "gemini-3.8-flash";
+
 /// Stable Gemini models supported by the native binary media path.
 pub const GEMINI_MODELS: &[&str] = &[
     DEFAULT_GEMINI_MODEL,
     "gemini-3.1-flash-lite",
     "gemini-3.6-flash",
+    LATEST_GEMINI_FLASH_MODEL,
 ];
 
 pub fn normalize_model_id(input: &str) -> Option<&'static str> {
@@ -71,9 +75,8 @@ pub fn normalize_model_id(input: &str) -> Option<&'static str> {
         "liquidai/lfm2-vl-450m" => Some("LiquidAI/LFM2-VL-450M"),
         "liquidai/lfm2.5-vl-1.6b" | "lfm2.5-vl-1.6b-q4_0.gguf" => Some("LiquidAI/LFM2.5-VL-1.6B"),
         "microsoft/mage-vl" | "mage-vl" => Some(EXPERIMENTAL_MODELS[0]),
-        "gemini-3.5-flash-lite" | "gemini-flash-lite-latest" | "gemini-flash-latest" => {
-            Some(DEFAULT_GEMINI_MODEL)
-        }
+        "gemini-3.5-flash-lite" | "gemini-flash-lite-latest" => Some(DEFAULT_GEMINI_MODEL),
+        "gemini-3.8-flash" | "gemini-flash-latest" => Some(LATEST_GEMINI_FLASH_MODEL),
         "gemini-3.6-flash" => Some(GEMINI_MODELS[2]),
         "gemini-3.1-flash-lite" | "gemini-3.1-flash-lite-preview" => Some(GEMINI_MODELS[1]),
         _ => None,

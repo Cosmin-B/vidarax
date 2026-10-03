@@ -177,6 +177,7 @@ impl InferenceProvider for AudioVideoTestProvider {
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+        assert_eq!(request.model.as_ref(), "gemini-3.8-flash");
         assert!(request.input_images.is_empty());
         assert_eq!(request.input_videos.len(), 1);
         let video = &request.input_videos[0];
@@ -610,6 +611,7 @@ async fn models_catalog_items_have_required_fields() {
     let res = router.oneshot(get("/v1/models")).await.unwrap();
     let body = collect_json(res.into_body()).await;
     let models = body["models"].as_array().unwrap();
+    assert!(models.iter().any(|item| item["id"] == "gemini-3.8-flash"));
     // Validate all items, not just the first.
     for item in models {
         assert!(item["id"].is_string(), "model must have string 'id'");
@@ -625,6 +627,22 @@ async fn models_catalog_items_have_required_fields() {
         assert!(
             item["fallback_candidates"].is_array(),
             "model must have array 'fallback_candidates'"
+        );
+    }
+}
+
+#[tokio::test]
+async fn latest_flash_run_accepts_canonical_and_alias() {
+    for model in ["gemini-3.8-flash", "gemini-flash-latest"] {
+        let router = app_router(AppState::with_wal_for_tests(tmp_wal("latest-flash")));
+        let res = router
+            .oneshot(post_json("/v1/runs", json!({"model": model})))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            collect_json(res.into_body()).await["model"],
+            "gemini-3.8-flash"
         );
     }
 }
@@ -653,7 +671,7 @@ async fn recorded_audio_video_reasoning_commits_moments_and_serves_raw_mp4() {
         .clone()
         .oneshot(post_json(
             "/v1/runs",
-            json!({ "mode": "balanced", "model": "gemini-3.5-flash-lite" }),
+            json!({ "mode": "balanced", "model": "gemini-3.8-flash" }),
         ))
         .await
         .unwrap();
@@ -667,7 +685,7 @@ async fn recorded_audio_video_reasoning_commits_moments_and_serves_raw_mp4() {
             &format!("/v1/runs/{run_id}/reason"),
             json!({
                 "source_uri": source.to_string_lossy(),
-                "model": "gemini-3.5-flash-lite",
+                "model": "gemini-3.8-flash",
                 "sampling_policy": "fixed",
                 "fixed_fps": 10.0,
                 "semantic_inference": true,

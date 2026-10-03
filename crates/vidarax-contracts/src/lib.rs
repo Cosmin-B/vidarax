@@ -49,9 +49,19 @@ mod tests {
 
     #[test]
     fn gemini_models_resolve_through_catalog() {
-        use crate::models::{normalize_model_id, DEFAULT_GEMINI_MODEL, GEMINI_MODELS};
+        use crate::models::{
+            normalize_model_id, DEFAULT_GEMINI_MODEL, GEMINI_MODELS, LATEST_GEMINI_FLASH_MODEL,
+        };
         for id in GEMINI_MODELS {
             assert_eq!(normalize_model_id(id), Some(*id));
+        }
+        assert_eq!(LATEST_GEMINI_FLASH_MODEL, "gemini-3.8-flash");
+        for id in [
+            "gemini-3.8-flash",
+            "GEMINI-3.8-FLASH",
+            "gemini-flash-latest",
+        ] {
+            assert_eq!(normalize_model_id(id), Some(LATEST_GEMINI_FLASH_MODEL));
         }
         assert_eq!(DEFAULT_GEMINI_MODEL, "gemini-3.5-flash-lite");
         assert_eq!(

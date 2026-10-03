@@ -107,9 +107,10 @@ impl GeminiProvider {
 
     fn request_model<'a>(&'a self, request: &'a InferenceRequest) -> &'a str {
         if request.model.is_empty() {
-            &self.default_model
+            vidarax_contracts::models::normalize_model_id(&self.default_model)
+                .unwrap_or(&self.default_model)
         } else {
-            &request.model
+            vidarax_contracts::models::normalize_model_id(&request.model).unwrap_or(&request.model)
         }
     }
 
@@ -141,6 +142,28 @@ impl GeminiProvider {
         deadline: Instant,
         uploaded_files: &mut Vec<String>,
     ) -> Result<String, ProviderError> {
+        if request.input_images.len() > 256 {
+            return Err(ProviderError::RequestBudget);
+        }
+        if request.input_videos.iter().any(|video| {
+            video
+                .sampling_fps
+                .is_some_and(|fps| !fps.is_finite() || fps <= 0.0 || fps > 24.0)
+        }) {
+            return Err(ProviderError::InvalidResponse(
+                "Gemini video FPS must be finite and in (0, 24]".into(),
+            ));
+        }
+        if request
+            .input_videos
+            .iter()
+            .any(|video| video.sampling_fps.is_some())
+            && self.max_video_fps_for_model(model).is_none()
+        {
+            return Err(ProviderError::InvalidResponse(
+                "explicit video FPS requires a supported Gemini model".into(),
+            ));
+        }
         // Media parts first (Gemini best practice), text prompt last.
         let mut parts: Vec<Value> = Vec::new();
 
@@ -181,6 +204,19 @@ impl GeminiProvider {
                         "fileUri": uri
                     }
                 }));
+            }
+        }
+
+        // generateContent still documents videoMetadata on each inline/File part.
+        // Explicit FPS uses static sampling; it never falls back to model defaults.
+        for (part, video) in parts
+            .iter_mut()
+            .skip(request.input_images.len())
+            .zip(&request.input_videos)
+        {
+            if let Some(fps) = video.sampling_fps {
+                part["videoMetadata"] = serde_json::json!({"fps": fps});
+                part["mediaProcessing"] = serde_json::json!("STATIC");
             }
         }
 
@@ -491,11 +527,16 @@ impl GeminiProvider {
             ProviderError::InvalidResponse("Gemini response missing candidates[0]".into())
         })?;
 
-        let text = candidate
-            .pointer("/content/parts/0/text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        // A response can contain several text parts, signatures, and thought
+        // summaries. Only visible answer text belongs in downstream review JSON.
+        let text: String = candidate
+            .pointer("/content/parts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|part| part.get("thought").and_then(Value::as_bool) != Some(true))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect();
 
         let finish_reason = candidate
             .pointer("/finishReason")
@@ -535,6 +576,16 @@ impl GeminiProvider {
 }
 
 impl InferenceProvider for GeminiProvider {
+    fn max_input_images_for_model(&self, _model: &str) -> usize {
+        256
+    }
+    fn max_video_fps_for_model(&self, model: &str) -> Option<f32> {
+        let canonical = vidarax_contracts::models::normalize_model_id(model)?;
+        vidarax_contracts::models::GEMINI_MODELS
+            .contains(&canonical)
+            .then_some(24.0)
+    }
+
     fn kind(&self) -> ProviderKind {
         ProviderKind::Gemini
     }
@@ -768,6 +819,7 @@ mod tests {
             raw_bytes: None,
             data_base64: "dmlkZW8=".to_string(),
             media_resolution: Some(crate::provider::MediaResolution::Medium),
+            sampling_fps: None,
         }];
         let body = p.build_payload(&req).unwrap();
         let v: Value = serde_json::from_str(&body).unwrap();
@@ -792,6 +844,36 @@ mod tests {
     }
 
     #[test]
+    fn explicit_video_fps_is_serialized_and_validated() {
+        let p = provider();
+        let mut req = request();
+        req.model = Arc::from("gemini-3.8-flash");
+        req.input_videos = vec![InferenceVideo {
+            media_type: "video/mp4",
+            raw_bytes: None,
+            data_base64: "dmlkZW8=".into(),
+            media_resolution: None,
+            sampling_fps: Some(24.0),
+        }];
+        let payload: Value = serde_json::from_str(&p.build_payload(&req).unwrap()).unwrap();
+        assert_eq!(
+            payload["contents"][0]["parts"][0]["videoMetadata"]["fps"],
+            24.0
+        );
+        assert_eq!(
+            payload["contents"][0]["parts"][0]["mediaProcessing"],
+            "STATIC"
+        );
+        for fps in [0.0, 25.0, f32::NAN] {
+            req.input_videos[0].sampling_fps = Some(fps);
+            assert!(p.build_payload(&req).is_err());
+        }
+        req.input_videos[0].sampling_fps = Some(24.0);
+        req.model = Arc::from("unrecognized-model");
+        assert!(p.build_payload(&req).is_err());
+    }
+
+    #[test]
     fn gemini_3_payload_omits_deprecated_sampling_parameters() {
         // build_payload is pure: it serializes the request verbatim and never
         // adds a thinkingConfig. Thinking support lives in infer()/attempt(),
@@ -809,6 +891,74 @@ mod tests {
             cfg.get("thinkingConfig").is_none(),
             "build_payload must never emit a thinkingConfig"
         );
+    }
+
+    #[test]
+    fn latest_flash_accepts_images_video_and_structured_output_without_thinking_override() {
+        let p = GeminiProvider::new("test-key".into(), "gemini-flash-latest".into()).unwrap();
+        let mut req = request();
+        req.input_images.push(InferenceImage {
+            media_type: "image/jpeg",
+            data_base64: "YWJj".into(),
+        });
+        req.input_videos.push(InferenceVideo {
+            media_type: "video/mp4",
+            raw_bytes: None,
+            data_base64: "dmlkZW8=".into(),
+            media_resolution: Some(crate::provider::MediaResolution::High),
+            sampling_fps: None,
+        });
+        req.guided_json =
+            Some(r#"{"type":"object","properties":{"description":{"type":"string"}}}"#.into());
+        assert_eq!(p.request_model(&req), "gemini-3.8-flash");
+        let payload: Value = serde_json::from_str(&p.build_payload(&req).unwrap()).unwrap();
+        let parts = payload["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["inlineData"]["mimeType"], "image/jpeg");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "video/mp4");
+        assert_eq!(parts[2]["text"], "describe this");
+        let cfg = &payload["generationConfig"];
+        assert_eq!(cfg["responseMimeType"], "application/json");
+        assert_eq!(cfg["responseSchema"]["type"], "object");
+        assert_eq!(cfg["mediaResolution"], "MEDIA_RESOLUTION_HIGH");
+        assert!(cfg.get("temperature").is_none());
+        assert!(cfg.get("thinkingConfig").is_none());
+        req.model = Arc::from("GEMINI-3.8-FLASH");
+        assert_eq!(p.request_model(&req), "gemini-3.8-flash");
+    }
+
+    #[test]
+    fn latest_flash_response_joins_visible_parts_and_skips_thoughts() {
+        let raw = serde_json::json!({
+            "candidates": [{"content": {"parts": [
+                {"thought": true, "text": "Reviewing the clip"},
+                {"thoughtSignature": "opaque"},
+                {"text": "{\"description\":"},
+                {"text": "\"foot sliding\"}"}
+            ]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 40, "candidatesTokenCount": 12,
+                "thoughtsTokenCount": 89, "totalTokenCount": 141}
+        });
+        let result = provider()
+            .parse_response(&raw.to_string(), "gemini-3.8-flash", Instant::now())
+            .unwrap();
+        assert_eq!(result.model.as_ref(), "gemini-3.8-flash");
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.output_text).unwrap()["description"],
+            "foot sliding"
+        );
+        assert_eq!(result.usage.thinking_tokens, 89);
+        assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+        assert!(!is_thinking_starved(&result));
+    }
+
+    #[test]
+    fn latest_flash_thought_only_response_preserves_starvation_detection() {
+        let raw = r#"{"candidates":[{"content":{"parts":[{"thought":true,"text":"Still thinking"}]},"finishReason":"MAX_TOKENS"}],"usageMetadata":{"thoughtsTokenCount":160}}"#;
+        let result = provider()
+            .parse_response(raw, "gemini-3.8-flash", Instant::now())
+            .unwrap();
+        assert!(result.output_text.is_empty());
+        assert!(is_thinking_starved(&result));
     }
 
     #[test]
@@ -1143,6 +1293,7 @@ mod tests {
                 raw_bytes: Some(Arc::from(mp4)),
                 data_base64: String::new(),
                 media_resolution: None,
+                sampling_fps: None,
             }],
             max_tokens: 100,
             temperature: 0.0,

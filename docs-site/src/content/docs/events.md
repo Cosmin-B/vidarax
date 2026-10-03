@@ -122,7 +122,7 @@ Policy control adds immutable timeline records:
 | `policy_rollback_rejected` | Records a failed restore. |
 | `policy_replay_evaluated` | Stores the deterministic candidate replay summary. |
 
-With concurrent semantic inference, `semantic_chunk_inferred` records are appended as chunks finish and can therefore arrive out of `chunk_index` order. Use the WAL sequence for observation order and `chunk_index` for source order.
+The `gemini-3-8-flash` review branch journals recorded review chunks in `chunk_index` source order, even when inference completes out of order. Earlier versions append `semantic_chunk_inferred` as chunks finish, so their records can arrive out of source order. Use WAL sequence for observation order and `chunk_index` for source order. See [Gemini Flash review](/gemini-flash/) for implementation status and evidence limits.
 
 Live sessions add streaming kinds through the event sink. The worker's `event_type` string becomes the WAL `kind`, and all of them share one payload shape, `{ session_id, frame_index, pts_ms, coordinate_schema, coordinates, confidence, description }`, where this `pts_ms` is media time:
 
