@@ -673,7 +673,10 @@ impl InferenceProvider for GeminiProvider {
     }
 
     fn configured_kinds_for_model(&self, model: &str) -> Vec<ProviderKind> {
-        if model == self.default_model {
+        let model = vidarax_contracts::models::normalize_model_id(model).unwrap_or(model);
+        let configured = vidarax_contracts::models::normalize_model_id(&self.default_model)
+            .unwrap_or(&self.default_model);
+        if model == configured {
             vec![ProviderKind::Gemini]
         } else {
             Vec::new()
@@ -759,6 +762,31 @@ mod tests {
             allow_fallback: false,
             guided_json: None,
             scheduling: Default::default(),
+        }
+    }
+
+    #[test]
+    fn flash_alias_configuration_matches_canonical_and_case_variants() {
+        let models = [
+            "gemini-3.8-flash",
+            "gemini-flash-latest",
+            "GEMINI-3.8-FLASH",
+        ];
+        for configured in models {
+            let provider = GeminiProvider::new("test-key".into(), configured.into()).unwrap();
+            for model in models {
+                assert_eq!(
+                    provider.configured_kinds_for_model(model),
+                    vec![ProviderKind::Gemini],
+                    "configured={configured}, requested={model}"
+                );
+            }
+            assert!(provider
+                .configured_kinds_for_model("gemini-3.5-flash-lite")
+                .is_empty());
+            assert!(provider
+                .configured_kinds_for_model("unknown-model")
+                .is_empty());
         }
     }
 

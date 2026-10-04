@@ -896,16 +896,12 @@ impl InferenceProvider for ModelRoutingProvider {
     }
 
     fn configured_kinds_for_model(&self, model: &str) -> Vec<ProviderKind> {
-        self.routes
-            .get(model)
-            .unwrap_or(&self.default)
+        self.provider_for_model(model)
             .configured_kinds_for_model(model)
     }
 
     fn reserved_output_tokens(&self, request: &InferenceRequest) -> u64 {
-        self.routes
-            .get(request.model.as_ref())
-            .unwrap_or(&self.default)
+        self.provider_for_model(request.model.as_ref())
             .reserved_output_tokens(request)
     }
 }
@@ -1564,6 +1560,47 @@ mod tests {
         }
         assert_eq!(routed.seen_models.lock().unwrap().len(), 3);
         assert!(default.seen_models.lock().unwrap().is_empty());
+    }
+
+    fn flash_alias_router() -> ModelRoutingProvider {
+        let routed = Arc::new(
+            crate::gemini::GeminiProvider::new("test-key".into(), "gemini-3.8-flash".into())
+                .unwrap(),
+        );
+        let default = Arc::new(RecordingModelProvider::new(ProviderKind::Vllm));
+        let mut routes: HashMap<String, Arc<dyn InferenceProvider + Send + Sync>> = HashMap::new();
+        routes.insert("gemini-3.8-flash".into(), routed);
+        ModelRoutingProvider::new(routes, default)
+    }
+
+    #[test]
+    fn flash_alias_routes_reserve_gemini_output_headroom() {
+        let router = flash_alias_router();
+        let mut req = request();
+        req.model = Arc::from("gemini-3.8-flash");
+        req.allow_fallback = false;
+        let reserved = router.reserved_output_tokens(&req);
+        assert!(reserved > u64::from(req.max_tokens));
+        for model in ["gemini-flash-latest", "GEMINI-3.8-FLASH"] {
+            req.model = Arc::from(model);
+            assert_eq!(router.reserved_output_tokens(&req), reserved, "{model}");
+        }
+    }
+
+    #[test]
+    fn flash_alias_routes_report_gemini_configuration() {
+        let router = flash_alias_router();
+        for model in [
+            "gemini-3.8-flash",
+            "gemini-flash-latest",
+            "GEMINI-3.8-FLASH",
+        ] {
+            assert_eq!(
+                router.configured_kinds_for_model(model),
+                vec![ProviderKind::Gemini],
+                "{model}"
+            );
+        }
     }
 
     #[test]
