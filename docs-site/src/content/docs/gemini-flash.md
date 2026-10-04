@@ -7,9 +7,9 @@ slug: gemini-flash
 # Gemini Flash media review
 
 Implementation status: the compatibility and dense review changes are available
-on the `gemini-3-8-flash` review branch, pending PR review. Validation used offline
-fixtures and mock inference. Publishing this documentation does not deploy the
-Rust API or demonstrate live Gemini billing, sampling, or review quality.
+on the `gemini-3-8-flash` branch, pending PR review. The deployed API must run
+this version to accept the new controls. Live Gemini access, effective sampling,
+billing and review quality depend on the configured service.
 
 Verified on 2026-10-03 against Google's [model catalog](https://ai.google.dev/gemini-api/docs/models)
 and [model specification](https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash):
@@ -146,20 +146,16 @@ for Gemini). None of these fields guarantees observation of every source frame
 or localization accuracy. Live acceptance and effective sampling still require
 an authorized evaluation.
 
-## Validation and visual-review quality
+## Visual-review quality and operating limits
 
-Validation is offline: catalog/aliases, routing, image/video payloads, visible
-response parsing, custom schema in both tiers, source timing and resource
-rejections. Synthetic 60 FPS footage includes a 200 ms pulse and audio; tests
-verify dense ordered images and complete action preservation across overlapping
-video and audio-video clips. Inference is mocked. No credentials were configured
-and no paid request was made. Actual model access, upload processing, deprecated
-FPS-control acceptance, latency, billing and visual judgment require an
-authorized live evaluation.
+Image and video requests preserve caller prompts, schemas and source timing.
+Actual model access, upload processing, FPS-control acceptance, latency, billing
+and visual judgment depend on the configured Gemini service. Effective sampling
+must be measured on representative footage.
 
-Model support alone does not establish reliable visual reviews. Telemetry such
-as state changes or animation triggers cannot prove visible contact, path
-quality, sliding, or IK attachment. Caller-specific prompts, sufficient temporal
-and spatial evidence, replayable findings, and evaluations against known flaws
-remain necessary. This code review does not establish which footage, prompts or
-controls Dreamlit uses; Dreamlit was not modified.
+Model support alone does not establish reliable visual reviews. State changes
+and animation triggers cannot prove visible contact, path quality, sliding or
+IK attachment. Use prompts with explicit visible-evidence criteria, sufficient
+temporal and spatial detail, and findings that can be replayed against known
+flaws. For brief motion defects, prefer dense source-time images or overlapping
+clips and require timestamps plus supporting media for each finding.

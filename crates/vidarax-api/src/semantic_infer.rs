@@ -555,7 +555,12 @@ pub async fn prepare_realtime_chunks(
         let duration_ms = if media.timestamp_windows {
             pts_end_ms.saturating_sub(pts_start_ms).max(1)
         } else {
-            media.window_ms
+            media
+                .source_end_ms
+                .into_iter()
+                .chain(source_duration_ms)
+                .map(|end| end.saturating_sub(pts_start_ms))
+                .fold(media.window_ms, u64::min)
         };
         let clip_spec = if media.mode != SemanticMediaMode::Frames && semantic_decode_enabled {
             Some(ClipSpec {
@@ -1503,8 +1508,8 @@ fn intervals_overlap(
         && right_start <= left_end.saturating_add(tolerance_ms)
 }
 
-/// Only suppress the same description/kind over an overlapping absolute source
-/// interval. Different findings and adjacent repeated actions remain separate.
+/// Suppress a matching finding only when its absolute source interval is fully
+/// covered. Extending findings retain their interval and evidence offsets.
 pub fn deduplicate_source_moments(
     moments: &mut Vec<SemanticMoment>,
     seen: &mut Vec<SemanticMoment>,
@@ -1514,8 +1519,8 @@ pub fn deduplicate_source_moments(
             previous.kind == moment.kind
                 && previous.description == moment.description
                 && previous.modalities == moment.modalities
-                && previous.start_pts_ms < moment.end_pts_ms
-                && moment.start_pts_ms < previous.end_pts_ms
+                && previous.start_pts_ms <= moment.start_pts_ms
+                && moment.end_pts_ms <= previous.end_pts_ms
         });
         if !duplicate {
             seen.push(moment.clone());
@@ -2050,6 +2055,36 @@ mod tests {
         deduplicate_source_moments(&mut incoming, &mut seen);
         assert_eq!(incoming.len(), 2);
         assert_eq!(incoming[0].start_pts_ms, 1100);
+    }
+
+    #[test]
+    fn overlap_dedup_preserves_an_extending_interval_and_its_evidence_offsets() {
+        let previous = SemanticMoment {
+            start_offset_ms: 0,
+            end_offset_ms: 1_000,
+            start_pts_ms: 0,
+            end_pts_ms: 1_000,
+            modalities: vec!["video".into()],
+            kind: "interaction".into(),
+            description: "The player moves forward.".into(),
+            intent: None,
+            audio_visual_relation: None,
+            confidence: 0.9,
+        };
+        let extending = SemanticMoment {
+            start_offset_ms: 100,
+            end_offset_ms: 1_100,
+            start_pts_ms: 500,
+            end_pts_ms: 1_500,
+            ..previous.clone()
+        };
+        let mut seen = vec![previous];
+        let mut incoming = vec![extending.clone()];
+
+        deduplicate_source_moments(&mut incoming, &mut seen);
+
+        assert_eq!(serde_json::to_value(&incoming).unwrap(), json!([extending]));
+        assert_eq!(seen.len(), 2);
     }
 
     use super::*;
@@ -2598,6 +2633,139 @@ Ignore this trailing {not json}."#;
             parse_semantic_overlay(raw, None).expect("later valid object should parse");
         assert_eq!(overlay.event_type, "scene_cut");
         assert_eq!(overlay.confidence, 0.8);
+    }
+
+    async fn assert_legacy_clip_bounds(start_ms: u64, target_end_ms: Option<u64>, end_ms: u64) {
+        use vidarax_core::ingest::{prepare_source_for_reuse, probe_media_info, InputSource};
+
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let fixture = Fixture(std::env::temp_dir().join(format!(
+            "vidarax-legacy-bounds-{}-{start_ms}-{}",
+            std::process::id(),
+            target_end_ms.unwrap_or(0),
+        )));
+        std::fs::create_dir_all(&fixture.0).unwrap();
+        let path = fixture.0.join("source.mp4");
+        let mut child = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=64x64:rate=20:duration=2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-y",
+            ])
+            .arg(&path)
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() < std::time::Duration::from_secs(5) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                outcome => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("fixture generation failed or exceeded 5 seconds: {outcome:?}");
+                }
+            }
+        };
+        assert!(status.success());
+        let source = InputSource::FilePath(path.to_string_lossy().into_owned());
+        let prepared = Arc::new(prepare_source_for_reuse(&source).unwrap());
+        assert_eq!(prepared.media_info().unwrap().duration_ms, Some(2_000));
+        let signals = [start_ms, start_ms + 50].map(|pts_ms| FrameSignal {
+            frame_index: pts_ms / 50,
+            pts_ms,
+            perceptual_hash: 0,
+            luma_mean: 0.5,
+            flicker_score: 0.0,
+            ghosting_score: 0.0,
+            noise_variance_score: 0.0,
+        });
+        let mut pipeline = TwoPassPipeline::new(Default::default(), Default::default());
+        let decode = vidarax_core::ingest::pipeline::build_decode_pipeline("cpu-ffmpeg").unwrap();
+        let chunks = prepare_realtime_chunks(
+            &signals,
+            5,
+            1,
+            None,
+            &mut pipeline,
+            &decode,
+            &prepared,
+            SemanticMediaConfig {
+                mode: SemanticMediaMode::Video,
+                window_ms: 500,
+                resolution: MediaResolution::Low,
+                persist_evidence: true,
+                timestamp_windows: false,
+                overlap_ms: 0,
+                video_fps: None,
+                context_frames: 0,
+                source_start_ms: Some(start_ms),
+                source_end_ms: target_end_ms,
+            },
+            true,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(chunks.len(), 1);
+        let spec = chunks[0].clip_spec.clone().unwrap();
+        assert_eq!(spec.source_start_ms, start_ms);
+        assert_eq!(spec.duration_ms, end_ms - start_ms);
+
+        let result = infer_chunk_semantics(
+            None,
+            true,
+            "inspect",
+            1_000,
+            1,
+            &[],
+            0,
+            chunks[0].pts_start_ms,
+            chunks[0].pts_end_ms,
+            TieredVlmConfig::single_model("test-model"),
+            None,
+            None,
+            Some(spec),
+            None,
+            None,
+        )
+        .await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        let evidence = result.media.unwrap();
+        assert_eq!(evidence.source_start_ms, start_ms);
+        assert_eq!(evidence.source_end_ms, end_ms);
+        let clip = fixture.0.join("clip.mp4");
+        std::fs::write(&clip, &evidence.bytes).unwrap();
+        let clip_info =
+            probe_media_info(&InputSource::FilePath(clip.to_string_lossy().into_owned())).unwrap();
+        assert_eq!(clip_info.duration_ms, Some(end_ms - start_ms));
+    }
+
+    #[tokio::test]
+    async fn legacy_clip_stops_at_target_end() {
+        assert_legacy_clip_bounds(500, Some(600), 600).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_clip_stops_at_source_end_with_or_without_a_later_target_end() {
+        assert_legacy_clip_bounds(1_900, None, 2_000).await;
+        assert_legacy_clip_bounds(1_900, Some(2_500), 2_000).await;
     }
 
     #[tokio::test]

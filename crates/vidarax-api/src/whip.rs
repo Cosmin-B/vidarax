@@ -1384,9 +1384,10 @@ struct UpdatePromptResponse {
 /// Replaces the VLM analysis prompt for a running WebRTC session and
 /// optionally sets a JSON schema for structured output. The update is sent
 /// to the live pipeline as a generation-tagged command, and the handler
-/// waits up to two seconds for a VLM worker acknowledgement. The worker
-/// applies the new values before its next work item, so `200 OK` means the
-/// update is actually in effect, not merely queued.
+/// gives queued commands a two-second deadline. Cancellation and replacement
+/// share one decision: a worker that has begun the synchronous replacement
+/// finishes it and reports its result. The worker applies the new values before
+/// its next work item, so `200 OK` means the update is actually in effect.
 ///
 /// Body: `{ "prompt": "new prompt text", "output_schema": {...} }`
 ///
@@ -1414,19 +1415,22 @@ pub async fn whip_update_prompt(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let update = session.update_config(
-        body.prompt.clone(),
-        body.output_schema.as_ref().map(Value::to_string),
-    );
-    match tokio::time::timeout(Duration::from_secs(2), update).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            tracing::warn!(sess_id = %sess_id, error = %err, "WHIP prompt update rejected");
-            return StatusCode::CONFLICT.into_response();
-        }
-        Err(_) => {
+    match session
+        .update_config_with_timeout(
+            body.prompt.clone(),
+            body.output_schema.as_ref().map(Value::to_string),
+            Duration::from_secs(2),
+        )
+        .await
+    {
+        Ok(()) => {}
+        Err(vidarax_core::webrtc::runtime::SessionControlError::TimedOut) => {
             tracing::warn!(sess_id = %sess_id, "WHIP prompt update acknowledgement timed out");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        Err(err) => {
+            tracing::warn!(sess_id = %sess_id, error = %err, "WHIP prompt update rejected");
+            return StatusCode::CONFLICT.into_response();
         }
     }
     tracing::info!(

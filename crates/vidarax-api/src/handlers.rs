@@ -1941,6 +1941,32 @@ async fn assemble_realtime_reason_response(
     })
 }
 
+fn review_plan_chunk_count(
+    media: &SemanticMediaConfig,
+    sample_count: usize,
+    first_sample_pts: u64,
+    chunk_size: usize,
+    source_duration_ms: Option<u64>,
+) -> Result<u64, String> {
+    let count = if media.mode == SemanticMediaMode::Frames || !media.timestamp_windows {
+        sample_count.div_ceil(chunk_size) as u64
+    } else {
+        let start = media.source_start_ms.unwrap_or(first_sample_pts);
+        let end = media
+            .source_end_ms
+            .or(source_duration_ms)
+            .ok_or("native review requires known source duration")?;
+        1 + end
+            .saturating_sub(start)
+            .saturating_sub(media.window_ms)
+            .div_ceil(media.window_ms - media.overlap_ms)
+    };
+    if count > 2048 {
+        return Err(format!("review exceeds 2048 chunks/windows ({count} planned); narrow the interval or split the request"));
+    }
+    Ok(count)
+}
+
 #[tracing::instrument(name = "api.reason_realtime_run", skip_all, fields(run_id))]
 pub async fn reason_realtime_run(
     State(state): State<AppState>,
@@ -2053,7 +2079,8 @@ pub async fn reason_realtime_run(
                     semantic_frames_per_chunk + usize::from(payload.visual_diff.unwrap_or(false))
                         > provider.max_input_images_for_model(model)
                 } else {
-                    provider.media_transport_for_model(model) != MediaTransport::BinaryFile
+                    (media.timestamp_windows
+                        && provider.media_transport_for_model(model) != MediaTransport::BinaryFile)
                         || media.video_fps.is_some_and(|fps| {
                             provider
                                 .max_video_fps_for_model(model)
@@ -2135,19 +2162,6 @@ pub async fn reason_realtime_run(
         }
         let start = media.source_start_ms.unwrap_or(0);
         let duration = prepared.media_info().ok().and_then(|info| info.duration_ms);
-        if media.mode != SemanticMediaMode::Frames {
-            let review_end = media
-                .source_end_ms
-                .or(duration)
-                .ok_or("native review requires known source duration")?;
-            let stride = media.window_ms - media.overlap_ms;
-            if review_end.saturating_sub(start).div_ceil(stride) > 2048 {
-                return Err(
-                    "native review exceeds 2048 windows; narrow the interval or split the request"
-                        .into(),
-                );
-            }
-        }
         if media
             .source_end_ms
             .is_some_and(|end| duration.is_some_and(|duration| end > duration))
@@ -2163,14 +2177,14 @@ pub async fn reason_realtime_run(
                 "requested source interval contains no decoded samples; increase fixed_fps".into(),
             );
         }
+        review_plan_chunk_count(&media, decoded.frame_signals.len(), decoded.frame_signals[0].pts_ms, chunk_size, duration)?;
         let decode_elapsed_us = decode_started.elapsed().as_micros() as u64;
 
         // Native media modes extract encoded windows just in time inside
         // the bounded inference tasks.
         let decoded_jpegs = if semantic_decode_enabled && media.mode == SemanticMediaMode::Frames {
-            if decoded.frame_signals.len().div_ceil(chunk_size) > 2048
-                || crate::semantic_infer::review_submission_count(&decoded.frame_signals, chunk_size, semantic_frames_per_chunk, media.context_frames, budget_previous_image) > 20_000 {
-                return Err("review exceeds 2048 chunks or 20000 image submissions across tiers; narrow the interval or split the request".into());
+            if crate::semantic_infer::review_submission_count(&decoded.frame_signals, chunk_size, semantic_frames_per_chunk, media.context_frames, budget_previous_image) > 20_000 {
+                return Err("review exceeds 20000 image submissions across tiers; narrow the interval or split the request".into());
             }
             let indices = crate::semantic_infer::review_frame_indices(
                 &decoded.frame_signals,
@@ -3326,6 +3340,86 @@ mod tests {
         let n = WAL_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("vidarax-handlers-{tag}-{n}.wal"));
         AppState::with_wal_for_tests(path)
+    }
+
+    fn plan_media(timestamp_windows: bool) -> super::SemanticMediaConfig {
+        super::SemanticMediaConfig {
+            mode: super::SemanticMediaMode::Video,
+            window_ms: 1000,
+            overlap_ms: 0,
+            timestamp_windows,
+            video_fps: None,
+            context_frames: 0,
+            source_start_ms: None,
+            source_end_ms: None,
+            resolution: vidarax_core::provider::MediaResolution::Low,
+            persist_evidence: false,
+        }
+    }
+
+    #[test]
+    fn review_plan_legacy_and_frames_use_filtered_sample_chunks() {
+        let mut media = plan_media(false);
+        for mode in [
+            super::SemanticMediaMode::Video,
+            super::SemanticMediaMode::Frames,
+        ] {
+            media.mode = mode;
+            assert_eq!(
+                super::review_plan_chunk_count(&media, 2048 * 5, 500, 5, Some(300_000)).unwrap(),
+                2048
+            );
+            assert!(
+                super::review_plan_chunk_count(&media, 2048 * 5 + 1, 500, 5, Some(300_000))
+                    .is_err()
+            );
+            let error =
+                super::review_plan_chunk_count(&media, 300 * 60, 0, 5, Some(300_000)).unwrap_err();
+            assert!(error.contains("3600 planned"), "{error}");
+            assert_eq!(
+                super::review_plan_chunk_count(&media, 10, 2500, 5, None).unwrap(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn review_plan_native_overlap_counts_only_scheduled_windows() {
+        let mut media = plan_media(true);
+        media.overlap_ms = 500;
+        assert_eq!(
+            super::review_plan_chunk_count(&media, 60, 0, 5, Some(1000)).unwrap(),
+            1
+        );
+        assert_eq!(
+            super::review_plan_chunk_count(&media, 61, 0, 5, Some(1001)).unwrap(),
+            2
+        );
+        assert_eq!(
+            super::review_plan_chunk_count(&media, 90, 0, 5, Some(1500)).unwrap(),
+            2
+        );
+        assert_eq!(
+            super::review_plan_chunk_count(&media, 91, 0, 5, Some(1501)).unwrap(),
+            3
+        );
+        assert_eq!(
+            super::review_plan_chunk_count(&media, 1, 0, 5, Some(1000 + 2047 * 500)).unwrap(),
+            2048
+        );
+        assert!(super::review_plan_chunk_count(&media, 1, 0, 5, Some(1001 + 2047 * 500)).is_err());
+        media.source_start_ms = Some(250);
+        media.source_end_ms = Some(2750);
+        assert_eq!(
+            super::review_plan_chunk_count(&media, 150, 267, 5, Some(10_000)).unwrap(),
+            4
+        );
+        media.source_start_ms = None;
+        media.source_end_ms = None;
+        assert_eq!(
+            super::review_plan_chunk_count(&media, 60, 500, 5, Some(1500)).unwrap(),
+            1
+        );
     }
 
     #[test]

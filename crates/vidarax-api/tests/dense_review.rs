@@ -411,3 +411,38 @@ async fn explicit_coverage_rejects_unsupported_controls_and_insufficient_budgets
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
+
+#[tokio::test]
+async fn legacy_video_clips_accept_json_data_url_provider_without_native_fps_controls() {
+    let fixture = Fixture::new();
+    let provider = Arc::new(Recorder {
+        native: false,
+        ..Recorder::new()
+    });
+    let (status, result, events) = run(
+        &fixture,
+        provider.clone(),
+        json!({
+            "video_clip_mode": true,
+            "video_clip_duration_s": 0.5,
+            "chunk_size": 60,
+            "semantic_inference": true,
+            "first_pass_model": "gemini-3.8-flash",
+            "second_pass_model": "gemini-3.6-flash"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let calls = provider.calls.lock().unwrap();
+    assert_eq!(calls.len(), 6);
+    assert!(calls
+        .iter()
+        .all(|call| call.video_frames == Some(30) && call.fps.is_none() && call.images == 0));
+    let chunks = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "semantic_chunk_inferred")
+        .count();
+    assert_eq!(chunks, 3);
+}

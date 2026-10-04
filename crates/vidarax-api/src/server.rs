@@ -57,6 +57,42 @@ async fn wait_for_ctrl_c() {
     tracing::info!(signal = "SIGINT", "vidarax-api shutdown signal received");
 }
 
+#[cfg(any(test, feature = "h3-experimental"))]
+async fn serve_owned_listeners(
+    h1: impl Future<Output = io::Result<()>>,
+    h3: impl Future<Output = io::Result<()>>,
+    shutdown: impl Future<Output = ()>,
+    stop: tokio::sync::watch::Sender<bool>,
+) -> io::Result<()> {
+    tokio::pin!(h1, h3, shutdown);
+    let (h1_result, h3_result) = tokio::select! {
+        result = &mut h1 => {
+            let _ = stop.send(true);
+            (result, h3.await)
+        }
+        result = &mut h3 => {
+            let _ = stop.send(true);
+            (h1.await, result)
+        }
+        _ = &mut shutdown => {
+            let _ = stop.send(true);
+            tokio::join!(h1, h3)
+        }
+    };
+    h1_result.and(h3_result)
+}
+
+#[cfg(any(test, feature = "h3-experimental"))]
+async fn drain_owned_tasks(tasks: &mut tokio::task::JoinSet<()>) -> io::Result<()> {
+    let mut first_error = None;
+    while let Some(result) = tasks.join_next().await {
+        if let Err(err) = result {
+            first_error.get_or_insert_with(|| io::Error::other(err));
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 #[cfg(feature = "h3-experimental")]
 use axum::body::Body;
 #[cfg(feature = "h3-experimental")]
@@ -72,7 +108,7 @@ use tokio_quiche::buf_factory::BufFactory;
 #[cfg(feature = "h3-experimental")]
 use tokio_quiche::http3::driver::{
     H3Event, InboundFrame, InboundFrameStream, IncomingH3Headers, OutboundFrame,
-    OutboundFrameSender, ServerEventStream, ServerH3Event,
+    OutboundFrameSender, ServerEventStream, ServerH3Controller, ServerH3Event,
 };
 #[cfg(feature = "h3-experimental")]
 use tokio_quiche::http3::settings::Http3Settings;
@@ -97,12 +133,9 @@ const MAX_H3_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 #[cfg(feature = "h3-experimental")]
 pub async fn serve_h3_experimental(config: &ServerConfig, app: Router) -> io::Result<()> {
-    let h1_addr = config.bind_addr.clone();
-    let h1_app = app.clone();
-    // Both listeners register the same process-level shutdown signal; h3 stops
-    // accepting here while the h1/h2 task drains through axum.
-    let _h1_task = tokio::spawn(async move { serve_h1h2(&h1_addr, h1_app).await });
-
+    // Bind both transports before running either listener so startup errors
+    // return to the caller without leaving a detached server behind.
+    let h1_listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     let socket = tokio::net::UdpSocket::bind(&config.h3_bind_addr).await?;
     let mut listeners = listen(
         [socket],
@@ -119,66 +152,102 @@ pub async fn serve_h3_experimental(config: &ServerConfig, app: Router) -> io::Re
     )?;
 
     tracing::info!(addr = %config.h3_bind_addr, "vidarax-api h3 listening");
-
-    let accepted_connection_stream = &mut listeners[0];
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
-    loop {
-        let conn_res = tokio::select! {
-            _ = &mut shutdown => break,
-            conn_res = accepted_connection_stream.next() => conn_res,
-        };
-
-        let Some(conn_res) = conn_res else {
-            break;
-        };
-
-        let conn = match conn_res {
-            Ok(conn) => conn,
-            Err(err) => {
-                tracing::error!(%err, "vidarax-api h3 accept error");
-                continue;
-            }
-        };
-
-        let (driver, mut controller) = ServerH3Driver::new(Http3Settings::default());
-        conn.start(driver);
-
-        let app = app.clone();
-        tokio::spawn(async move {
-            let event_rx = controller.event_receiver_mut();
-            if let Err(err) = serve_h3_connection(app, event_rx).await {
-                tracing::error!(%err, "vidarax-api h3 connection error");
-            }
-        });
-    }
-
-    Ok(())
+    let (stop_tx, mut h1_stop) = tokio::sync::watch::channel(false);
+    let mut h3_stop = h1_stop.clone();
+    let h3_stop_tx = stop_tx.clone();
+    let h1 = serve_h1h2_with_shutdown(h1_listener, app.clone(), async move {
+        let _ = h1_stop.changed().await;
+    });
+    let h3 = async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let conn_res = tokio::select! {
+                biased;
+                _ = h3_stop.changed() => break,
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(err)) = result {
+                        tracing::error!(%err, "vidarax-api h3 connection task error");
+                    }
+                    continue;
+                }
+                conn_res = listeners[0].next() => conn_res,
+            };
+            let Some(conn_res) = conn_res else {
+                break;
+            };
+            let conn = match conn_res {
+                Ok(conn) => conn,
+                Err(err) => {
+                    tracing::error!(%err, "vidarax-api h3 accept error");
+                    continue;
+                }
+            };
+            let (driver, controller) = ServerH3Driver::new(Http3Settings::default());
+            conn.start(driver);
+            let app = app.clone();
+            let stop = h3_stop.clone();
+            connections.spawn(async move {
+                if let Err(err) = serve_h3_connection(app, controller, stop).await {
+                    tracing::error!(%err, "vidarax-api h3 connection error");
+                }
+            });
+        }
+        let _ = h3_stop_tx.send(true);
+        // Keep the UDP listener alive while existing streams finish sending.
+        let result = drain_owned_tasks(&mut connections).await;
+        drop(listeners);
+        result
+    };
+    serve_owned_listeners(h1, h3, shutdown_signal(), stop_tx).await
 }
 
 #[cfg(feature = "h3-experimental")]
 async fn serve_h3_connection(
     app: Router,
-    h3_event_receiver: &mut ServerEventStream,
+    mut controller: ServerH3Controller,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
-    while let Some(event) = h3_event_receiver.recv().await {
+    let mut event_rx: ServerEventStream = controller.take_event_receiver();
+    let mut requests = tokio::task::JoinSet::new();
+    let mut connection_result = Ok(());
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = stop.changed() => break,
+            result = requests.join_next(), if !requests.is_empty() => {
+                if let Some(Err(err)) = result {
+                    tracing::error!(%err, "vidarax-api h3 request task error");
+                }
+                continue;
+            }
+            event = event_rx.recv() => event,
+        };
+        let Some(event) = event else {
+            break;
+        };
         match event {
-            ServerH3Event::Core(H3Event::ConnectionShutdown(_)) => return Ok(()),
+            ServerH3Event::Core(H3Event::ConnectionShutdown(_)) => break,
             ServerH3Event::Core(H3Event::ConnectionError(err)) => {
-                return Err(io::Error::other(err.to_string()))
+                connection_result = Err(io::Error::other(err.to_string()));
+                break;
             }
             ServerH3Event::Headers {
                 incoming_headers, ..
             } => {
                 let app = app.clone();
-                tokio::spawn(async move {
+                requests.spawn(async move {
                     handle_h3_headers(app, incoming_headers).await;
                 });
             }
             _ => {}
         }
     }
-    Ok(())
+    // Request tasks retain their stream senders through response completion.
+    let drain_result = drain_owned_tasks(&mut requests).await;
+    // The driver uses its last seen stream ID for GOAWAY, so send it only
+    // after accepted requests finish to avoid rejecting an active stream.
+    controller.send_goaway();
+    connection_result.and(drain_result)
 }
 
 #[cfg(feature = "h3-experimental")]
@@ -394,6 +463,137 @@ mod tests {
     };
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn experimental_shutdown_owns_both_listener_drains() {
+        let (h1_started_tx, h1_started_rx) = tokio::sync::oneshot::channel();
+        let (h1_release_tx, h1_release_rx) = tokio::sync::oneshot::channel();
+        let h1_state = Arc::new(Mutex::new(Some((h1_started_tx, h1_release_rx))));
+        let app = Router::new().route(
+            "/slow",
+            get(move || {
+                let (started, release) = h1_state.lock().unwrap().take().unwrap();
+                async move {
+                    started.send(()).unwrap();
+                    release.await.unwrap();
+                    "done"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop_tx, mut h1_stop) = tokio::sync::watch::channel(false);
+        let mut h3_stop = h1_stop.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (h3_started_tx, h3_started_rx) = tokio::sync::oneshot::channel();
+        let (h3_release_tx, h3_release_rx) = tokio::sync::oneshot::channel();
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        let h3 = async move {
+            let mut requests = tokio::task::JoinSet::new();
+            requests.spawn(async move {
+                h3_started_tx.send(()).unwrap();
+                h3_release_rx.await.unwrap();
+            });
+            h3_stop.changed().await.unwrap();
+            stopped_tx.send(()).unwrap();
+            super::drain_owned_tasks(&mut requests).await
+        };
+        let mut server = tokio::spawn(super::serve_owned_listeners(
+            serve_h1h2_with_shutdown(listener, app, async move {
+                h1_stop.changed().await.unwrap();
+            }),
+            h3,
+            async move {
+                shutdown_rx.await.unwrap();
+            },
+            stop_tx,
+        ));
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), h1_started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), h3_started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        shutdown_tx.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut server)
+                .await
+                .is_err(),
+            "server returned before pending requests drained"
+        );
+        tokio::time::timeout(Duration::from_secs(2), stopped_rx)
+            .await
+            .expect("H3 listener did not observe shutdown")
+            .expect("H3 listener was dropped before observing shutdown");
+        h1_release_tx.send(()).unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response).contains("done"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut server)
+                .await
+                .is_err(),
+            "server returned before the H3 request drained"
+        );
+        h3_release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_failure_stops_and_drains_other_listener() {
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let h3 = async move {
+            started_tx.send(()).unwrap();
+            stop_rx.changed().await.unwrap();
+            stopped_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            Ok(())
+        };
+        let h1 = async move {
+            started_rx.await.unwrap();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "listener failed",
+            ))
+        };
+        let mut server = tokio::spawn(super::serve_owned_listeners(
+            h1,
+            h3,
+            std::future::pending(),
+            stop_tx,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), stopped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut server)
+            .await
+            .is_err());
+        release_tx.send(()).unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
 
     #[tokio::test]
     async fn injected_shutdown_stops_h1h2_server_promptly() {
