@@ -42,7 +42,7 @@ stateful decoder and one stateful VLM worker preserve order within a stream.
 
 For the latest stable full Flash model, select `gemini-3.8-flash` and configure
 its Gemini backend. See [Gemini Flash media review](docs/gemini-flash.md) for
-aliases, image/video support, configuration, and validation limits.
+aliases, configuration, media support, request limits and evidence limits.
 
 | Input | Analysis path | Provider boundary |
 |---|---|---|

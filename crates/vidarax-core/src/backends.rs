@@ -27,7 +27,7 @@ use vidarax_contracts::models::{normalize_model_id, DEFAULT_GEMINI_MODEL};
 use crate::gemini::GeminiProvider;
 use crate::provider::{
     HttpTransport, InferenceProvider, ModelRoutingProvider, OpenAiCompatProvider, ProviderKind,
-    ProviderRouter,
+    ProviderRouter, OPENAI_COMPAT_DEFAULT_MAX_INPUT_IMAGES,
 };
 use crate::zone::RestrictedZonePolicy;
 
@@ -68,7 +68,7 @@ pub struct BackendEntry {
     /// type.
     #[serde(default)]
     pub openai_kind: Option<String>,
-    /// Declared image capacity of the deployed OpenAI-compatible model. Default 5.
+    /// Declared image capacity of the deployed OpenAI-compatible model. Default 64.
     pub max_input_images: Option<usize>,
     /// Backends are tried in ascending priority order (lowest value = first).
     #[serde(default = "default_priority")]
@@ -280,7 +280,11 @@ fn build_single_provider(
 
             Ok(Box::new(
                 OpenAiCompatProvider::new(transport, kind)
-                    .with_max_input_images(entry.max_input_images.unwrap_or(5))
+                    .with_max_input_images(
+                        entry
+                            .max_input_images
+                            .unwrap_or(OPENAI_COMPAT_DEFAULT_MAX_INPUT_IMAGES),
+                    )
                     .with_model_mapping(entry.model.clone(), entry.upstream_model.clone()),
             ))
         }
@@ -785,6 +789,53 @@ base_url = "${_VDX_TEST_URL}"
         };
         let provider = build_provider_chain(&[entry]).expect("single provider");
         assert_eq!(provider.kind(), ProviderKind::Vllm);
+    }
+
+    #[test]
+    fn openai_builder_default_capacity_preserves_live_clip_batches() {
+        let config = parse_config(
+            r#"
+[[backends]]
+name = "vllm"
+type = "openai_compat"
+base_url = "http://127.0.0.1:8000"
+"#,
+        )
+        .expect("parse backend without an explicit image capacity");
+        let provider = build_provider_chain(&config.backends).expect("build provider");
+        assert_eq!(
+            provider.max_input_images_for_model("openbmb/MiniCPM-V-4.5"),
+            64
+        );
+    }
+
+    #[test]
+    fn openai_builder_preserves_explicit_image_capacity_bounds() {
+        for capacity in [0, 1, 5, 64, 256, 257] {
+            let config = parse_config(&format!(
+                r#"
+[[backends]]
+name = "vllm"
+type = "openai_compat"
+base_url = "http://127.0.0.1:8000"
+max_input_images = {capacity}
+"#
+            ))
+            .expect("parse explicit image capacity");
+            let result = build_provider_chain(&config.backends);
+            if (1..=256).contains(&capacity) {
+                let provider = result.expect("capacity within the supported range");
+                assert_eq!(
+                    provider.max_input_images_for_model("openbmb/MiniCPM-V-4.5"),
+                    capacity
+                );
+            } else {
+                assert!(result
+                    .err()
+                    .unwrap()
+                    .contains("max_input_images must be in [1, 256]"));
+            }
+        }
     }
 
     #[test]

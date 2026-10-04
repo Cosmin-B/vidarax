@@ -98,8 +98,10 @@ optional controls.
 
 Both tier providers must declare the required capacity. Gemini accepts up to
 256 images and explicit video FPS in `(0,24]`. An OpenAI-compatible backend is
-conservatively limited to 5 images by default; set its `max_input_images` to a
-verified value (1–256) for a backend supporting more. Native FPS requires a
+limited to 64 images by default to preserve live clip batches. Set
+`max_input_images` (1–256) to match the backend capacity. Live clip admission
+checks both inference tiers before startup. Configure failover backends for
+compatible image counts. Native FPS requires a
 provider declaring that capability. Dense and native requests disable fallback
 that could discard controls.
 
@@ -143,8 +145,8 @@ is the requested interval; `provider_sampling_status` is `requested_unverified`
 when FPS is specified. No service acknowledgment/effective-rate measurement is
 available in this path. `timestamp_resolution_ms` remains conservative (1000 ms
 for Gemini). None of these fields guarantees observation of every source frame
-or localization accuracy. Live acceptance and effective sampling still require
-an authorized evaluation.
+or localization accuracy. Measure live acceptance and effective sampling on
+representative footage.
 
 ## Visual-review quality and operating limits
 

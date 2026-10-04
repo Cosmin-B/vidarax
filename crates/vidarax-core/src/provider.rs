@@ -540,6 +540,9 @@ pub struct OpenAiCompatProvider<T: Transport> {
     max_input_images: usize,
 }
 
+/// Default image capacity includes the largest supported live clip batch.
+pub const OPENAI_COMPAT_DEFAULT_MAX_INPUT_IMAGES: usize = 64;
+
 impl<T: Transport> OpenAiCompatProvider<T> {
     pub fn new(transport: T, kind: ProviderKind) -> Self {
         Self {
@@ -547,7 +550,7 @@ impl<T: Transport> OpenAiCompatProvider<T> {
             kind,
             served_model: None,
             upstream_model: None,
-            max_input_images: 5,
+            max_input_images: OPENAI_COMPAT_DEFAULT_MAX_INPUT_IMAGES,
             model_cache: ArcSwap::from(Arc::new(Arc::from(""))),
         }
     }
@@ -1170,6 +1173,52 @@ mod tests {
         format!(
             "{{\"id\":\"cmpl\",\"choices\":[{{\"message\":{{\"role\":\"assistant\",\"content\":\"{text}\"}}}}]}}"
         )
+    }
+
+    #[test]
+    fn openai_default_capacity_preserves_live_clip_batches() {
+        let provider = OpenAiCompatProvider::new(
+            MockTransport::ok(&completion_json("ok")),
+            ProviderKind::Vllm,
+        );
+        assert_eq!(
+            provider.max_input_images_for_model("openbmb/MiniCPM-V-4.5"),
+            64
+        );
+        let mut req = request();
+        req.input_images = vec![
+            InferenceImage {
+                media_type: "image/jpeg",
+                data_base64: "YWJj".into(),
+            };
+            64
+        ];
+        provider.infer(&req).unwrap();
+        assert_eq!(provider.transport.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn openai_explicit_capacity_rejects_before_transport() {
+        let provider = OpenAiCompatProvider::new(
+            MockTransport::ok(&completion_json("ok")),
+            ProviderKind::Vllm,
+        )
+        .with_max_input_images(5);
+        let mut req = request();
+        req.input_images = vec![
+            InferenceImage {
+                media_type: "image/jpeg",
+                data_base64: "YWJj".into(),
+            };
+            5
+        ];
+        provider.infer(&req).unwrap();
+        req.input_images.push(req.input_images[0].clone());
+        assert!(matches!(
+            provider.infer(&req),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+        assert_eq!(provider.transport.calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
