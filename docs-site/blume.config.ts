@@ -29,6 +29,7 @@ export default defineConfig({
         page("Architecture", "/architecture"),
         page("Ingest", "/ingest"),
         page("Local audio", "/audio"),
+        page("Gemini Flash review", "/gemini-flash"),
         page("Mage-VL debug", "/mage-vl"),
         page("Per-frame filter", "/gate"),
         page("API reference", "/api"),

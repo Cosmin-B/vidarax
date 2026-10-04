@@ -212,29 +212,44 @@ impl DeliveryHub {
         &self.metrics
     }
 
-    async fn reserve(&self, config: WebhookConfig) -> Result<String, String> {
+    async fn register(
+        &self,
+        state: AppState,
+        config: WebhookConfig,
+    ) -> Result<(String, u64), WebhookRegistrationError> {
         if !self.webhooks_enabled {
-            return Err(
-                "webhook delivery requires VIDARAX_WEBHOOK_SECRET with at least 32 bytes"
-                    .to_string(),
-            );
+            return Err(WebhookRegistrationError::Unavailable(
+                "webhook delivery requires VIDARAX_WEBHOOK_SECRET with at least 32 bytes".into(),
+            ));
         }
         let (reply, response) = oneshot::channel();
         self.commands
-            .send(WebhookCommand::Reserve { config, reply })
+            .send(WebhookCommand::Register {
+                state,
+                config,
+                reply,
+            })
             .await
-            .map_err(|_| "webhook coordinator is closed".to_string())?;
-        response
-            .await
-            .map_err(|_| "webhook coordinator dropped its reply".to_string())?
+            .map_err(|_| {
+                WebhookRegistrationError::Unavailable("webhook coordinator is closed".into())
+            })?;
+        response.await.map_err(|_| {
+            WebhookRegistrationError::Unavailable("webhook coordinator dropped its reply".into())
+        })?
     }
 
-    async fn activate(&self, webhook_id: String, registered_seq: u64) -> Result<(), String> {
+    async fn unregister(
+        &self,
+        state: AppState,
+        run_id: String,
+        webhook_id: String,
+    ) -> Result<(), String> {
         let (reply, response) = oneshot::channel();
         self.commands
-            .send(WebhookCommand::Activate {
+            .send(WebhookCommand::Unregister {
+                state,
+                run_id,
                 webhook_id,
-                registered_seq,
                 reply,
             })
             .await
@@ -242,13 +257,6 @@ impl DeliveryHub {
         response
             .await
             .map_err(|_| "webhook coordinator dropped its reply".to_string())?
-    }
-
-    async fn cancel_reservation(&self, webhook_id: String) {
-        let _ = self
-            .commands
-            .send(WebhookCommand::Remove { webhook_id })
-            .await;
     }
 
     async fn list(&self, run_id: String) -> Result<Vec<WebhookSummary>, String> {
@@ -564,39 +572,17 @@ pub(crate) async fn create_webhook(
         event_kinds: event_kinds.clone(),
         registered_seq: 0,
     };
-    let signing_secret = match state.delivery().reserve(config).await {
-        Ok(secret) => secret,
-        Err(err) => {
-            return service_unavailable(&state, "webhooks_unavailable", err).into_response()
-        }
-    };
-    let event = match state
-        .append_run_event_async(
-            &run_id,
-            "webhook_registered",
-            json!({
-                "webhook_id": webhook_id,
-                "url": url,
-                "event_kinds": event_kinds,
-            }),
-        )
-        .await
-    {
-        Ok(event) => event,
-        Err(err) => {
-            state.delivery().cancel_reservation(webhook_id).await;
-            return internal_error(&state, format!("failed to persist webhook: {err}"))
-                .into_response();
-        }
-    };
-    if let Err(err) = state
-        .delivery()
-        .activate(webhook_id.clone(), event.seq)
-        .await
-    {
-        return internal_error(&state, format!("failed to activate webhook: {err}"))
-            .into_response();
-    }
+    let (signing_secret, registered_seq) =
+        match state.delivery().register(state.clone(), config).await {
+            Ok(result) => result,
+            Err(WebhookRegistrationError::Unavailable(err)) => {
+                return service_unavailable(&state, "webhooks_unavailable", err).into_response()
+            }
+            Err(WebhookRegistrationError::Persistence(err)) => {
+                return internal_error(&state, format!("failed to persist webhook: {err}"))
+                    .into_response()
+            }
+        };
     (
         StatusCode::CREATED,
         Json(json!({
@@ -605,7 +591,7 @@ pub(crate) async fn create_webhook(
             "webhook_id": webhook_id,
             "url": url,
             "event_kinds": event_kinds,
-            "registered_seq": event.seq,
+            "registered_seq": registered_seq,
             "signing_secret": signing_secret,
         })),
     )
@@ -655,20 +641,13 @@ pub(crate) async fn delete_webhook(
         .into_response();
     }
     if let Err(err) = state
-        .append_run_event_async(
-            &run_id,
-            "webhook_deleted",
-            json!({ "webhook_id": webhook_id }),
-        )
+        .delivery()
+        .unregister(state.clone(), run_id.clone(), webhook_id.clone())
         .await
     {
         return internal_error(&state, format!("failed to persist webhook deletion: {err}"))
             .into_response();
     }
-    state
-        .delivery()
-        .cancel_reservation(webhook_id.clone())
-        .await;
     ok(json!({
         "request_id": state.next_request_id(),
         "run_id": run_id,
@@ -678,18 +657,23 @@ pub(crate) async fn delete_webhook(
     .into_response()
 }
 
+#[derive(Debug)]
+enum WebhookRegistrationError {
+    Unavailable(String),
+    Persistence(String),
+}
+
 enum WebhookCommand {
-    Reserve {
+    Register {
+        state: AppState,
         config: WebhookConfig,
-        reply: oneshot::Sender<Result<String, String>>,
+        reply: oneshot::Sender<Result<(String, u64), WebhookRegistrationError>>,
     },
-    Activate {
+    Unregister {
+        state: AppState,
+        run_id: String,
         webhook_id: String,
-        registered_seq: u64,
         reply: oneshot::Sender<Result<(), String>>,
-    },
-    Remove {
-        webhook_id: String,
     },
     List {
         run_id: String,
@@ -747,62 +731,70 @@ async fn run_coordinator(
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 match command {
-                    WebhookCommand::Reserve { config, reply } => {
-                        let result = if secret.is_none() {
-                            Err("webhook delivery requires VIDARAX_WEBHOOK_SECRET with at least 32 bytes".to_string())
+                    WebhookCommand::Register { state, mut config, reply } => {
+                        let unavailable = if secret.is_none() {
+                            Some("webhook delivery requires VIDARAX_WEBHOOK_SECRET with at least 32 bytes".to_string())
                         } else if delivery_log.is_none() {
-                            Err("webhook delivery log is unavailable".to_string())
+                            Some("webhook delivery log is unavailable".to_string())
                         } else if hooks.len() >= MAX_WEBHOOKS {
-                            Err(format!("webhook limit reached ({MAX_WEBHOOKS})"))
+                            Some(format!("webhook limit reached ({MAX_WEBHOOKS})"))
                         } else if hooks.contains_key(&config.webhook_id) {
-                            Err("webhook id collision".to_string())
+                            Some("webhook id collision".to_string())
                         } else {
-                            let hook_secret = derive_webhook_secret(
-                                secret.as_ref().expect("enabled webhooks require a secret").as_bytes(),
-                                &config,
-                            );
-                            hooks.insert(config.webhook_id.clone(), HookEntry {
-                                config,
-                                wake: None,
-                                stop: None,
-                                status: Arc::new(Mutex::new(WorkerStatus::default())),
-                            });
-                            metrics.webhook_configured.store(hooks.len() as u64, Ordering::Relaxed);
-                            Ok(hex_bytes(&hook_secret))
+                            None
                         };
-                        let _ = reply.send(result);
-                    }
-                    WebhookCommand::Activate { webhook_id, registered_seq, reply } => {
-                        let result = match hooks.get_mut(&webhook_id) {
-                            Some(entry) if entry.wake.is_none() => {
-                                entry.config.registered_seq = registered_seq;
+                        if let Some(error) = unavailable {
+                            let _ = reply.send(Err(WebhookRegistrationError::Unavailable(error)));
+                            continue;
+                        }
+                        // The coordinator owns persistence and activation together. The state
+                        // is retained only until this command finishes, including if its reply closes.
+                        let result = state.append_run_event_async(
+                            &config.run_id, "webhook_registered", json!({
+                                "webhook_id": config.webhook_id, "url": config.url,
+                                "event_kinds": config.event_kinds,
+                            }),
+                        ).await;
+                        match result {
+                            Ok(event) => {
+                                config.registered_seq = event.seq;
                                 let hook_secret = derive_webhook_secret(
-                                    secret.as_ref().expect("reservation required secret").as_bytes(),
-                                    &entry.config,
+                                    secret.as_ref().expect("enabled webhooks require a secret").as_bytes(), &config,
                                 );
-                                let activated = spawn_hook_worker(
-                                    entry.config.clone(),
-                                    WorkerStatus { last_terminal_seq: registered_seq, ..WorkerStatus::default() },
+                                let entry = spawn_hook_worker(
+                                    config.clone(),
+                                    WorkerStatus { last_terminal_seq: event.seq, ..WorkerStatus::default() },
                                     wal.clone(),
-                                    Arc::clone(delivery_log.as_ref().expect("reservation required delivery log")),
+                                    Arc::clone(delivery_log.as_ref().expect("enabled webhooks require a delivery log")),
                                     Arc::<[u8]>::from(hook_secret),
                                     Arc::clone(&metrics),
                                 );
-                                *entry = activated;
-                                Ok(())
+                                hooks.insert(config.webhook_id.clone(), entry);
+                                metrics.webhook_configured.store(hooks.len() as u64, Ordering::Relaxed);
+                                let _ = reply.send(Ok((hex_bytes(&hook_secret), event.seq)));
                             }
-                            Some(_) => Err("webhook is already active".to_string()),
-                            None => Err("webhook reservation was not found".to_string()),
-                        };
-                        let _ = reply.send(result);
-                    }
-                    WebhookCommand::Remove { webhook_id } => {
-                        if let Some(mut hook) = hooks.remove(&webhook_id) {
-                            if let Some(stop) = hook.stop.take() {
-                                let _ = stop.send(());
+                            Err(error) => {
+                                // No entry is published before persistence succeeds.
+                                let _ = reply.send(Err(WebhookRegistrationError::Persistence(error)));
                             }
                         }
-                        metrics.webhook_configured.store(hooks.len() as u64, Ordering::Relaxed);
+                    }
+                    WebhookCommand::Unregister { state, run_id, webhook_id, reply } => {
+                        let result = state.append_run_event_async(
+                            &run_id, "webhook_deleted", json!({ "webhook_id": webhook_id }),
+                        ).await;
+                        match result {
+                            Ok(_) => {
+                                if let Some(mut hook) = hooks.remove(&webhook_id) {
+                                    if let Some(stop) = hook.stop.take() {
+                                        let _ = stop.send(());
+                                    }
+                                }
+                                metrics.webhook_configured.store(hooks.len() as u64, Ordering::Relaxed);
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(error) => { let _ = reply.send(Err(error)); }
+                        }
                     }
                     WebhookCommand::List { run_id, reply } => {
                         let mut summaries = hooks.values()
@@ -1397,6 +1389,187 @@ mod tests {
         drop(log);
         std::fs::remove_file(path).unwrap();
         std::fs::remove_file(log_path).unwrap();
+    }
+
+    fn cancellation_config() -> WebhookConfig {
+        WebhookConfig {
+            webhook_id: "wh_cancel".into(),
+            run_id: "run-cancel".into(),
+            url: "https://unused.invalid/hook".into(),
+            event_kinds: vec!["never-emitted".into()],
+            registered_seq: 0,
+        }
+    }
+
+    fn wait_for_delivery_shutdown(state: AppState) {
+        let metrics = Arc::downgrade(state.delivery().metrics());
+        drop(state);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while metrics.strong_count() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "delivery coordinator retained application state"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    async fn cancellation_case(fail: bool, delete: bool) {
+        let path = test_path("webhook-cancellation");
+        let state = AppState::with_wal_for_tests_and_webhook_secret(
+            path.clone(),
+            "test-only-webhook-secret-32-bytes!".into(),
+        );
+        if delete {
+            state
+                .delivery()
+                .register(state.clone(), cancellation_config())
+                .await
+                .unwrap();
+        }
+        state.pause_timeline_appends_for_tests();
+        state.set_timeline_append_failure_for_tests(fail);
+        let task_state = state.clone();
+        let request = tokio::spawn(async move {
+            if delete {
+                task_state
+                    .delivery()
+                    .unregister(task_state.clone(), "run-cancel".into(), "wh_cancel".into())
+                    .await
+            } else {
+                task_state
+                    .delivery()
+                    .register(task_state.clone(), cancellation_config())
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:?}"))
+            }
+        });
+        state.wait_until_timeline_writer_paused_for_tests();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        state.resume_timeline_appends_for_tests();
+        // A writer barrier observes the accepted command after it is committed or rejected.
+        let barrier = tokio::time::timeout(
+            Duration::from_secs(3),
+            state.append_run_event_async("run-barrier", "barrier", json!({})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(barrier.is_err(), fail);
+        state.set_timeline_append_failure_for_tests(false);
+        let hooks = tokio::time::timeout(
+            Duration::from_secs(3),
+            state.delivery().list("run-cancel".into()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let events = vidarax_core::timeline::read_all_events(&path).unwrap();
+        let restored = restore_webhook_configs(&events);
+        if delete != fail {
+            assert!(
+                hooks.is_empty(),
+                "cancelled operation left a live reservation or worker"
+            );
+            assert!(restored.is_empty());
+        } else {
+            assert_eq!(hooks.len(), 1);
+            assert_eq!(
+                hooks[0].state, "active",
+                "durable registration remained pending after cancellation"
+            );
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored[0].registered_seq, hooks[0].registered_seq);
+        }
+        assert_eq!(
+            state
+                .delivery()
+                .metrics()
+                .webhook_attempts
+                .load(Ordering::Relaxed),
+            0
+        );
+        wait_for_delivery_shutdown(state);
+        let _ = std::fs::remove_file(path.clone());
+        let _ = std::fs::remove_file(delivery_log_path_for(&path));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn webhook_create_completes_after_request_cancellation() {
+        cancellation_case(false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn webhook_create_rolls_back_after_request_cancellation_and_wal_failure() {
+        cancellation_case(true, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn webhook_delete_completes_after_request_cancellation() {
+        cancellation_case(false, true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn webhook_delete_failure_preserves_hook_after_request_cancellation() {
+        cancellation_case(true, true).await;
+    }
+
+    #[test]
+    fn webhook_create_finishes_after_request_runtime_shutdown() {
+        let path = test_path("webhook-runtime-shutdown");
+        let state = AppState::with_wal_for_tests_and_webhook_secret(
+            path.clone(),
+            "test-only-webhook-secret-32-bytes!".into(),
+        );
+        state.pause_timeline_appends_for_tests();
+        let request_state = state.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::spawn(async move {
+                request_state
+                    .delivery()
+                    .register(request_state.clone(), cancellation_config())
+                    .await
+            });
+            tokio::task::yield_now().await;
+        });
+        state.wait_until_timeline_writer_paused_for_tests();
+        drop(runtime);
+        state.resume_timeline_appends_for_tests();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hooks = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                state.delivery().list("run-cancel".into()),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        });
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].state, "active");
+        let restored =
+            restore_webhook_configs(&vidarax_core::timeline::read_all_events(&path).unwrap());
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].registered_seq, hooks[0].registered_seq);
+        assert_eq!(
+            state
+                .delivery()
+                .metrics()
+                .webhook_attempts
+                .load(Ordering::Relaxed),
+            0
+        );
+        wait_for_delivery_shutdown(state);
+        let _ = std::fs::remove_file(path.clone());
+        let _ = std::fs::remove_file(delivery_log_path_for(&path));
     }
 
     #[test]

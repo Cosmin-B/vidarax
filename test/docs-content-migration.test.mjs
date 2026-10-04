@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,14 +11,16 @@ const docsRoot = path.join(repositoryRoot, 'docs-site', 'src', 'content', 'docs'
 const docsSiteRoot = path.join(repositoryRoot, 'docs-site');
 const manifest = JSON.parse(await readFile(path.join(docsSiteRoot, 'source-manifest.json'), 'utf8'));
 
-test('the 22 pinned Vidarax pages use Blume routes and preserve executable examples', async () => {
+test('the pinned Vidarax pages keep Blume routes and converted executable examples', async () => {
   assert.equal(manifest.files.length, 22);
   const currentPages = await collectMarkdown(docsRoot);
-  assert.equal(currentPages.length, 22);
+  const currentPagePaths = new Set(currentPages);
 
   for (const entry of manifest.files) {
     const relative = entry.path.slice('docs-site/src/content/docs/'.length).replace(/\.mdoc$/, '.mdx');
-    const current = await readFile(path.join(docsRoot, relative), 'utf8');
+    const currentPath = path.join(docsRoot, relative);
+    assert.ok(currentPagePaths.has(currentPath), `missing pinned page: ${relative}`);
+    const current = await readFile(currentPath, 'utf8');
     assert.doesNotMatch(withoutFences(current), /\]\(\/docs(?:\/|[#)])/);
     if (entry.route) assert.match(current, new RegExp(`^---\\n[\\s\\S]*?\\nslug: ${escapeRegExp(entry.route)}\\n`));
     else assert.match(current, /^---\n[\s\S]*?\n---\n/);
@@ -25,7 +28,10 @@ test('the 22 pinned Vidarax pages use Blume routes and preserve executable examp
       cwd: repositoryRoot,
       encoding: 'utf8',
     });
-    assert.deepEqual(fencedPayloads(current), fencedPayloads(original), entry.path);
+    assert.equal(createHash('sha256').update(original).digest('hex'), entry.sha256, entry.path);
+    if (entry.path.endsWith('.mdoc')) {
+      assert.deepEqual(fencedPayloads(current), fencedPayloads(original), entry.path);
+    }
   }
 
   const quickstart = await readFile(path.join(docsRoot, 'quickstart.mdx'), 'utf8');

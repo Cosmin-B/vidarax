@@ -151,7 +151,7 @@ fn whip_setup_error_response(err: &WebRtcSetupError) -> (StatusCode, &'static st
 /// - `Location: /v1/stream/whip/{sess_id}` header
 ///
 /// Errors:
-/// - `400` — empty or non-UTF-8 SDP offer body
+/// - `400` — invalid offer body or live clip exceeds an inference tier's image capacity
 /// - `415` — offer video cannot be served (no live-serveable codec, or multiple video m-sections)
 /// - `500` — malformed SDP, rustrtc, or ICE negotiation failure
 #[tracing::instrument(name = "whip.offer", skip_all)]
@@ -182,6 +182,18 @@ pub async fn whip_offer(
         Ok(config) => config,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
+
+    let requested_clip = attach_config
+        .as_ref()
+        .and_then(|config| config.clip_mode.clone())
+        .map(|clip| clip.into_core());
+    if let Err(message) = validate_whip_image_capacity(
+        state.provider().map(|provider| provider.as_ref()),
+        &state.webrtc_config().vlm_tiering,
+        requested_clip.as_ref(),
+    ) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
 
     // Create the rustrtc PeerConnection and negotiate the SDP answer.
     let generation = state.next_pipeline_generation();
@@ -239,6 +251,14 @@ async fn start_whip_session(
     live_audio_runtime: Option<LiveAudioRuntime>,
     commands: tokio::sync::mpsc::Receiver<SessionCommand>,
 ) -> Response {
+    if let Err(message) = validate_whip_image_capacity(
+        state.provider().map(|provider| provider.as_ref()),
+        &state.webrtc_config().vlm_tiering,
+        clip_config.as_ref(),
+    ) {
+        session.close();
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
     let sess_id = new_session_id();
     let principal = state.security_policy().principal_key_from_headers(&headers);
 
@@ -725,6 +745,37 @@ fn parse_attach_config_header(headers: &HeaderMap) -> Result<Option<AttachStream
     serde_json::from_str::<AttachStreamRequest>(json)
         .map(Some)
         .map_err(|err| format!("invalid {ATTACH_CONFIG_HEADER}: {err}"))
+}
+
+fn validate_whip_image_capacity(
+    provider: Option<&(dyn InferenceProvider + Send + Sync)>,
+    tiering: &vidarax_core::tiered_vlm::TieredVlmConfig,
+    clip: Option<&CoreClipConfig>,
+) -> Result<(), String> {
+    let required_images = match clip {
+        Some(clip) => {
+            clip.validate()?;
+            // Match the accumulator's millisecond truncation and include both
+            // the first image and the sample that reaches the window boundary.
+            let interval_ms = 1000 / u64::from(clip.target_fps);
+            let window_ms = (clip.clip_length_seconds * 1000.0) as u64;
+            (window_ms.div_ceil(interval_ms) as usize + 1)
+                .min(vidarax_core::webrtc::clip::MAX_CLIP_FRAMES_PER_REQUEST)
+        }
+        None => 1,
+    };
+    let Some(provider) = provider else {
+        return Ok(());
+    };
+    for model in [&tiering.first_pass_model, &tiering.second_pass_model] {
+        let capacity = provider.max_input_images_for_model(model);
+        if capacity < required_images {
+            return Err(format!(
+                "live configuration requires capacity for {required_images} images, but model '{model}' allows {capacity}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn apply_attach_config(
@@ -1384,9 +1435,10 @@ struct UpdatePromptResponse {
 /// Replaces the VLM analysis prompt for a running WebRTC session and
 /// optionally sets a JSON schema for structured output. The update is sent
 /// to the live pipeline as a generation-tagged command, and the handler
-/// waits up to two seconds for a VLM worker acknowledgement. The worker
-/// applies the new values before its next work item, so `200 OK` means the
-/// update is actually in effect, not merely queued.
+/// gives queued commands a two-second deadline. Cancellation and replacement
+/// share one decision: a worker that has begun the synchronous replacement
+/// finishes it and reports its result. The worker applies the new values before
+/// its next work item, so `200 OK` means the update is actually in effect.
 ///
 /// Body: `{ "prompt": "new prompt text", "output_schema": {...} }`
 ///
@@ -1414,19 +1466,22 @@ pub async fn whip_update_prompt(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let update = session.update_config(
-        body.prompt.clone(),
-        body.output_schema.as_ref().map(Value::to_string),
-    );
-    match tokio::time::timeout(Duration::from_secs(2), update).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            tracing::warn!(sess_id = %sess_id, error = %err, "WHIP prompt update rejected");
-            return StatusCode::CONFLICT.into_response();
-        }
-        Err(_) => {
+    match session
+        .update_config_with_timeout(
+            body.prompt.clone(),
+            body.output_schema.as_ref().map(Value::to_string),
+            Duration::from_secs(2),
+        )
+        .await
+    {
+        Ok(()) => {}
+        Err(vidarax_core::webrtc::runtime::SessionControlError::TimedOut) => {
             tracing::warn!(sess_id = %sess_id, "WHIP prompt update acknowledgement timed out");
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        Err(err) => {
+            tracing::warn!(sess_id = %sess_id, error = %err, "WHIP prompt update rejected");
+            return StatusCode::CONFLICT.into_response();
         }
     }
     tracing::info!(
@@ -1478,6 +1533,195 @@ mod tests {
             vidarax_core::webrtc::runtime::PipelineGeneration::new(1),
         );
         (Arc::new(session), commands)
+    }
+
+    struct ImageCapacityProvider {
+        first: usize,
+        second: usize,
+    }
+
+    impl super::InferenceProvider for ImageCapacityProvider {
+        fn kind(&self) -> super::ProviderKind {
+            super::ProviderKind::Vllm
+        }
+
+        fn infer(
+            &self,
+            _: &super::InferenceRequest,
+        ) -> Result<super::InferenceResult, super::ProviderError> {
+            panic!("image admission must not invoke inference")
+        }
+
+        fn max_input_images_for_model(&self, model: &str) -> usize {
+            if model == "Qwen/Qwen3-VL-2B-Instruct" {
+                self.first
+            } else {
+                self.second
+            }
+        }
+    }
+
+    fn capacity_tiering() -> vidarax_core::tiered_vlm::TieredVlmConfig {
+        vidarax_core::tiered_vlm::TieredVlmConfig {
+            first_pass_model: Arc::from("Qwen/Qwen3-VL-2B-Instruct"),
+            second_pass_model: Arc::from("Qwen/Qwen3-VL-8B-Instruct"),
+            second_pass_threshold: 0.7,
+            second_pass_max_tokens: 256,
+        }
+    }
+
+    fn capacity_clip(fps: u32, seconds: f32) -> super::CoreClipConfig {
+        super::CoreClipConfig {
+            target_fps: fps,
+            clip_length_seconds: seconds,
+            delay_seconds: 0.0,
+        }
+    }
+
+    #[test]
+    fn whip_image_capacity_accepts_supported_clip_windows() {
+        let provider = ImageCapacityProvider {
+            first: 64,
+            second: 64,
+        };
+        let tiering = capacity_tiering();
+        for clip in [capacity_clip(10, 1.0), capacity_clip(30, 60.0)] {
+            super::validate_whip_image_capacity(Some(&provider), &tiering, Some(&clip)).unwrap();
+        }
+    }
+
+    #[test]
+    fn whip_image_capacity_checks_each_inference_tier() {
+        let clip = capacity_clip(10, 1.0);
+        for provider in [
+            ImageCapacityProvider {
+                first: 10,
+                second: 64,
+            },
+            ImageCapacityProvider {
+                first: 64,
+                second: 10,
+            },
+        ] {
+            let err = super::validate_whip_image_capacity(
+                Some(&provider),
+                &capacity_tiering(),
+                Some(&clip),
+            )
+            .unwrap_err();
+            assert!(err.contains("11 images"), "{err}");
+        }
+    }
+
+    #[test]
+    fn whip_image_capacity_includes_endpoint_and_integer_sampling_interval() {
+        let provider = ImageCapacityProvider {
+            first: 4,
+            second: 4,
+        };
+        for clip in [capacity_clip(6, 0.5), capacity_clip(30, 0.1)] {
+            let err = super::validate_whip_image_capacity(
+                Some(&provider),
+                &capacity_tiering(),
+                Some(&clip),
+            )
+            .unwrap_err();
+            assert!(err.contains("5 images"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn whip_image_capacity_rejects_before_persistence_or_session_start() {
+        let state = AppState::with_wal_for_tests_and_endpoints(
+            std::env::temp_dir().join(format!(
+                "vidarax-whip-image-capacity-{}.wal",
+                std::process::id()
+            )),
+            Some(Arc::new(ImageCapacityProvider {
+                first: 5,
+                second: 5,
+            })),
+        );
+        let (session, commands) = test_pipeline_session();
+        let response = start_whip_session(
+            state.clone(),
+            HeaderMap::new(),
+            Arc::clone(&session),
+            "v=0\r\n".into(),
+            Some(capacity_clip(10, 1.0)),
+            None,
+            commands,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.session_count(), 0);
+        assert!(state.read_all_events().unwrap().is_empty());
+        assert_eq!(session.close_call_count_for_tests(), 1);
+    }
+
+    #[tokio::test]
+    async fn whip_image_capacity_supported_clip_starts_and_terminates() {
+        for (capacity, clip) in [(11, capacity_clip(10, 1.0)), (64, capacity_clip(30, 60.0))] {
+            let state = AppState::with_wal_for_tests_and_endpoints(
+                std::env::temp_dir().join(format!(
+                    "vidarax-whip-image-capacity-accepted-{capacity}-{}.wal",
+                    std::process::id()
+                )),
+                Some(Arc::new(ImageCapacityProvider {
+                    first: capacity,
+                    second: capacity,
+                })),
+            );
+            let (session, commands) = test_pipeline_session();
+            let response = start_whip_session(
+                state.clone(),
+                HeaderMap::new(),
+                Arc::clone(&session),
+                "v=0\r\n".into(),
+                Some(clip),
+                None,
+                commands,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let run_id = response.headers()[RUN_ID_HEADER].to_str().unwrap();
+            let location = response.headers()[axum::http::header::LOCATION]
+                .to_str()
+                .unwrap();
+            let sess_id = location.strip_prefix("/v1/stream/whip/").unwrap();
+            assert_eq!(state.session_count(), 1);
+            assert_eq!(state.count_active_runs_for_principal("public", now_ms()), 1);
+            assert_eq!(session.close_call_count_for_tests(), 0);
+            assert_eq!(
+                state
+                    .read_run_events(run_id)
+                    .unwrap()
+                    .iter()
+                    .filter(|event| event.kind == "run_created")
+                    .count(),
+                1
+            );
+
+            let status = whip_terminate(
+                State(state.clone()),
+                Path(sess_id.to_string()),
+                HeaderMap::new(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(state.session_count(), 0);
+            assert_eq!(state.count_active_runs_for_principal("public", now_ms()), 0);
+            assert_eq!(session.close_call_count_for_tests(), 1);
+            let events = state.read_run_events(run_id).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.kind == "run_completed")
+                    .count(),
+                1
+            );
+            assert!(events.iter().all(|event| event.kind != "run_deleted"));
+        }
     }
 
     #[test]

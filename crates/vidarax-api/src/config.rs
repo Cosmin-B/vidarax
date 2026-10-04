@@ -35,6 +35,7 @@ pub fn load_backend_config(
                     model: None,
                     upstream_model: None,
                     openai_kind: Some("vllm".to_string()),
+                    max_input_images: None,
                     priority: 1,
                 });
             }
@@ -47,6 +48,7 @@ pub fn load_backend_config(
                     model: None,
                     upstream_model: None,
                     openai_kind: Some("sglang".to_string()),
+                    max_input_images: None,
                     priority: 2,
                 });
             }

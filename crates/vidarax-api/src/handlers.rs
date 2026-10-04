@@ -19,8 +19,7 @@ use vidarax_core::audio_sidecar::AudioSidecarClient;
 use vidarax_core::coordinates::{FrameCoordinates, IMAGE_COORDINATE_SCHEMA};
 use vidarax_core::gate::{FrameSignal, GateEventType};
 use vidarax_core::ingest::{
-    compute_semantic_frame_indices, prepare_source_for_reuse, probe_source_fps, DecodedJpegFrame,
-    InputSource, Mp4DecodeConfig,
+    prepare_source_for_reuse, probe_source_fps, DecodedJpegFrame, InputSource, Mp4DecodeConfig,
 };
 use vidarax_core::pipeline::{TwoPassConfig, TwoPassPipeline};
 use vidarax_core::provider::{
@@ -1145,13 +1144,28 @@ fn validate_realtime_reason_params(
     }
     let semantic_inference = payload.semantic_inference.unwrap_or(true);
     let semantic_frames_per_chunk = payload.semantic_frames_per_chunk.unwrap_or(2);
-    if !(1..=4).contains(&semantic_frames_per_chunk) {
+    if !(1..=256).contains(&semantic_frames_per_chunk) {
         return Err(validation_error(
             state,
             "invalid realtime reason request",
             vec![field_error(
                 "semantic_frames_per_chunk",
-                "semantic_frames_per_chunk must be in [1, 4]".to_string(),
+                "semantic_frames_per_chunk must be in [1, 256]".to_string(),
+            )],
+        ));
+    }
+    let context_frames = payload.semantic_context_frames.unwrap_or(0);
+    if context_frames > 128
+        || payload
+            .source_end_ms
+            .is_some_and(|end| end <= payload.source_start_ms.unwrap_or(0))
+    {
+        return Err(validation_error(
+            state,
+            "invalid review coverage",
+            vec![field_error(
+                "semantic_context_frames/source_end_ms",
+                "context must be <=128 and source_end_ms must exceed source_start_ms".into(),
             )],
         ));
     }
@@ -1248,7 +1262,33 @@ fn validate_realtime_reason_params(
                 )],
             ));
         }
+        let overlap_ms = options.overlap_ms.unwrap_or(0);
+        if overlap_ms >= window_ms
+            || overlap_ms > window_ms / 2
+            || (mode == SemanticMediaMode::Frames
+                && (overlap_ms > 0 || options.video_fps.is_some()))
+        {
+            return Err(validation_error(state, "invalid media controls", vec![field_error("media.overlap_ms", "overlap must be <= half the window and native video controls require video/audio_video mode".into())]));
+        }
+        if options
+            .video_fps
+            .is_some_and(|fps| !fps.is_finite() || fps <= 0.0 || fps > 24.0)
+        {
+            return Err(validation_error(
+                state,
+                "invalid media controls",
+                vec![field_error(
+                    "media.video_fps",
+                    "video_fps must be finite and in (0, 24]".into(),
+                )],
+            ));
+        }
         SemanticMediaConfig {
+            overlap_ms,
+            video_fps: options.video_fps,
+            context_frames,
+            source_start_ms: payload.source_start_ms,
+            source_end_ms: payload.source_end_ms,
             mode,
             window_ms,
             resolution: options
@@ -1263,17 +1303,24 @@ fn validate_realtime_reason_params(
     } else {
         let legacy_video = payload.video_clip_mode.unwrap_or(false);
         let duration_s = payload.video_clip_duration_s.unwrap_or(0.5);
-        if legacy_video && (!duration_s.is_finite() || duration_s <= 0.0 || duration_s > 60.0) {
+        // Reject sub-millisecond windows before conversion: a positive float
+        // can otherwise round to zero and become a zero scheduling stride.
+        if legacy_video && (!duration_s.is_finite() || !(0.001..=60.0).contains(&duration_s)) {
             return Err(validation_error(
                 state,
                 "invalid realtime reason request",
                 vec![field_error(
                     "video_clip_duration_s",
-                    "video_clip_duration_s must be in (0, 60]".to_string(),
+                    "video_clip_duration_s must be finite and in [0.001, 60]".to_string(),
                 )],
             ));
         }
         SemanticMediaConfig {
+            overlap_ms: 0,
+            video_fps: None,
+            context_frames,
+            source_start_ms: payload.source_start_ms,
+            source_end_ms: payload.source_end_ms,
             mode: if legacy_video {
                 SemanticMediaMode::Video
             } else {
@@ -1285,6 +1332,26 @@ fn validate_realtime_reason_params(
             timestamp_windows: false,
         }
     };
+    if media.mode != SemanticMediaMode::Frames && context_frames > 0 {
+        return Err(validation_error(
+            state,
+            "invalid media controls",
+            vec![field_error(
+                "semantic_context_frames",
+                "use media.overlap_ms for native video context".into(),
+            )],
+        ));
+    }
+    if media.video_fps.is_some() && !semantic_inference {
+        return Err(validation_error(
+            state,
+            "invalid media controls",
+            vec![field_error(
+                "media.video_fps",
+                "explicit provider sampling requires semantic_inference=true".into(),
+            )],
+        ));
+    }
     let local_audio = if let Some(options) = payload.local_audio {
         if media.mode != SemanticMediaMode::AudioVideo {
             return Err(validation_error(
@@ -1573,6 +1640,14 @@ async fn append_semantic_chunk_event(
                     1
                 }),
             );
+            object.insert(
+                "provider_sampling_interval_ms".into(),
+                json!(media.video_fps.map(|fps| (1000.0 / fps).ceil() as u64)),
+            );
+            object.insert(
+                "provider_sampling_status".into(),
+                json!(media.video_fps.map(|_| "requested_unverified")),
+            );
             object.insert("clip_bytes".to_string(), json!(media.bytes.len()));
             object.insert("extraction_ms".to_string(), json!(media.extraction_ms));
             object.insert("audio_streams".to_string(), json!(media.audio_streams));
@@ -1640,6 +1715,8 @@ async fn append_semantic_chunk_event(
                     "start_pts_ms": moment.start_pts_ms,
                     "end_pts_ms": moment.end_pts_ms,
                     "timestamp_resolution_ms": if result.provider.as_deref() == Some("gemini") { 1_000 } else { 1 },
+                    "provider_sampling_interval_ms": result.media.as_ref().and_then(|media| media.video_fps).map(|fps| (1000.0 / fps).ceil() as u64),
+                    "provider_sampling_status": result.media.as_ref().and_then(|media| media.video_fps).map(|_| "requested_unverified"),
                     "modalities": &moment.modalities,
                     "kind": moment.kind.as_str(),
                     "description": moment.description.as_str(),
@@ -1864,6 +1941,32 @@ async fn assemble_realtime_reason_response(
     })
 }
 
+fn review_plan_chunk_count(
+    media: &SemanticMediaConfig,
+    sample_count: usize,
+    first_sample_pts: u64,
+    chunk_size: usize,
+    source_duration_ms: Option<u64>,
+) -> Result<u64, String> {
+    let count = if media.mode == SemanticMediaMode::Frames || !media.timestamp_windows {
+        sample_count.div_ceil(chunk_size) as u64
+    } else {
+        let start = media.source_start_ms.unwrap_or(first_sample_pts);
+        let end = media
+            .source_end_ms
+            .or(source_duration_ms)
+            .ok_or("native review requires known source duration")?;
+        1 + end
+            .saturating_sub(start)
+            .saturating_sub(media.window_ms)
+            .div_ceil(media.window_ms - media.overlap_ms)
+    };
+    if count > 2048 {
+        return Err(format!("review exceeds 2048 chunks/windows ({count} planned); narrow the interval or split the request"));
+    }
+    Ok(count)
+}
+
 #[tracing::instrument(name = "api.reason_realtime_run", skip_all, fields(run_id))]
 pub async fn reason_realtime_run(
     State(state): State<AppState>,
@@ -1959,6 +2062,43 @@ pub async fn reason_realtime_run(
             );
         }
     }
+    let budget_previous_image = payload.visual_diff.unwrap_or(false);
+    let strict_coverage = semantic_frames_per_chunk > 4
+        || media.context_frames > 0
+        || media.overlap_ms > 0
+        || media.video_fps.is_some()
+        || media.source_start_ms.is_some()
+        || media.source_end_ms.is_some();
+    if semantic_inference {
+        if let Some(provider) = state.provider() {
+            for model in [
+                &tiered_config.first_pass_model,
+                &tiered_config.second_pass_model,
+            ] {
+                let invalid = if media.mode == SemanticMediaMode::Frames {
+                    semantic_frames_per_chunk + usize::from(payload.visual_diff.unwrap_or(false))
+                        > provider.max_input_images_for_model(model)
+                } else {
+                    (media.timestamp_windows
+                        && provider.media_transport_for_model(model) != MediaTransport::BinaryFile)
+                        || media.video_fps.is_some_and(|fps| {
+                            provider
+                                .max_video_fps_for_model(model)
+                                .is_none_or(|max| fps > max)
+                        })
+                };
+                if invalid {
+                    return validation_error(&state, "unsupported review controls", vec![field_error("model", format!("{model} does not support the requested frame count/native FPS; configure provider capacity or select a compatible model"))]);
+                }
+            }
+        } else if strict_coverage {
+            return service_unavailable(
+                &state,
+                "inference_provider_unavailable",
+                "explicit review coverage requires a configured provider",
+            );
+        }
+    }
     let decode_source = params.decode_source;
     let decode_pipeline = state.decode_pipeline();
     let (
@@ -2003,7 +2143,7 @@ pub async fn reason_realtime_run(
         };
         let decode_config = Mp4DecodeConfig {
             sample_fps,
-            max_frames: max_frames as usize,
+            max_frames: max_frames as usize + usize::from(strict_coverage),
             // Signals stay at source resolution; only VLM-bound JPEGs are
             // downscaled (below), so the gate engine keeps full detail.
             max_edge: None,
@@ -2013,17 +2153,51 @@ pub async fn reason_realtime_run(
         };
         // Pass 1: frame signals (cheap, no encoding)
         let decode_started = Instant::now();
-        let decoded = decode_pipeline.decode_signals(decode_source, decode_config)?;
+        let mut decoded = decode_pipeline.decode_signals(decode_source, decode_config)?;
+        if strict_coverage && decoded.frame_signals.len() > max_frames as usize {
+            return Err(
+                "requested coverage exceeds max_frames; increase the explicit decode budget"
+                    .to_string(),
+            );
+        }
+        let start = media.source_start_ms.unwrap_or(0);
+        let duration = prepared.media_info().ok().and_then(|info| info.duration_ms);
+        if media
+            .source_end_ms
+            .is_some_and(|end| duration.is_some_and(|duration| end > duration))
+            || duration.is_some_and(|duration| start >= duration)
+        {
+            return Err("requested source interval is outside video duration".to_string());
+        }
+        decoded.frame_signals.retain(|frame| {
+            frame.pts_ms >= start && media.source_end_ms.is_none_or(|end| frame.pts_ms < end)
+        });
+        if decoded.frame_signals.is_empty() {
+            return Err(
+                "requested source interval contains no decoded samples; increase fixed_fps".into(),
+            );
+        }
+        review_plan_chunk_count(&media, decoded.frame_signals.len(), decoded.frame_signals[0].pts_ms, chunk_size, duration)?;
         let decode_elapsed_us = decode_started.elapsed().as_micros() as u64;
 
         // Native media modes extract encoded windows just in time inside
         // the bounded inference tasks.
         let decoded_jpegs = if semantic_decode_enabled && media.mode == SemanticMediaMode::Frames {
-            let indices = compute_semantic_frame_indices(
-                decoded.frame_signals.len(),
+            if crate::semantic_infer::review_submission_count(&decoded.frame_signals, chunk_size, semantic_frames_per_chunk, media.context_frames, budget_previous_image) > 20_000 {
+                return Err("review exceeds 20000 image submissions across tiers; narrow the interval or split the request".into());
+            }
+            let indices = crate::semantic_infer::review_frame_indices(
+                &decoded.frame_signals,
                 chunk_size,
                 semantic_frames_per_chunk,
+                media.context_frames,
             );
+            if indices.len() > 10_000 {
+                return Err(
+                    "review JPEG count exceeds 10000; narrow the interval or split the request"
+                        .into(),
+                );
+            }
             let jpegs = decode_pipeline.decode_jpegs(
                 decode_source,
                 sample_fps,
@@ -2032,8 +2206,35 @@ pub async fn reason_realtime_run(
                 semantic_frame_max_edge,
                 crop,
             )?;
-            let lookup: std::collections::HashMap<u64, DecodedJpegFrame> =
-                jpegs.into_iter().map(|f| (f.frame_index, f)).collect();
+            if jpegs.len() != indices.len() {
+                return Err("JPEG decoder did not produce every requested frame".into());
+            }
+            if jpegs
+                .iter()
+                .map(|frame| frame.jpeg_bytes.len())
+                .sum::<usize>()
+                > 256 * 1024 * 1024
+            {
+                return Err(
+                    "review JPEG bytes exceed 256 MiB; downscale frames or split the request"
+                        .into(),
+                );
+            }
+            let timestamps: std::collections::HashMap<_, _> = decoded
+                .frame_signals
+                .iter()
+                .map(|signal| (signal.frame_index, signal.pts_ms))
+                .collect();
+            let lookup: std::collections::HashMap<u64, DecodedJpegFrame> = jpegs
+                .into_iter()
+                .map(|mut frame| {
+                    frame.pts_ms = timestamps
+                        .get(&frame.frame_index)
+                        .copied()
+                        .unwrap_or(frame.pts_ms);
+                    (frame.frame_index, frame)
+                })
+                .collect();
             Some(lookup)
         } else {
             None
@@ -2099,6 +2300,12 @@ pub async fn reason_realtime_run(
                 "coordinates": decoded.coordinates,
                 "media_mode": media.mode.as_str(),
                 "media_window_ms": media.window_ms,
+                "media_overlap_ms": media.overlap_ms,
+                "provider_video_fps": media.video_fps,
+                "source_start_ms": media.source_start_ms,
+                "source_end_ms": media.source_end_ms,
+                "semantic_frames_per_chunk": semantic_frames_per_chunk,
+                "semantic_context_frames": media.context_frames,
                 "video_streams": media_info.as_ref().map(|info| info.video_streams),
                 "audio_streams": media_info.as_ref().map(|info| info.audio_streams),
                 "audio_channels": media_info.as_ref().map(|info| info.audio_channels),
@@ -2160,6 +2367,7 @@ pub async fn reason_realtime_run(
     let chunk_preps = prepare_realtime_chunks(
         &decoded.frame_signals,
         chunk_size,
+        semantic_frames_per_chunk,
         decoded_jpegs.as_ref(),
         &mut pipeline,
         &clip_decode_pipeline,
@@ -2223,20 +2431,38 @@ pub async fn reason_realtime_run(
         Some(state.inference_dispatch()),
         Some(semantic_event_tx),
     );
-    let semantic_journal = async {
-        while let Some((chunk_idx, result)) = semantic_event_rx.recv().await {
-            append_semantic_chunk_event(
-                &state,
-                &run_id,
-                &request_id,
-                &stream_id,
-                &index_name,
-                chunk_idx,
-                &result,
-            )
-            .await?;
+    // The journal owns its receiver: an append error must close the channel
+    // so dispatch cannot wait forever sending to a consumer that has exited.
+    let semantic_journal = {
+        let state = &state;
+        let run_id = &run_id;
+        let request_id = &request_id;
+        let stream_id = &stream_id;
+        let index_name = &index_name;
+        let overlap_ms = media.overlap_ms;
+        async move {
+            let mut seen_moments = Vec::new();
+            let mut pending = std::collections::BTreeMap::new();
+            let mut next_chunk = 0;
+            while let Some((chunk_idx, result)) = semantic_event_rx.recv().await {
+                pending.insert(chunk_idx, result);
+                while let Some(mut result) = pending.remove(&next_chunk) {
+                    let chunk_idx = next_chunk;
+                    next_chunk += 1;
+                    if overlap_ms > 0 {
+                        crate::semantic_infer::deduplicate_source_moments(
+                            &mut result.moments,
+                            &mut seen_moments,
+                        );
+                    }
+                    append_semantic_chunk_event(
+                        state, run_id, request_id, stream_id, index_name, chunk_idx, &result,
+                    )
+                    .await?;
+                }
+            }
+            Ok::<(), String>(())
         }
-        Ok::<(), String>(())
     };
     let ((semantic_results, task_end_times), semantic_journal_result) =
         tokio::join!(semantic_dispatch, semantic_journal);
@@ -3114,6 +3340,309 @@ mod tests {
         let n = WAL_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("vidarax-handlers-{tag}-{n}.wal"));
         AppState::with_wal_for_tests(path)
+    }
+
+    fn plan_media(timestamp_windows: bool) -> super::SemanticMediaConfig {
+        super::SemanticMediaConfig {
+            mode: super::SemanticMediaMode::Video,
+            window_ms: 1000,
+            overlap_ms: 0,
+            timestamp_windows,
+            video_fps: None,
+            context_frames: 0,
+            source_start_ms: None,
+            source_end_ms: None,
+            resolution: vidarax_core::provider::MediaResolution::Low,
+            persist_evidence: false,
+        }
+    }
+
+    #[test]
+    fn review_plan_legacy_and_frames_use_filtered_sample_chunks() {
+        let mut media = plan_media(false);
+        for mode in [
+            super::SemanticMediaMode::Video,
+            super::SemanticMediaMode::Frames,
+        ] {
+            media.mode = mode;
+            assert_eq!(
+                super::review_plan_chunk_count(&media, 2048 * 5, 500, 5, Some(300_000)).unwrap(),
+                2048
+            );
+            assert!(
+                super::review_plan_chunk_count(&media, 2048 * 5 + 1, 500, 5, Some(300_000))
+                    .is_err()
+            );
+            let error =
+                super::review_plan_chunk_count(&media, 300 * 60, 0, 5, Some(300_000)).unwrap_err();
+            assert!(error.contains("3600 planned"), "{error}");
+            assert_eq!(
+                super::review_plan_chunk_count(&media, 10, 2500, 5, None).unwrap(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn review_plan_native_overlap_counts_only_scheduled_windows() {
+        let mut media = plan_media(true);
+        media.overlap_ms = 500;
+        assert_eq!(
+            super::review_plan_chunk_count(&media, 60, 0, 5, Some(1000)).unwrap(),
+            1
+        );
+        assert_eq!(
+            super::review_plan_chunk_count(&media, 61, 0, 5, Some(1001)).unwrap(),
+            2
+        );
+        assert_eq!(
+            super::review_plan_chunk_count(&media, 90, 0, 5, Some(1500)).unwrap(),
+            2
+        );
+        assert_eq!(
+            super::review_plan_chunk_count(&media, 91, 0, 5, Some(1501)).unwrap(),
+            3
+        );
+        assert_eq!(
+            super::review_plan_chunk_count(&media, 1, 0, 5, Some(1000 + 2047 * 500)).unwrap(),
+            2048
+        );
+        assert!(super::review_plan_chunk_count(&media, 1, 0, 5, Some(1001 + 2047 * 500)).is_err());
+        media.source_start_ms = Some(250);
+        media.source_end_ms = Some(2750);
+        assert_eq!(
+            super::review_plan_chunk_count(&media, 150, 267, 5, Some(10_000)).unwrap(),
+            4
+        );
+        media.source_start_ms = None;
+        media.source_end_ms = None;
+        assert_eq!(
+            super::review_plan_chunk_count(&media, 60, 500, 5, Some(1500)).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_clip_duration_rejects_invalid_and_submillisecond_values_before_source_validation() {
+        let state = test_state("legacy-duration-invalid");
+        let mut payload: crate::models::RealtimeReasonRequest = serde_json::from_value(json!({
+            "source_uri": "/nonexistent-unit-test-source.mp4",
+            "model": "Qwen/Qwen3-VL-2B-Instruct",
+            "video_clip_mode": true,
+            "semantic_inference": false
+        }))
+        .unwrap();
+        for duration in [
+            f32::NEG_INFINITY,
+            -1.0,
+            -0.0,
+            0.0,
+            f32::from_bits(1),
+            0.0001,
+            0.00049,
+            0.0005,
+            0.000999,
+            f32::from_bits(0.001_f32.to_bits() - 1),
+            f32::NAN,
+            f32::INFINITY,
+            60.00001,
+            f32::from_bits(60.0_f32.to_bits() + 1),
+            f32::MAX,
+        ] {
+            payload.video_clip_duration_s = Some(duration);
+            let (status, axum::Json(body)) =
+                match super::validate_realtime_reason_params(&state, &payload) {
+                    Ok(_) => panic!("invalid legacy duration accepted: {duration:?}"),
+                    Err(error) => error,
+                };
+            assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(body["error"]["code"], "validation_error");
+            assert_eq!(
+                body["error"]["details"][0]["field"], "video_clip_duration_s",
+                "duration={duration:?}, body={body}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_clip_duration_keeps_boundary_rounding_nonzero_and_default_unchanged() {
+        let state = test_state("legacy-duration-valid");
+        let sequence = WAL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let source = std::env::temp_dir().join(format!(
+            "vidarax-duration-unit-{}-{sequence}.mp4",
+            std::process::id()
+        ));
+        // Validation only: no media decoder or inference is invoked.
+        std::fs::write(&source, b"unit-test path fixture").unwrap();
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _fixture = Fixture(source.clone());
+        let mut payload: crate::models::RealtimeReasonRequest = serde_json::from_value(json!({
+            "source_uri": source.to_string_lossy(),
+            "model": "Qwen/Qwen3-VL-2B-Instruct",
+            "video_clip_mode": true,
+            "semantic_inference": false
+        }))
+        .unwrap();
+        for (duration, expected_ms) in [
+            (0.001, 1),
+            (0.00149, 1),
+            (0.0015, 2),
+            (0.00151, 2),
+            (0.5, 500),
+            (60.0, 60_000),
+        ] {
+            payload.video_clip_duration_s = Some(duration);
+            let params = super::validate_realtime_reason_params(&state, &payload).unwrap_or_else(
+                |(status, axum::Json(body))| {
+                    panic!("duration={duration}, status={status}, body={body}")
+                },
+            );
+            assert_eq!(params.media.window_ms, expected_ms);
+            assert!(params.media.window_ms > params.media.overlap_ms);
+        }
+        payload.video_clip_duration_s = None;
+        let params = super::validate_realtime_reason_params(&state, &payload)
+            .unwrap_or_else(|(_, axum::Json(body))| panic!("{body}"));
+        assert_eq!(params.media.window_ms, 500);
+    }
+
+    #[tokio::test]
+    async fn semantic_journal_failure_returns_without_blocking_remaining_completions() {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use axum::Json;
+        use http_body_util::BodyExt;
+        use std::sync::{Arc, Mutex};
+        use vidarax_core::provider::{
+            InferenceProvider, InferenceRequest, InferenceResult, ProviderError, TokenUsage,
+        };
+
+        struct FailJournalProvider {
+            state: Mutex<Option<AppState>>,
+            calls: AtomicU64,
+        }
+
+        impl InferenceProvider for FailJournalProvider {
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::Vllm
+            }
+
+            fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                // Earlier ingestion events must commit before the journal fails.
+                // Taking the state also breaks the test provider's ownership cycle.
+                if let Some(state) = self.state.lock().unwrap().take() {
+                    state.set_timeline_append_failure_for_tests(true);
+                }
+                Ok(InferenceResult {
+                    provider: ProviderKind::Vllm,
+                    model: Arc::clone(&request.model),
+                    output_text: r#"{"event_type":"context_observation","object_label":"frame_context","summary":"ok","description":"chunk completed","confidence":0.95}"#.to_string(),
+                    fallback_used: false,
+                    finish_reason: Some("stop".to_string()),
+                    inference_latency_ms: 1,
+                    usage: TokenUsage::default(),
+                })
+            }
+        }
+
+        struct Cleanup {
+            state: AppState,
+            provider: Arc<FailJournalProvider>,
+            directory: std::path::PathBuf,
+        }
+
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                self.state.set_timeline_append_failure_for_tests(false);
+                self.provider.state.lock().unwrap().take();
+                let _ = std::fs::remove_dir_all(&self.directory);
+            }
+        }
+
+        let n = WAL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "vidarax-journal-failure-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let provider = Arc::new(FailJournalProvider {
+            state: Mutex::new(None),
+            calls: AtomicU64::new(0),
+        });
+        let state = AppState::with_wal_for_tests_and_endpoints(
+            directory.join("timeline.wal"),
+            Some(provider.clone()),
+        );
+        let _cleanup = Cleanup {
+            state: state.clone(),
+            provider: provider.clone(),
+            directory: directory.clone(),
+        };
+        *provider.state.lock().unwrap() = Some(state.clone());
+
+        let source = directory.join("source.mp4");
+        let mut command = Command::new("ffmpeg");
+        command
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=64x64:rate=10:duration=2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+            ])
+            .arg(&source);
+        assert!(run_command_with_timeout(
+            &mut command,
+            Duration::from_secs(5),
+            "journal test fixture generation timed out",
+        )
+        .unwrap()
+        .status
+        .success());
+
+        let run_id = state.next_run_id();
+        state
+            .append_run_event(&run_id, "run_created", json!({"principal_key":"public"}))
+            .unwrap();
+        let payload = serde_json::from_value(json!({
+            "source_uri": source.to_string_lossy(),
+            "model": "Qwen/Qwen3-VL-2B-Instruct",
+            "sampling_policy": "fixed", "fixed_fps": 10, "max_frames": 30,
+            "chunk_size": 5, "semantic_frames_per_chunk": 1, "vlm_concurrency": 1,
+            "semantic_timeout_ms": 1000,
+        }))
+        .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::reason_realtime_run(State(state), Path(run_id), HeaderMap::new(), Json(payload)),
+        )
+        .await
+        .expect("journal failure must close its receiver so completion sends can finish")
+        .into_response();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "{body}"
+        );
+        assert!(body.contains("internal_error"), "{body}");
+        assert!(provider.calls.load(Ordering::Relaxed) >= 3);
     }
 
     fn infer_request(schema: serde_json::Value) -> InferRequest {

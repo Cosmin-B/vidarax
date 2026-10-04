@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -120,12 +120,46 @@ pub enum SessionCommand {
         prompt: Arc<str>,
         guided_json: Option<Arc<str>>,
         accepted: oneshot::Sender<Result<(), SessionControlError>>,
+        decision: Arc<ConfigUpdateDecision>,
     },
+}
+
+/// Serializes cancellation with the synchronous configuration replacement.
+#[derive(Debug)]
+pub struct ConfigUpdateDecision(Mutex<ConfigUpdateState>);
+
+#[derive(Debug)]
+enum ConfigUpdateState {
+    Pending,
+    Completed(Result<(), SessionControlError>),
+    Cancelled,
+}
+
+impl ConfigUpdateDecision {
+    fn cancel_or_result(&self) -> Result<(), SessionControlError> {
+        let mut state = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        match *state {
+            ConfigUpdateState::Completed(result) => result,
+            ConfigUpdateState::Pending | ConfigUpdateState::Cancelled => {
+                *state = ConfigUpdateState::Cancelled;
+                Err(SessionControlError::TimedOut)
+            }
+        }
+    }
+}
+
+struct CancelConfigUpdate(Arc<ConfigUpdateDecision>);
+
+impl Drop for CancelConfigUpdate {
+    fn drop(&mut self) {
+        let _ = self.0.cancel_or_result();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionControlError {
     Closed,
+    TimedOut,
     StaleGeneration {
         expected: PipelineGeneration,
         received: PipelineGeneration,
@@ -136,6 +170,7 @@ impl fmt::Display for SessionControlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Closed => f.write_str("pipeline generation is closed"),
+            Self::TimedOut => f.write_str("configuration update was cancelled at its deadline"),
             Self::StaleGeneration { expected, received } => write!(
                 f,
                 "stale pipeline generation: expected {}, received {}",
@@ -189,20 +224,54 @@ impl SessionControl {
         prompt: Arc<str>,
         guided_json: Option<Arc<str>>,
     ) -> Result<(), SessionControlError> {
+        self.update_config_inner(prompt, guided_json, None).await
+    }
+
+    /// Cancel at the deadline only if the worker has not replaced the configuration.
+    pub async fn update_config_with_timeout(
+        &self,
+        prompt: Arc<str>,
+        guided_json: Option<Arc<str>>,
+        timeout: Duration,
+    ) -> Result<(), SessionControlError> {
+        self.update_config_inner(prompt, guided_json, Some(timeout))
+            .await
+    }
+
+    async fn update_config_inner(
+        &self,
+        prompt: Arc<str>,
+        guided_json: Option<Arc<str>>,
+        timeout: Option<Duration>,
+    ) -> Result<(), SessionControlError> {
         if self.is_stopping() {
             return Err(SessionControlError::Closed);
         }
+        let decision = Arc::new(ConfigUpdateDecision(Mutex::new(ConfigUpdateState::Pending)));
+        let cancellation = CancelConfigUpdate(Arc::clone(&decision));
         let (accepted, response) = oneshot::channel();
-        self.commands
-            .send(SessionCommand::UpdateConfig {
-                generation: self.generation,
-                prompt,
-                guided_json,
-                accepted,
-            })
-            .await
-            .map_err(|_| SessionControlError::Closed)?;
-        response.await.map_err(|_| SessionControlError::Closed)?
+        let update = async {
+            self.commands
+                .send(SessionCommand::UpdateConfig {
+                    generation: self.generation,
+                    prompt,
+                    guided_json,
+                    accepted,
+                    decision: Arc::clone(&decision),
+                })
+                .await
+                .map_err(|_| SessionControlError::Closed)?;
+            response.await.map_err(|_| SessionControlError::Closed)?
+        };
+        let result = match timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, update).await {
+                Ok(result) => result,
+                Err(_) => decision.cancel_or_result(),
+            },
+            None => update.await,
+        };
+        drop(cancellation);
+        result
     }
 }
 
@@ -219,27 +288,62 @@ pub fn apply_pending_session_commands(
                 prompt: next_prompt,
                 guided_json: next_guided_json,
                 accepted,
+                decision,
             } => {
-                // The HTTP acknowledgement deadline owns command validity. If
-                // the caller timed out and dropped its receiver while this
-                // worker was in inference, do not apply the now-unobservable
-                // update later.
-                if accepted.is_closed() {
-                    continue;
-                }
-                if received != generation {
-                    let _ = accepted.send(Err(SessionControlError::StaleGeneration {
-                        expected: generation,
-                        received,
-                    }));
-                    continue;
-                }
-                *prompt = next_prompt;
-                *guided_json = next_guided_json;
-                let _ = accepted.send(Ok(()));
+                apply_config_command(
+                    received,
+                    generation,
+                    next_prompt,
+                    next_guided_json,
+                    accepted,
+                    decision,
+                    prompt,
+                    guided_json,
+                    || {},
+                    || {},
+                );
             }
         }
     }
+}
+
+// The hooks bracket acquisition of the cancellation/application gate.
+// Production uses empty closures; tests can synchronize competing threads here.
+#[allow(clippy::too_many_arguments)]
+fn apply_config_command(
+    received: PipelineGeneration,
+    generation: PipelineGeneration,
+    next_prompt: Arc<str>,
+    next_guided_json: Option<Arc<str>>,
+    accepted: oneshot::Sender<Result<(), SessionControlError>>,
+    decision: Arc<ConfigUpdateDecision>,
+    prompt: &mut Arc<str>,
+    guided_json: &mut Option<Arc<str>>,
+    before_decision: impl FnOnce(),
+    after_claim: impl FnOnce(),
+) {
+    if accepted.is_closed() {
+        return;
+    }
+    before_decision();
+    let mut state = decision.0.lock().unwrap_or_else(|err| err.into_inner());
+    if !matches!(*state, ConfigUpdateState::Pending) {
+        return;
+    }
+    after_claim();
+    let result = if received != generation {
+        Err(SessionControlError::StaleGeneration {
+            expected: generation,
+            received,
+        })
+    } else {
+        *prompt = next_prompt;
+        *guided_json = next_guided_json;
+        Ok(())
+    };
+    *state = ConfigUpdateState::Completed(result);
+    // Sending and publishing the result share the same gate as cancellation.
+    let _ = accepted.send(result);
 }
 
 pub struct StageHandle {
@@ -633,6 +737,183 @@ mod tests {
         let mut schema = None;
         apply_pending_session_commands(&mut receiver, generation, &mut prompt, &mut schema);
         assert_eq!(prompt.as_ref(), "current");
+    }
+
+    #[tokio::test]
+    async fn deadline_cancels_before_worker_claim() {
+        let generation = PipelineGeneration::new(3);
+        let (control, mut receiver) = SessionControl::channel(generation);
+        let update = tokio::spawn(async move {
+            control
+                .update_config_with_timeout(
+                    Arc::from("late"),
+                    Some(Arc::from("{}")),
+                    Duration::from_millis(10),
+                )
+                .await
+        });
+        // Receipt proves admission happened before the deadline.
+        let command = receiver.recv().await.unwrap();
+        assert_eq!(update.await.unwrap(), Err(SessionControlError::TimedOut));
+        let super::SessionCommand::UpdateConfig {
+            generation: received,
+            prompt: next_prompt,
+            guided_json: next_schema,
+            accepted,
+            decision,
+        } = command;
+        let mut prompt = Arc::from("current");
+        let mut schema = Some(Arc::from("old-schema"));
+        super::apply_config_command(
+            received,
+            generation,
+            next_prompt,
+            next_schema,
+            accepted,
+            decision,
+            &mut prompt,
+            &mut schema,
+            || {},
+            || {},
+        );
+        assert_eq!(prompt.as_ref(), "current");
+        assert_eq!(schema.as_deref(), Some("old-schema"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_open_receiver_check_prevents_replacement() {
+        let generation = PipelineGeneration::new(3);
+        let (control, mut receiver) = SessionControl::channel(generation);
+        let update = tokio::spawn(async move {
+            control
+                .update_config(Arc::from("late"), Some(Arc::from("{}")))
+                .await
+        });
+        let command = receiver.recv().await.unwrap();
+        let (checked_tx, checked_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let super::SessionCommand::UpdateConfig {
+                generation: received,
+                prompt: next_prompt,
+                guided_json: next_schema,
+                accepted,
+                decision,
+            } = command;
+            let mut prompt = Arc::from("current");
+            let mut schema = Some(Arc::from("old-schema"));
+            super::apply_config_command(
+                received,
+                generation,
+                next_prompt,
+                next_schema,
+                accepted,
+                decision,
+                &mut prompt,
+                &mut schema,
+                || {
+                    checked_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                },
+                || {},
+            );
+            (prompt, schema)
+        });
+        checked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        update.abort();
+        let _ = update.await;
+        resume_tx.send(()).unwrap();
+        let (prompt, schema) = worker.join().unwrap();
+        assert_eq!(prompt.as_ref(), "current");
+        assert_eq!(schema.as_deref(), Some("old-schema"));
+    }
+
+    #[test]
+    fn cancellation_after_worker_claim_returns_applied_result() {
+        let generation = PipelineGeneration::new(3);
+        let decision = Arc::new(super::ConfigUpdateDecision(std::sync::Mutex::new(
+            super::ConfigUpdateState::Pending,
+        )));
+        let cancellation = Arc::clone(&decision);
+        let (accepted, response) = tokio::sync::oneshot::channel();
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut prompt = Arc::from("current");
+            let mut schema = Some(Arc::from("old-schema"));
+            super::apply_config_command(
+                generation,
+                generation,
+                Arc::from("next"),
+                Some(Arc::from("{}")),
+                accepted,
+                decision,
+                &mut prompt,
+                &mut schema,
+                || {},
+                || {
+                    claimed_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                },
+            );
+            (prompt, schema)
+        });
+        claimed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let canceller = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            cancellation.cancel_or_result()
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        resume_tx.send(()).unwrap();
+        let (prompt, schema) = worker.join().unwrap();
+        assert_eq!(canceller.join().unwrap(), Ok(()));
+        assert_eq!(response.blocking_recv().unwrap(), Ok(()));
+        assert_eq!(prompt.as_ref(), "next");
+        assert_eq!(schema.as_deref(), Some("{}"));
+    }
+
+    #[tokio::test]
+    async fn stale_generation_rejects_both_prompt_and_schema() {
+        let received = PipelineGeneration::new(3);
+        let active = PipelineGeneration::new(4);
+        let (control, mut receiver) = SessionControl::channel(received);
+        let update = tokio::spawn(async move {
+            control
+                .update_config(Arc::from("next"), Some(Arc::from("{}")))
+                .await
+        });
+        let command = receiver.recv().await.unwrap();
+        let super::SessionCommand::UpdateConfig {
+            generation,
+            prompt: next_prompt,
+            guided_json: next_schema,
+            accepted,
+            decision,
+        } = command;
+        let mut prompt = Arc::from("current");
+        let mut schema = Some(Arc::from("old-schema"));
+        super::apply_config_command(
+            generation,
+            active,
+            next_prompt,
+            next_schema,
+            accepted,
+            decision,
+            &mut prompt,
+            &mut schema,
+            || {},
+            || {},
+        );
+        assert_eq!(
+            update.await.unwrap(),
+            Err(SessionControlError::StaleGeneration {
+                expected: active,
+                received,
+            })
+        );
+        assert_eq!(prompt.as_ref(), "current");
+        assert_eq!(schema.as_deref(), Some("old-schema"));
     }
 
     #[test]

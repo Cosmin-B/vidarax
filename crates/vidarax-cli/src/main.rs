@@ -111,7 +111,7 @@ enum Commands {
 ")]
     Search(SearchArgs),
     /// Upload a local video and run the full analysis pipeline.
-    Analyze(AnalyzeArgs),
+    Analyze(Box<AnalyzeArgs>),
     /// Submit and list feedback.
     #[command(subcommand)]
     Feedback(FeedbackCommands),
@@ -299,6 +299,23 @@ struct AnalyzeArgs {
     /// Reason chunk size.
     #[arg(long, value_name = "N", default_value_t = 25)]
     chunk_size: usize,
+    /// Number of images per frame-review chunk (1..256).
+    #[arg(long)]
+    semantic_frames_per_chunk: Option<usize>,
+    /// Context frames on each side (0..128).
+    #[arg(long)]
+    semantic_context_frames: Option<usize>,
+    /// Target source-time interval in milliseconds.
+    #[arg(long)]
+    source_start_ms: Option<u64>,
+    #[arg(long)]
+    source_end_ms: Option<u64>,
+    /// Overlap between native windows, at most half of --media-window-ms.
+    #[arg(long)]
+    media_overlap_ms: Option<u64>,
+    /// Static provider FPS, separate from --fixed-fps (0..24].
+    #[arg(long)]
+    video_fps: Option<f32>,
     /// Per-chunk semantic provider timeout in milliseconds.
     #[arg(long, value_name = "MS", default_value_t = 30_000)]
     semantic_timeout_ms: u64,
@@ -510,6 +527,30 @@ impl AnalyzeArgs {
                     "persist_evidence": !self.no_persist_evidence,
                 }),
             );
+        }
+        for (name, value) in [
+            (
+                "semantic_frames_per_chunk",
+                self.semantic_frames_per_chunk.map(|v| json!(v)),
+            ),
+            (
+                "semantic_context_frames",
+                self.semantic_context_frames.map(|v| json!(v)),
+            ),
+            ("source_start_ms", self.source_start_ms.map(|v| json!(v))),
+            ("source_end_ms", self.source_end_ms.map(|v| json!(v))),
+        ] {
+            if let Some(value) = value {
+                body.insert(name.into(), value);
+            }
+        }
+        if self.media != AnalyzeMediaArg::Frames {
+            if let Some(overlap) = self.media_overlap_ms {
+                body.get_mut("media").unwrap()["overlap_ms"] = json!(overlap);
+            }
+            if let Some(fps) = self.video_fps {
+                body.get_mut("media").unwrap()["video_fps"] = json!(fps);
+            }
         }
         body.insert("semantic_inference".to_string(), Value::Bool(!self.no_vlm));
         if self.include_frame_metadata {
@@ -1659,6 +1700,29 @@ fn validate_analyze_args(args: &AnalyzeArgs) -> Result<(), String> {
     if args.media == AnalyzeMediaArg::Frames && args.chunk_size == 0 {
         return Err("--chunk-size must be greater than 0".to_string());
     }
+    if args
+        .semantic_frames_per_chunk
+        .is_some_and(|n| !(1..=256).contains(&n))
+        || args.semantic_context_frames.is_some_and(|n| n > 128)
+    {
+        return Err("frame count must be in [1,256], context in [0,128]".into());
+    }
+    if args
+        .video_fps
+        .is_some_and(|fps| !fps.is_finite() || fps <= 0.0 || fps > 24.0)
+        || args
+            .source_end_ms
+            .is_some_and(|end| end <= args.source_start_ms.unwrap_or(0))
+    {
+        return Err(
+            "video FPS must be in (0,24] and source_end_ms must exceed source_start_ms".into(),
+        );
+    }
+    if args.media == AnalyzeMediaArg::Frames
+        && (args.video_fps.is_some() || args.media_overlap_ms.is_some())
+    {
+        return Err("native FPS/overlap requires --media video or audio-video".into());
+    }
     if args.media != AnalyzeMediaArg::Frames
         && args
             .media_window_ms
@@ -2691,6 +2755,12 @@ mod tests {
             fixed_fps: 1.0,
             chunk_size: 25,
             semantic_timeout_ms: 30_000,
+            semantic_frames_per_chunk: None,
+            semantic_context_frames: None,
+            source_start_ms: None,
+            source_end_ms: None,
+            media_overlap_ms: None,
+            video_fps: None,
             max_frames: None,
             index_name: None,
             sampling_policy: None,
@@ -2720,6 +2790,31 @@ mod tests {
         assert!("0.1,0.2,0.3".parse::<CropArg>().is_err());
         assert!("a,b,c,d".parse::<CropArg>().is_err());
         assert!("".parse::<CropArg>().is_err());
+    }
+
+    #[test]
+    fn reason_body_preserves_dense_native_review_controls_and_custom_prompt() {
+        let mut args = analyze_args();
+        args.media = AnalyzeMediaArg::Video;
+        args.model = Some("gemini-3.8-flash".into());
+        args.video_fps = Some(24.0);
+        args.media_window_ms = Some(2000);
+        args.media_overlap_ms = Some(1000);
+        args.source_start_ms = Some(500);
+        args.source_end_ms = Some(2500);
+        args.prompt = Some("Inspect caller criterion".into());
+        let body = args.reason_body("/tmp/x.mp4");
+        assert_eq!(body["media"]["video_fps"], 24.0);
+        assert_eq!(body["media"]["overlap_ms"], 1000);
+        assert_eq!(body["source_start_ms"], 500);
+        assert_eq!(body["source_end_ms"], 2500);
+        assert_eq!(body["semantic_prompt"], "Inspect caller criterion");
+        args.media = AnalyzeMediaArg::Frames;
+        args.semantic_frames_per_chunk = Some(120);
+        args.semantic_context_frames = Some(30);
+        let body = args.reason_body("/tmp/x.mp4");
+        assert_eq!(body["semantic_frames_per_chunk"], 120);
+        assert_eq!(body["semantic_context_frames"], 30);
     }
 
     #[test]

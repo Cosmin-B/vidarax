@@ -408,3 +408,43 @@ The main hardening knobs are:
   limiter still uses the historical `TENANT` variable name.
 - Terminate TLS at a proxy or use the experimental HTTP/3 TLS settings.
 - Keep insecure media toggles disabled unless the source network is trusted.
+
+
+## Static website and documentation rollout
+
+The existing Cloudflare Workers static asset service is `vidarax-site`, serving
+`https://vidarax.cosminbararu.com` with the Blume documentation mounted at `/docs/`.
+This is the website deployment; it does not roll out the Rust API process.
+The existing website assembler lives in the separate `websites` checkout at
+`scripts/build-cloudflare-sites.mjs`. It merges `sites/vidarax` with this
+repository's `docs-site/dist`, preserving the existing custom domain, asset
+routing, and compatibility date (`2026-08-21`). No API host is inferred from it.
+
+From a reviewed source checkout with the existing dependencies available:
+
+```bash
+npm --prefix docs-site run validate
+VIDARAX_DOCS_SITE="$PWD/docs-site" node "$WEBSITES_CHECKOUT/scripts/build-cloudflare-sites.mjs" --site vidarax --output "$SITE_STAGE"
+wrangler deployments list --config "$SITE_STAGE/vidarax/wrangler.jsonc" --json
+wrangler deploy --config "$SITE_STAGE/vidarax/wrangler.jsonc" --dry-run
+wrangler deploy --config "$SITE_STAGE/vidarax/wrangler.jsonc"
+```
+
+Record the active version before deploying and keep the assembled assets and
+configuration with the source commit. Check the marketing root, docs root,
+changed page, sidebar, and `/docs/api/docs/pages.json` after rollout. A docs
+preview of an unmerged implementation must say so explicitly; publishing its
+examples does not prove a deployed API supports them. For a new page on a review
+branch, point its generated edit link to that branch until its source is merged.
+
+Rollback to the recorded pre-rollout version using the same configuration:
+
+```bash
+wrangler rollback "$PREVIOUS_WEBSITE_VERSION" --config "$SITE_STAGE/vidarax/wrangler.jsonc" --message "Restore previous reviewed website" --yes
+```
+
+Recheck the same public routes after rollback. The active website version read
+on 2026-10-03 before this rollout was
+`7649a834-6505-4f0f-87de-4aac1a93e85c`; future rollouts must read the current
+version instead of reusing this historical value. API rollout and rollback need
+the API service's own deployment workflow and are outside this website process.

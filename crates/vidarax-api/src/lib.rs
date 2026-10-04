@@ -197,6 +197,7 @@ fn backend_entries_from_explicit_urls(
             model: None,
             upstream_model: None,
             openai_kind: Some("vllm".to_string()),
+            max_input_images: None,
             priority: 1,
         });
     }
@@ -209,6 +210,7 @@ fn backend_entries_from_explicit_urls(
             model: None,
             upstream_model: None,
             openai_kind: Some("sglang".to_string()),
+            max_input_images: None,
             priority: 2,
         });
     }
@@ -352,6 +354,7 @@ mod tests {
             model: None,
             upstream_model: None,
             openai_kind: None,
+            max_input_images: None,
             priority: 1,
         };
         vidarax_core::backends::build_provider_chain(&[entry]).unwrap()

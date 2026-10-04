@@ -164,6 +164,8 @@ pub struct InferenceVideo {
     /// Provider-side media sampling policy. Providers that do not expose a
     /// native media-resolution control ignore this value.
     pub media_resolution: Option<MediaResolution>,
+    /// Explicit static video sampling requested at the provider boundary.
+    pub sampling_fps: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,6 +352,13 @@ impl InferenceProvider for AdmittedProvider {
         self.inner.media_transport_for_model(model)
     }
 
+    fn max_input_images_for_model(&self, model: &str) -> usize {
+        self.inner.max_input_images_for_model(model)
+    }
+    fn max_video_fps_for_model(&self, model: &str) -> Option<f32> {
+        self.inner.max_video_fps_for_model(model)
+    }
+
     fn kind_for_model(&self, model: &str) -> ProviderKind {
         self.inner.kind_for_model(model)
     }
@@ -397,6 +406,17 @@ pub trait InferenceProvider: Send + Sync {
     /// into a base64 string or a JSON data URL inside the server.
     fn media_transport_for_model(&self, _model: &str) -> MediaTransport {
         MediaTransport::JsonDataUrl
+    }
+
+    /// Conservative image limit; deployments can explicitly declare a larger one.
+    fn max_input_images_for_model(&self, _model: &str) -> usize {
+        5
+    }
+
+    /// Maximum FPS control the provider can serialize; not verified effective density.
+    /// None means explicit native video FPS is unsupported.
+    fn max_video_fps_for_model(&self, _model: &str) -> Option<f32> {
+        None
     }
 
     /// Provider kinds that can currently accept work.
@@ -517,7 +537,11 @@ pub struct OpenAiCompatProvider<T: Transport> {
     served_model: Option<Arc<str>>,
     upstream_model: Option<Arc<str>>,
     model_cache: ArcSwap<Arc<str>>,
+    max_input_images: usize,
 }
+
+/// Default image capacity includes the largest supported live clip batch.
+pub const OPENAI_COMPAT_DEFAULT_MAX_INPUT_IMAGES: usize = 64;
 
 impl<T: Transport> OpenAiCompatProvider<T> {
     pub fn new(transport: T, kind: ProviderKind) -> Self {
@@ -526,8 +550,14 @@ impl<T: Transport> OpenAiCompatProvider<T> {
             kind,
             served_model: None,
             upstream_model: None,
+            max_input_images: OPENAI_COMPAT_DEFAULT_MAX_INPUT_IMAGES,
             model_cache: ArcSwap::from(Arc::new(Arc::from(""))),
         }
+    }
+
+    pub fn with_max_input_images(mut self, limit: usize) -> Self {
+        self.max_input_images = limit;
+        self
     }
 
     /// Override the model id sent to the OpenAI-compatible backend while
@@ -550,11 +580,26 @@ impl<T: Transport> OpenAiCompatProvider<T> {
 }
 
 impl<T: Transport> InferenceProvider for OpenAiCompatProvider<T> {
+    fn max_input_images_for_model(&self, _model: &str) -> usize {
+        self.max_input_images
+    }
+
     fn kind(&self) -> ProviderKind {
         self.kind
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+        if request.input_images.len() > self.max_input_images
+            || request
+                .input_videos
+                .iter()
+                .any(|video| video.sampling_fps.is_some())
+        {
+            return Err(ProviderError::InvalidResponse(
+                "unsupported media controls or image count exceeds configured provider limit"
+                    .into(),
+            ));
+        }
         let model = canonical_model(&request.model)?;
         if self
             .served_model
@@ -647,6 +692,13 @@ impl<P: InferenceProvider, F: InferenceProvider> InferenceProvider for ProviderR
         self.primary.media_transport_for_model(model)
     }
 
+    fn max_input_images_for_model(&self, model: &str) -> usize {
+        self.primary.max_input_images_for_model(model)
+    }
+    fn max_video_fps_for_model(&self, model: &str) -> Option<f32> {
+        self.primary.max_video_fps_for_model(model)
+    }
+
     fn available_kinds(&self) -> Vec<ProviderKind> {
         let mut kinds = self.primary.available_kinds();
         for kind in self.fallback.available_kinds() {
@@ -704,6 +756,13 @@ impl InferenceProvider for Arc<dyn InferenceProvider + Send + Sync> {
         (**self).media_transport_for_model(model)
     }
 
+    fn max_input_images_for_model(&self, model: &str) -> usize {
+        (**self).max_input_images_for_model(model)
+    }
+    fn max_video_fps_for_model(&self, model: &str) -> Option<f32> {
+        (**self).max_video_fps_for_model(model)
+    }
+
     fn available_kinds(&self) -> Vec<ProviderKind> {
         (**self).available_kinds()
     }
@@ -758,6 +817,13 @@ impl ModelRoutingProvider {
         Self { routes, default }
     }
 
+    fn provider_for_model(&self, model: &str) -> &Arc<dyn InferenceProvider + Send + Sync> {
+        self.routes
+            .get(model)
+            .or_else(|| normalize_model_id(model).and_then(|id| self.routes.get(id)))
+            .unwrap_or(&self.default)
+    }
+
     /// Model ids with an explicit route, sorted for stable diagnostics and
     /// test assertions.
     pub fn route_models(&self) -> Vec<&str> {
@@ -777,17 +843,21 @@ impl InferenceProvider for ModelRoutingProvider {
         // route's backend, everything else by the default. Reporting the wrong
         // one here is exactly the bug this override fixes, so the two lookups
         // must stay in lockstep.
-        self.routes
-            .get(model)
-            .map(|p| p.kind())
-            .unwrap_or_else(|| self.default.kind())
+        self.provider_for_model(model).kind()
     }
 
     fn media_transport_for_model(&self, model: &str) -> MediaTransport {
-        self.routes
-            .get(model)
-            .unwrap_or(&self.default)
+        self.provider_for_model(model)
             .media_transport_for_model(model)
+    }
+
+    fn max_input_images_for_model(&self, model: &str) -> usize {
+        self.provider_for_model(model)
+            .max_input_images_for_model(model)
+    }
+    fn max_video_fps_for_model(&self, model: &str) -> Option<f32> {
+        self.provider_for_model(model)
+            .max_video_fps_for_model(model)
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
@@ -812,9 +882,7 @@ impl InferenceProvider for ModelRoutingProvider {
         // a silent hop to a backend that was not pinned for that model. An
         // unrouted model id still falls through to `default`, which honors
         // `allow_fallback` as usual.
-        self.routes
-            .get(request.model.as_ref())
-            .unwrap_or(&self.default)
+        self.provider_for_model(request.model.as_ref())
             .infer(request)
     }
 
@@ -831,16 +899,12 @@ impl InferenceProvider for ModelRoutingProvider {
     }
 
     fn configured_kinds_for_model(&self, model: &str) -> Vec<ProviderKind> {
-        self.routes
-            .get(model)
-            .unwrap_or(&self.default)
+        self.provider_for_model(model)
             .configured_kinds_for_model(model)
     }
 
     fn reserved_output_tokens(&self, request: &InferenceRequest) -> u64 {
-        self.routes
-            .get(request.model.as_ref())
-            .unwrap_or(&self.default)
+        self.provider_for_model(request.model.as_ref())
             .reserved_output_tokens(request)
     }
 }
@@ -1112,6 +1176,52 @@ mod tests {
     }
 
     #[test]
+    fn openai_default_capacity_preserves_live_clip_batches() {
+        let provider = OpenAiCompatProvider::new(
+            MockTransport::ok(&completion_json("ok")),
+            ProviderKind::Vllm,
+        );
+        assert_eq!(
+            provider.max_input_images_for_model("openbmb/MiniCPM-V-4.5"),
+            64
+        );
+        let mut req = request();
+        req.input_images = vec![
+            InferenceImage {
+                media_type: "image/jpeg",
+                data_base64: "YWJj".into(),
+            };
+            64
+        ];
+        provider.infer(&req).unwrap();
+        assert_eq!(provider.transport.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn openai_explicit_capacity_rejects_before_transport() {
+        let provider = OpenAiCompatProvider::new(
+            MockTransport::ok(&completion_json("ok")),
+            ProviderKind::Vllm,
+        )
+        .with_max_input_images(5);
+        let mut req = request();
+        req.input_images = vec![
+            InferenceImage {
+                media_type: "image/jpeg",
+                data_base64: "YWJj".into(),
+            };
+            5
+        ];
+        provider.infer(&req).unwrap();
+        req.input_images.push(req.input_images[0].clone());
+        assert!(matches!(
+            provider.infer(&req),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+        assert_eq!(provider.transport.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn normalizes_model_alias_before_call() {
         let provider = OpenAiCompatProvider::new(
             MockTransport::ok(&completion_json("ok")),
@@ -1316,6 +1426,7 @@ mod tests {
             raw_bytes: None,
             data_base64: "dmlk".to_string(),
             media_resolution: None,
+            sampling_fps: None,
         }];
         let body = build_payload("openbmb/MiniCPM-V-4_5", &req);
         let value: Value = serde_json::from_str(&body).unwrap();
@@ -1341,6 +1452,7 @@ mod tests {
             raw_bytes: None,
             data_base64: "dmlk".to_string(),
             media_resolution: None,
+            sampling_fps: None,
         }];
         let body = build_payload("openbmb/MiniCPM-V-4_5", &req);
         let value: Value = serde_json::from_str(&body).unwrap();
@@ -1361,6 +1473,7 @@ mod tests {
             raw_bytes: Some(Arc::from(&b"vid"[..])),
             data_base64: String::new(),
             media_resolution: None,
+            sampling_fps: None,
         }];
 
         let body = build_payload("openbmb/MiniCPM-V-4_5", &req);
@@ -1475,6 +1588,68 @@ mod tests {
             ["gemini-3.1-flash-lite"]
         );
         assert!(default.seen_models.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn latest_flash_request_alias_routes_to_gemini_without_local_fallback() {
+        let routed = Arc::new(RecordingModelProvider::new(ProviderKind::Gemini));
+        let default = Arc::new(RecordingModelProvider::new(ProviderKind::Vllm));
+        let mut routes: HashMap<String, Arc<dyn InferenceProvider + Send + Sync>> = HashMap::new();
+        routes.insert("gemini-3.8-flash".into(), routed.clone());
+        let router = ModelRoutingProvider::new(routes, default.clone());
+        for model in [
+            "gemini-3.8-flash",
+            "gemini-flash-latest",
+            "GEMINI-3.8-FLASH",
+        ] {
+            let mut req = request();
+            req.model = Arc::from(model);
+            assert_eq!(router.kind_for_model(model), ProviderKind::Gemini);
+            assert_eq!(router.infer(&req).unwrap().provider, ProviderKind::Gemini);
+        }
+        assert_eq!(routed.seen_models.lock().unwrap().len(), 3);
+        assert!(default.seen_models.lock().unwrap().is_empty());
+    }
+
+    fn flash_alias_router() -> ModelRoutingProvider {
+        let routed = Arc::new(
+            crate::gemini::GeminiProvider::new("test-key".into(), "gemini-3.8-flash".into())
+                .unwrap(),
+        );
+        let default = Arc::new(RecordingModelProvider::new(ProviderKind::Vllm));
+        let mut routes: HashMap<String, Arc<dyn InferenceProvider + Send + Sync>> = HashMap::new();
+        routes.insert("gemini-3.8-flash".into(), routed);
+        ModelRoutingProvider::new(routes, default)
+    }
+
+    #[test]
+    fn flash_alias_routes_reserve_gemini_output_headroom() {
+        let router = flash_alias_router();
+        let mut req = request();
+        req.model = Arc::from("gemini-3.8-flash");
+        req.allow_fallback = false;
+        let reserved = router.reserved_output_tokens(&req);
+        assert!(reserved > u64::from(req.max_tokens));
+        for model in ["gemini-flash-latest", "GEMINI-3.8-FLASH"] {
+            req.model = Arc::from(model);
+            assert_eq!(router.reserved_output_tokens(&req), reserved, "{model}");
+        }
+    }
+
+    #[test]
+    fn flash_alias_routes_report_gemini_configuration() {
+        let router = flash_alias_router();
+        for model in [
+            "gemini-3.8-flash",
+            "gemini-flash-latest",
+            "GEMINI-3.8-FLASH",
+        ] {
+            assert_eq!(
+                router.configured_kinds_for_model(model),
+                vec![ProviderKind::Gemini],
+                "{model}"
+            );
+        }
     }
 
     #[test]
@@ -1713,6 +1888,7 @@ mod tests {
             raw_bytes: Some(Arc::from(&b"123456"[..])),
             data_base64: String::new(),
             media_resolution: None,
+            sampling_fps: None,
         });
         req.scheduling =
             InferenceScheduling::new(Arc::from("camera-1"), LatencyClass::Live, 100, 1);

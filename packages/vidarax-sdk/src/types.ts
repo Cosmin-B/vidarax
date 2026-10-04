@@ -364,7 +364,11 @@ export interface RealtimeReasonRequest {
   segment_ms?: number;
   marker_correction_window_frames?: number;
   semantic_inference?: boolean;
+  /** At most 256 source images per chunk; provider capacity must be configured. */
   semantic_frames_per_chunk?: number;
+  semantic_context_frames?: number;
+  source_start_ms?: number;
+  source_end_ms?: number;
   semantic_frame_max_edge?: number;
   crop?: CropRegion;
   semantic_timeout_ms?: number;
@@ -392,6 +396,9 @@ export type MediaAnalysisResolution = "low" | "medium" | "high";
 export interface MediaAnalysisOptions {
   mode: MediaAnalysisMode;
   window_ms?: number;
+  overlap_ms?: number;
+  /** Static provider sampling (0, 24], separate from local fixed_fps. */
+  video_fps?: number;
   resolution?: MediaAnalysisResolution;
   persist_evidence?: boolean;
 }
@@ -456,6 +463,10 @@ export interface MultimodalMomentEventPayload extends MultimodalMoment {
   stream_id: string;
   chunk_index: number;
   timestamp_resolution_ms: number;
+  /** Requested provider cadence, not guaranteed localization accuracy. */
+  provider_sampling_interval_ms?: number | null;
+  /** No server acknowledgment or effective sampling measurement is available. */
+  provider_sampling_status?: "requested_unverified" | null;
   provider: string;
   index_name: string | null;
   evidence: MediaEvidence | null;

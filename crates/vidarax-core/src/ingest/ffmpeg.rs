@@ -11,6 +11,124 @@ use crate::gate::FrameSignal;
 use super::fetch::with_prefetched_downloadable_source;
 use super::InputSource;
 
+/// Bound encoded JPEG pipes while draining stderr concurrently to avoid deadlock.
+pub(super) trait BoundedJpegOutput {
+    fn bounded_jpeg_output(&mut self) -> std::io::Result<std::process::Output>;
+}
+impl BoundedJpegOutput for Command {
+    fn bounded_jpeg_output(&mut self) -> std::io::Result<std::process::Output> {
+        bounded_jpeg_output(self, 256 * 1024 * 1024, std::time::Duration::from_secs(120))
+    }
+}
+
+// Recorded decode policy: bound output and child lifetime, including after the
+// requesting task is dropped. Pipe readers drain while the supervisor polls.
+fn bounded_jpeg_output(
+    command: &mut Command,
+    limit: u64,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stdout_task = std::thread::spawn(move || {
+        let mut stdout = Vec::new();
+        let result = stdout_pipe
+            .take(limit + 1)
+            .read_to_end(&mut stdout)
+            .map(|_| stdout);
+        let _ = tx.send(result);
+    });
+    let stderr_task = std::thread::spawn(move || {
+        let mut stderr = Vec::new();
+        let _ = (&mut stderr_pipe)
+            .take(1024 * 1024)
+            .read_to_end(&mut stderr);
+        let _ = std::io::copy(&mut stderr_pipe, &mut std::io::sink());
+        stderr
+    });
+    let started = std::time::Instant::now();
+    let mut stdout = None;
+    let mut failure = None;
+    let status = loop {
+        if stdout.is_none() {
+            if let Ok(result) = rx.try_recv() {
+                if result
+                    .as_ref()
+                    .is_ok_and(|bytes| bytes.len() as u64 > limit)
+                {
+                    failure = Some(std::io::Error::other(
+                        "review JPEG output exceeds byte budget",
+                    ));
+                } else if result.is_err() {
+                    failure = Some(std::io::Error::other("failed to read ffmpeg output"));
+                }
+                stdout = Some(result);
+            }
+        }
+        if failure.is_none() && started.elapsed() >= timeout {
+            failure = Some(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "recorded ffmpeg extraction timed out",
+            ));
+        }
+        if failure.is_some() {
+            let _ = child.kill();
+            break child.wait();
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(error) => {
+                failure = Some(error);
+                let _ = child.kill();
+                break child.wait();
+            }
+        }
+    };
+    let _ = stdout_task.join();
+    let stderr = stderr_task.join().unwrap_or_default();
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    let stdout = stdout
+        .or_else(|| rx.recv().ok())
+        .ok_or_else(|| std::io::Error::other("ffmpeg output reader failed"))??;
+    if stdout.len() as u64 > limit {
+        return Err(std::io::Error::other(
+            "review JPEG output exceeds byte budget",
+        ));
+    }
+    Ok(std::process::Output {
+        status: status?,
+        stdout,
+        stderr,
+    })
+}
+
+// Own the read result before deleting the temporary path on every return.
+fn read_clip_and_remove(path: &std::path::Path, exact: bool) -> Result<Vec<u8>, String> {
+    let result = (|| {
+        if exact
+            && std::fs::metadata(path)
+                .map_err(|e| format!("failed to inspect clip: {e}"))?
+                .len()
+                > AUDIO_VIDEO_CLIP_MAX_BYTES
+        {
+            return Err("native video clip exceeds 64 MiB; shorten the window".into());
+        }
+        std::fs::read(path).map_err(|e| format!("failed to read clip: {e}"))
+    })();
+    let _ = std::fs::remove_file(path);
+    result
+}
+
 static FFMPEG_PATH: OnceLock<String> = OnceLock::new();
 static FFPROBE_PATH: OnceLock<String> = OnceLock::new();
 static NVIDIA_SMI_PATH: OnceLock<String> = OnceLock::new();
@@ -272,6 +390,7 @@ pub struct DecodedMp4Batch {
 #[derive(Debug, Clone)]
 pub struct DecodedJpegFrame {
     pub frame_index: u64,
+    pub pts_ms: u64,
     pub jpeg_bytes: Arc<[u8]>,
 }
 
@@ -676,8 +795,8 @@ fn decode_mp4_to_jpeg_frames_inner(
             "mjpeg",
             "-",
         ])
-        .output()
-        .map_err(|_| "failed to run ffmpeg".to_string())?;
+        .bounded_jpeg_output()
+        .map_err(|error| format!("JPEG extraction failed: {error}"))?;
     if !output.status.success() {
         tracing::warn!(
             stderr = %String::from_utf8_lossy(&output.stderr).trim(),
@@ -884,6 +1003,7 @@ pub(crate) fn parse_jpeg_stream_to_frames(
 
         frames.push(DecodedJpegFrame {
             frame_index: frames.len() as u64,
+            pts_ms: 0,
             // Store each decoded JPEG behind an Arc so chunk dispatch can copy
             // frame descriptors without copying image payloads.
             jpeg_bytes: raw[start..end].to_vec().into(),
@@ -1110,7 +1230,7 @@ pub fn extract_video_clip(
     crop: Option<CropRegion>,
 ) -> Result<Vec<u8>, String> {
     with_prefetched_downloadable_source(source, |source| {
-        extract_video_clip_inner(source, start_s, duration_s, crop)
+        extract_video_clip_inner(source, start_s, duration_s, crop, false)
     })?
 }
 
@@ -1206,7 +1326,7 @@ fn extract_audio_wav_inner(
             "wav",
             "-",
         ])
-        .output()
+        .bounded_jpeg_output()
         .map_err(|_| "failed to run ffmpeg audio extraction".to_string())?;
     if !output.status.success() {
         return Err(format!(
@@ -1328,8 +1448,11 @@ fn extract_audio_video_clip_inner(
             "-y",
             &tmp_str,
         ])
-        .output()
-        .map_err(|_| "failed to run ffmpeg".to_string())?;
+        .bounded_jpeg_output()
+        .map_err(|error| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("ffmpeg audio-video extraction failed: {error}")
+        })?;
 
     if !output.status.success() {
         let _ = std::fs::remove_file(&tmp);
@@ -1367,11 +1490,24 @@ fn extract_audio_video_clip_inner(
     })
 }
 
+/// Re-encode a source window without keyframe-aligned stream-copy boundaries.
+pub fn extract_video_clip_exact(
+    source: &InputSource,
+    start_s: f32,
+    duration_s: f32,
+    crop: Option<CropRegion>,
+) -> Result<Vec<u8>, String> {
+    with_prefetched_downloadable_source(source, |source| {
+        extract_video_clip_inner(source, start_s, duration_s, crop, true)
+    })?
+}
+
 fn extract_video_clip_inner(
     source: &InputSource,
     start_s: f32,
     duration_s: f32,
     crop: Option<CropRegion>,
+    exact: bool,
 ) -> Result<Vec<u8>, String> {
     if !start_s.is_finite() || start_s < 0.0 {
         return Err("start_s must be >= 0".to_string());
@@ -1394,7 +1530,7 @@ fn extract_video_clip_inner(
     let tmp = unique_ffmpeg_temp_path("clip", "mp4");
     let tmp_str = tmp.to_string_lossy().to_string();
 
-    let output = if use_stream_copy {
+    let output = if use_stream_copy && !exact {
         Command::new(ffmpeg_path())
             .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
             .args(ffmpeg_input_options_for_source(source))
@@ -1413,7 +1549,10 @@ fn extract_video_clip_inner(
                 &tmp_str,
             ])
             .output()
-            .map_err(|_| "failed to run ffmpeg".to_string())?
+            .map_err(|error| {
+                let _ = std::fs::remove_file(&tmp);
+                format!("failed to run ffmpeg: {error}")
+            })?
     } else {
         let mut cmd = Command::new(ffmpeg_path());
         cmd.args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
@@ -1431,8 +1570,10 @@ fn extract_video_clip_inner(
             "-y",
             &tmp_str,
         ]);
-        cmd.output()
-            .map_err(|_| "failed to run ffmpeg".to_string())?
+        cmd.bounded_jpeg_output().map_err(|error| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("failed to run ffmpeg: {error}")
+        })?
     };
 
     if !output.status.success() {
@@ -1446,8 +1587,7 @@ fn extract_video_clip_inner(
         return Err("video clip extraction failed".to_string());
     }
 
-    let bytes = std::fs::read(&tmp).map_err(|e| format!("failed to read clip: {e}"))?;
-    let _ = std::fs::remove_file(&tmp);
+    let bytes = read_clip_and_remove(&tmp, exact)?;
 
     if bytes.is_empty() {
         return Err("ffmpeg produced empty clip output".to_string());
@@ -1543,8 +1683,8 @@ pub(crate) fn decode_selective_jpeg_frames_inner(
             "mjpeg",
             "-",
         ])
-        .output()
-        .map_err(|_| "failed to run ffmpeg".to_string())?;
+        .bounded_jpeg_output()
+        .map_err(|error| format!("JPEG extraction failed: {error}"))?;
 
     if !output.status.success() {
         tracing::warn!(
@@ -1562,6 +1702,7 @@ pub(crate) fn decode_selective_jpeg_frames_inner(
     parsed.truncate(usable);
     for (frame, &idx) in parsed.iter_mut().zip(indices.iter()) {
         frame.frame_index = idx;
+        frame.pts_ms = ((idx as f64 / sample_fps as f64) * 1000.0).round() as u64;
     }
 
     Ok(parsed)
@@ -1569,6 +1710,84 @@ pub(crate) fn decode_selective_jpeg_frames_inner(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bounded_decoder_times_out_and_reaps_child() {
+        let pid_file = super::unique_ffmpeg_temp_path("pid", "txt");
+        let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+        let started = std::time::Instant::now();
+        let error = super::bounded_jpeg_output(
+            std::process::Command::new("sh").args(["-c", &script]),
+            32,
+            std::time::Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let live = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!live.success(), "decoder child must be reaped");
+        let _ = std::fs::remove_file(pid_file);
+    }
+
+    #[test]
+    fn bounded_decoder_drains_saturated_stderr_and_rejects_overflow() {
+        let output = super::bounded_jpeg_output(
+            std::process::Command::new("python3").args([
+                "-c",
+                "import sys; sys.stderr.write('x' * 2000000); sys.stdout.write('jpeg')",
+            ]),
+            32,
+            std::time::Duration::from_secs(3),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"jpeg");
+        assert_eq!(output.stderr.len(), 1024 * 1024);
+        let error = super::bounded_jpeg_output(
+            std::process::Command::new("python3")
+                .args(["-c", "import sys; sys.stdout.write('x' * 1000000)"]),
+            32,
+            std::time::Duration::from_secs(3),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("byte budget"));
+    }
+
+    #[test]
+    fn exact_clip_budget_error_removes_temporary_file() {
+        let path = super::unique_ffmpeg_temp_path("oversize", "mp4");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(super::AUDIO_VIDEO_CLIP_MAX_BYTES + 1)
+            .unwrap();
+        assert!(super::read_clip_and_remove(&path, true)
+            .unwrap_err()
+            .contains("64 MiB"));
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_clip_metadata_and_read_errors_remove_temporary_paths() {
+        let path = super::unique_ffmpeg_temp_path("bad_clip", "mp4");
+        let missing = super::unique_ffmpeg_temp_path("missing", "mp4");
+        std::os::unix::fs::symlink(&missing, &path).unwrap();
+        assert!(super::read_clip_and_remove(&path, true)
+            .unwrap_err()
+            .contains("inspect"));
+        assert!(std::fs::symlink_metadata(&path).is_err());
+        std::os::unix::fs::symlink(std::env::temp_dir(), &path).unwrap();
+        assert!(super::read_clip_and_remove(&path, true)
+            .unwrap_err()
+            .contains("read"));
+        assert!(std::fs::symlink_metadata(&path).is_err());
+    }
+
     use std::fs;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};

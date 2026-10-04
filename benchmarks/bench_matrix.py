@@ -35,12 +35,15 @@ PRICES_PER_MTOK = {
     # prices, not a live quote: override them per run with VIDARAX_PRICE_INPUT /
     # VIDARAX_PRICE_OUTPUT for exact accounting. Longest matching key wins in
     # price_for_model(), so version-qualified ids resolve exactly.
+    # Google standard pricing verified 2026-10-03; promotion ends 2026-12-31.
+    # https://ai.google.dev/gemini-api/docs/pricing
+    "gemini-3.8-flash": (0.75, 3.75),
     "gemini-3.6-flash": (1.50, 7.50),
     "gemini-3.5-flash-lite": (0.30, 2.50),
     "gemini-3.1-flash-lite": (0.25, 1.50),
     "gemini-flash-lite-latest": (0.30, 2.50),     # alias -> 3.5-flash-lite
     "gemini-flash-lite": (0.30, 2.50),
-    "gemini-flash-latest": (0.30, 2.50),          # alias -> 3.5-flash-lite
+    "gemini-flash-latest": (0.75, 3.75),          # Vidarax alias -> 3.8-flash
     "gemini-flash": (0.25, 1.50),
     "gemini": (0.25, 1.50),  # generic fallback
 }

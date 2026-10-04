@@ -22,12 +22,12 @@
 use std::sync::Arc;
 
 use serde::Deserialize;
-use vidarax_contracts::models::DEFAULT_GEMINI_MODEL;
+use vidarax_contracts::models::{normalize_model_id, DEFAULT_GEMINI_MODEL};
 
 use crate::gemini::GeminiProvider;
 use crate::provider::{
     HttpTransport, InferenceProvider, ModelRoutingProvider, OpenAiCompatProvider, ProviderKind,
-    ProviderRouter,
+    ProviderRouter, OPENAI_COMPAT_DEFAULT_MAX_INPUT_IMAGES,
 };
 use crate::zone::RestrictedZonePolicy;
 
@@ -68,6 +68,8 @@ pub struct BackendEntry {
     /// type.
     #[serde(default)]
     pub openai_kind: Option<String>,
+    /// Declared image capacity of the deployed OpenAI-compatible model. Default 64.
+    pub max_input_images: Option<usize>,
     /// Backends are tried in ascending priority order (lowest value = first).
     #[serde(default = "default_priority")]
     pub priority: u32,
@@ -249,6 +251,15 @@ fn build_single_provider(
                 _ => ProviderKind::Vllm,
             };
 
+            if entry
+                .max_input_images
+                .is_some_and(|n| !(1..=256).contains(&n))
+            {
+                return Err(format!(
+                    "backend '{}': max_input_images must be in [1, 256]",
+                    entry.name
+                ));
+            }
             let transport = HttpTransport::new(base_url)
                 .map_err(|e| format!("backend '{}': transport error: {e:?}", entry.name))?;
 
@@ -269,12 +280,23 @@ fn build_single_provider(
 
             Ok(Box::new(
                 OpenAiCompatProvider::new(transport, kind)
+                    .with_max_input_images(
+                        entry
+                            .max_input_images
+                            .unwrap_or(OPENAI_COMPAT_DEFAULT_MAX_INPUT_IMAGES),
+                    )
                     .with_model_mapping(entry.model.clone(), entry.upstream_model.clone()),
             ))
         }
         "gemini" => Ok(Box::new(build_gemini_provider(entry)?)),
         other => Err(format!("backend '{}': unknown type '{other}'", entry.name)),
     }
+}
+
+/// Resolve a configured Gemini alias to the same id accepted by API requests.
+fn gemini_backend_model(entry: &BackendEntry) -> &str {
+    let model = entry.model.as_deref().unwrap_or(DEFAULT_GEMINI_MODEL);
+    normalize_model_id(model).unwrap_or(model)
 }
 
 /// Construct a [`GeminiProvider`] from a `gemini` [`BackendEntry`].
@@ -285,7 +307,7 @@ fn build_single_provider(
 fn build_gemini_provider(entry: &BackendEntry) -> Result<GeminiProvider, String> {
     // Note: env vars are already interpolated by parse_config().
     let api_key = entry.api_key.as_deref().unwrap_or("");
-    let model = entry.model.as_deref().unwrap_or(DEFAULT_GEMINI_MODEL);
+    let model = gemini_backend_model(entry);
     if api_key.is_empty() || api_key.contains("${") {
         return Err(format!("backend '{}': gemini requires api_key", entry.name));
     }
@@ -330,7 +352,7 @@ fn select_model_route_entries(entries: &[BackendEntry]) -> Vec<&BackendEntry> {
     let mut claimed_models: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut selected = Vec::with_capacity(gemini_entries.len());
     for entry in gemini_entries {
-        let model = entry.model.as_deref().unwrap_or(DEFAULT_GEMINI_MODEL);
+        let model = gemini_backend_model(entry);
         if claimed_models.insert(model) {
             selected.push(entry);
         } else {
@@ -358,10 +380,7 @@ fn build_model_routes(
     let mut routes: std::collections::HashMap<String, Arc<dyn InferenceProvider + Send + Sync>> =
         std::collections::HashMap::new();
     for entry in select_model_route_entries(entries) {
-        let model = entry
-            .model
-            .clone()
-            .unwrap_or_else(|| DEFAULT_GEMINI_MODEL.to_string());
+        let model = gemini_backend_model(entry).to_string();
         let provider = build_gemini_provider(entry)?;
         routes.insert(model, Arc::new(provider));
     }
@@ -378,10 +397,7 @@ fn model_route_winners_for_tests(
     select_model_route_entries(entries)
         .into_iter()
         .map(|entry| {
-            let model = entry
-                .model
-                .clone()
-                .unwrap_or_else(|| DEFAULT_GEMINI_MODEL.to_string());
+            let model = gemini_backend_model(entry).to_string();
             (model, entry.name.clone())
         })
         .collect()
@@ -649,6 +665,7 @@ base_url = "${_VDX_TEST_URL}"
             model: None,
             upstream_model: None,
             openai_kind: None,
+            max_input_images: None,
             priority: 1,
         };
         assert!(build_provider_chain(&[entry]).is_err());
@@ -664,6 +681,7 @@ base_url = "${_VDX_TEST_URL}"
             model: Some("gemini-3.1-flash-lite".into()),
             upstream_model: None,
             openai_kind: None,
+            max_input_images: None,
             priority: 1,
         };
         let result = build_provider_chain(&[entry]);
@@ -685,6 +703,7 @@ base_url = "${_VDX_TEST_URL}"
             model: Some("gemini-3.1-flash-lite".into()),
             upstream_model: None,
             openai_kind: None,
+            max_input_images: None,
             priority: 1,
         };
         let result = build_provider_chain(&[entry]);
@@ -708,6 +727,7 @@ base_url = "${_VDX_TEST_URL}"
             model: None,
             upstream_model: None,
             openai_kind: None,
+            max_input_images: None,
             priority: 1,
         };
         let result = build_provider_chain(&[entry]);
@@ -724,6 +744,7 @@ base_url = "${_VDX_TEST_URL}"
             model: None,
             upstream_model: None,
             openai_kind: None,
+            max_input_images: None,
             priority: 1,
         };
         assert!(build_provider_chain(&[entry]).is_err());
@@ -741,6 +762,7 @@ base_url = "${_VDX_TEST_URL}"
             model: None,
             upstream_model: None,
             openai_kind: None,
+            max_input_images: None,
             priority: 1,
         };
         let result = build_provider_chain(&[entry]);
@@ -762,10 +784,58 @@ base_url = "${_VDX_TEST_URL}"
             model: None,
             upstream_model: None,
             openai_kind: None,
+            max_input_images: None,
             priority: 1,
         };
         let provider = build_provider_chain(&[entry]).expect("single provider");
         assert_eq!(provider.kind(), ProviderKind::Vllm);
+    }
+
+    #[test]
+    fn openai_builder_default_capacity_preserves_live_clip_batches() {
+        let config = parse_config(
+            r#"
+[[backends]]
+name = "vllm"
+type = "openai_compat"
+base_url = "http://127.0.0.1:8000"
+"#,
+        )
+        .expect("parse backend without an explicit image capacity");
+        let provider = build_provider_chain(&config.backends).expect("build provider");
+        assert_eq!(
+            provider.max_input_images_for_model("openbmb/MiniCPM-V-4.5"),
+            64
+        );
+    }
+
+    #[test]
+    fn openai_builder_preserves_explicit_image_capacity_bounds() {
+        for capacity in [0, 1, 5, 64, 256, 257] {
+            let config = parse_config(&format!(
+                r#"
+[[backends]]
+name = "vllm"
+type = "openai_compat"
+base_url = "http://127.0.0.1:8000"
+max_input_images = {capacity}
+"#
+            ))
+            .expect("parse explicit image capacity");
+            let result = build_provider_chain(&config.backends);
+            if (1..=256).contains(&capacity) {
+                let provider = result.expect("capacity within the supported range");
+                assert_eq!(
+                    provider.max_input_images_for_model("openbmb/MiniCPM-V-4.5"),
+                    capacity
+                );
+            } else {
+                assert!(result
+                    .err()
+                    .unwrap()
+                    .contains("max_input_images must be in [1, 256]"));
+            }
+        }
     }
 
     #[test]
@@ -779,6 +849,7 @@ base_url = "${_VDX_TEST_URL}"
             model: None,
             upstream_model: None,
             openai_kind: Some("sglang".into()),
+            max_input_images: None,
             priority: 1,
         };
         let provider = build_provider_chain(&[entry]).expect("single provider");
@@ -797,6 +868,7 @@ base_url = "${_VDX_TEST_URL}"
             model: None,
             upstream_model: None,
             openai_kind: Some("mlx".into()),
+            max_input_images: None,
             priority: 1,
         };
         let provider = build_provider_chain(&[entry]).expect("single provider");
@@ -814,6 +886,7 @@ base_url = "${_VDX_TEST_URL}"
             model: None,
             upstream_model: None,
             openai_kind: None,
+            max_input_images: None,
             priority: 1,
         };
         let provider = build_provider_chain(&[entry]).expect("single provider");
@@ -831,6 +904,7 @@ base_url = "${_VDX_TEST_URL}"
                 model: None,
                 upstream_model: None,
                 openai_kind: None,
+                max_input_images: None,
                 priority: 2,
             },
             BackendEntry {
@@ -841,6 +915,7 @@ base_url = "${_VDX_TEST_URL}"
                 model: None,
                 upstream_model: None,
                 openai_kind: None,
+                max_input_images: None,
                 priority: 1,
             },
         ];
@@ -861,6 +936,7 @@ base_url = "${_VDX_TEST_URL}"
             model: None,
             upstream_model: None,
             openai_kind: None,
+            max_input_images: None,
             priority: 1,
         }];
 
@@ -888,6 +964,7 @@ base_url = "${_VDX_TEST_URL}"
                 model: None,
                 upstream_model: None,
                 openai_kind: None,
+                max_input_images: None,
                 priority: 1,
             },
             BackendEntry {
@@ -898,6 +975,7 @@ base_url = "${_VDX_TEST_URL}"
                 model: Some("gemini-3.1-flash-lite".into()),
                 upstream_model: None,
                 openai_kind: None,
+                max_input_images: None,
                 priority: 10,
             },
         ];
@@ -916,6 +994,42 @@ base_url = "${_VDX_TEST_URL}"
     }
 
     #[test]
+    fn latest_flash_alias_config_routes_canonical_model_with_binary_media() {
+        let mut entries = vec![BackendEntry {
+            name: "flash".into(),
+            backend_type: "gemini".into(),
+            base_url: None,
+            api_key: Some("test-api-key".into()),
+            model: Some("gemini-flash-latest".into()),
+            upstream_model: None,
+            openai_kind: None,
+            max_input_images: None,
+            priority: 2,
+        }];
+        let mut duplicate = entries[0].clone();
+        duplicate.name = "canonical".into();
+        duplicate.model = Some("gemini-3.8-flash".into());
+        duplicate.priority = 3;
+        entries.push(duplicate);
+        let routes = build_model_routes(&entries).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert!(routes.contains_key("gemini-3.8-flash"));
+        assert_eq!(
+            model_route_winners_for_tests(&entries)["gemini-3.8-flash"],
+            "flash"
+        );
+        let provider = build_provider_with_model_routing(&entries).unwrap();
+        assert_eq!(
+            provider.kind_for_model("gemini-3.8-flash"),
+            ProviderKind::Gemini
+        );
+        assert_eq!(
+            provider.media_transport_for_model("gemini-3.8-flash"),
+            crate::provider::MediaTransport::BinaryFile
+        );
+    }
+
+    #[test]
     fn model_routing_gemini_without_explicit_model_uses_default_route_key() {
         let entries = vec![BackendEntry {
             name: "gemini".into(),
@@ -925,6 +1039,7 @@ base_url = "${_VDX_TEST_URL}"
             model: None,
             upstream_model: None,
             openai_kind: None,
+            max_input_images: None,
             priority: 1,
         }];
 
@@ -947,6 +1062,7 @@ base_url = "${_VDX_TEST_URL}"
                 model: Some("gemini-3.1-flash-lite".into()),
                 upstream_model: None,
                 openai_kind: None,
+                max_input_images: None,
                 priority: 1,
             },
             BackendEntry {
@@ -957,6 +1073,7 @@ base_url = "${_VDX_TEST_URL}"
                 model: Some("gemini-3.1-flash-lite".into()),
                 upstream_model: None,
                 openai_kind: None,
+                max_input_images: None,
                 priority: 2,
             },
         ];
@@ -988,6 +1105,7 @@ base_url = "${_VDX_TEST_URL}"
                 model: Some("gemini-3.1-flash-lite".into()),
                 upstream_model: None,
                 openai_kind: None,
+                max_input_images: None,
                 priority: 2,
             },
             BackendEntry {
@@ -998,6 +1116,7 @@ base_url = "${_VDX_TEST_URL}"
                 model: Some("gemini-3.1-flash-lite".into()),
                 upstream_model: None,
                 openai_kind: None,
+                max_input_images: None,
                 priority: 1,
             },
         ];
@@ -1024,6 +1143,7 @@ base_url = "${_VDX_TEST_URL}"
             model: Some("gemini-3.1-flash-lite".into()),
             upstream_model: None,
             openai_kind: None,
+            max_input_images: None,
             priority: 5,
         };
         let omega = || BackendEntry {
@@ -1034,6 +1154,7 @@ base_url = "${_VDX_TEST_URL}"
             model: Some("gemini-3.1-flash-lite".into()),
             upstream_model: None,
             openai_kind: None,
+            max_input_images: None,
             priority: 5,
         };
 
@@ -1058,6 +1179,7 @@ base_url = "${_VDX_TEST_URL}"
                 model: None,
                 upstream_model: None,
                 openai_kind: None,
+                max_input_images: None,
                 priority: 1,
             },
             BackendEntry {
@@ -1068,6 +1190,7 @@ base_url = "${_VDX_TEST_URL}"
                 model: Some("gemini-3.1-flash-lite".into()),
                 upstream_model: None,
                 openai_kind: None,
+                max_input_images: None,
                 priority: 10,
             },
         ];

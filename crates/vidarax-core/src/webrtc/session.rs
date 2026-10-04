@@ -918,6 +918,18 @@ impl WebRtcSession {
             .await
     }
 
+    /// Apply a live update or cancel it before replacement at the deadline.
+    pub async fn update_config_with_timeout(
+        &self,
+        prompt: String,
+        guided_json: Option<String>,
+        timeout: std::time::Duration,
+    ) -> Result<(), SessionControlError> {
+        self.control
+            .update_config_with_timeout(Arc::from(prompt), guided_json.map(Arc::from), timeout)
+            .await
+    }
+
     pub fn stopping_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.control.stopping_flag()
     }
