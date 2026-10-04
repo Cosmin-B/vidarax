@@ -11,6 +11,7 @@ live work releases stale buffers as soon as a newer item replaces it.
 | Live decoded frames | A pending FIFO retained stale frames, and a producer could keep a drain loop running. | One pending frame retains the newest output. Each call drains at most 16 items and recycles replacements. Drop disconnects the reader before joining it. |
 | JPEG encoding | A byte check after encoding allowed the temporary buffer to grow past its limit. | The encoder writer rejects output before it exceeds 2 MiB. Normal encoded bytes stay identical. |
 | Sidecar exchange | Partial socket progress could restart a timeout. A failed embedding batch could strand queued callers. | One deadline covers framing, payload and response. A failed batch releases its bytes and wakes its callers; the worker continues. |
+| Structured Gemini response | Hidden thinking could exhaust the output budget after starting JSON, leaving a partial answer without a retry. | A length cutoff with thinking tokens and incomplete requested JSON uses the existing single headroom retry. Complete JSON and free-form text keep their prior policy. |
 | Browser and SDK | A completed response header could end the timeout before the body. Replacement could leave a reader or late media callback alive. | Body reads share the request deadline. Stream exit cancels and releases its reader. Generation ownership closes late tracks and rejects stale callbacks. |
 
 ```mermaid
