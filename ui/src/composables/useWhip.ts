@@ -18,27 +18,38 @@ import { api } from '@/lib/api'
 import { iceServersWithTurn, ls, STORAGE_KEYS, UI_DEFAULTS } from '@/lib/config'
 import { useStreamStore } from '@/stores/stream'
 import type { StreamSourceType } from '@/stores/stream'
-import { stopDurableWhipSession } from '@/lib/whipLifecycle'
+import { stopDurableWhipSession, type DurableWhipSession } from '@/lib/whipLifecycle'
 
-/** Wait for ICE gathering to complete, with a 3 s timeout fallback. */
-function waitForIceComplete(pc: RTCPeerConnection): Promise<string> {
-  return new Promise((resolve) => {
-    if (pc.iceGatheringState === 'complete') {
-      resolve(pc.localDescription!.sdp)
-      return
+/** Wait for ICE gathering, component cancellation, or a 3 s timeout. */
+function waitForIceComplete(pc: RTCPeerConnection, signal: AbortSignal): Promise<string> {
+  if (signal.aborted) return Promise.resolve('')
+  if (pc.iceGatheringState === 'complete') return Promise.resolve(pc.localDescription?.sdp ?? '')
+  return new Promise(resolve => {
+    const finish = () => {
+      clearTimeout(timer)
+      pc.removeEventListener('icegatheringstatechange', check)
+      signal.removeEventListener('abort', finish)
+      resolve(signal.aborted ? '' : pc.localDescription?.sdp ?? '')
     }
     const check = () => {
-      if (pc.iceGatheringState === 'complete') {
-        pc.removeEventListener('icegatheringstatechange', check)
-        resolve(pc.localDescription!.sdp)
-      }
+      if (pc.iceGatheringState === 'complete') finish()
     }
+    const timer = setTimeout(finish, 3000)
     pc.addEventListener('icegatheringstatechange', check)
-    setTimeout(() => {
-      pc.removeEventListener('icegatheringstatechange', check)
-      resolve(pc.localDescription?.sdp ?? '')
-    }, 3000)
+    signal.addEventListener('abort', finish, { once: true })
   })
+}
+
+interface WhipConnection {
+  stream: MediaStream | null
+  peer: RTCPeerConnection | null
+  session: DurableWhipSession | null
+  timer: ReturnType<typeof setInterval> | null
+  abort: AbortController
+  offerPending: boolean
+  polling: boolean
+  prevFrames: number
+  prevTs: number
 }
 
 export interface WhipStartOptions {
@@ -52,10 +63,7 @@ export function useWhip() {
   const streamStore = useStreamStore()
 
   const localStream = ref<MediaStream | null>(null)
-  const pc = ref<RTCPeerConnection | null>(null)
-  let metricsTimer: ReturnType<typeof setInterval> | null = null
-  let prevFrames = 0
-  let prevTs = 0
+  let active: WhipConnection | null = null
 
   /** Acquire local media based on source type. */
   async function acquireMedia(sourceType: StreamSourceType): Promise<MediaStream> {
@@ -75,143 +83,182 @@ export function useWhip() {
   }
 
   async function startStream(sourceType: StreamSourceType, options: WhipStartOptions = {}): Promise<void> {
+    const previous = active
+    const connection: WhipConnection = {
+      stream: null,
+      peer: null,
+      session: null,
+      timer: null,
+      abort: new AbortController(),
+      offerPending: false,
+      polling: false,
+      prevFrames: 0,
+      prevTs: 0,
+    }
+    active = connection
+    localStream.value = null
+    if (previous) void stopConnection(previous)
+    streamStore.setMediaStream(null)
+    streamStore.reset()
+    streamStore.setSource(sourceType)
     streamStore.setState('negotiating')
-    streamStore.setError(null)
+    let connected = false
 
     try {
-      // ── 1. Acquire media ──────────────────────────────────────────────
-      const stream = await acquireMedia(sourceType)
-      localStream.value = stream
-      streamStore.setMediaStream(stream)
+      connection.stream = await acquireMedia(sourceType)
+      if (active !== connection) return
+      localStream.value = connection.stream
+      streamStore.setMediaStream(connection.stream)
 
-      // ── 2. Peer connection ────────────────────────────────────────────
       const turnUrl = ls(STORAGE_KEYS.turnUrl, UI_DEFAULTS.turnUrl)
-      const conn = new RTCPeerConnection({ iceServers: iceServersWithTurn(turnUrl) })
-      pc.value = conn
+      const peer = new RTCPeerConnection({ iceServers: iceServersWithTurn(turnUrl) })
+      connection.peer = peer
+      connection.stream.getTracks().forEach(track => peer.addTrack(track, connection.stream!))
 
-      stream.getTracks().forEach(track => conn.addTrack(track, stream))
-
-      // ── 3. Create offer ───────────────────────────────────────────────
-      const offer = await conn.createOffer()
-      await conn.setLocalDescription(offer)
-
-      // Wait for ICE candidates to trickle in (or hit timeout)
-      const offerSdp = await waitForIceComplete(conn)
+      const offer = await peer.createOffer()
+      if (active !== connection) return
+      await peer.setLocalDescription(offer)
+      if (active !== connection) return
+      const offerSdp = await waitForIceComplete(peer, connection.abort.signal)
+      if (active !== connection) return
       if (!offerSdp) throw new Error('Failed to build local SDP')
 
-      // ── 4. WHIP negotiation ───────────────────────────────────────────
-      let whipResult: { answer_sdp: string; session_id: string; location: string; run_id?: string }
+      const prompt = options.prompt?.trim()
+      const attachConfig = {
+        ...(prompt ? { prompt } : {}),
+        ...(options.localAudio ? {
+          local_audio: {
+            profile: sourceType === 'screen' ? 'screen_recording' as const : 'physical_world' as const,
+            speech_engine: 'whisper' as const,
+            min_confidence: 0.35,
+            max_events: 32,
+          },
+        } : {}),
+      }
+      connection.offerPending = true
+      let whipResult: Awaited<ReturnType<typeof api.stream.whipOffer>>
       try {
-        const prompt = options.prompt?.trim()
-        const attachConfig = {
-          ...(prompt ? { prompt } : {}),
-          ...(options.localAudio ? {
-            local_audio: {
-              profile: sourceType === 'screen' ? 'screen_recording' as const : 'physical_world' as const,
-              speech_engine: 'whisper' as const,
-              min_confidence: 0.35,
-              max_events: 32,
-            },
-          } : {}),
-        }
         whipResult = await api.stream.whipOffer(
           offerSdp,
           Object.keys(attachConfig).length > 0 ? attachConfig : undefined,
         )
-      } catch (whipErr) {
-        const msg = whipErr instanceof Error ? whipErr.message : 'WHIP negotiation failed'
-        throw new Error(`WHIP negotiation failed: ${msg}`)
+      } finally {
+        connection.offerPending = false
       }
       const { answer_sdp, session_id, location, run_id } = whipResult
+      // Own the server session before applying its answer. A failed answer or
+      // a stop during the request must still release the returned session.
+      connection.session = { sessionId: session_id, runId: run_id ?? '' }
+      if (active !== connection) return
+      await peer.setRemoteDescription({ type: 'answer', sdp: answer_sdp })
+      if (active !== connection) return
 
-      await conn.setRemoteDescription({ type: 'answer', sdp: answer_sdp })
-
-      // ── 5. Store session ──────────────────────────────────────────────
       streamStore.setSession({
-        sessionId: session_id,
-        runId: run_id ?? '',
+        ...connection.session,
         locationUrl: location,
         createdAt: new Date().toISOString(),
       })
       streamStore.setState('connected')
-
-      // ── 6. Metrics polling ────────────────────────────────────────────
-      prevTs = Date.now()
-      metricsTimer = setInterval(() => pollMetrics(conn), 1000)
-
-      // Handle peer disconnect from the remote side
-      conn.onconnectionstatechange = () => {
-        if (conn.connectionState === 'failed' || conn.connectionState === 'disconnected') {
+      connected = true
+      connection.prevTs = Date.now()
+      connection.timer = setInterval(() => { void pollMetrics(connection) }, 1000)
+      peer.onconnectionstatechange = () => {
+        if (active === connection && (peer.connectionState === 'failed' || peer.connectionState === 'disconnected')) {
           streamStore.setError('WebRTC connection lost')
         }
       }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Stream failed'
-      streamStore.setError(msg)
-      cleanup()
+      if (active === connection) {
+        streamStore.setError(err instanceof Error ? err.message : 'Stream failed')
+      }
+    } finally {
+      if (!connected || active !== connection) {
+        if (active === connection) {
+          active = null
+          localStream.value = null
+          streamStore.setMediaStream(null)
+        }
+        await stopConnection(connection)
+      }
     }
   }
 
   async function stopStream(): Promise<void> {
-    const session = streamStore.activeSession
-    if (session) {
-      await stopDurableWhipSession(session, api.runs.stop, api.stream.whipTerminate)
-    }
-    cleanup()
+    const connection = active
+    active = null
+    localStream.value = null
+    streamStore.setMediaStream(null)
     streamStore.reset()
+    if (connection) await stopConnection(connection)
   }
 
-  async function pollMetrics(conn: RTCPeerConnection): Promise<void> {
+  async function pollMetrics(connection: WhipConnection): Promise<void> {
+    if (connection.polling || !connection.peer) return
+    connection.polling = true
     try {
-      const stats = await conn.getStats()
+      const stats = await connection.peer.getStats()
+      if (active !== connection) return
       const now = Date.now()
-      const elapsed = (now - prevTs) / 1000
-
+      const elapsed = (now - connection.prevTs) / 1000
       let bytesSent = 0
       let framesEncoded = 0
-
       stats.forEach(report => {
         if (report.type === 'outbound-rtp' && report.kind === 'video') {
           bytesSent += (report as RTCOutboundRtpStreamStats).bytesSent ?? 0
           framesEncoded = (report as RTCOutboundRtpStreamStats).framesEncoded ?? 0
         }
       })
-
-      const fps = elapsed > 0 ? Math.round((framesEncoded - prevFrames) / elapsed) : 0
-
+      const fps = elapsed > 0 ? Math.round((framesEncoded - connection.prevFrames) / elapsed) : 0
       streamStore.updateMetrics({
         bytesTransferred: bytesSent,
         frameCount: framesEncoded,
         fps: Math.max(0, fps),
-        latencyMs: 0, // round-trip time available via candidate-pair stats if needed
+        latencyMs: 0,
       })
-
-      prevFrames = framesEncoded
-      prevTs = now
+      connection.prevFrames = framesEncoded
+      connection.prevTs = now
     } catch {
-      // stats can fail transiently
+      // A closed peer can reject a pending stats request.
+    } finally {
+      connection.polling = false
     }
   }
 
-  function cleanup(): void {
-    if (metricsTimer !== null) {
-      clearInterval(metricsTimer)
-      metricsTimer = null
+  async function stopConnection(connection: WhipConnection): Promise<void> {
+    connection.abort.abort()
+    if (connection.timer !== null) {
+      clearInterval(connection.timer)
+      connection.timer = null
     }
-    if (pc.value) {
-      pc.value.onconnectionstatechange = null
-      pc.value.close()
-      pc.value = null
+    if (connection.peer) connection.peer.onconnectionstatechange = null
+    if (connection.stream) {
+      connection.stream.getTracks().forEach(track => track.stop())
+      connection.stream = null
     }
-    if (localStream.value) {
-      localStream.value.getTracks().forEach(t => t.stop())
-      localStream.value = null
+    // An offer can return a durable session after stop. Its pending caller
+    // retains the peer until it can stop that run before closing transport.
+    if (connection.offerPending) return
+    let peer = connection.peer
+    connection.peer = null
+    const closePeer = () => {
+      peer?.close()
+      peer = null
     }
-    prevFrames = 0
-    prevTs = 0
+    const session = connection.session
+    connection.session = null
+    try {
+      if (session) {
+        await stopDurableWhipSession(session, api.runs.stop, async sessionId => {
+          closePeer()
+          await api.stream.whipTerminate(sessionId)
+        })
+      }
+    } finally {
+      closePeer()
+    }
   }
 
-  onUnmounted(cleanup)
+  onUnmounted(() => { void stopStream() })
 
   return { localStream, startStream, stopStream }
 }

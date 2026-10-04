@@ -1,6 +1,6 @@
 //! Process admission units for one live media-pipeline generation.
 
-use crate::webrtc::decode::{DecoderBackend, VideoCodec};
+use crate::webrtc::decode::{DecoderBackend, VideoCodec, YuvPlanePools};
 use crate::webrtc::session::{MAX_RTP_ACCESS_UNIT_BYTES, RTP_FRAME_QUEUE_CAPACITY};
 use crate::webrtc::signals::MAX_JPEG_BYTES_PER_FRAME;
 use crate::webrtc::workers::{
@@ -53,7 +53,11 @@ impl MediaSessionResources {
             .saturating_add(sidecar_reader_workers);
 
         let pixels = u64::from(cfg.decode_width).saturating_mul(u64::from(cfg.decode_height));
-        let yuv_frame_bytes = pixels.saturating_mul(3).saturating_div(2);
+        // Pools round luma to a capacity bucket and derive both chroma pools
+        // from it. Admission must cover those allocations, not only pixels.
+        let yuv_frame_bytes =
+            YuvPlanePools::allocated_bytes_per_slot(cfg.decode_width, cfg.decode_height)
+                .max(pixels.saturating_mul(3).saturating_div(2));
         let decoded_frame_bytes = yuv_frame_bytes
             .saturating_mul(decode_output_pool_slots(cfg.gpu_available, codec) as u64);
         let zone_evidence_slots = if !clip_mode && cfg.restricted_zone.is_some() {
@@ -155,5 +159,16 @@ mod tests {
             crate::webrtc::signals::MAX_JPEG_BYTES_PER_FRAME as u64
                 * crate::webrtc::workers::ZONE_EVIDENCE_QUEUE_CAPACITY as u64
         );
+    }
+
+    #[test]
+    fn decoded_frame_reservation_covers_rounded_plane_capacities() {
+        let mut cfg = WorkerPoolConfig::from(&WebRtcConfig::default());
+        cfg.decode_width = 1280;
+        cfg.decode_height = 720;
+        let resources = MediaSessionResources::for_pipeline(&cfg, VideoCodec::H264, false);
+        // 921,600 luma bytes occupy a 1 MiB pool position; U and V each
+        // occupy 256 KiB. Twenty positions include both sides of replacement.
+        assert_eq!(resources.decoded_frame_bytes, 1_572_864 * 20);
     }
 }

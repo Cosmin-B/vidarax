@@ -5,6 +5,8 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
+use crate::sidecar_io::{exchange_deadline, remaining, DeadlineStream};
+
 pub const EMBEDDING_DIM: usize = 768;
 pub const MAX_JPEG_BYTES: usize = 10 * 1024 * 1024;
 
@@ -59,7 +61,8 @@ impl From<std::io::Error> for EmbeddingSidecarError {
     }
 }
 
-/// Persistent connection with reconnect backoff. Callers fail open on errors.
+/// Persistent connection with one deadline per exchange and reconnect backoff.
+/// A failed exchange closes the connection. Callers fail open on errors.
 pub struct EmbeddingSidecarClient {
     address: SocketAddr,
     timeout: Duration,
@@ -116,7 +119,8 @@ impl EmbeddingSidecarClient {
     }
 
     fn exchange(&mut self, jpeg: &[u8]) -> Result<[f32; EMBEDDING_DIM], EmbeddingSidecarError> {
-        let stream = self.connection()?;
+        let deadline = exchange_deadline(self.timeout)?;
+        let mut stream = DeadlineStream::new(self.connection(deadline)?, deadline);
         let jpeg_len = u32::try_from(jpeg.len())
             .map_err(|_| EmbeddingSidecarError::ImageTooLarge(jpeg.len()))?;
         let mut request_header = [0_u8; HEADER_BYTES];
@@ -166,16 +170,59 @@ impl EmbeddingSidecarClient {
         Ok(embedding)
     }
 
-    fn connection(&mut self) -> Result<&mut TcpStream, EmbeddingSidecarError> {
+    fn connection(&mut self, deadline: Instant) -> Result<&mut TcpStream, EmbeddingSidecarError> {
         if self.stream.is_none() {
-            let stream = TcpStream::connect_timeout(&self.address, self.timeout)?;
-            stream.set_read_timeout(Some(self.timeout))?;
-            stream.set_write_timeout(Some(self.timeout))?;
+            let stream = TcpStream::connect_timeout(&self.address, remaining(deadline)?)?;
             stream.set_nodelay(true)?;
             self.stream = Some(stream);
         }
         self.stream
             .as_mut()
             .ok_or(EmbeddingSidecarError::Protocol("missing connection"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn trickled_response_cannot_restart_exchange_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let peer = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fixture");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut header = [0; HEADER_BYTES];
+            stream.read_exact(&mut header).expect("request header");
+            let mut jpeg = vec![0; u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize];
+            stream.read_exact(&mut jpeg).expect("request JPEG");
+            let mut response = [0; HEADER_BYTES];
+            response[..4].copy_from_slice(&RESPONSE_MAGIC);
+            response[4] = PROTOCOL_VERSION;
+            response[6..8].copy_from_slice(&(EMBEDDING_DIM as u16).to_be_bytes());
+            response[8..12].copy_from_slice(&(EMBEDDING_BYTES as u32).to_be_bytes());
+            for byte in response {
+                thread::sleep(Duration::from_millis(30));
+                if stream.write_all(&[byte]).is_err() {
+                    return;
+                }
+            }
+            let _ = stream.write_all(&[0; EMBEDDING_BYTES]);
+        });
+
+        let mut client = EmbeddingSidecarClient::new(&address.to_string(), 80).unwrap();
+        let result = client.embed(b"jpeg");
+        peer.join().unwrap();
+        assert!(matches!(result, Err(EmbeddingSidecarError::Io(_))));
+        assert!(client.stream.is_none());
+        assert!(matches!(
+            client.embed(b"jpeg"),
+            Err(EmbeddingSidecarError::BackingOff)
+        ));
     }
 }

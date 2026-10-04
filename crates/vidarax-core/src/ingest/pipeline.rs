@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::{Arc, OnceLock};
 
-use super::ffmpeg::BoundedJpegOutput;
+use super::ffmpeg::BoundedMediaOutput;
 use crate::crop::CropRegion;
 use crate::ingest::{
     decode_mp4_to_frame_signals, decode_selective_jpeg_frames, extract_video_clip,
@@ -347,7 +347,7 @@ fn decode_selective_jpeg_frames_nvdec_inner(
             "mjpeg",
             "-",
         ])
-        .bounded_jpeg_output()
+        .bounded_media_output()
         .map_err(|_| "failed to run ffmpeg with NVDEC".to_string())?;
 
     if !output.status.success() {
@@ -513,7 +513,7 @@ fn decode_selective_jpeg_frames_videotoolbox_inner(
             "mjpeg",
             "-",
         ])
-        .bounded_jpeg_output()
+        .bounded_media_output()
         .map_err(|_| "failed to run ffmpeg with VideoToolbox".to_string())?;
 
     if !output.status.success() {

@@ -62,7 +62,7 @@ The sidecar paths are built around one hazard: a subprocess connected by two pip
 
 A reader thread owns ffmpeg's stdout. It continuously reads complete YUV frames and hands them to the decode side through a bounded channel using blocking sends. The handoff is lossless: the reader never drops or evicts a decoded frame. When the channel is full, the reader blocks.
 
-Each frame is read directly into buffers acquired from a bounded pool. Recycled buffers keep their capacity, so once the pool has been through its first cycles the steady-state read loop does not allocate. The pool is sized to cover every place a frame can legally exist at once: the full reader channel, the decoder's small pending FIFO, the frame the reader is currently assembling, and the frame the consumer currently holds.
+Each frame is read directly into buffers acquired from a bounded pool. Recycled buffers keep their capacity, so once the pool has been through its first cycles the steady-state read loop does not allocate. The pool is sized to cover every place a frame can legally exist at once: the full reader channel, the newest decoded frame and its received replacement, the frame the reader is currently assembling, and the frame the consumer currently holds.
 
 ### The drain-before-write rule
 

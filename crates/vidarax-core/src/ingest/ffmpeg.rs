@@ -4,6 +4,7 @@ use std::sync::{
     Arc, OnceLock,
 };
 
+use crate::audio_sidecar::MAX_AUDIO_DURATION_MS;
 use crate::coordinates::FrameCoordinates;
 use crate::crop::CropRegion;
 use crate::gate::FrameSignal;
@@ -11,52 +12,128 @@ use crate::gate::FrameSignal;
 use super::fetch::with_prefetched_downloadable_source;
 use super::InputSource;
 
-/// Bound encoded JPEG pipes while draining stderr concurrently to avoid deadlock.
-pub(super) trait BoundedJpegOutput {
-    fn bounded_jpeg_output(&mut self) -> std::io::Result<std::process::Output>;
+const MEDIA_OUTPUT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const MEDIA_STDERR_MAX_BYTES: u64 = 1024 * 1024;
+const MEDIA_PROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Bound media-tool pipes while draining stderr concurrently to avoid deadlock.
+pub(super) trait BoundedMediaOutput {
+    fn bounded_media_output(&mut self) -> std::io::Result<std::process::Output>;
+    fn bounded_media_output_with_limit(
+        &mut self,
+        limit: u64,
+    ) -> std::io::Result<std::process::Output>;
 }
-impl BoundedJpegOutput for Command {
-    fn bounded_jpeg_output(&mut self) -> std::io::Result<std::process::Output> {
-        bounded_jpeg_output(self, 256 * 1024 * 1024, std::time::Duration::from_secs(120))
+impl BoundedMediaOutput for Command {
+    fn bounded_media_output(&mut self) -> std::io::Result<std::process::Output> {
+        bounded_media_output(self, MEDIA_OUTPUT_MAX_BYTES, MEDIA_PROCESS_TIMEOUT)
+    }
+
+    fn bounded_media_output_with_limit(
+        &mut self,
+        limit: u64,
+    ) -> std::io::Result<std::process::Output> {
+        bounded_media_output(self, limit, MEDIA_PROCESS_TIMEOUT)
     }
 }
 
 // Recorded decode policy: bound output and child lifetime, including after the
 // requesting task is dropped. Pipe readers drain while the supervisor polls.
-fn bounded_jpeg_output(
+pub(super) fn bounded_media_output(
     command: &mut Command,
     limit: u64,
     timeout: std::time::Duration,
 ) -> std::io::Result<std::process::Output> {
+    bounded_media_output_with_input(command, limit, timeout, None)
+}
+
+fn bounded_media_output_with_input(
+    command: &mut Command,
+    limit: u64,
+    timeout: std::time::Duration,
+    input: Option<Vec<u8>>,
+) -> std::io::Result<std::process::Output> {
     use std::io::Read;
     use std::process::Stdio;
+    let started = std::time::Instant::now();
     let mut child = command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
     let stdout_pipe = child.stdout.take().expect("piped stdout");
     let mut stderr_pipe = child.stderr.take().expect("piped stderr");
     let (tx, rx) = std::sync::mpsc::channel();
-    let stdout_task = std::thread::spawn(move || {
-        let mut stdout = Vec::new();
-        let result = stdout_pipe
-            .take(limit + 1)
-            .read_to_end(&mut stdout)
-            .map(|_| stdout);
-        let _ = tx.send(result);
-    });
-    let stderr_task = std::thread::spawn(move || {
-        let mut stderr = Vec::new();
-        let _ = (&mut stderr_pipe)
-            .take(1024 * 1024)
-            .read_to_end(&mut stderr);
-        let _ = std::io::copy(&mut stderr_pipe, &mut std::io::sink());
-        stderr
-    });
-    let started = std::time::Instant::now();
+    let stdout_task = std::thread::Builder::new()
+        .name("vx-media-stdout".into())
+        .spawn(move || {
+            let mut stdout = Vec::new();
+            let result = stdout_pipe
+                .take(limit.saturating_add(1))
+                .read_to_end(&mut stdout)
+                .map(|_| stdout);
+            let _ = tx.send(result);
+        });
+    let stdout_task = match stdout_task {
+        Ok(task) => task,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let stderr_task = std::thread::Builder::new()
+        .name("vx-media-stderr".into())
+        .spawn(move || {
+            let mut stderr = Vec::new();
+            let _ = (&mut stderr_pipe)
+                .take(MEDIA_STDERR_MAX_BYTES)
+                .read_to_end(&mut stderr);
+            let _ = std::io::copy(&mut stderr_pipe, &mut std::io::sink());
+            stderr
+        });
+    let stderr_task = match stderr_task {
+        Ok(task) => task,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_task.join();
+            return Err(error);
+        }
+    };
+    let (input_tx, input_rx) = std::sync::mpsc::channel();
+    let input_task = if let Some(input) = input {
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let task = std::thread::Builder::new()
+            .name("vx-media-stdin".into())
+            .spawn(move || {
+                use std::io::Write;
+                let result = stdin.write_all(&input).and_then(|_| stdin.flush());
+                let _ = input_tx.send(result);
+            });
+        match task {
+            Ok(task) => Some(task),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_task.join();
+                let _ = stderr_task.join();
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     let mut stdout = None;
     let mut failure = None;
     let status = loop {
+        if let Ok(Err(error)) = input_rx.try_recv() {
+            failure = Some(error);
+        }
         if stdout.is_none() {
             if let Ok(result) = rx.try_recv() {
                 if result
@@ -64,10 +141,10 @@ fn bounded_jpeg_output(
                     .is_ok_and(|bytes| bytes.len() as u64 > limit)
                 {
                     failure = Some(std::io::Error::other(
-                        "review JPEG output exceeds byte budget",
+                        "media tool output exceeds byte budget",
                     ));
                 } else if result.is_err() {
-                    failure = Some(std::io::Error::other("failed to read ffmpeg output"));
+                    failure = Some(std::io::Error::other("failed to read media tool output"));
                 }
                 stdout = Some(result);
             }
@@ -75,7 +152,7 @@ fn bounded_jpeg_output(
         if failure.is_none() && started.elapsed() >= timeout {
             failure = Some(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                "recorded ffmpeg extraction timed out",
+                "media tool timed out",
             ));
         }
         if failure.is_some() {
@@ -94,15 +171,23 @@ fn bounded_jpeg_output(
     };
     let _ = stdout_task.join();
     let stderr = stderr_task.join().unwrap_or_default();
+    if let Some(task) = input_task {
+        let _ = task.join();
+        if failure.is_none() {
+            if let Ok(Err(error)) = input_rx.try_recv() {
+                failure = Some(error);
+            }
+        }
+    }
     if let Some(error) = failure {
         return Err(error);
     }
     let stdout = stdout
         .or_else(|| rx.recv().ok())
-        .ok_or_else(|| std::io::Error::other("ffmpeg output reader failed"))??;
+        .ok_or_else(|| std::io::Error::other("media tool output reader failed"))??;
     if stdout.len() as u64 > limit {
         return Err(std::io::Error::other(
-            "review JPEG output exceeds byte budget",
+            "media tool output exceeds byte budget",
         ));
     }
     Ok(std::process::Output {
@@ -433,7 +518,7 @@ fn probe_media_info_inner(source: &InputSource) -> Result<MediaInfo, String> {
             "json",
             source_uri,
         ])
-        .output()
+        .bounded_media_output()
         .map_err(|_| "failed to run ffprobe".to_string())?;
     if !output.status.success() {
         return Err("media probe failed".to_string());
@@ -493,7 +578,7 @@ fn probe_source_fps_inner(source: &InputSource) -> Option<f32> {
             "default=noprint_wrappers=1:nokey=1",
             source_uri,
         ])
-        .output()
+        .bounded_media_output()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -528,6 +613,48 @@ fn decode_mp4_to_frame_signals_with_prefetch_validator(
     Ok(decoded)
 }
 
+// Rows contain five integer fields, five comma-space separators, an MD5 and
+// a newline. Keep the existing diagnostic allowance for container headers and
+// retain the process-wide output ceiling for callers with very large counts.
+fn framemd5_output_limit(max_frames: usize) -> u64 {
+    const ROW_MAX_BYTES: u64 = 5 * 20 + 5 * 2 + 32 + 1;
+    (max_frames as u64)
+        .saturating_mul(ROW_MAX_BYTES)
+        .saturating_add(MEDIA_STDERR_MAX_BYTES)
+        .min(MEDIA_OUTPUT_MAX_BYTES)
+}
+
+fn run_framemd5(
+    mut command: Command,
+    source: &InputSource,
+    config: Mp4DecodeConfig,
+) -> std::io::Result<std::process::Output> {
+    let fps_expr = format!("{}fps={:.3}", crop_prefix(config.crop), config.sample_fps);
+    command
+        .args([
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            ffmpeg_protocol_whitelist_for_source(source),
+        ])
+        .args(ffmpeg_input_options_for_source(source))
+        .args([
+            "-i",
+            source.as_ffmpeg_input(),
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            &fps_expr,
+            "-frames:v",
+            &config.max_frames.to_string(),
+            "-f",
+            "framemd5",
+            "-",
+        ])
+        .bounded_media_output_with_limit(framemd5_output_limit(config.max_frames))
+}
+
 fn decode_mp4_to_frame_signals_inner(
     source: &InputSource,
     config: Mp4DecodeConfig,
@@ -553,16 +680,8 @@ fn decode_mp4_to_frame_signals_inner(
         }
         _ => None,
     };
-    let protocol_whitelist = ffmpeg_protocol_whitelist_for_source(source);
-    let fps_expr = format!("{}fps={:.3}", crop_prefix(config.crop), config.sample_fps);
-    let output = Command::new(ffmpeg_path())
-        .args(["-v", "error", "-protocol_whitelist", protocol_whitelist])
-        .args(ffmpeg_input_options_for_source(source))
-        .args([
-            "-i", source_uri, "-an", "-sn", "-dn", "-vf", &fps_expr, "-f", "framemd5", "-",
-        ])
-        .output()
-        .map_err(|_| "failed to run ffmpeg".to_string())?;
+    let output = run_framemd5(Command::new(ffmpeg_path()), source, config)
+        .map_err(|error| format!("failed to run ffmpeg: {error}"))?;
     if !output.status.success() {
         tracing::warn!(
             stderr = %String::from_utf8_lossy(&output.stderr).trim(),
@@ -621,7 +740,7 @@ fn probe_source_dimensions_inner(source: &InputSource) -> Option<(u32, u32)> {
             "csv=p=0:s=x",
             source_uri,
         ])
-        .output()
+        .bounded_media_output()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -672,7 +791,11 @@ fn compute_ahashes_from_source(
             "gray",
             "-",
         ])
-        .output()
+        .bounded_media_output_with_limit(
+            (max_frames as u64)
+                .saturating_mul(64)
+                .min(MEDIA_OUTPUT_MAX_BYTES),
+        )
         .map_err(|_| "failed to run ffmpeg".to_string())?;
     if !output.status.success() {
         return Err(format!(
@@ -795,7 +918,7 @@ fn decode_mp4_to_jpeg_frames_inner(
             "mjpeg",
             "-",
         ])
-        .bounded_jpeg_output()
+        .bounded_media_output()
         .map_err(|error| format!("JPEG extraction failed: {error}"))?;
     if !output.status.success() {
         tracing::warn!(
@@ -1237,6 +1360,52 @@ pub fn extract_video_clip(
 pub const AUDIO_VIDEO_CLIP_MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub const AUDIO_WAV_MAX_BYTES: usize = 4 * 1024 * 1024;
 
+/// Consume one Ogg Opus window and return mono 16 kHz PCM WAV bytes.
+///
+/// This blocks while the owned ffmpeg child runs. Input writes and output reads
+/// run concurrently; output is limited to 4 MiB and the child to 120 seconds.
+/// Errors kill and reap the child before all pipe workers are joined.
+pub fn decode_ogg_opus_wav(ogg: Vec<u8>) -> Result<Vec<u8>, String> {
+    let output = bounded_media_output_with_input(
+        Command::new(ffmpeg_path()).args([
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            "pipe",
+            "-f",
+            "ogg",
+            "-i",
+            "pipe:0",
+            "-vn",
+            "-sn",
+            "-dn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            "-f",
+            "wav",
+            "pipe:1",
+        ]),
+        AUDIO_WAV_MAX_BYTES as u64,
+        MEDIA_PROCESS_TIMEOUT,
+        Some(ogg),
+    )
+    .map_err(|error| format!("ffmpeg Opus extraction failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffmpeg Opus extraction failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if output.stdout.is_empty() {
+        return Err("ffmpeg produced empty WAV output".to_string());
+    }
+    Ok(output.stdout)
+}
+
 #[derive(Debug)]
 pub struct ExtractedAudioVideoClip {
     pub bytes: Vec<u8>,
@@ -1271,7 +1440,10 @@ fn extract_audio_wav_inner(
     if !start_s.is_finite() || start_s < 0.0 {
         return Err("start_s must be >= 0".to_string());
     }
-    if !duration_s.is_finite() || duration_s <= 0.0 || duration_s > 60.0 {
+    if !duration_s.is_finite()
+        || duration_s <= 0.0
+        || duration_s > MAX_AUDIO_DURATION_MS as f32 / 1_000.0
+    {
         return Err("duration_s must be in (0, 60]".to_string());
     }
     if media_info.audio_streams == 0 {
@@ -1326,7 +1498,7 @@ fn extract_audio_wav_inner(
             "wav",
             "-",
         ])
-        .bounded_jpeg_output()
+        .bounded_media_output_with_limit(AUDIO_WAV_MAX_BYTES as u64)
         .map_err(|_| "failed to run ffmpeg audio extraction".to_string())?;
     if !output.status.success() {
         return Err(format!(
@@ -1369,7 +1541,10 @@ fn extract_audio_video_clip_inner(
     if !start_s.is_finite() || start_s < 0.0 {
         return Err("start_s must be >= 0".to_string());
     }
-    if !duration_s.is_finite() || duration_s <= 0.0 || duration_s > 60.0 {
+    if !duration_s.is_finite()
+        || duration_s <= 0.0
+        || duration_s > MAX_AUDIO_DURATION_MS as f32 / 1_000.0
+    {
         return Err("duration_s must be in (0, 60]".to_string());
     }
     if media_info.video_streams == 0 {
@@ -1448,7 +1623,7 @@ fn extract_audio_video_clip_inner(
             "-y",
             &tmp_str,
         ])
-        .bounded_jpeg_output()
+        .bounded_media_output()
         .map_err(|error| {
             let _ = std::fs::remove_file(&tmp);
             format!("ffmpeg audio-video extraction failed: {error}")
@@ -1548,7 +1723,7 @@ fn extract_video_clip_inner(
                 "-y",
                 &tmp_str,
             ])
-            .output()
+            .bounded_media_output()
             .map_err(|error| {
                 let _ = std::fs::remove_file(&tmp);
                 format!("failed to run ffmpeg: {error}")
@@ -1570,7 +1745,7 @@ fn extract_video_clip_inner(
             "-y",
             &tmp_str,
         ]);
-        cmd.bounded_jpeg_output().map_err(|error| {
+        cmd.bounded_media_output().map_err(|error| {
             let _ = std::fs::remove_file(&tmp);
             format!("failed to run ffmpeg: {error}")
         })?
@@ -1683,7 +1858,7 @@ pub(crate) fn decode_selective_jpeg_frames_inner(
             "mjpeg",
             "-",
         ])
-        .bounded_jpeg_output()
+        .bounded_media_output()
         .map_err(|error| format!("JPEG extraction failed: {error}"))?;
 
     if !output.status.success() {
@@ -1711,11 +1886,69 @@ pub(crate) fn decode_selective_jpeg_frames_inner(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn framemd5_child_stops_at_requested_frame_count() {
+        let mut command = std::process::Command::new("python3");
+        command.args(["-c", "import sys; a=sys.argv; n=int(a[a.index('-frames:v')+1]) if '-frames:v' in a else 10000; [print('0, %d, %d, 1, 384, %s' % (i, i, '0'*32)) for i in range(n)]"]);
+        let output = super::run_framemd5(
+            command,
+            &super::InputSource::FilePath("fixture.mp4".into()),
+            super::Mp4DecodeConfig {
+                max_frames: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().lines().count(), 3);
+    }
+
+    #[test]
+    fn bounded_media_input_and_output_make_progress_concurrently() {
+        let output = super::bounded_media_output_with_input(
+            std::process::Command::new("python3").args(["-c", "import sys; sys.stdout.buffer.write(b'x'*1000000); sys.stdout.buffer.flush(); data=sys.stdin.buffer.read(); sys.stdout.buffer.write(str(len(data)).encode())"]),
+            2 * 1024 * 1024,
+            std::time::Duration::from_secs(3),
+            Some(vec![0; 2 * 1024 * 1024]),
+        ).unwrap();
+        assert!(output.status.success());
+        assert_eq!(&output.stdout[1_000_000..], b"2097152");
+    }
+
+    #[test]
+    fn bounded_media_timeout_releases_blocked_input_writer() {
+        let started = std::time::Instant::now();
+        let error = super::bounded_media_output_with_input(
+            std::process::Command::new("python3").args(["-c", "import time; time.sleep(30)"]),
+            32,
+            std::time::Duration::from_millis(100),
+            Some(vec![0; 2 * 1024 * 1024]),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn bounded_media_input_failure_kills_child_and_releases_readers() {
+        let started = std::time::Instant::now();
+        let error = super::bounded_media_output_with_input(
+            std::process::Command::new("python3")
+                .args(["-c", "import os,time; os.close(0); time.sleep(30)"]),
+            32,
+            std::time::Duration::from_secs(3),
+            Some(vec![0; 2 * 1024 * 1024]),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[test]
     fn bounded_decoder_times_out_and_reaps_child() {
         let pid_file = super::unique_ffmpeg_temp_path("pid", "txt");
         let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
         let started = std::time::Instant::now();
-        let error = super::bounded_jpeg_output(
+        let error = super::bounded_media_output(
             std::process::Command::new("sh").args(["-c", &script]),
             32,
             std::time::Duration::from_millis(100),
@@ -1736,7 +1969,7 @@ mod tests {
 
     #[test]
     fn bounded_decoder_drains_saturated_stderr_and_rejects_overflow() {
-        let output = super::bounded_jpeg_output(
+        let output = super::bounded_media_output(
             std::process::Command::new("python3").args([
                 "-c",
                 "import sys; sys.stderr.write('x' * 2000000); sys.stdout.write('jpeg')",
@@ -1748,7 +1981,7 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(output.stdout, b"jpeg");
         assert_eq!(output.stderr.len(), 1024 * 1024);
-        let error = super::bounded_jpeg_output(
+        let error = super::bounded_media_output(
             std::process::Command::new("python3")
                 .args(["-c", "import sys; sys.stdout.write('x' * 1000000)"]),
             32,

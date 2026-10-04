@@ -1,6 +1,141 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Vidarax } from "../src/client.js";
+import { NetworkError, ParseError, RetryExhaustedError } from "../src/errors.js";
+
+describe("request resource lifetimes", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it.each([200, 503])("keeps the deadline through an HTTP %i response body", async (status) => {
+    vi.useFakeTimers();
+    let signal!: AbortSignal;
+    vi.stubGlobal("fetch", vi.fn(async (_url: unknown, init: RequestInit) => {
+      signal = init.signal!;
+      return new Response(new ReadableStream({
+        start(controller) {
+          signal.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError")), { once: true });
+        },
+      }), { status });
+    }));
+    const client = new Vidarax("https://vidarax.example", { timeoutMs: 100, maxRetries: 0 });
+    const check = expect(client.health()).rejects.toBeInstanceOf(RetryExhaustedError);
+    await vi.advanceTimersByTimeAsync(100);
+    await check;
+    expect(signal.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps the WHIP deadline through the SDP answer body", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", vi.fn(async (_url: unknown, init: RequestInit) => new Response(new ReadableStream({
+      start(controller) {
+        init.signal!.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError")), { once: true });
+      },
+    }), { status: 201 })));
+    const client = new Vidarax("https://vidarax.example", { timeoutMs: 100 });
+    const check = expect(client.whipOffer("v=0")).rejects.toBeInstanceOf(NetworkError);
+    await vi.advanceTimersByTimeAsync(100);
+    await check;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps the fetch upload deadline through its response body", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("XMLHttpRequest", undefined);
+    vi.stubGlobal("fetch", vi.fn(async (_url: unknown, init: RequestInit) => new Response(new ReadableStream({
+      start(controller) {
+        init.signal!.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError")), { once: true });
+      },
+    }))));
+    const client = new Vidarax("https://vidarax.example", { timeoutMs: 100 });
+    const check = expect(client.uploadFile(new File(['video'], 'video.mp4'))).rejects.toBeInstanceOf(NetworkError);
+    await vi.advanceTimersByTimeAsync(100);
+    await check;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("applies the SDK deadline to uploads with progress callbacks", async () => {
+    vi.useFakeTimers();
+    let xhr!: ProgressUpload;
+    class ProgressUpload extends EventTarget {
+      timeout = 0;
+      upload = new EventTarget();
+      constructor() { super(); xhr = this; }
+      open() {}
+      setRequestHeader() {}
+      send() { setTimeout(() => this.dispatchEvent(new Event("timeout")), this.timeout); }
+    }
+    vi.stubGlobal("XMLHttpRequest", ProgressUpload);
+    const client = new Vidarax("https://vidarax.example", { timeoutMs: 100 });
+    const check = expect(client.uploadFile(new File(['video'], 'video.mp4'), () => {})).rejects.toBeInstanceOf(NetworkError);
+    expect(xhr.timeout).toBe(100);
+    await vi.advanceTimersByTimeAsync(100);
+    await check;
+  });
+
+  it("cancels and releases the SSE reader when its consumer stops", async () => {
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('id: 1\nevent: gate\ndata: {"sequence":1,"pts_ms":0,"data":{}}\n\n'));
+      },
+      cancel,
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(body)));
+    const client = new Vidarax("https://vidarax.example");
+    for await (const _event of client.subscribeEvents("run-1", { reconnect: false })) break;
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(body.locked).toBe(false);
+  });
+
+  it("parses CRLF delimiters split between network chunks", async () => {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('id: 1\r\nevent: gate\r\ndata: {"sequence":1,"pts_ms":0,"data":{}}\r'));
+        controller.enqueue(encoder.encode('\n\r\n'));
+        controller.close();
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(body)));
+    const client = new Vidarax("https://vidarax.example");
+    const events = [];
+    for await (const event of client.subscribeEvents("run-1", { reconnect: false })) events.push(event);
+    expect(events).toHaveLength(1);
+    expect(body.locked).toBe(false);
+  });
+
+  it("enforces the SSE limit on UTF-8 bytes in a completed event", async () => {
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const data = JSON.stringify({ sequence: 1, pts_ms: 0, data: { text: 'é'.repeat(2 * 1024 * 1024) } });
+        controller.enqueue(new TextEncoder().encode(`id: 1\nevent: gate\ndata: ${data}\n\n`));
+      },
+      cancel,
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(body)));
+    const client = new Vidarax("https://vidarax.example");
+    await expect(client.subscribeEvents("run-1", { reconnect: false }).next()).rejects.toBeInstanceOf(ParseError);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(body.locked).toBe(false);
+  });
+
+  it("releases the reconnect timer when the subscription is aborted", async () => {
+    vi.useFakeTimers();
+    const abort = new AbortController();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("")));
+    const client = new Vidarax("https://vidarax.example");
+    const next = client.subscribeEvents("run-1", { signal: abort.signal, reconnectDelayMs: 100_000 }).next();
+    await vi.advanceTimersByTimeAsync(0);
+    abort.abort();
+    await expect(next).resolves.toEqual({ done: true, value: undefined });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
 
 describe("WHIP offer", () => {
   afterEach(() => {

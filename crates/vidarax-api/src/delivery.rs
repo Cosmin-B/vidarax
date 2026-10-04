@@ -1316,11 +1316,16 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_path(name: &str) -> PathBuf {
+        static PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("vidarax-delivery-{name}-{nanos}.wal"))
+        let sequence = PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "vidarax-delivery-{name}-{}-{nanos}-{sequence}.wal",
+            std::process::id()
+        ))
     }
 
     #[tokio::test]

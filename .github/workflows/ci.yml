@@ -37,6 +37,8 @@ jobs:
         run: |
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_audio_runtime.py
           PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_audio_perception_server.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_audio_protocol_resources.py
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_embedding_resources.py
           python3 - <<'PY'
           from pathlib import Path
           for source in (
@@ -44,6 +46,9 @@ jobs:
               "scripts/audio_runtime.py",
               "scripts/audio_perception_server.py",
               "scripts/test_audio_perception_server.py",
+              "scripts/embedding_server.py",
+              "scripts/test_audio_protocol_resources.py",
+              "scripts/test_embedding_resources.py",
           ):
               compile(Path(source).read_text(encoding="utf-8"), source, "exec")
           PY
@@ -98,6 +103,8 @@ jobs:
         run: |
           python -B scripts/test_audio_runtime.py
           python -B scripts/test_audio_perception_server.py
+          python -B scripts/test_audio_protocol_resources.py
+          python -B scripts/test_embedding_resources.py
 
       - name: Compile the sidecar entry point
         run: python -m py_compile scripts/audio_perception_server.py

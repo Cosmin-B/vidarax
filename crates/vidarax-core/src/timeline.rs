@@ -24,7 +24,7 @@ pub fn sync_file_durable(file: &File) -> std::io::Result<()> {
     }
 }
 
-/// Apply restrictive file permissions (owner read/write only) on Unix (C-4).
+/// Set owner-only permissions and reject symlink opens on Unix.
 #[cfg(unix)]
 fn apply_restrictive_permissions(opts: &mut OpenOptions) -> &mut OpenOptions {
     use std::os::unix::fs::OpenOptionsExt;

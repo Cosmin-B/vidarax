@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -411,45 +411,19 @@ fn validate_prefetched_media_container_with_probe_for_test(
     validate_prefetched_media_container_with_probe(path, probe_path, extra_probe_args, timeout)
 }
 
-struct ProbeOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-}
-
 fn run_probe_command_with_timeout(
     command: &mut Command,
     timeout: Duration,
-) -> Result<ProbeOutput, String> {
-    command.stdout(Stdio::piped()).stderr(Stdio::null());
-    let mut child = command
-        .spawn()
-        .map_err(|_| "failed to inspect prefetched media".to_string())?;
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                if let Some(mut pipe) = child.stdout.take() {
-                    pipe.read_to_end(&mut stdout)
-                        .map_err(|_| "failed to inspect prefetched media".to_string())?;
-                }
-                return Ok(ProbeOutput { status, stdout });
+) -> Result<std::process::Output, String> {
+    super::ffmpeg::bounded_media_output(command, REMOTE_MEDIA_PREFETCH_MAX_BYTES, timeout).map_err(
+        |error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                "remote media probe timed out".to_string()
+            } else {
+                format!("failed to inspect prefetched media: {error}")
             }
-            Ok(None) => {
-                if started.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("remote media probe timed out".to_string());
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err("failed to inspect prefetched media".to_string());
-            }
-        }
-    }
+        },
+    )
 }
 
 #[derive(Debug)]
@@ -736,7 +710,7 @@ mod tests {
         let err = validate_prefetched_media_container_with_probe_for_test(
             &path,
             "sh",
-            &["-c", "sleep 5"],
+            &["-c", "exec sleep 5"],
             Duration::from_millis(50),
         )
         .expect_err("slow ffprobe command must time out");

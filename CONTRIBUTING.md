@@ -48,6 +48,11 @@ These are separate backends and either can fall back independently.
 
 ## Review and style
 
+Read [Runtime contracts](docs/native-systems-profile.md) before changing
+ownership, capacity, process boundaries or allocation-sensitive paths. The
+profile links the source of each local contract and keeps unknown budgets
+explicit.
+
 Changes are reviewed before merge. Keep changes scoped and include the command
 output or failure reason for the checks you ran.
 

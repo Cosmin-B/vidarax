@@ -48,9 +48,8 @@ pub enum GateEventType {
 
 /// Reason a gate decision was made.
 ///
-/// Replaces `&'static str` on [`GateEvent`], shrinking the struct from
-/// 48 bytes to 32 bytes and enabling exhaustive `match` without string
-/// comparison.
+/// The enum keeps reason selection independent of string comparison. Use
+/// [`GateReasonCode::as_str`] when serializing the decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateReasonCode {
     InitialFrame,
@@ -66,8 +65,7 @@ pub enum GateReasonCode {
 impl GateReasonCode {
     /// Return the canonical string label for this reason code.
     ///
-    /// Preserves the same byte sequence as the old `&'static str` field so
-    /// that external consumers (schemas, FNV hashes, etc.) remain compatible.
+    /// These labels are part of the event schema and deterministic replay hash.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::InitialFrame => "initial_frame",
@@ -84,7 +82,8 @@ impl GateReasonCode {
 
 /// Gate decision for a single frame.
 ///
-/// Size: 32 bytes (was 48 bytes with `&'static str` reason_code).
+/// The timestamp uses source milliseconds. Classification does not advance
+/// the gate's reference frame; commit only after the selected output exists.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GateEvent {
     pub event_type: GateEventType,

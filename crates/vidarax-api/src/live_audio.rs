@@ -6,8 +6,6 @@
 //! WAL.
 
 use std::collections::HashMap;
-use std::io::Write;
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -26,12 +24,18 @@ const LIVE_AUDIO_WORK_QUEUE_CAPACITY: usize = 2;
 const MIN_LIVE_AUDIO_WINDOW_MS: u64 = 250;
 const OPUS_PRE_SKIP: u16 = 312;
 const OPUS_CLOCK_RATE: u32 = 48_000;
+// RFC 7587 assigns one Opus packet to each RTP payload. The minimum packet
+// duration is 2.5 ms, which advances the 48 kHz clock by 120 ticks. A window
+// therefore retains at most ceil(window_ms * 48 / 120) + 1 packets: 1601 at
+// four seconds. Each access unit also has the ingress byte limit.
+const OPUS_MIN_TIMESTAMP_ADVANCE: u32 = OPUS_CLOCK_RATE / 400;
 
 struct TrackAccumulator {
     anchor_timestamp: u32,
     window_start_timestamp: u32,
     clock_rate: u32,
     last_sequence_number: Option<u16>,
+    last_timestamp: u32,
     frames: Vec<LiveAudioFrame>,
 }
 
@@ -44,6 +48,7 @@ impl TrackAccumulator {
             window_start_timestamp: timestamp,
             clock_rate,
             last_sequence_number: frame.sequence_number,
+            last_timestamp: timestamp,
             frames: vec![frame],
         }
     }
@@ -53,11 +58,14 @@ impl TrackAccumulator {
             self.window_start_timestamp = frame.rtp_timestamp;
         }
         self.last_sequence_number = frame.sequence_number;
+        self.last_timestamp = frame.rtp_timestamp;
         self.frames.push(frame);
     }
 
     fn accepts(&self, frame: &LiveAudioFrame) -> bool {
+        let advance = frame.rtp_timestamp.wrapping_sub(self.last_timestamp);
         self.clock_rate == frame.clock_rate
+            && (OPUS_MIN_TIMESTAMP_ADVANCE..=i32::MAX as u32).contains(&advance)
             && match (self.last_sequence_number, frame.sequence_number) {
                 (Some(previous), Some(next)) => previous.wrapping_add(1) == next,
                 _ => true,
@@ -127,7 +135,7 @@ pub(crate) fn spawn_live_audio_pipeline(
     tokio::spawn(async move {
         let mut tracks: HashMap<u64, TrackAccumulator> = HashMap::new();
         while let Some(frame) = audio_rx.recv().await {
-            if frame.clock_rate == 0 || frame.data.is_empty() {
+            if frame.clock_rate != OPUS_CLOCK_RATE || frame.data.is_empty() {
                 aggregation_metrics.inc_webrtc_audio_queue_drop();
                 continue;
             }
@@ -138,7 +146,9 @@ pub(crate) fn spawn_live_audio_pipeline(
             };
             if !accumulator.accepts(&frame) {
                 let stale = accumulator.take_window();
-                if stale.frames.len() > 1 && work_tx.try_send(stale).is_err() {
+                if !stale.frames.is_empty()
+                    && (stale.frames.len() == 1 || work_tx.try_send(stale).is_err())
+                {
                     aggregation_metrics.inc_webrtc_audio_queue_drop();
                 }
                 *accumulator = TrackAccumulator::new(frame);
@@ -389,50 +399,11 @@ fn opus_window_to_wav(frames: &[LiveAudioFrame]) -> Result<Vec<u8>, String> {
         return Err("live audio codec clock must be 48000 Hz Opus".to_string());
     }
     let ogg = build_ogg_opus(frames)?;
-    let mut child = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "ogg",
-            "-i",
-            "pipe:0",
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-            "-f",
-            "wav",
-            "pipe:1",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("start ffmpeg for live Opus decode: {error}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| "ffmpeg live audio stdin unavailable".to_string())?
-        .write_all(&ogg)
-        .map_err(|error| format!("write live Opus to ffmpeg: {error}"))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("wait for live Opus decode: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "ffmpeg live Opus decode failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    if output.stdout.len() < 44 {
+    let wav = vidarax_core::ingest::decode_ogg_opus_wav(ogg)?;
+    if wav.len() < 44 {
         return Err("ffmpeg returned an empty live audio WAV".to_string());
     }
-    Ok(output.stdout)
+    Ok(wav)
 }
 
 fn build_ogg_opus(frames: &[LiveAudioFrame]) -> Result<Vec<u8>, String> {
@@ -567,5 +538,59 @@ mod tests {
         assert_eq!(first.source_start_ms, 0);
         accumulator.push(frame(144_000, &[3]));
         assert_eq!(accumulator.source_start_ms(), 2_000);
+    }
+
+    #[test]
+    fn accumulator_rejects_repeated_and_short_timestamps() {
+        let accumulator = TrackAccumulator::new(frame(48_000, &[1]));
+        for timestamp in [48_000, 48_001, 48_119, 47_880] {
+            let mut next = frame(timestamp, &[2]);
+            next.sequence_number = Some(2);
+            assert!(!accumulator.accepts(&next));
+        }
+        let mut next = frame(48_120, &[2]);
+        next.sequence_number = Some(2);
+        assert!(accumulator.accepts(&next));
+        next.clock_rate = 8_000;
+        assert!(!accumulator.accepts(&next));
+    }
+
+    #[test]
+    fn accumulator_preserves_timestamp_and_sequence_wrap() {
+        let mut first = frame(u32::MAX - 59, &[1]);
+        first.sequence_number = Some(u16::MAX);
+        let mut accumulator = TrackAccumulator::new(first);
+        let mut next = frame(60, &[2]);
+        next.sequence_number = Some(0);
+        assert!(accumulator.accepts(&next));
+        accumulator.push(next);
+        assert_eq!(accumulator.duration_ms(), 2);
+        accumulator.take_window();
+
+        let mut repeated = frame(60, &[3]);
+        repeated.sequence_number = Some(1);
+        assert!(!accumulator.accepts(&repeated));
+        let mut next = frame(180, &[3]);
+        next.sequence_number = Some(1);
+        assert!(accumulator.accepts(&next));
+        next.sequence_number = Some(2);
+        assert!(!accumulator.accepts(&next));
+    }
+
+    #[test]
+    fn accumulator_minimum_opus_packets_reach_four_second_window_bound() {
+        let start = u32::MAX - 59;
+        let mut accumulator = TrackAccumulator::new(frame(start, &[1]));
+        for index in 1..=1600u32 {
+            let mut next = frame(start.wrapping_add(index * 120), &[1]);
+            next.sequence_number = Some((index + 1) as u16);
+            assert!(accumulator.accepts(&next));
+            accumulator.push(next);
+            if index < 1600 {
+                assert!(accumulator.duration_ms() < 4_000);
+            }
+        }
+        assert_eq!(accumulator.duration_ms(), 4_000);
+        assert_eq!(accumulator.take_window().frames.len(), 1601);
     }
 }

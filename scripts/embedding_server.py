@@ -70,11 +70,19 @@ def _extract_embeddings(images: list[Image.Image]) -> np.ndarray:
     return embeddings.cpu().float().numpy()
 
 
-def _read_exact(sock: socket.socket, length: int) -> bytearray | None:
+def _remaining(deadline: float) -> float:
+    remaining = deadline - time.perf_counter()
+    if remaining <= 0:
+        raise socket.timeout("embedding request deadline exceeded")
+    return remaining
+
+
+def _read_exact(sock: socket.socket, length: int, deadline: float) -> bytearray | None:
     data = bytearray(length)
     view = memoryview(data)
     offset = 0
     while offset < length:
+        sock.settimeout(_remaining(deadline))
         received = sock.recv_into(view[offset:])
         if received == 0:
             return None
@@ -125,7 +133,9 @@ class MicroBatcher:
             self.work.put_nowait(item)
             return True
         except queue.Full:
-            self.release(len(item.jpeg))
+            jpeg_bytes = len(item.jpeg)
+            item.jpeg.clear()
+            self.release(jpeg_bytes)
             return False
 
     def _run(self) -> None:
@@ -141,10 +151,21 @@ class MicroBatcher:
                     batch.append(self.work.get(timeout=remaining))
                 except queue.Empty:
                     break
+            batch_bytes = sum(len(item.jpeg) for item in batch)
             try:
                 self._infer(batch)
+            except Exception:
+                logger.exception("embedding batch failed")
+                for item in batch:
+                    item.error = "embedding batch failed"
             finally:
-                self.release(sum(len(item.jpeg) for item in batch))
+                # The handler can retain its WorkItem on a persistent socket.
+                # Release JPEG storage before returning its byte reservation.
+                for item in batch:
+                    item.jpeg.clear()
+                self.release(batch_bytes)
+                for item in batch:
+                    item.done.set()
 
     def release(self, released: int) -> None:
         with self.budget_lock:
@@ -156,7 +177,8 @@ class MicroBatcher:
         images: list[Image.Image] = []
         for item in batch:
             try:
-                images.append(Image.open(io.BytesIO(item.jpeg)).convert("RGB"))
+                with Image.open(io.BytesIO(item.jpeg)) as source:
+                    images.append(source.convert("RGB"))
                 valid_items.append(item)
             except Exception as exc:  # malformed input is isolated to one request
                 item.error = f"invalid JPEG: {exc}"
@@ -176,6 +198,8 @@ class MicroBatcher:
             for item in valid_items:
                 item.error = message
         finally:
+            for image in images:
+                image.close()
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             logger.debug("embedded batch=%d in %.2fms", len(valid_items), elapsed_ms)
             for item in valid_items:
@@ -191,7 +215,8 @@ class EmbeddingRequestHandler(socketserver.BaseRequestHandler):
 
     def handle(self) -> None:
         while True:
-            raw_header = _read_exact(self.request, REQUEST_HEADER.size)
+            self.deadline = time.perf_counter() + self.server.request_timeout_s
+            raw_header = _read_exact(self.request, REQUEST_HEADER.size, self.deadline)
             if raw_header is None:
                 return
             magic, version, _flags, reserved, jpeg_len = REQUEST_HEADER.unpack(raw_header)
@@ -207,7 +232,7 @@ class EmbeddingRequestHandler(socketserver.BaseRequestHandler):
                 self._respond_error(STATUS_OVERLOADED, "embedding byte budget is full")
                 return
             try:
-                jpeg = _read_exact(self.request, jpeg_len)
+                jpeg = _read_exact(self.request, jpeg_len, self.deadline)
             except Exception:
                 self.server.batcher.release(jpeg_len)
                 raise
@@ -219,7 +244,7 @@ class EmbeddingRequestHandler(socketserver.BaseRequestHandler):
             if not self.server.batcher.submit_reserved(item):
                 self._respond_error(STATUS_OVERLOADED, "embedding queue is full")
                 continue
-            if not item.done.wait(self.server.request_timeout_s):
+            if not item.done.wait(max(0.0, self.deadline - time.perf_counter())):
                 self._respond_error(STATUS_TIMEOUT, "embedding deadline exceeded")
                 continue
             if item.embedding is None:
@@ -236,8 +261,13 @@ class EmbeddingRequestHandler(socketserver.BaseRequestHandler):
                 EMBEDDING_DIM,
                 len(item.embedding),
             )
-            self.request.sendall(header)
-            self.request.sendall(item.embedding)
+            self._send_response(header, item.embedding)
+
+    def _send_response(self, header: bytes, payload: bytes) -> None:
+        self.request.settimeout(_remaining(self.deadline))
+        self.request.sendall(header)
+        self.request.settimeout(_remaining(self.deadline))
+        self.request.sendall(payload)
 
     def _respond_error(self, status: int, message: str) -> None:
         payload = message.encode("utf-8", errors="replace")[:1024]
@@ -248,8 +278,7 @@ class EmbeddingRequestHandler(socketserver.BaseRequestHandler):
             0,
             len(payload),
         )
-        self.request.sendall(header)
-        self.request.sendall(payload)
+        self._send_response(header, payload)
 
 
 class EmbeddingTcpServer(socketserver.ThreadingTCPServer):

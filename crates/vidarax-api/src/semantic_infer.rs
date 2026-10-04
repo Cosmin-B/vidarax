@@ -79,6 +79,30 @@ const MULTIMODAL_MAX_TOKENS: u32 = 1_024;
 const CUSTOM_SCHEMA_MAX_TOKENS: u32 = 1_024;
 const MAX_MULTIMODAL_MOMENTS: usize = 32;
 
+struct SemanticDispatchTasks {
+    tasks: JoinSet<(usize, ChunkSemanticResult, Instant)>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SemanticDispatchTasks {
+    fn new() -> Self {
+        Self {
+            tasks: JoinSet::new(),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+impl Drop for SemanticDispatchTasks {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Active windows own provider completion and the journal sender. They
+        // finish before releasing their media; no pending window is started.
+        self.tasks.detach_all();
+    }
+}
+
 pub struct DecodedSignals {
     pub signals: Vec<FrameSignal>,
     pub sampling_policy: SamplingPolicy,
@@ -620,6 +644,8 @@ pub async fn run_semantic_dispatch(
         return (semantic_results, task_end_times);
     }
 
+    let mut dispatch_tasks = SemanticDispatchTasks::new();
+
     if temporal_chain {
         let mut last_description = String::new();
         let mut last_pts_ms: u64 = 0;
@@ -635,29 +661,37 @@ pub async fn run_semantic_dispatch(
                 )
             };
 
-            let prev_jpeg_ref = if visual_diff {
-                last_jpeg.as_deref()
-            } else {
-                None
-            };
-            let result = infer_chunk_semantics(
+            let prev_jpeg = if visual_diff { last_jpeg.clone() } else { None };
+            spawn_semantic_task(
+                &mut dispatch_tasks.tasks,
+                (chunk_idx, prep),
                 providers.clone(),
-                true,
                 &prompt_with_context,
                 semantic_timeout_ms,
                 semantic_frames_per_chunk,
-                &prep.chunk_jpegs,
-                prep.frame_offset as u64,
-                prep.pts_start_ms,
-                prep.pts_end_ms,
                 tiered_config.clone(),
                 guided_json_str.as_ref().map(Arc::clone),
-                prev_jpeg_ref,
-                prep.clip_spec.clone(),
                 observer.clone(),
                 inference_dispatch.clone(),
-            )
-            .await;
+                prev_jpeg,
+                Arc::clone(&dispatch_tasks.cancelled),
+                completion_tx.clone(),
+            );
+            let result = match dispatch_tasks
+                .tasks
+                .join_next()
+                .await
+                .expect("one active window")
+            {
+                Ok((_, result, _)) => result,
+                Err(error) => {
+                    let result = semantic_join_failure_result(error);
+                    if let Some(tx) = &completion_tx {
+                        let _ = tx.send((chunk_idx, result.clone())).await;
+                    }
+                    result
+                }
+            };
 
             if visual_diff {
                 if let Some(frame) = select_semantic_images(&prep.chunk_jpegs, 1).first() {
@@ -678,14 +712,10 @@ pub async fn run_semantic_dispatch(
                 last_pts_ms = prep.pts_end_ms;
             }
 
-            if let Some(tx) = &completion_tx {
-                let _ = tx.send((chunk_idx, result.clone())).await;
-            }
             semantic_results[chunk_idx] = Some(result);
             task_end_times[chunk_idx] = Instant::now();
         }
     } else {
-        let mut join_set: JoinSet<(usize, ChunkSemanticResult, Instant)> = JoinSet::new();
         let max_in_flight = vlm_concurrency.max(1);
         let mut task_chunks: HashMap<TaskId, usize> =
             HashMap::with_capacity(max_in_flight.min(num_chunks));
@@ -693,7 +723,7 @@ pub async fn run_semantic_dispatch(
 
         for _ in 0..max_in_flight.min(num_chunks) {
             let (chunk_idx, task_id) = spawn_semantic_task(
-                &mut join_set,
+                &mut dispatch_tasks.tasks,
                 pending.next().expect("bounded by num_chunks"),
                 providers.clone(),
                 semantic_prompt,
@@ -703,17 +733,17 @@ pub async fn run_semantic_dispatch(
                 guided_json_str.as_ref().map(Arc::clone),
                 observer.clone(),
                 inference_dispatch.clone(),
+                None,
+                Arc::clone(&dispatch_tasks.cancelled),
+                completion_tx.clone(),
             );
             task_chunks.insert(task_id, chunk_idx);
         }
 
-        while let Some(joined) = join_set.join_next_with_id().await {
+        while let Some(joined) = dispatch_tasks.tasks.join_next_with_id().await {
             match joined {
                 Ok((task_id, (idx, result, finished))) => {
                     task_chunks.remove(&task_id);
-                    if let Some(tx) = &completion_tx {
-                        let _ = tx.send((idx, result.clone())).await;
-                    }
                     semantic_results[idx] = Some(result);
                     task_end_times[idx] = finished;
                 }
@@ -739,7 +769,7 @@ pub async fn run_semantic_dispatch(
 
             if let Some(next) = pending.next() {
                 let (chunk_idx, task_id) = spawn_semantic_task(
-                    &mut join_set,
+                    &mut dispatch_tasks.tasks,
                     next,
                     providers.clone(),
                     semantic_prompt,
@@ -749,6 +779,9 @@ pub async fn run_semantic_dispatch(
                     guided_json_str.as_ref().map(Arc::clone),
                     observer.clone(),
                     inference_dispatch.clone(),
+                    None,
+                    Arc::clone(&dispatch_tasks.cancelled),
+                    completion_tx.clone(),
                 );
                 task_chunks.insert(task_id, chunk_idx);
             }
@@ -770,6 +803,9 @@ fn spawn_semantic_task(
     guided_json_str: Option<Arc<str>>,
     observer: Option<Arc<dyn InferenceObserver>>,
     inference_dispatch: Option<Arc<tokio::sync::Semaphore>>,
+    prev_jpeg: Option<Arc<[u8]>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    completion_tx: Option<tokio::sync::mpsc::Sender<(usize, ChunkSemanticResult)>>,
 ) -> (usize, TaskId) {
     let providers_c = providers;
     let prompt_c = semantic_prompt.to_string();
@@ -802,13 +838,18 @@ fn spawn_semantic_task(
             pts_end_ms,
             tiered_config_c,
             guided_json_c,
-            None,
+            prev_jpeg.as_deref(),
             clip_spec_c,
             observer_c,
             inference_dispatch_c,
+            Some(cancelled),
         )
         .await;
-        (chunk_idx, overlay, Instant::now())
+        let finished = Instant::now();
+        if let Some(tx) = completion_tx {
+            let _ = tx.send((chunk_idx, overlay.clone())).await;
+        }
+        (chunk_idx, overlay, finished)
     });
     (chunk_idx, handle.id())
 }
@@ -880,6 +921,7 @@ pub async fn infer_chunk_semantics(
     clip_spec: Option<ClipSpec>,
     observer: Option<Arc<dyn InferenceObserver>>,
     inference_dispatch: Option<Arc<tokio::sync::Semaphore>>,
+    cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> ChunkSemanticResult {
     if !semantic_available {
         return ChunkSemanticResult::default();
@@ -1194,6 +1236,14 @@ pub async fn infer_chunk_semantics(
     // instead of the router's default kind.
     let first_pass_kind = provider.kind_for_model(tiered_config.first_pass_model.as_ref());
     let call_started = Instant::now();
+    if cancelled
+        .as_ref()
+        .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
+    {
+        result.used_fallback = true;
+        result.error = Some("cancelled".to_string());
+        return result;
+    }
     let dispatch_permit = match inference_dispatch {
         Some(dispatch) => match dispatch.try_acquire_owned() {
             Ok(permit) => Some(permit),
@@ -1205,11 +1255,19 @@ pub async fn infer_chunk_semantics(
         },
         None => None,
     };
+    let _dispatch_permit = dispatch_permit;
+    if cancelled
+        .as_ref()
+        .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
+    {
+        result.used_fallback = true;
+        result.error = Some("cancelled".to_string());
+        return result;
+    }
     let provider_result = match tokio::task::spawn_blocking({
         let provider = Arc::clone(&provider);
         let observer_for_call = observer.clone();
         move || {
-            let _dispatch_permit = dispatch_permit;
             run_tiered_with_second_pass_schema(
                 provider.as_ref(),
                 &tiered_config,
@@ -2744,6 +2802,7 @@ Ignore this trailing {not json}."#;
             Some(spec),
             None,
             None,
+            None,
         )
         .await;
         assert!(result.error.is_none(), "{:?}", result.error);
@@ -2830,6 +2889,7 @@ Ignore this trailing {not json}."#;
             Some(spec.clone()),
             None,
             None,
+            None,
         )
         .await;
         assert!(failed.error.unwrap().contains("requires an audio stream"));
@@ -2849,6 +2909,7 @@ Ignore this trailing {not json}."#;
             None,
             None,
             Some(spec),
+            None,
             None,
             None,
         )
@@ -2885,6 +2946,7 @@ Ignore this trailing {not json}."#;
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -2900,7 +2962,12 @@ Ignore this trailing {not json}."#;
     }
 
     #[tokio::test]
-    async fn cancelled_dispatch_holds_permit_until_blocking_provider_exits() {
+    async fn cancelled_dispatch_delivers_active_completion_and_stops_pending_windows() {
+        assert_cancelled_dispatch(false).await;
+        assert_cancelled_dispatch(true).await;
+    }
+
+    async fn assert_cancelled_dispatch(temporal_chain: bool) {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{mpsc, Mutex};
         use std::time::Duration;
@@ -2909,6 +2976,7 @@ Ignore this trailing {not json}."#;
             started: tokio::sync::Notify,
             release: Mutex<mpsc::Receiver<()>>,
             finished: AtomicBool,
+            calls: std::sync::atomic::AtomicUsize,
         }
 
         impl InferenceProvider for BlockingProvider {
@@ -2917,6 +2985,7 @@ Ignore this trailing {not json}."#;
             }
 
             fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
                 self.started.notify_one();
                 // A dropped sender also releases this wait if an assertion fails.
                 let released = self
@@ -2935,6 +3004,7 @@ Ignore this trailing {not json}."#;
             started: tokio::sync::Notify::new(),
             release: Mutex::new(release_rx),
             finished: AtomicBool::new(false),
+            calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let dispatch_permits = Arc::new(tokio::sync::Semaphore::new(1));
         let permits_for_task = Arc::clone(&dispatch_permits);
@@ -2942,7 +3012,7 @@ Ignore this trailing {not json}."#;
         let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(1);
         let dispatch = tokio::spawn(async move {
             run_semantic_dispatch(
-                &[test_chunk_prep(0)],
+                &[test_chunk_prep(0), test_chunk_prep(1)],
                 Some(provider_for_task),
                 true,
                 "classify",
@@ -2951,7 +3021,7 @@ Ignore this trailing {not json}."#;
                 TieredVlmConfig::single_model("test-model"),
                 None,
                 false,
-                false,
+                temporal_chain,
                 1,
                 None,
                 Some(permits_for_task),
@@ -2967,16 +3037,14 @@ Ignore this trailing {not json}."#;
         assert!(dispatch.await.unwrap_err().is_cancelled());
         assert_eq!(dispatch_permits.available_permits(), 0);
         assert!(!provider.finished.load(Ordering::Acquire));
-        // Dispatch cancellation closes the journal channel even though the
-        // blocking provider is still running: its eventual result is discarded.
-        assert!(
+        release_tx.send(()).unwrap();
+        let (chunk_idx, result) =
             tokio::time::timeout(Duration::from_secs(1), completion_rx.recv())
                 .await
-                .expect("cancelled dispatcher must drop its completion sender")
-                .is_none()
-        );
-
-        release_tx.send(()).unwrap();
+                .expect("active window must retain its completion sender")
+                .unwrap();
+        assert_eq!(chunk_idx, 0);
+        assert!(result.overlay.is_some());
         let _permit = tokio::time::timeout(
             Duration::from_secs(1),
             Arc::clone(&dispatch_permits).acquire_owned(),
@@ -2986,6 +3054,34 @@ Ignore this trailing {not json}."#;
         .unwrap();
         assert!(provider.finished.load(Ordering::Acquire));
         assert!(completion_rx.recv().await.is_none());
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_preparation_does_not_start_provider() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let prep = test_chunk_prep(0);
+        let result = infer_chunk_semantics(
+            Some(Arc::new(SemanticTestProvider)),
+            true,
+            "classify",
+            1000,
+            1,
+            &prep.chunk_jpegs,
+            0,
+            0,
+            33,
+            TieredVlmConfig::single_model("test-model"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(cancelled),
+        )
+        .await;
+        assert_eq!(result.error.as_deref(), Some("cancelled"));
+        assert!(result.overlay.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -20,6 +20,7 @@ pub mod metrics;
 pub mod novelty;
 pub mod pipeline;
 pub mod provider;
+mod sidecar_io;
 pub mod tiered_vlm;
 pub mod timeline;
 pub mod trigger;

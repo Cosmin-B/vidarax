@@ -1,4 +1,4 @@
-import { ref } from 'vue'
+import { ref, onUnmounted } from 'vue'
 import { api, followRunEvents, type RawRunEvent } from '@/lib/api'
 import { useEventsStore, type AgentEvent, type KeyframeEntry } from '@/stores/events'
 import { logger } from '@/lib/logger'
@@ -70,13 +70,13 @@ function keyframeEvidence(raw: RawRunEvent): Record<string, unknown> | null {
   return null
 }
 
-async function loadKeyframe(raw: RawRunEvent, runId: string): Promise<KeyframeEntry | null> {
+async function loadKeyframe(raw: RawRunEvent, runId: string, signal: AbortSignal): Promise<KeyframeEntry | null> {
   const evidence = keyframeEvidence(raw)
   if (!evidence) return null
   const sha256 = evidence.image_sha256
   if (typeof sha256 !== 'string' || !/^[0-9a-fA-F]{64}$/.test(sha256)) return null
 
-  const blob = await api.runs.keyframe(runId, sha256)
+  const blob = await api.runs.keyframe(runId, sha256, signal)
   const assertion = objectField(raw.payload.assertion)
   return {
     id: raw.seq,
@@ -99,12 +99,15 @@ async function loadKeyframe(raw: RawRunEvent, runId: string): Promise<KeyframeEn
 }
 
 function reconnectDelay(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve()
   return new Promise(resolve => {
-    const timer = setTimeout(resolve, ms)
-    signal.addEventListener('abort', () => {
+    const finish = () => {
       clearTimeout(timer)
+      signal.removeEventListener('abort', finish)
       resolve()
-    }, { once: true })
+    }
+    const timer = setTimeout(finish, ms)
+    signal.addEventListener('abort', finish, { once: true })
   })
 }
 
@@ -119,7 +122,8 @@ export function useEventStream() {
   let lastSequence = 0
   const loadedKeyframes = new Set<string>()
 
-  function processEvent(raw: RawRunEvent, runId: string): void {
+  function processEvent(raw: RawRunEvent, runId: string, generation: number, signal: AbortSignal): void {
+    if (signal.aborted || streamGeneration !== generation) return
     if (raw.seq <= lastSequence) return
     const event = mapEvent(raw, runId)
     if (event) eventsStore.addEvent(event)
@@ -135,11 +139,14 @@ export function useEventStream() {
     if (loadedKeyframes.has(normalizedSha)) return
     loadedKeyframes.add(normalizedSha)
 
-    void loadKeyframe(raw, runId)
+    void loadKeyframe(raw, runId, signal)
       .then(keyframe => {
-        if (keyframe && activeRunId === runId) eventsStore.addKeyframe(keyframe)
+        if (!keyframe) return
+        if (!signal.aborted && streamGeneration === generation) eventsStore.addKeyframe(keyframe)
+        else URL.revokeObjectURL(keyframe.image_url)
       })
       .catch(error => {
+        if (signal.aborted || streamGeneration !== generation) return
         loadedKeyframes.delete(normalizedSha)
         logger.warn('[Timeline] Evidence load failed:', error)
       })
@@ -154,12 +161,13 @@ export function useEventStream() {
           lastSequence,
           signal,
           () => {
+            if (signal.aborted || streamGeneration !== generation) return
             isConnected.value = true
             connectionError.value = null
             eventsStore.setConnectionStatus(true)
             reconnectMs = INITIAL_RECONNECT_MS
           },
-          raw => processEvent(raw, runId),
+          raw => processEvent(raw, runId, generation, signal),
         )
         if (signal.aborted) return
         throw new Error('Timeline stream closed')
@@ -198,6 +206,8 @@ export function useEventStream() {
     isConnected.value = false
     eventsStore.setConnectionStatus(false)
   }
+
+  onUnmounted(disconnect)
 
   return {
     isConnected,
