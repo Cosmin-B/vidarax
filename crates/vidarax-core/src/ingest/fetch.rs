@@ -415,15 +415,14 @@ fn run_probe_command_with_timeout(
     command: &mut Command,
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
-    super::ffmpeg::bounded_media_output(command, REMOTE_MEDIA_PREFETCH_MAX_BYTES, timeout).map_err(
-        |error| {
+    crate::media_process::bounded_media_output(command, REMOTE_MEDIA_PREFETCH_MAX_BYTES, timeout)
+        .map_err(|error| {
             if error.kind() == std::io::ErrorKind::TimedOut {
                 "remote media probe timed out".to_string()
             } else {
                 format!("failed to inspect prefetched media: {error}")
             }
-        },
-    )
+        })
 }
 
 #[derive(Debug)]

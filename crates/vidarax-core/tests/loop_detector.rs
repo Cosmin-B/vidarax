@@ -1,6 +1,17 @@
 use vidarax_core::loop_detector::LoopDetector;
 
 #[test]
+fn all_ones_hash_does_not_match_unfilled_history() {
+    let mut detector = LoopDetector::new(6, 3);
+    for _ in 0..3 {
+        assert!(!detector.check(u64::MAX));
+    }
+    assert!(detector.check(u64::MAX));
+    detector.reset();
+    assert!(!detector.check(u64::MAX));
+}
+
+#[test]
 fn no_loop_with_distinct_hashes() {
     let mut detector = LoopDetector::new(6, 3);
     // Each hash has 8 bits set in a different byte, so every pair has hamming

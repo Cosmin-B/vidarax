@@ -43,8 +43,8 @@ fn fnv_hash(s: &str) -> u64 {
 ///
 /// # Thread safety
 ///
-/// `DedupFilter` is intentionally *not* `Sync`. Each VLM worker thread owns
-/// its own instance, avoiding any shared-state synchronisation overhead.
+/// Each VLM worker owns its filter. Mutation requires an exclusive borrow;
+/// workers do not share or synchronize this state.
 pub struct DedupFilter {
     last_description: String,
     last_hash: u64,
@@ -56,8 +56,8 @@ impl DedupFilter {
     pub fn new() -> Self {
         Self {
             last_description: String::new(),
-            // A hash of the empty string is not `0`, so we use `0` as a
-            // sentinel that can never collide with a real description hash.
+            // The empty initial description has a nonzero FNV hash. The exact
+            // string comparison also distinguishes any nonempty hash collision.
             last_hash: 0,
             suppressed_count: 0,
         }

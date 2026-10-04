@@ -241,14 +241,70 @@ struct ExtractedLocalAudio {
     extraction_ms: u64,
 }
 
+/// Retain failure codes until the event writer needs their wire text.
+/// Only failures with external diagnostic details own a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticFailure {
+    Cancelled,
+    NoJpegFrames,
+    ReviewImageBytesExceeded,
+    UnsupportedModel,
+    HttpStatus(u16),
+    Transport,
+    InvalidResponse,
+    ProviderSaturated,
+    DeadlineMissed,
+    RequestBudgetExceeded,
+    Join(String),
+    MediaExtraction(String),
+    MediaExtractionJoin(String),
+    Parse(SemanticParseError),
+}
+
+impl SemanticFailure {
+    pub fn is_media_extraction(&self) -> bool {
+        matches!(
+            self,
+            Self::MediaExtraction(_) | Self::MediaExtractionJoin(_)
+        )
+    }
+}
+
+impl std::fmt::Display for SemanticFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("cancelled"),
+            Self::NoJpegFrames => f.write_str("chunk_has_no_jpeg_frames"),
+            Self::ReviewImageBytesExceeded => f.write_str("review_image_bytes_exceed_32_mib"),
+            Self::UnsupportedModel => f.write_str("unsupported_model"),
+            Self::HttpStatus(code) => write!(f, "http_status_{code}"),
+            Self::Transport => f.write_str("transport_error"),
+            Self::InvalidResponse => f.write_str("invalid_response"),
+            Self::ProviderSaturated => f.write_str("provider_saturated"),
+            Self::DeadlineMissed => f.write_str("deadline_missed"),
+            Self::RequestBudgetExceeded => f.write_str("request_budget_exceeded"),
+            Self::Join(detail) => write!(f, "join_error:{detail}"),
+            Self::MediaExtraction(detail) => write!(f, "media_extraction_failed:{detail}"),
+            Self::MediaExtractionJoin(detail) => write!(f, "media_extraction_join_error:{detail}"),
+            Self::Parse(error) => write!(f, "semantic_parse_failed:{}", error.as_str()),
+        }
+    }
+}
+
+impl serde::Serialize for SemanticFailure {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChunkSemanticResult {
     pub overlay: Option<SemanticOverlay>,
     pub raw_output: Option<Value>,
-    pub provider: Option<String>,
+    pub provider: Option<&'static str>,
     pub provider_fallback_used: bool,
     pub used_fallback: bool,
-    pub error: Option<String>,
+    pub error: Option<SemanticFailure>,
     pub attempted: bool,
     pub finish_reason: Option<String>,
     pub response_chars: Option<usize>,
@@ -858,7 +914,7 @@ fn semantic_join_failure_result(err: JoinError) -> ChunkSemanticResult {
     ChunkSemanticResult {
         attempted: true,
         used_fallback: true,
-        error: Some(format!("join_error:{err}")),
+        error: Some(SemanticFailure::Join(err.to_string())),
         ..ChunkSemanticResult::default()
     }
 }
@@ -945,7 +1001,7 @@ pub async fn infer_chunk_semantics(
         let sel = select_semantic_images(chunk_jpegs, semantic_frames_per_chunk);
         if sel.is_empty() {
             result.used_fallback = true;
-            result.error = Some("chunk_has_no_jpeg_frames".to_string());
+            result.error = Some(SemanticFailure::NoJpegFrames);
             return result;
         }
         sel
@@ -1035,12 +1091,12 @@ pub async fn infer_chunk_semantics(
             Ok(Ok((media, wav))) => (Some(media), wav),
             Ok(Err(error)) => {
                 result.used_fallback = true;
-                result.error = Some(format!("media_extraction_failed:{error}"));
+                result.error = Some(SemanticFailure::MediaExtraction(error));
                 return result;
             }
             Err(error) => {
                 result.used_fallback = true;
-                result.error = Some(format!("media_extraction_join_error:{error}"));
+                result.error = Some(SemanticFailure::MediaExtractionJoin(error.to_string()));
                 return result;
             }
         }
@@ -1189,7 +1245,7 @@ pub async fn infer_chunk_semantics(
         .sum::<usize>()
         > 32 * 1024 * 1024
     {
-        result.error = Some("review_image_bytes_exceed_32_mib".into());
+        result.error = Some(SemanticFailure::ReviewImageBytesExceeded);
         result.used_fallback = true;
         return result;
     }
@@ -1241,7 +1297,7 @@ pub async fn infer_chunk_semantics(
         .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
     {
         result.used_fallback = true;
-        result.error = Some("cancelled".to_string());
+        result.error = Some(SemanticFailure::Cancelled);
         return result;
     }
     let dispatch_permit = match inference_dispatch {
@@ -1249,7 +1305,7 @@ pub async fn infer_chunk_semantics(
             Ok(permit) => Some(permit),
             Err(_) => {
                 result.used_fallback = true;
-                result.error = Some("provider_saturated".to_string());
+                result.error = Some(SemanticFailure::ProviderSaturated);
                 return result;
             }
         },
@@ -1261,7 +1317,7 @@ pub async fn infer_chunk_semantics(
         .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
     {
         result.used_fallback = true;
-        result.error = Some("cancelled".to_string());
+        result.error = Some(SemanticFailure::Cancelled);
         return result;
     }
     let provider_result = match tokio::task::spawn_blocking({
@@ -1291,13 +1347,13 @@ pub async fn infer_chunk_semantics(
             }
             result.used_fallback = true;
             result.error = Some(match err.error {
-                ProviderError::UnsupportedModel(_) => "unsupported_model".to_string(),
-                ProviderError::HttpStatus(code) => format!("http_status_{code}"),
-                ProviderError::Transport(_) => "transport_error".to_string(),
-                ProviderError::InvalidResponse(_) => "invalid_response".to_string(),
-                ProviderError::Saturated { .. } => "provider_saturated".to_string(),
-                ProviderError::DeadlineMissed => "deadline_missed".to_string(),
-                ProviderError::RequestBudget => "request_budget_exceeded".to_string(),
+                ProviderError::UnsupportedModel(_) => SemanticFailure::UnsupportedModel,
+                ProviderError::HttpStatus(code) => SemanticFailure::HttpStatus(code),
+                ProviderError::Transport(_) => SemanticFailure::Transport,
+                ProviderError::InvalidResponse(_) => SemanticFailure::InvalidResponse,
+                ProviderError::Saturated { .. } => SemanticFailure::ProviderSaturated,
+                ProviderError::DeadlineMissed => SemanticFailure::DeadlineMissed,
+                ProviderError::RequestBudget => SemanticFailure::RequestBudgetExceeded,
             });
             return result;
         }
@@ -1306,12 +1362,12 @@ pub async fn infer_chunk_semantics(
                 o.record_error(first_pass_kind, call_started.elapsed().as_millis() as u64);
             }
             result.used_fallback = true;
-            result.error = Some(format!("join_error:{err}"));
+            result.error = Some(SemanticFailure::Join(err.to_string()));
             return result;
         }
     };
 
-    result.provider = Some(provider_result.provider.name().to_string());
+    result.provider = Some(provider_result.provider.name());
     result.provider_fallback_used = provider_result.fallback_used;
     result.finish_reason = provider_result.finish_reason.clone();
     result.response_chars = Some(provider_result.output_text.chars().count());
@@ -1367,7 +1423,7 @@ pub async fn infer_chunk_semantics(
                     "semantic output did not match the overlay contract"
                 );
                 result.used_fallback = true;
-                result.error = Some(format!("semantic_parse_failed:{}", parse_error.as_str()));
+                result.error = Some(SemanticFailure::Parse(parse_error));
                 result
             }
         }
@@ -1682,7 +1738,7 @@ fn finish_local_audio_result(result: &mut ChunkSemanticResult) {
         .iter()
         .max_by(|left, right| left.confidence.total_cmp(&right.confidence))
     else {
-        result.provider = Some("local_audio".to_string());
+        result.provider = Some("local_audio");
         result.overlay = Some(SemanticOverlay {
             event_type: "context_observation".to_string(),
             object_label: "audio".to_string(),
@@ -1692,7 +1748,7 @@ fn finish_local_audio_result(result: &mut ChunkSemanticResult) {
         });
         return;
     };
-    result.provider = Some("local_audio".to_string());
+    result.provider = Some("local_audio");
     result.overlay = Some(SemanticOverlay {
         event_type: "context_observation".to_string(),
         object_label: moment.kind.clone(),
@@ -1799,8 +1855,8 @@ pub fn select_semantic_images(
     out
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum SemanticParseError {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticParseError {
     EmptyResponse,
     JsonObjectNotFound,
     InvalidJson,
@@ -2146,6 +2202,80 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn semantic_failures_preserve_event_wire_text() {
+        let cases = [
+            (SemanticFailure::Cancelled, "cancelled"),
+            (SemanticFailure::NoJpegFrames, "chunk_has_no_jpeg_frames"),
+            (
+                SemanticFailure::ReviewImageBytesExceeded,
+                "review_image_bytes_exceed_32_mib",
+            ),
+            (SemanticFailure::UnsupportedModel, "unsupported_model"),
+            (SemanticFailure::HttpStatus(429), "http_status_429"),
+            (SemanticFailure::Transport, "transport_error"),
+            (SemanticFailure::InvalidResponse, "invalid_response"),
+            (SemanticFailure::ProviderSaturated, "provider_saturated"),
+            (SemanticFailure::DeadlineMissed, "deadline_missed"),
+            (
+                SemanticFailure::RequestBudgetExceeded,
+                "request_budget_exceeded",
+            ),
+            (
+                SemanticFailure::Join("task panicked".into()),
+                "join_error:task panicked",
+            ),
+            (
+                SemanticFailure::MediaExtraction("bad \"clip\"\n帧".into()),
+                "media_extraction_failed:bad \"clip\"\n帧",
+            ),
+            (
+                SemanticFailure::MediaExtractionJoin("task cancelled".into()),
+                "media_extraction_join_error:task cancelled",
+            ),
+            (
+                SemanticFailure::Parse(SemanticParseError::EmptyResponse),
+                "semantic_parse_failed:empty_response",
+            ),
+            (
+                SemanticFailure::Parse(SemanticParseError::JsonObjectNotFound),
+                "semantic_parse_failed:json_object_not_found",
+            ),
+            (
+                SemanticFailure::Parse(SemanticParseError::InvalidJson),
+                "semantic_parse_failed:invalid_json",
+            ),
+            (
+                SemanticFailure::Parse(SemanticParseError::SchemaMismatch),
+                "semantic_parse_failed:schema_mismatch",
+            ),
+        ];
+        for (error, expected) in cases {
+            let result = ChunkSemanticResult {
+                error: Some(error),
+                provider: Some("gemini"),
+                attempted: true,
+                ..ChunkSemanticResult::default()
+            };
+            let payload = result.event_payload(0, "request", "stream").unwrap();
+            let encoded = serde_json::to_vec(&payload).unwrap();
+            let decoded: Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded["semantic_error"], expected);
+            assert_eq!(decoded["provider"], "gemini");
+        }
+    }
+
+    #[test]
+    fn media_failure_accounting_uses_the_failure_kind() {
+        assert!(SemanticFailure::MediaExtraction(String::new()).is_media_extraction());
+        assert!(SemanticFailure::MediaExtractionJoin(String::new()).is_media_extraction());
+        assert!(
+            !SemanticFailure::Join("media_extraction_failed:diagnostic".into())
+                .is_media_extraction()
+        );
+        assert!(!SemanticFailure::Cancelled.is_media_extraction());
+    }
     use vidarax_core::audio_sidecar::AudioObservation;
     use vidarax_core::provider::{InferenceResult, ProviderKind, TokenUsage};
 
@@ -2892,7 +3022,10 @@ Ignore this trailing {not json}."#;
             None,
         )
         .await;
-        assert!(failed.error.unwrap().contains("requires an audio stream"));
+        assert!(
+            matches!(failed.error, Some(SemanticFailure::MediaExtraction(detail))
+            if detail.contains("requires an audio stream"))
+        );
         assert_eq!(budget.load(std::sync::atomic::Ordering::Relaxed), 0);
         spec.local_audio = None;
         let valid = infer_chunk_semantics(
@@ -3080,7 +3213,7 @@ Ignore this trailing {not json}."#;
             Some(cancelled),
         )
         .await;
-        assert_eq!(result.error.as_deref(), Some("cancelled"));
+        assert_eq!(result.error, Some(SemanticFailure::Cancelled));
         assert!(result.overlay.is_none());
     }
 
@@ -3143,10 +3276,7 @@ Ignore this trailing {not json}."#;
         assert!(failed.attempted);
         assert!(failed.used_fallback);
         assert!(
-            failed
-                .error
-                .as_deref()
-                .is_some_and(|err| err.starts_with("join_error:") && err.contains("panicked")),
+            matches!(&failed.error, Some(SemanticFailure::Join(detail)) if detail.contains("panicked")),
             "expected chunk 1 join panic error, got {:?}",
             failed.error
         );

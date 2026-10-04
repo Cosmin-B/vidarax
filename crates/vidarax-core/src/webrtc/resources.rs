@@ -1,7 +1,7 @@
 //! Process admission units for one live media-pipeline generation.
 
 use crate::webrtc::decode::{DecoderBackend, VideoCodec, YuvPlanePools};
-use crate::webrtc::session::{MAX_RTP_ACCESS_UNIT_BYTES, RTP_FRAME_QUEUE_CAPACITY};
+use crate::webrtc::session::{MAX_RTP_NAL_BYTES, RTP_FRAME_QUEUE_CAPACITY};
 use crate::webrtc::signals::MAX_JPEG_BYTES_PER_FRAME;
 use crate::webrtc::workers::{
     decode_output_pool_slots, jpeg_pool_slots, per_stream_analysis_workers,
@@ -75,7 +75,7 @@ impl MediaSessionResources {
                 .saturating_add(zone_evidence_slots)
                 .saturating_add(trigger_binary_slots) as u64,
         );
-        let rtp_queue_bytes = (MAX_RTP_ACCESS_UNIT_BYTES as u64)
+        let rtp_queue_bytes = (MAX_RTP_NAL_BYTES as u64)
             .saturating_mul((RTP_FRAME_QUEUE_CAPACITY + decode_workers + 1) as u64);
         // One YCbCr interleave scratch per decoder and one base64 request
         // buffer per VLM worker. Provider protocols may require base64 on the

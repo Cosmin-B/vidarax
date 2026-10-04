@@ -12,6 +12,11 @@ live work releases stale buffers as soon as a newer item replaces it.
 | JPEG encoding | A byte check after encoding allowed the temporary buffer to grow past its limit. | The encoder writer rejects output before it exceeds 2 MiB. Normal encoded bytes stay identical. |
 | Sidecar exchange | Partial socket progress could restart a timeout. A failed embedding batch could strand queued callers. | One deadline covers framing, payload and response. A failed batch releases its bytes and wakes its callers; the worker continues. |
 | Structured Gemini response | Hidden thinking could exhaust the output budget after starting JSON, leaving a partial answer without a retry. | A length cutoff with thinking tokens and incomplete requested JSON uses the existing single headroom retry. Complete JSON and free-form text keep their prior policy. |
+| Loop history | Unused slots contained an all-ones hash and counted as prior frames. | Only populated slots count. The first all-ones frame no longer starts a false loop, including after reset. |
+| RTP reassembly | Compressed payload limits applied after fragment assembly. Queue buffers could grow beyond their reservation when Annex B framing was added. | Fragment append checks the existing 2 MiB limit. Queue-buffer growth is capped and its reservation includes the four-byte prefix. Overflow drops incomplete media and recovers on clean input. |
+| Semantic failure | Literal and numeric codes became owned strings before their result was retained. Media-failure accounting inspected a string prefix. | Results retain enum variants and numeric details. Event serialization preserves the wire text; accounting matches the failure kind. |
+| Frame metadata | A reusable gate-event batch sat between two independent phases. | Both phases finish per frame and retain only the metadata output. |
+| Decoder FFI | Enabling VP8 allowed unsafe operations throughout the decoder module. | Only the private libvpx module receives that exception. The parent decoder remains under the crate-wide restriction. |
 | Browser and SDK | A completed response header could end the timeout before the body. Replacement could leave a reader or late media callback alive. | Body reads share the request deadline. Stream exit cancels and releases its reader. Generation ownership closes late tracks and rejects stale callbacks. |
 
 ```mermaid
@@ -57,8 +62,37 @@ is involved. Arms ran sequentially on one host.
 The frame limit avoids decoding the rest of the long input. The bounded helper
 adds pipe-reader threads and a 20 ms child-status polling interval; short calls
 cost more in this run. These dev-profile samples do not establish release
-latency, service throughput or a workload-wide speedup. A production latency
-budget remains unspecified.
+latency, service throughput or a workload-wide speedup.
+
+## Frame-analysis storage and cost
+
+The frame-analysis comparison removed the intermediate gate-event buffer.
+Both versions returned identical values for every metadata field, checked over
+960,000 frames per run. Each run included eight pipeline constructions, gate
+classification, window scoring, metadata output and a caller checksum.
+Input preparation and process startup were outside the timed region.
+
+| Batch size | Commit policy | Before median (range), ns/frame | After median (range), ns/frame | Allocation calls per pipeline |
+|---|---|---:|---:|---:|
+| 1 | Immediate | 22.089 (22.049–22.540) | 21.205 (20.917–21.785) | 3 → 2 |
+| 1 | Deferred | 22.491 (22.457–22.613) | 21.740 (21.286–21.986) | 3 → 2 |
+| 32 | Immediate | 34.319 (34.262–34.364) | 30.221 (30.177–30.298) | 9 → 5 |
+| 32 | Deferred | 33.210 (33.128–33.348) | 30.195 (30.155–30.353) | 9 → 5 |
+| 256 | Immediate | 34.741 (34.649–34.801) | 31.107 (31.046–31.207) | 15 → 8 |
+| 256 | Deferred | 33.762 (33.737–33.869) | 31.105 (31.077–31.192) | 15 → 8 |
+
+Setup: baseline `a238545f0fb56b310ed48f298816d5fc71f60b06`, Rust 1.89,
+`rustc --edition=2021 -O`, macOS 26.4 arm64, a 16-frame context window and
+the default gate configuration. Both arms used the same prepared 120,000-frame
+signal array for each pipeline. Deferred runs committed the batch after
+consuming its metadata. One warm-up preceded seven runs per arm, alternating
+the order of the arms. Allocation counts include buffer growth.
+
+The medians were 3–12% lower on this fixture. The removed buffer saves 96 bytes
+of allocated storage per pipeline at batch size 1, 1,440 bytes of allocation
+traffic at size 32 and 12,192 bytes at size 256. These byte differences include
+growth allocations, not peak process memory. The comparison does not measure
+decode, inference or network latency.
 
 ## Remaining limits
 
@@ -71,5 +105,5 @@ does not establish an aggregate process budget for every live audio track,
 sidecar connection, allocator or codec allocation. Process boundaries do not
 provide an OS security sandbox.
 
-See [Runtime contracts](native-systems-profile.md) for source owners and
-unresolved workload requirements.
+See [Runtime contracts](native-systems-profile.md) for measurement limits and
+the [Core ownership map](core-ownership-map.md) for module boundaries.

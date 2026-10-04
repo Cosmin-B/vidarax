@@ -281,7 +281,12 @@ pub fn apply_pending_session_commands(
     prompt: &mut Arc<str>,
     guided_json: &mut Option<Arc<str>>,
 ) {
-    while let Ok(command) = receiver.try_recv() {
+    // A producer may refill the bounded queue while we drain it. Leave time
+    // for media work after at most one queue capacity of configuration updates.
+    for _ in 0..SESSION_COMMAND_QUEUE_CAPACITY {
+        let Ok(command) = receiver.try_recv() else {
+            break;
+        };
         match command {
             SessionCommand::UpdateConfig {
                 generation: received,
@@ -395,17 +400,16 @@ pub struct JoinDeadlineInputs {
     pub max_serial_inference_attempts: u64,
     /// Admission wait before a pass may run (AdmissionLimits::wait_timeout).
     pub admission_wait_ms: u64,
-    /// Sidecar embedding timeout, which arms each socket operation.
+    /// End-to-end sidecar embedding exchange timeout.
     pub novelty_embedding_timeout_ms: u64,
 }
 
 /// Join deadline for generation teardown, derived from the work a healthy
 /// worker can legitimately be inside when stop is raised: an admission wait
 /// before each of the two tiered passes, the serial fallback attempts of one
-/// tiered call, and one sidecar exchange budgeted as its five timeout-armed
-/// socket operations (connect, two writes, two reads). A sidecar that drips
-/// bytes slower than that budget counts as wedged on purpose. All arithmetic
-/// saturates and the result is capped at 24 hours.
+/// tiered call, and one end-to-end sidecar exchange. The serial inference
+/// allowance is conservative; providers also share the request deadline.
+/// All arithmetic saturates and the result is capped at 24 hours.
 pub fn supervise_join_deadline_from(inputs: &JoinDeadlineInputs) -> Duration {
     const CAP_MS: u64 = 86_400_000;
     let per_attempt = CLIP_FIRST_PASS_TIMEOUT_MS + CLIP_SECOND_PASS_TIMEOUT_MS;
@@ -414,7 +418,7 @@ pub fn supervise_join_deadline_from(inputs: &JoinDeadlineInputs) -> Duration {
         .max(1)
         .saturating_mul(per_attempt);
     let admission = inputs.admission_wait_ms.saturating_mul(2);
-    let novelty = inputs.novelty_embedding_timeout_ms.saturating_mul(5);
+    let novelty = inputs.novelty_embedding_timeout_ms;
     let total = inference
         .saturating_add(admission)
         .saturating_add(novelty)
@@ -669,7 +673,7 @@ mod tests {
         });
         let expected = 2 * (super::CLIP_FIRST_PASS_TIMEOUT_MS + super::CLIP_SECOND_PASS_TIMEOUT_MS)
             + 2 * 120_000
-            + 5 * 1_500
+            + 1_500
             + 5_000;
         assert_eq!(d, std::time::Duration::from_millis(expected));
     }

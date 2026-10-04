@@ -1,11 +1,17 @@
 use std::net::SocketAddr;
 
-use rustrtc::media::depacketizer::{DefaultDepacketizerFactory, Depacketizer, DepacketizerFactory};
+use rustrtc::media::depacketizer::{
+    DefaultDepacketizerFactory, Depacketizer, DepacketizerFactory, H264Depacketizer,
+};
 use rustrtc::media::frame::{MediaKind, MediaSample, VideoFrame, VideoPixelFormat};
 use rustrtc::media::MediaResult;
 use rustrtc::rtp::RtpPacket;
 
 use crate::webrtc::decode::VideoCodec;
+
+/// Maximum compressed access-unit payload retained during reassembly or
+/// admitted into the RTP frame queue. Overflow drops the incomplete unit.
+pub const MAX_RTP_ACCESS_UNIT_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct VidaraxDepacketizerFactory {
@@ -19,24 +25,69 @@ impl VidaraxDepacketizerFactory {
 }
 
 impl DepacketizerFactory for VidaraxDepacketizerFactory {
-    // The boxed trait object here is rustrtc's plugin shape, not a design choice
-    // of ours: its receiver owns the RTP loop and calls the depacketizer once per
-    // packet through this box, so the indirect dispatch happens inside the
-    // dependency. Handing back our two concrete depacketizers by value and letting
-    // the compiler dispatch them statically would only pay off if we also took over
-    // the receive loop, and the per-packet work is NAL splitting and payload
-    // copying — the dispatch sits next to that, it does not bound it. Reusing
-    // rustrtc's path is the better trade even though it costs the vtable hop.
-    //
-    // Audio, application, and any video codec other than the two below fall through
-    // to rustrtc's default factory on purpose; codec selection upstream only lets a
-    // negotiated video codec reach us, so the wildcard is delegation, not a gap.
+    // rustrtc owns the receiver loop and requires a boxed depacketizer. Select
+    // the codec once at session startup; keep reassembly state on that owner.
     fn create(&self, kind: MediaKind) -> Box<dyn Depacketizer> {
         match (kind, self.codec) {
             (MediaKind::Video, VideoCodec::Vp8) => Box::new(Vp8Depacketizer::new()),
             (MediaKind::Video, VideoCodec::H265) => Box::new(H265Depacketizer::new()),
+            (MediaKind::Video, VideoCodec::H264) => Box::new(BoundedH264Depacketizer::new()),
             _ => DefaultDepacketizerFactory.create(kind),
         }
+    }
+}
+
+/// Bound the dependency's FU-A buffer before forwarding each fragment.
+/// Packet parsing and sample construction remain in rustrtc.
+struct BoundedH264Depacketizer {
+    inner: H264Depacketizer,
+    fragment_bytes: usize,
+}
+
+impl BoundedH264Depacketizer {
+    fn new() -> Self {
+        Self {
+            inner: H264Depacketizer::new(),
+            fragment_bytes: 0,
+        }
+    }
+}
+
+impl Depacketizer for BoundedH264Depacketizer {
+    fn push(
+        &mut self,
+        packet: RtpPacket,
+        clock_rate: u32,
+        addr: SocketAddr,
+        kind: MediaKind,
+    ) -> MediaResult<Vec<MediaSample>> {
+        if kind != MediaKind::Video {
+            return self.inner.push(packet, clock_rate, addr, kind);
+        }
+        let payload = &packet.payload;
+        let fragmented = payload.len() >= 2 && payload[0] & 0x1f == 28;
+        let mut fragment_end = false;
+        if fragmented {
+            if payload[1] & 0x80 != 0 {
+                self.fragment_bytes = 1; // Reconstructed NAL header.
+            }
+            self.fragment_bytes = self.fragment_bytes.saturating_add(payload.len() - 2);
+            fragment_end = payload[1] & 0x40 != 0;
+        }
+        if payload.len() > MAX_RTP_ACCESS_UNIT_BYTES
+            || self.fragment_bytes > MAX_RTP_ACCESS_UNIT_BYTES
+        {
+            // Replacing the owner drops retained fragment storage and makes
+            // continuations fail until rustrtc receives a clean FU-A start.
+            self.inner = H264Depacketizer::new();
+            self.fragment_bytes = 0;
+            return Ok(Vec::new());
+        }
+        let samples = self.inner.push(packet, clock_rate, addr, kind);
+        if fragment_end {
+            self.fragment_bytes = 0;
+        }
+        samples
     }
 }
 
@@ -188,6 +239,11 @@ impl Depacketizer for Vp8Depacketizer {
         }
 
         self.last_seq = Some(seq);
+        if partition_payload.len() > MAX_RTP_ACCESS_UNIT_BYTES - self.frame_buf.len() {
+            self.reset_frame();
+            self.dropping_until_start = true;
+            return Ok(Vec::new());
+        }
         self.frame_buf.extend_from_slice(partition_payload);
 
         if marker {
@@ -242,7 +298,23 @@ impl H265Depacketizer {
     }
 
     fn append_nal(&mut self, nal: &[u8]) -> bool {
-        if nal.len() < 2 {
+        let separator = if self.access_unit_buf.is_empty() {
+            0
+        } else {
+            ANNEX_B_START_CODE.len()
+        };
+        let pending_fragment = if self.fragment_buf.is_empty() {
+            0
+        } else {
+            ANNEX_B_START_CODE.len() + self.fragment_buf.len()
+        };
+        let combined_bytes = self
+            .access_unit_buf
+            .len()
+            .saturating_add(separator)
+            .saturating_add(nal.len())
+            .saturating_add(pending_fragment);
+        if nal.len() < 2 || combined_bytes > MAX_RTP_ACCESS_UNIT_BYTES {
             self.reset_access_unit();
             self.dropping_until_new_ts = true;
             return false;
@@ -333,6 +405,24 @@ impl H265Depacketizer {
         let is_start = fu_header & 0x80 != 0;
         let is_end = fu_header & 0x40 != 0;
         let fu_type = fu_header & 0x3f;
+
+        let separator = if self.access_unit_buf.is_empty() {
+            0
+        } else {
+            ANNEX_B_START_CODE.len()
+        };
+        let combined_bytes = self
+            .access_unit_buf
+            .len()
+            .saturating_add(separator)
+            .saturating_add(self.fragment_buf.len())
+            .saturating_add(if is_start { 2 } else { 0 })
+            .saturating_add(fu_payload.len());
+        if combined_bytes > MAX_RTP_ACCESS_UNIT_BYTES {
+            self.reset_access_unit();
+            self.dropping_until_new_ts = true;
+            return false;
+        }
 
         if is_start {
             if !self.fragment_buf.is_empty() {
@@ -539,6 +629,113 @@ mod tests {
             )
             .unwrap();
         assert_eq!(video_data(recovered), clean);
+    }
+
+    #[test]
+    fn vp8_reassembly_drops_overflow_and_recovers() {
+        let limit = crate::webrtc::session::MAX_RTP_ACCESS_UNIT_BYTES;
+        let mut decoder = Vp8Depacketizer::new();
+        let mut first = vec![0x10];
+        first.extend(vec![0xaa; limit / 2]);
+        assert_empty(decoder.push(
+            packet(first, 1, 100, false),
+            90_000,
+            addr(),
+            MediaKind::Video,
+        ));
+        let mut second = vec![0x00];
+        second.extend(vec![0xbb; limit / 2]);
+        assert_empty(decoder.push(
+            packet(second, 2, 100, false),
+            90_000,
+            addr(),
+            MediaKind::Video,
+        ));
+        assert_eq!(decoder.frame_buf.len(), limit);
+        assert_empty(decoder.push(
+            packet(vec![0x00, 0xcc], 3, 100, true),
+            90_000,
+            addr(),
+            MediaKind::Video,
+        ));
+        assert!(decoder.frame_buf.is_empty());
+        let clean = decoder
+            .push(
+                packet(vec![0x10, 0xdd], 4, 200, true),
+                90_000,
+                addr(),
+                MediaKind::Video,
+            )
+            .unwrap();
+        assert_eq!(video_data(clean), vec![0xdd]);
+    }
+
+    #[test]
+    fn h265_reassembly_bounds_combined_nals_and_fragments() {
+        let limit = crate::webrtc::session::MAX_RTP_ACCESS_UNIT_BYTES;
+        let mut decoder = H265Depacketizer::new();
+        assert_empty(decoder.push(
+            packet(h265_nal(32, &[0xaa]), 1, 100, false),
+            90_000,
+            addr(),
+            MediaKind::Video,
+        ));
+        let mut fragment = h265_payload_header(49);
+        fragment.push(0x80 | 1);
+        fragment.extend(vec![0xbb; limit - 2]);
+        assert_empty(decoder.push(
+            packet(fragment, 2, 100, false),
+            90_000,
+            addr(),
+            MediaKind::Video,
+        ));
+        assert!(decoder.access_unit_buf.is_empty());
+        assert!(decoder.fragment_buf.is_empty());
+        assert_h265_recovery(&mut decoder, 3);
+
+        let mut exact = h265_header(1).to_vec();
+        exact.resize(limit, 0xcc);
+        assert_empty(decoder.push(
+            packet(exact, 4, 300, false),
+            90_000,
+            addr(),
+            MediaKind::Video,
+        ));
+        assert_eq!(decoder.access_unit_buf.len(), limit);
+        assert_empty(decoder.push(
+            packet(h265_nal(32, &[0xdd]), 5, 300, true),
+            90_000,
+            addr(),
+            MediaKind::Video,
+        ));
+        assert_h265_recovery(&mut decoder, 6);
+    }
+
+    #[test]
+    fn h264_factory_bounds_fragment_reassembly_before_queue_ingress() {
+        let limit = crate::webrtc::session::MAX_RTP_ACCESS_UNIT_BYTES;
+        let mut decoder =
+            VidaraxDepacketizerFactory::new(VideoCodec::H264).create(MediaKind::Video);
+        let mut start = vec![0x7c, 0x85];
+        start.extend(vec![0xaa; limit / 2]);
+        assert_empty(decoder.push(
+            packet(start, 1, 100, false),
+            90_000,
+            addr(),
+            MediaKind::Video,
+        ));
+        let mut end = vec![0x7c, 0x45];
+        end.extend(vec![0xbb; limit / 2]);
+        assert_empty(decoder.push(packet(end, 2, 100, true), 90_000, addr(), MediaKind::Video));
+        let clean = decoder
+            .push(
+                packet(vec![0x65, 0xcc], 3, 200, true),
+                90_000,
+                addr(),
+                MediaKind::Video,
+            )
+            .unwrap();
+        assert_eq!(video_data(clean), vec![0x65, 0xcc]);
     }
 
     #[test]

@@ -102,17 +102,19 @@ ownership, units, blocking and failure when they matter to the caller.
 Implementation comments explain the invariant, ordering or resource cost.
 Keep one noun for each object and remove line-by-line narration.
 
-## Unresolved requirements
+## Measurement limits
 
-- Product latency and throughput budgets, representative workload distributions
-  and host-specific memory targets are not established by CI regression gates.
-- Effective provider FPS, model billing, visual defect recall and real service
-  latency require a separately authorized live run on representative media.
-- OS sandboxing and production CPU/NUMA placement depend on the deployed host.
-  No host policy is inferred from local service templates.
+The release gate measures the gate operation and executable size. It does not
+measure end-to-end request latency or service throughput. The local ingest
+comparison includes process startup and cleanup for its stated inputs.
 
-Update the smallest affected contract when source behavior changes. Revisit
-these unknowns when the owner supplies a workload, budget or deployment policy.
+The live Gemini comparison used one synthetic, one-second clip with four known
+defect frames. The dense request detected that defect; the sparse request did
+not. This result does not establish recall on other media or the provider's
+effective sampling rate. The reported cost uses response token counts and
+published prices; it is an estimate, not an account invoice.
 
 See [Resources through completion](runtime-resource-changes.md) for the
 behavior changes, retained-capacity ledger and matched local ingest costs.
+The [Core ownership map](core-ownership-map.md) covers each core module and
+explains the execution, lifetime and protocol boundaries.

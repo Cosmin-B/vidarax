@@ -1604,8 +1604,8 @@ async fn append_semantic_chunk_event(
     };
     if result
         .error
-        .as_deref()
-        .is_some_and(|error| error.starts_with("media_extraction_"))
+        .as_ref()
+        .is_some_and(|error| error.is_media_extraction())
     {
         state.pipeline_metrics().inc_media_clip_extraction_failure();
     }
@@ -1696,7 +1696,7 @@ async fn append_semantic_chunk_event(
             object.insert("pts_end_ms".to_string(), json!(media.source_end_ms));
             object.insert(
                 "timestamp_resolution_ms".to_string(),
-                json!(if result.provider.as_deref() == Some("gemini") {
+                json!(if result.provider == Some("gemini") {
                     1_000
                 } else {
                     1
@@ -1776,7 +1776,7 @@ async fn append_semantic_chunk_event(
                     "end_offset_ms": moment.end_offset_ms,
                     "start_pts_ms": moment.start_pts_ms,
                     "end_pts_ms": moment.end_pts_ms,
-                    "timestamp_resolution_ms": if result.provider.as_deref() == Some("gemini") { 1_000 } else { 1 },
+                    "timestamp_resolution_ms": if result.provider == Some("gemini") { 1_000 } else { 1 },
                     "provider_sampling_interval_ms": result.media.as_ref().and_then(|media| media.video_fps).map(|fps| (1000.0 / fps).ceil() as u64),
                     "provider_sampling_status": result.media.as_ref().and_then(|media| media.video_fps).map(|_| "requested_unverified"),
                     "modalities": &moment.modalities,
@@ -1785,7 +1785,7 @@ async fn append_semantic_chunk_event(
                     "intent": moment.intent.as_deref(),
                     "audio_visual_relation": moment.audio_visual_relation.as_deref(),
                     "confidence": moment.confidence,
-                    "provider": result.provider.as_deref(),
+                    "provider": result.provider,
                     "index_name": index_name,
                     "evidence": evidence.as_ref(),
                 }),

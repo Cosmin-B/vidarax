@@ -72,10 +72,9 @@ use crate::zone::RestrictedZonePolicy;
 /// unchanged.
 const ANNEX_B_START: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
 pub const RTP_FRAME_QUEUE_CAPACITY: usize = 128;
-/// Maximum compressed access-unit payload admitted into the owned RTP queue.
-/// This turns the queue's item bound into a byte bound as well. Oversized
-/// frames are shed before the pipeline-owned copy is made.
-pub const MAX_RTP_ACCESS_UNIT_BYTES: usize = 2 * 1024 * 1024;
+pub use crate::webrtc::depacketize::MAX_RTP_ACCESS_UNIT_BYTES;
+/// Retained queue-buffer capacity, including an Annex B prefix when needed.
+pub const MAX_RTP_NAL_BYTES: usize = MAX_RTP_ACCESS_UNIT_BYTES + ANNEX_B_START.len();
 pub const LIVE_AUDIO_QUEUE_CAPACITY: usize = 256;
 pub const MAX_RTP_AUDIO_ACCESS_UNIT_BYTES: usize = 64 * 1024;
 
@@ -1018,17 +1017,31 @@ async fn enqueue_rtp_frame_lossless(
 }
 
 fn frame_payload_to_nals(codec: VideoCodec, payload: &[u8], pool: &VecPool) -> RecycledBytes {
+    debug_assert!(payload.len() <= MAX_RTP_ACCESS_UNIT_BYTES);
     let mut nals = pool.acquire();
+    let prefix_len = match codec {
+        VideoCodec::H264 | VideoCodec::H265 => ANNEX_B_START.len(),
+        VideoCodec::Vp8 => 0,
+    };
+    let needed = prefix_len + payload.len();
+    if needed > nals.capacity() {
+        // Amortize reuse while keeping Vec growth inside the capacity reserved
+        // by generation admission, including the encoded-stream prefix.
+        let capacity = nals
+            .capacity()
+            .saturating_mul(2)
+            .max(needed)
+            .min(MAX_RTP_NAL_BYTES);
+        nals.reserve_exact(capacity);
+    }
     match codec {
         VideoCodec::H264 | VideoCodec::H265 => {
             // ffmpeg h264/hevc demuxers expect Annex B start codes. H.264 is
             // depacketized by rustrtc; H.265 by the in-crate HEVC RTP depacketizer.
-            nals.reserve(ANNEX_B_START.len() + payload.len());
             nals.extend_from_slice(&ANNEX_B_START);
             nals.extend_from_slice(payload);
         }
         VideoCodec::Vp8 => {
-            nals.reserve(payload.len());
             nals.extend_from_slice(payload);
         }
     }
@@ -1041,6 +1054,22 @@ fn frame_payload_to_nals(codec: VideoCodec, payload: &[u8], pool: &VecPool) -> R
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nal_pool_growth_stays_inside_the_framed_payload_reservation() {
+        let pool = crate::webrtc::recycle::VecPool::with_slots(1);
+        for bytes in [
+            super::MAX_RTP_ACCESS_UNIT_BYTES / 2,
+            super::MAX_RTP_ACCESS_UNIT_BYTES,
+        ] {
+            let payload = vec![0xaa; bytes];
+            let nals = super::frame_payload_to_nals(super::VideoCodec::H264, &payload, &pool);
+            assert_eq!(nals.len(), payload.len() + super::ANNEX_B_START.len());
+            assert_eq!(&nals[super::ANNEX_B_START.len()..], payload);
+            drop(nals);
+        }
+        let retained = pool.acquire();
+        assert_eq!(retained.capacity(), super::MAX_RTP_NAL_BYTES);
+    }
     use super::{
         enqueue_rtp_frame_lossless, frame_payload_to_nals, rtp_nal_pool_slots, RtpFrame,
         WebRtcConfig, WebRtcSession, WebRtcSetupError, ANNEX_B_START, RTP_FRAME_QUEUE_CAPACITY,
