@@ -38,34 +38,36 @@ PTS findings](frame-exact-pts-design.md).
 
 ## ffmpeg YUV reader behavior
 
-The ffmpeg YUV reader handoff is bounded and uses blocking sends. Each
-`decode()` call drains all currently-ready reader output before writing more
-encoded input to ffmpeg stdin. That ordering makes room for output already
-produced and narrows the coupled-pipe deadlock window. The implementation has
-no measured or enforced maximum decoded-output burst per input write. After the write, the decoder returns the freshest
-pending decoded YUV frame. If several decoded frames were already waiting, the
-older decoded YUV frames are shed, their pooled Y/U/V buffers are recycled, and
-`vidarax_pipeline_frames_dropped_total` is incremented for the shed count.
+The ffmpeg YUV reader handoff holds at most 16 frames and uses blocking
+sends. Each `decode()` call receives at most 16 ready frames before writing
+encoded input. The decoder retains the newest received frame and recycles each
+older frame as its replacement arrives. It counts those replacements in
+`vidarax_pipeline_frames_dropped_total`.
 
-This is a real-time freshness policy: under sustained overload the engine sheds
-the oldest decoded output, not encoded input, so codec state is preserved while
-analysis stays as close as possible to the current RTP label.
+This bounds the drain's work even when the reader refills the channel. The
+reader handoff remains lossless. The decoder sheds decoded output to keep
+analysis close to the current RTP label. It always writes encoded input so the
+codec retains its state.
 
-Boundedness still comes from the existing end-to-end backpressure. When
-analysis is slow, the decode worker blocks on the bounded downstream
-`frame_tx`, stops calling `decode()`, stops pulling RTP, and stops feeding
-ffmpeg input. ffmpeg then stops producing decoded YUV beyond its normal
-pipeline depth. A one-time diagnostic warns and increments a metric if the
-decoder-local pending FIFO exceeds a generous sanity bound.
+The drain makes room for output that ffmpeg has already produced. The
+implementation has no measured or enforced maximum decoded-output burst per
+input write, so this ordering does not establish that the coupled pipes cannot
+deadlock. Source-time labels remain an approximation because raw YUV output
+has no timestamp channel.
+
+Decoder destruction disconnects the reader channel before killing and reaping
+the ffmpeg child. Disconnection releases a reader blocked on a full channel.
+The decoder then joins that reader before releasing its resources.
 
 ## YUV output pool sizing
 
 The YUV output pool is sized per decode backend:
 
-- `NvDec` and `FfmpegSw` use the ffmpeg reader path: 16 reader handoff slots, 4
-  decoder-pending allowance slots, 1 reader-constructing frame, and 1
-  decode-consumer frame, for 22 YUV420 slots. At 1920x1080 this is about
-  65,318,400 bytes, or 62.3 MiB per session.
+- `NvDec` and `FfmpegSw` use 16 reader handoff positions, one newest
+  decoded frame, one received replacement, one constructing frame, and one
+  consumer frame. The pool has 20 positions. At 1920x1080, the luma capacity
+  rounds to 2 MiB and each chroma capacity is 512 KiB. The plane capacities
+  total 60 MiB per session. This is a source-derived pool capacity, not RSS.
 - `Unsupported` allocates no decode output pool work because it never produces
   YUV frames.
 

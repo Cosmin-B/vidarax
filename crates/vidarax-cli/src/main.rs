@@ -20,6 +20,7 @@ use owo_colors::OwoColorize;
 use reqwest::Method;
 use serde_json::{json, Map, Value};
 use vidarax_contracts::lifecycle::StreamState;
+use vidarax_contracts::processing::{REQUEST_FPS_MAX, REQUEST_FPS_MIN};
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8080";
 const API_TIMEOUT_SECS: u64 = 10;
@@ -1694,8 +1695,11 @@ fn validate_analyze_args(args: &AnalyzeArgs) -> Result<(), String> {
         }
         _ => return Err("provide a FILE or --source-uri".to_string()),
     }
-    if args.fixed_fps <= 0.0 {
-        return Err("--fixed-fps must be greater than 0".to_string());
+    if !args.fixed_fps.is_finite() || !(REQUEST_FPS_MIN..=REQUEST_FPS_MAX).contains(&args.fixed_fps)
+    {
+        return Err(format!(
+            "--fixed-fps must be in [{REQUEST_FPS_MIN}, {REQUEST_FPS_MAX}]"
+        ));
     }
     if args.media == AnalyzeMediaArg::Frames && args.chunk_size == 0 {
         return Err("--chunk-size must be greater than 0".to_string());
@@ -2777,6 +2781,23 @@ mod tests {
             voice_feedback: false,
             no_vlm: false,
             include_frame_metadata: false,
+        }
+    }
+
+    #[test]
+    fn analyze_rejects_non_finite_and_out_of_contract_fixed_fps() {
+        let mut args = analyze_args();
+        args.file = None;
+        args.source_uri = Some("file:///tmp/clip.mp4".to_string());
+        for fps in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, 0.1, 121.0] {
+            args.fixed_fps = fps;
+            assert!(validate_analyze_args(&args)
+                .unwrap_err()
+                .contains("--fixed-fps"));
+        }
+        for fps in [REQUEST_FPS_MIN, REQUEST_FPS_MAX] {
+            args.fixed_fps = fps;
+            assert!(validate_analyze_args(&args).is_ok());
         }
     }
 

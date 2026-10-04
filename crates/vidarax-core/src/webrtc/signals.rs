@@ -18,10 +18,35 @@ use crate::webrtc::recycle::{RecycledBytes, VecPool};
 /// actually moving through it. A frame that needs more still grows from here —
 /// this is a floor, not a cap.
 const JPEG_TYPICAL_CAPACITY: usize = 256 * 1024;
-/// Hard bound for a JPEG payload that can enter downstream queues. The encoder
-/// writes into owned memory first; an oversized result is recycled immediately
-/// and never becomes queued work.
+/// Bound for encoded JPEG bytes and the backing capacity retained by the pool.
+/// The encoder stops before writing beyond this limit.
 pub const MAX_JPEG_BYTES_PER_FRAME: usize = 2 * 1024 * 1024;
+
+struct JpegBuffer<'a>(&'a mut Vec<u8>);
+
+impl jpeg_encoder::JfifWrite for JpegBuffer<'_> {
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), jpeg_encoder::EncodingError> {
+        if bytes.len() > MAX_JPEG_BYTES_PER_FRAME - self.0.len() {
+            return Err(jpeg_encoder::EncodingError::Write(format!(
+                "encoded payload exceeds the {MAX_JPEG_BYTES_PER_FRAME} byte pipeline limit"
+            )));
+        }
+        let needed = self.0.len() + bytes.len();
+        if needed > self.0.capacity() {
+            // Keep amortized growth without letting Vec's next capacity exceed
+            // the byte envelope reserved for this pool slot.
+            let capacity = self
+                .0
+                .capacity()
+                .saturating_mul(2)
+                .max(needed)
+                .min(MAX_JPEG_BYTES_PER_FRAME);
+            self.0.reserve_exact(capacity - self.0.len());
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+}
 
 /// Compute a 64-bit perceptual hash from the Y (luma) plane.
 ///
@@ -468,11 +493,16 @@ pub(crate) fn yuv_to_jpeg_unchecked(
     }
 
     let mut buf = output_pool.acquire();
+    if buf.capacity() > MAX_JPEG_BYTES_PER_FRAME {
+        // A caller-supplied pool may contain older oversized buffers. Release
+        // that allocation instead of retaining it after this encode.
+        buf = Vec::new();
+    }
     // Grow a fresh buffer to the reserve size in one shot so the encoder's first
     // write doesn't climb through a chain of small reallocations. Once a buffer
     // has cycled through the pool this is a no-op.
     buf.reserve(JPEG_TYPICAL_CAPACITY);
-    let encoder = jpeg_encoder::Encoder::new(&mut buf, quality);
+    let encoder = jpeg_encoder::Encoder::new(JpegBuffer(&mut buf), quality);
     let outcome = encoder.encode(
         scratch,
         yuv.width as u16,
@@ -485,15 +515,7 @@ pub(crate) fn yuv_to_jpeg_unchecked(
     // path this handle drops at the end of the match and the slot goes back.
     let bytes = output_pool.recycle(buf);
     match outcome {
-        Ok(()) if bytes.len() <= MAX_JPEG_BYTES_PER_FRAME => Ok(bytes),
-        Ok(()) => Err(JpegEncodeError {
-            width: yuv.width,
-            height: yuv.height,
-            detail: format!(
-                "encoded payload exceeds the {} byte pipeline limit",
-                MAX_JPEG_BYTES_PER_FRAME
-            ),
-        }),
+        Ok(()) => Ok(bytes),
         Err(err) => Err(JpegEncodeError {
             width: yuv.width,
             height: yuv.height,
@@ -632,6 +654,56 @@ mod tests {
             "pooled buffer lost its reservation: {} < {JPEG_TYPICAL_CAPACITY}",
             recycled.capacity(),
         );
+    }
+
+    #[test]
+    fn jpeg_byte_limit_stops_encoding_before_pool_capacity_grows() {
+        let mut state = 0x1234_5678_u32;
+        let mut noise = |len: usize| -> RecycledBytes {
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state as u8
+                })
+                .collect::<Vec<_>>()
+                .into()
+        };
+        let frame = YuvFrame {
+            y: noise(2048 * 2048),
+            u: noise(1024 * 1024),
+            v: noise(1024 * 1024),
+            width: 2048,
+            height: 2048,
+        };
+        let mut scratch = Vec::new();
+        let pool = VecPool::with_slots(1);
+        assert!(yuv_to_jpeg(&frame, 100, &mut scratch, &pool).is_err());
+        let recycled = pool.acquire();
+        assert!(recycled.capacity() <= MAX_JPEG_BYTES_PER_FRAME);
+
+        let mut unbounded = Vec::new();
+        jpeg_encoder::Encoder::new(&mut unbounded, 100)
+            .encode(&scratch, 2048, 2048, jpeg_encoder::ColorType::Ycbcr)
+            .unwrap();
+        assert!(unbounded.len() > MAX_JPEG_BYTES_PER_FRAME);
+    }
+
+    #[test]
+    fn jpeg_capacity_limit_preserves_bytes_and_replaces_oversized_pool_slot() {
+        let pool = VecPool::with_slots(1);
+        let oversized = pool.recycle(Vec::with_capacity(MAX_JPEG_BYTES_PER_FRAME + 1));
+        drop(oversized);
+        let mut scratch = Vec::new();
+        let encoded = yuv_to_jpeg(&solid_frame(64, 64), 75, &mut scratch, &pool).unwrap();
+        let mut reference = Vec::new();
+        jpeg_encoder::Encoder::new(&mut reference, 75)
+            .encode(&scratch, 64, 64, jpeg_encoder::ColorType::Ycbcr)
+            .unwrap();
+        assert_eq!(&*encoded, reference);
+        drop(encoded);
+        assert!(pool.acquire().capacity() <= MAX_JPEG_BYTES_PER_FRAME);
     }
 
     #[test]

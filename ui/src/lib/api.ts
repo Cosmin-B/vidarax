@@ -80,10 +80,11 @@ async function request<T>(
   return res.text() as unknown as Promise<T>
 }
 
-async function requestBlob(path: string, accept: string): Promise<Blob> {
+async function requestBlob(path: string, accept: string, signal?: AbortSignal): Promise<Blob> {
   const auth = useAuthStore()
   const res = await fetch(`${auth.apiEndpoint}${path}`, {
     headers: { ...auth.defaultHeaders(), Accept: accept },
+    signal,
   })
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText)
@@ -124,49 +125,57 @@ export async function followRunEvents(
     throw new ApiError(response.status, message)
   }
   if (!response.body) throw new Error('Timeline stream has no response body')
-  onOpen()
-
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
   let buffer = ''
-  while (!signal.aborted) {
-    const { value, done } = await reader.read()
-    buffer += decoder.decode(value, { stream: !done })
-    // Normalize after concatenation so a CRLF split across network chunks is
-    // handled as one delimiter rather than two unrelated characters.
-    buffer = buffer.replace(/\r\n/g, '\n')
+  try {
+    onOpen()
+    while (!signal.aborted) {
+      const { value, done } = await reader.read()
+      buffer += decoder.decode(value, { stream: !done })
+      // Normalize after concatenation so a CRLF split across network chunks is
+      // handled as one delimiter rather than two unrelated characters.
+      buffer = buffer.replace(/\r\n/g, '\n')
 
-    let boundary = buffer.indexOf('\n\n')
-    while (boundary >= 0) {
-      const block = buffer.slice(0, boundary)
-      buffer = buffer.slice(boundary + 2)
-      const lines = block.split('\n')
-      let kind = ''
-      const data: string[] = []
-      for (const line of lines) {
-        if (line.startsWith('event:')) kind = line.slice(6).trimStart()
-        else if (line.startsWith('data:')) data.push(line.slice(5).trimStart())
-      }
-      if (kind && data.length > 0) {
-        const envelope = JSON.parse(data.join('\n')) as CloudEventEnvelope
-        if (!Number.isSafeInteger(envelope.sequence) || envelope.sequence < 0) {
-          throw new Error('Timeline stream returned an invalid sequence')
+      let boundary = buffer.indexOf('\n\n')
+      while (boundary >= 0) {
+        const block = buffer.slice(0, boundary)
+        buffer = buffer.slice(boundary + 2)
+        if (encoder.encode(block).length > MAX_SSE_BUFFER_BYTES) {
+          throw new Error('Timeline stream event exceeded 1 MiB')
         }
-        await onEvent({
-          seq: envelope.sequence,
-          pts_ms: Number(envelope.pts_ms ?? 0),
-          kind,
-          payload: envelope.data ?? {},
-        })
+        const lines = block.split('\n')
+        let kind = ''
+        const data: string[] = []
+        for (const line of lines) {
+          if (line.startsWith('event:')) kind = line.slice(6).trimStart()
+          else if (line.startsWith('data:')) data.push(line.slice(5).trimStart())
+        }
+        if (kind && data.length > 0) {
+          const envelope = JSON.parse(data.join('\n')) as CloudEventEnvelope
+          if (!Number.isSafeInteger(envelope.sequence) || envelope.sequence < 0) {
+            throw new Error('Timeline stream returned an invalid sequence')
+          }
+          await onEvent({
+            seq: envelope.sequence,
+            pts_ms: Number(envelope.pts_ms ?? 0),
+            kind,
+            payload: envelope.data ?? {},
+          })
+        }
+        boundary = buffer.indexOf('\n\n')
       }
-      boundary = buffer.indexOf('\n\n')
+      // Bound the unfinished event, not a network chunk that may contain many
+      // already-delimited small events.
+      if (encoder.encode(buffer).length > MAX_SSE_BUFFER_BYTES) {
+        throw new Error('Timeline stream event exceeded 1 MiB')
+      }
+      if (done) return
     }
-    // Bound the unfinished event, not a network chunk that may contain many
-    // already-delimited small events.
-    if (buffer.length > MAX_SSE_BUFFER_BYTES) {
-      throw new Error('Timeline stream event exceeded 1 MiB')
-    }
-    if (done) return
+  } finally {
+    await reader.cancel().catch(() => undefined)
+    reader.releaseLock()
   }
 }
 
@@ -451,11 +460,12 @@ export const api = {
     events(runId: string): Promise<RunEventsResponse> {
       return request<RunEventsResponse>('GET', `/v1/runs/${validateId(runId)}/events`)
     },
-    keyframe(runId: string, sha256: string): Promise<Blob> {
+    keyframe(runId: string, sha256: string, signal?: AbortSignal): Promise<Blob> {
       if (!/^[0-9a-fA-F]{64}$/.test(sha256)) throw new Error('Invalid keyframe SHA-256')
       return requestBlob(
         `/v1/runs/${validateId(runId)}/keyframes/${sha256.toLowerCase()}`,
         'image/jpeg',
+        signal,
       )
     },
     media(runId: string, sha256: string): Promise<Blob> {

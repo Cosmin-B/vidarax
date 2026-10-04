@@ -9,12 +9,12 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::{Arc, OnceLock};
 
-use super::ffmpeg::BoundedJpegOutput;
 use crate::crop::CropRegion;
 use crate::ingest::{
     decode_mp4_to_frame_signals, decode_selective_jpeg_frames, extract_video_clip,
     DecodedJpegFrame, DecodedMp4Batch, InputSource, Mp4DecodeConfig,
 };
+use crate::media_process::BoundedMediaOutput;
 
 static DETECTED_BACKEND: OnceLock<PipelineBackend> = OnceLock::new();
 type DecodeFactory = fn() -> Arc<dyn DecodePipeline>;
@@ -52,8 +52,8 @@ impl PipelineBackend {
             let detected = if std::process::Command::new(super::nvidia_smi_path())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
+                .bounded_media_output()
+                .map(|output| output.status.success())
                 .unwrap_or(false)
             {
                 Self::NvdecCuda
@@ -347,7 +347,7 @@ fn decode_selective_jpeg_frames_nvdec_inner(
             "mjpeg",
             "-",
         ])
-        .bounded_jpeg_output()
+        .bounded_media_output()
         .map_err(|_| "failed to run ffmpeg with NVDEC".to_string())?;
 
     if !output.status.success() {
@@ -513,7 +513,7 @@ fn decode_selective_jpeg_frames_videotoolbox_inner(
             "mjpeg",
             "-",
         ])
-        .bounded_jpeg_output()
+        .bounded_media_output()
         .map_err(|_| "failed to run ffmpeg with VideoToolbox".to_string())?;
 
     if !output.status.success() {

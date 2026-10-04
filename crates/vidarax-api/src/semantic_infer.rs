@@ -79,6 +79,30 @@ const MULTIMODAL_MAX_TOKENS: u32 = 1_024;
 const CUSTOM_SCHEMA_MAX_TOKENS: u32 = 1_024;
 const MAX_MULTIMODAL_MOMENTS: usize = 32;
 
+struct SemanticDispatchTasks {
+    tasks: JoinSet<(usize, ChunkSemanticResult, Instant)>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SemanticDispatchTasks {
+    fn new() -> Self {
+        Self {
+            tasks: JoinSet::new(),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+impl Drop for SemanticDispatchTasks {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Active windows own provider completion and the journal sender. They
+        // finish before releasing their media; no pending window is started.
+        self.tasks.detach_all();
+    }
+}
+
 pub struct DecodedSignals {
     pub signals: Vec<FrameSignal>,
     pub sampling_policy: SamplingPolicy,
@@ -217,14 +241,70 @@ struct ExtractedLocalAudio {
     extraction_ms: u64,
 }
 
+/// Retain failure codes until the event writer needs their wire text.
+/// Only failures with external diagnostic details own a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticFailure {
+    Cancelled,
+    NoJpegFrames,
+    ReviewImageBytesExceeded,
+    UnsupportedModel,
+    HttpStatus(u16),
+    Transport,
+    InvalidResponse,
+    ProviderSaturated,
+    DeadlineMissed,
+    RequestBudgetExceeded,
+    Join(String),
+    MediaExtraction(String),
+    MediaExtractionJoin(String),
+    Parse(SemanticParseError),
+}
+
+impl SemanticFailure {
+    pub fn is_media_extraction(&self) -> bool {
+        matches!(
+            self,
+            Self::MediaExtraction(_) | Self::MediaExtractionJoin(_)
+        )
+    }
+}
+
+impl std::fmt::Display for SemanticFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("cancelled"),
+            Self::NoJpegFrames => f.write_str("chunk_has_no_jpeg_frames"),
+            Self::ReviewImageBytesExceeded => f.write_str("review_image_bytes_exceed_32_mib"),
+            Self::UnsupportedModel => f.write_str("unsupported_model"),
+            Self::HttpStatus(code) => write!(f, "http_status_{code}"),
+            Self::Transport => f.write_str("transport_error"),
+            Self::InvalidResponse => f.write_str("invalid_response"),
+            Self::ProviderSaturated => f.write_str("provider_saturated"),
+            Self::DeadlineMissed => f.write_str("deadline_missed"),
+            Self::RequestBudgetExceeded => f.write_str("request_budget_exceeded"),
+            Self::Join(detail) => write!(f, "join_error:{detail}"),
+            Self::MediaExtraction(detail) => write!(f, "media_extraction_failed:{detail}"),
+            Self::MediaExtractionJoin(detail) => write!(f, "media_extraction_join_error:{detail}"),
+            Self::Parse(error) => write!(f, "semantic_parse_failed:{}", error.as_str()),
+        }
+    }
+}
+
+impl serde::Serialize for SemanticFailure {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChunkSemanticResult {
     pub overlay: Option<SemanticOverlay>,
     pub raw_output: Option<Value>,
-    pub provider: Option<String>,
+    pub provider: Option<&'static str>,
     pub provider_fallback_used: bool,
     pub used_fallback: bool,
-    pub error: Option<String>,
+    pub error: Option<SemanticFailure>,
     pub attempted: bool,
     pub finish_reason: Option<String>,
     pub response_chars: Option<usize>,
@@ -620,6 +700,8 @@ pub async fn run_semantic_dispatch(
         return (semantic_results, task_end_times);
     }
 
+    let mut dispatch_tasks = SemanticDispatchTasks::new();
+
     if temporal_chain {
         let mut last_description = String::new();
         let mut last_pts_ms: u64 = 0;
@@ -635,29 +717,37 @@ pub async fn run_semantic_dispatch(
                 )
             };
 
-            let prev_jpeg_ref = if visual_diff {
-                last_jpeg.as_deref()
-            } else {
-                None
-            };
-            let result = infer_chunk_semantics(
+            let prev_jpeg = if visual_diff { last_jpeg.clone() } else { None };
+            spawn_semantic_task(
+                &mut dispatch_tasks.tasks,
+                (chunk_idx, prep),
                 providers.clone(),
-                true,
                 &prompt_with_context,
                 semantic_timeout_ms,
                 semantic_frames_per_chunk,
-                &prep.chunk_jpegs,
-                prep.frame_offset as u64,
-                prep.pts_start_ms,
-                prep.pts_end_ms,
                 tiered_config.clone(),
                 guided_json_str.as_ref().map(Arc::clone),
-                prev_jpeg_ref,
-                prep.clip_spec.clone(),
                 observer.clone(),
                 inference_dispatch.clone(),
-            )
-            .await;
+                prev_jpeg,
+                Arc::clone(&dispatch_tasks.cancelled),
+                completion_tx.clone(),
+            );
+            let result = match dispatch_tasks
+                .tasks
+                .join_next()
+                .await
+                .expect("one active window")
+            {
+                Ok((_, result, _)) => result,
+                Err(error) => {
+                    let result = semantic_join_failure_result(error);
+                    if let Some(tx) = &completion_tx {
+                        let _ = tx.send((chunk_idx, result.clone())).await;
+                    }
+                    result
+                }
+            };
 
             if visual_diff {
                 if let Some(frame) = select_semantic_images(&prep.chunk_jpegs, 1).first() {
@@ -678,14 +768,10 @@ pub async fn run_semantic_dispatch(
                 last_pts_ms = prep.pts_end_ms;
             }
 
-            if let Some(tx) = &completion_tx {
-                let _ = tx.send((chunk_idx, result.clone())).await;
-            }
             semantic_results[chunk_idx] = Some(result);
             task_end_times[chunk_idx] = Instant::now();
         }
     } else {
-        let mut join_set: JoinSet<(usize, ChunkSemanticResult, Instant)> = JoinSet::new();
         let max_in_flight = vlm_concurrency.max(1);
         let mut task_chunks: HashMap<TaskId, usize> =
             HashMap::with_capacity(max_in_flight.min(num_chunks));
@@ -693,7 +779,7 @@ pub async fn run_semantic_dispatch(
 
         for _ in 0..max_in_flight.min(num_chunks) {
             let (chunk_idx, task_id) = spawn_semantic_task(
-                &mut join_set,
+                &mut dispatch_tasks.tasks,
                 pending.next().expect("bounded by num_chunks"),
                 providers.clone(),
                 semantic_prompt,
@@ -703,17 +789,17 @@ pub async fn run_semantic_dispatch(
                 guided_json_str.as_ref().map(Arc::clone),
                 observer.clone(),
                 inference_dispatch.clone(),
+                None,
+                Arc::clone(&dispatch_tasks.cancelled),
+                completion_tx.clone(),
             );
             task_chunks.insert(task_id, chunk_idx);
         }
 
-        while let Some(joined) = join_set.join_next_with_id().await {
+        while let Some(joined) = dispatch_tasks.tasks.join_next_with_id().await {
             match joined {
                 Ok((task_id, (idx, result, finished))) => {
                     task_chunks.remove(&task_id);
-                    if let Some(tx) = &completion_tx {
-                        let _ = tx.send((idx, result.clone())).await;
-                    }
                     semantic_results[idx] = Some(result);
                     task_end_times[idx] = finished;
                 }
@@ -739,7 +825,7 @@ pub async fn run_semantic_dispatch(
 
             if let Some(next) = pending.next() {
                 let (chunk_idx, task_id) = spawn_semantic_task(
-                    &mut join_set,
+                    &mut dispatch_tasks.tasks,
                     next,
                     providers.clone(),
                     semantic_prompt,
@@ -749,6 +835,9 @@ pub async fn run_semantic_dispatch(
                     guided_json_str.as_ref().map(Arc::clone),
                     observer.clone(),
                     inference_dispatch.clone(),
+                    None,
+                    Arc::clone(&dispatch_tasks.cancelled),
+                    completion_tx.clone(),
                 );
                 task_chunks.insert(task_id, chunk_idx);
             }
@@ -770,6 +859,9 @@ fn spawn_semantic_task(
     guided_json_str: Option<Arc<str>>,
     observer: Option<Arc<dyn InferenceObserver>>,
     inference_dispatch: Option<Arc<tokio::sync::Semaphore>>,
+    prev_jpeg: Option<Arc<[u8]>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    completion_tx: Option<tokio::sync::mpsc::Sender<(usize, ChunkSemanticResult)>>,
 ) -> (usize, TaskId) {
     let providers_c = providers;
     let prompt_c = semantic_prompt.to_string();
@@ -802,13 +894,18 @@ fn spawn_semantic_task(
             pts_end_ms,
             tiered_config_c,
             guided_json_c,
-            None,
+            prev_jpeg.as_deref(),
             clip_spec_c,
             observer_c,
             inference_dispatch_c,
+            Some(cancelled),
         )
         .await;
-        (chunk_idx, overlay, Instant::now())
+        let finished = Instant::now();
+        if let Some(tx) = completion_tx {
+            let _ = tx.send((chunk_idx, overlay.clone())).await;
+        }
+        (chunk_idx, overlay, finished)
     });
     (chunk_idx, handle.id())
 }
@@ -817,7 +914,7 @@ fn semantic_join_failure_result(err: JoinError) -> ChunkSemanticResult {
     ChunkSemanticResult {
         attempted: true,
         used_fallback: true,
-        error: Some(format!("join_error:{err}")),
+        error: Some(SemanticFailure::Join(err.to_string())),
         ..ChunkSemanticResult::default()
     }
 }
@@ -880,6 +977,7 @@ pub async fn infer_chunk_semantics(
     clip_spec: Option<ClipSpec>,
     observer: Option<Arc<dyn InferenceObserver>>,
     inference_dispatch: Option<Arc<tokio::sync::Semaphore>>,
+    cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> ChunkSemanticResult {
     if !semantic_available {
         return ChunkSemanticResult::default();
@@ -903,7 +1001,7 @@ pub async fn infer_chunk_semantics(
         let sel = select_semantic_images(chunk_jpegs, semantic_frames_per_chunk);
         if sel.is_empty() {
             result.used_fallback = true;
-            result.error = Some("chunk_has_no_jpeg_frames".to_string());
+            result.error = Some(SemanticFailure::NoJpegFrames);
             return result;
         }
         sel
@@ -993,12 +1091,12 @@ pub async fn infer_chunk_semantics(
             Ok(Ok((media, wav))) => (Some(media), wav),
             Ok(Err(error)) => {
                 result.used_fallback = true;
-                result.error = Some(format!("media_extraction_failed:{error}"));
+                result.error = Some(SemanticFailure::MediaExtraction(error));
                 return result;
             }
             Err(error) => {
                 result.used_fallback = true;
-                result.error = Some(format!("media_extraction_join_error:{error}"));
+                result.error = Some(SemanticFailure::MediaExtractionJoin(error.to_string()));
                 return result;
             }
         }
@@ -1147,7 +1245,7 @@ pub async fn infer_chunk_semantics(
         .sum::<usize>()
         > 32 * 1024 * 1024
     {
-        result.error = Some("review_image_bytes_exceed_32_mib".into());
+        result.error = Some(SemanticFailure::ReviewImageBytesExceeded);
         result.used_fallback = true;
         return result;
     }
@@ -1194,22 +1292,38 @@ pub async fn infer_chunk_semantics(
     // instead of the router's default kind.
     let first_pass_kind = provider.kind_for_model(tiered_config.first_pass_model.as_ref());
     let call_started = Instant::now();
+    if cancelled
+        .as_ref()
+        .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
+    {
+        result.used_fallback = true;
+        result.error = Some(SemanticFailure::Cancelled);
+        return result;
+    }
     let dispatch_permit = match inference_dispatch {
         Some(dispatch) => match dispatch.try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
                 result.used_fallback = true;
-                result.error = Some("provider_saturated".to_string());
+                result.error = Some(SemanticFailure::ProviderSaturated);
                 return result;
             }
         },
         None => None,
     };
+    let _dispatch_permit = dispatch_permit;
+    if cancelled
+        .as_ref()
+        .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
+    {
+        result.used_fallback = true;
+        result.error = Some(SemanticFailure::Cancelled);
+        return result;
+    }
     let provider_result = match tokio::task::spawn_blocking({
         let provider = Arc::clone(&provider);
         let observer_for_call = observer.clone();
         move || {
-            let _dispatch_permit = dispatch_permit;
             run_tiered_with_second_pass_schema(
                 provider.as_ref(),
                 &tiered_config,
@@ -1233,13 +1347,13 @@ pub async fn infer_chunk_semantics(
             }
             result.used_fallback = true;
             result.error = Some(match err.error {
-                ProviderError::UnsupportedModel(_) => "unsupported_model".to_string(),
-                ProviderError::HttpStatus(code) => format!("http_status_{code}"),
-                ProviderError::Transport(_) => "transport_error".to_string(),
-                ProviderError::InvalidResponse(_) => "invalid_response".to_string(),
-                ProviderError::Saturated { .. } => "provider_saturated".to_string(),
-                ProviderError::DeadlineMissed => "deadline_missed".to_string(),
-                ProviderError::RequestBudget => "request_budget_exceeded".to_string(),
+                ProviderError::UnsupportedModel(_) => SemanticFailure::UnsupportedModel,
+                ProviderError::HttpStatus(code) => SemanticFailure::HttpStatus(code),
+                ProviderError::Transport(_) => SemanticFailure::Transport,
+                ProviderError::InvalidResponse(_) => SemanticFailure::InvalidResponse,
+                ProviderError::Saturated { .. } => SemanticFailure::ProviderSaturated,
+                ProviderError::DeadlineMissed => SemanticFailure::DeadlineMissed,
+                ProviderError::RequestBudget => SemanticFailure::RequestBudgetExceeded,
             });
             return result;
         }
@@ -1248,12 +1362,12 @@ pub async fn infer_chunk_semantics(
                 o.record_error(first_pass_kind, call_started.elapsed().as_millis() as u64);
             }
             result.used_fallback = true;
-            result.error = Some(format!("join_error:{err}"));
+            result.error = Some(SemanticFailure::Join(err.to_string()));
             return result;
         }
     };
 
-    result.provider = Some(provider_result.provider.name().to_string());
+    result.provider = Some(provider_result.provider.name());
     result.provider_fallback_used = provider_result.fallback_used;
     result.finish_reason = provider_result.finish_reason.clone();
     result.response_chars = Some(provider_result.output_text.chars().count());
@@ -1309,7 +1423,7 @@ pub async fn infer_chunk_semantics(
                     "semantic output did not match the overlay contract"
                 );
                 result.used_fallback = true;
-                result.error = Some(format!("semantic_parse_failed:{}", parse_error.as_str()));
+                result.error = Some(SemanticFailure::Parse(parse_error));
                 result
             }
         }
@@ -1624,7 +1738,7 @@ fn finish_local_audio_result(result: &mut ChunkSemanticResult) {
         .iter()
         .max_by(|left, right| left.confidence.total_cmp(&right.confidence))
     else {
-        result.provider = Some("local_audio".to_string());
+        result.provider = Some("local_audio");
         result.overlay = Some(SemanticOverlay {
             event_type: "context_observation".to_string(),
             object_label: "audio".to_string(),
@@ -1634,7 +1748,7 @@ fn finish_local_audio_result(result: &mut ChunkSemanticResult) {
         });
         return;
     };
-    result.provider = Some("local_audio".to_string());
+    result.provider = Some("local_audio");
     result.overlay = Some(SemanticOverlay {
         event_type: "context_observation".to_string(),
         object_label: moment.kind.clone(),
@@ -1741,8 +1855,8 @@ pub fn select_semantic_images(
     out
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum SemanticParseError {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticParseError {
     EmptyResponse,
     JsonObjectNotFound,
     InvalidJson,
@@ -2088,6 +2202,80 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn semantic_failures_preserve_event_wire_text() {
+        let cases = [
+            (SemanticFailure::Cancelled, "cancelled"),
+            (SemanticFailure::NoJpegFrames, "chunk_has_no_jpeg_frames"),
+            (
+                SemanticFailure::ReviewImageBytesExceeded,
+                "review_image_bytes_exceed_32_mib",
+            ),
+            (SemanticFailure::UnsupportedModel, "unsupported_model"),
+            (SemanticFailure::HttpStatus(429), "http_status_429"),
+            (SemanticFailure::Transport, "transport_error"),
+            (SemanticFailure::InvalidResponse, "invalid_response"),
+            (SemanticFailure::ProviderSaturated, "provider_saturated"),
+            (SemanticFailure::DeadlineMissed, "deadline_missed"),
+            (
+                SemanticFailure::RequestBudgetExceeded,
+                "request_budget_exceeded",
+            ),
+            (
+                SemanticFailure::Join("task panicked".into()),
+                "join_error:task panicked",
+            ),
+            (
+                SemanticFailure::MediaExtraction("bad \"clip\"\n帧".into()),
+                "media_extraction_failed:bad \"clip\"\n帧",
+            ),
+            (
+                SemanticFailure::MediaExtractionJoin("task cancelled".into()),
+                "media_extraction_join_error:task cancelled",
+            ),
+            (
+                SemanticFailure::Parse(SemanticParseError::EmptyResponse),
+                "semantic_parse_failed:empty_response",
+            ),
+            (
+                SemanticFailure::Parse(SemanticParseError::JsonObjectNotFound),
+                "semantic_parse_failed:json_object_not_found",
+            ),
+            (
+                SemanticFailure::Parse(SemanticParseError::InvalidJson),
+                "semantic_parse_failed:invalid_json",
+            ),
+            (
+                SemanticFailure::Parse(SemanticParseError::SchemaMismatch),
+                "semantic_parse_failed:schema_mismatch",
+            ),
+        ];
+        for (error, expected) in cases {
+            let result = ChunkSemanticResult {
+                error: Some(error),
+                provider: Some("gemini"),
+                attempted: true,
+                ..ChunkSemanticResult::default()
+            };
+            let payload = result.event_payload(0, "request", "stream").unwrap();
+            let encoded = serde_json::to_vec(&payload).unwrap();
+            let decoded: Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded["semantic_error"], expected);
+            assert_eq!(decoded["provider"], "gemini");
+        }
+    }
+
+    #[test]
+    fn media_failure_accounting_uses_the_failure_kind() {
+        assert!(SemanticFailure::MediaExtraction(String::new()).is_media_extraction());
+        assert!(SemanticFailure::MediaExtractionJoin(String::new()).is_media_extraction());
+        assert!(
+            !SemanticFailure::Join("media_extraction_failed:diagnostic".into())
+                .is_media_extraction()
+        );
+        assert!(!SemanticFailure::Cancelled.is_media_extraction());
+    }
     use vidarax_core::audio_sidecar::AudioObservation;
     use vidarax_core::provider::{InferenceResult, ProviderKind, TokenUsage};
 
@@ -2744,6 +2932,7 @@ Ignore this trailing {not json}."#;
             Some(spec),
             None,
             None,
+            None,
         )
         .await;
         assert!(result.error.is_none(), "{:?}", result.error);
@@ -2830,9 +3019,13 @@ Ignore this trailing {not json}."#;
             Some(spec.clone()),
             None,
             None,
+            None,
         )
         .await;
-        assert!(failed.error.unwrap().contains("requires an audio stream"));
+        assert!(
+            matches!(failed.error, Some(SemanticFailure::MediaExtraction(detail))
+            if detail.contains("requires an audio stream"))
+        );
         assert_eq!(budget.load(std::sync::atomic::Ordering::Relaxed), 0);
         spec.local_audio = None;
         let valid = infer_chunk_semantics(
@@ -2849,6 +3042,7 @@ Ignore this trailing {not json}."#;
             None,
             None,
             Some(spec),
+            None,
             None,
             None,
         )
@@ -2885,6 +3079,7 @@ Ignore this trailing {not json}."#;
             None,
             None,
             None,
+            None,
         )
         .await;
 
@@ -2900,7 +3095,12 @@ Ignore this trailing {not json}."#;
     }
 
     #[tokio::test]
-    async fn cancelled_dispatch_holds_permit_until_blocking_provider_exits() {
+    async fn cancelled_dispatch_delivers_active_completion_and_stops_pending_windows() {
+        assert_cancelled_dispatch(false).await;
+        assert_cancelled_dispatch(true).await;
+    }
+
+    async fn assert_cancelled_dispatch(temporal_chain: bool) {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{mpsc, Mutex};
         use std::time::Duration;
@@ -2909,6 +3109,7 @@ Ignore this trailing {not json}."#;
             started: tokio::sync::Notify,
             release: Mutex<mpsc::Receiver<()>>,
             finished: AtomicBool,
+            calls: std::sync::atomic::AtomicUsize,
         }
 
         impl InferenceProvider for BlockingProvider {
@@ -2917,6 +3118,7 @@ Ignore this trailing {not json}."#;
             }
 
             fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
                 self.started.notify_one();
                 // A dropped sender also releases this wait if an assertion fails.
                 let released = self
@@ -2935,6 +3137,7 @@ Ignore this trailing {not json}."#;
             started: tokio::sync::Notify::new(),
             release: Mutex::new(release_rx),
             finished: AtomicBool::new(false),
+            calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let dispatch_permits = Arc::new(tokio::sync::Semaphore::new(1));
         let permits_for_task = Arc::clone(&dispatch_permits);
@@ -2942,7 +3145,7 @@ Ignore this trailing {not json}."#;
         let (completion_tx, mut completion_rx) = tokio::sync::mpsc::channel(1);
         let dispatch = tokio::spawn(async move {
             run_semantic_dispatch(
-                &[test_chunk_prep(0)],
+                &[test_chunk_prep(0), test_chunk_prep(1)],
                 Some(provider_for_task),
                 true,
                 "classify",
@@ -2951,7 +3154,7 @@ Ignore this trailing {not json}."#;
                 TieredVlmConfig::single_model("test-model"),
                 None,
                 false,
-                false,
+                temporal_chain,
                 1,
                 None,
                 Some(permits_for_task),
@@ -2967,16 +3170,14 @@ Ignore this trailing {not json}."#;
         assert!(dispatch.await.unwrap_err().is_cancelled());
         assert_eq!(dispatch_permits.available_permits(), 0);
         assert!(!provider.finished.load(Ordering::Acquire));
-        // Dispatch cancellation closes the journal channel even though the
-        // blocking provider is still running: its eventual result is discarded.
-        assert!(
+        release_tx.send(()).unwrap();
+        let (chunk_idx, result) =
             tokio::time::timeout(Duration::from_secs(1), completion_rx.recv())
                 .await
-                .expect("cancelled dispatcher must drop its completion sender")
-                .is_none()
-        );
-
-        release_tx.send(()).unwrap();
+                .expect("active window must retain its completion sender")
+                .unwrap();
+        assert_eq!(chunk_idx, 0);
+        assert!(result.overlay.is_some());
         let _permit = tokio::time::timeout(
             Duration::from_secs(1),
             Arc::clone(&dispatch_permits).acquire_owned(),
@@ -2986,6 +3187,34 @@ Ignore this trailing {not json}."#;
         .unwrap();
         assert!(provider.finished.load(Ordering::Acquire));
         assert!(completion_rx.recv().await.is_none());
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_preparation_does_not_start_provider() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let prep = test_chunk_prep(0);
+        let result = infer_chunk_semantics(
+            Some(Arc::new(SemanticTestProvider)),
+            true,
+            "classify",
+            1000,
+            1,
+            &prep.chunk_jpegs,
+            0,
+            0,
+            33,
+            TieredVlmConfig::single_model("test-model"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(cancelled),
+        )
+        .await;
+        assert_eq!(result.error, Some(SemanticFailure::Cancelled));
+        assert!(result.overlay.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3047,10 +3276,7 @@ Ignore this trailing {not json}."#;
         assert!(failed.attempted);
         assert!(failed.used_fallback);
         assert!(
-            failed
-                .error
-                .as_deref()
-                .is_some_and(|err| err.starts_with("join_error:") && err.contains("panicked")),
+            matches!(&failed.error, Some(SemanticFailure::Join(detail)) if detail.contains("panicked")),
             "expected chunk 1 join panic error, got {:?}",
             failed.error
         );

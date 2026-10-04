@@ -772,7 +772,11 @@ fn run_transition_hook(
                 let _ = child.wait();
                 return Err("activation hook exceeded 30 seconds".to_string());
             }
-            Err(error) => return Err(format!("edge transition hook wait failed: {error}")),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("edge transition hook wait failed: {error}"));
+            }
         }
     }
 }

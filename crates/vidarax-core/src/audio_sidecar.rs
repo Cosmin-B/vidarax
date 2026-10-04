@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::sidecar_io::{exchange_deadline, remaining, DeadlineStream};
+
 pub const MAX_AUDIO_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_AUDIO_DURATION_MS: u64 = 60_000;
 pub const MAX_FEEDBACK_TEXT_BYTES: usize = 16 * 1024;
 pub const MAX_AUDIO_METADATA_BYTES: usize = 512 * 1024;
 pub const MAX_SYNTHESIZED_AUDIO_BYTES: usize = 16 * 1024 * 1024;
@@ -466,7 +469,8 @@ impl AudioSidecarClient {
             .map_err(|_| AudioSidecarError::AudioTooLarge(audio.len()))?;
         let text_len =
             u32::try_from(text.len()).map_err(|_| AudioSidecarError::TextTooLarge(text.len()))?;
-        let stream = self.connection()?;
+        let deadline = exchange_deadline(self.timeout)?;
+        let mut stream = DeadlineStream::new(self.connection(deadline)?, deadline);
         let mut header = [0_u8; REQUEST_HEADER_BYTES];
         header[..4].copy_from_slice(&REQUEST_MAGIC);
         header[4] = PROTOCOL_VERSION;
@@ -533,17 +537,18 @@ impl AudioSidecarClient {
         Ok((metadata, response_audio))
     }
 
-    fn connection(&mut self) -> Result<&mut TcpStream, AudioSidecarError> {
+    fn connection(&mut self, deadline: Instant) -> Result<&mut TcpStream, AudioSidecarError> {
         if self.stream.is_none() {
             let reconnecting = self.consecutive_failures > 0;
-            let stream =
-                TcpStream::connect_timeout(&self.address, self.timeout).map_err(|error| {
+            let stream = TcpStream::connect_timeout(&self.address, remaining(deadline)?).map_err(
+                |error| {
                     if reconnecting {
                         AudioSidecarError::ReconnectFailed(error)
                     } else {
                         AudioSidecarError::Io(error)
                     }
-                })?;
+                },
+            )?;
             stream.set_read_timeout(Some(self.timeout))?;
             stream.set_write_timeout(Some(self.timeout))?;
             stream.set_nodelay(true)?;
@@ -578,7 +583,7 @@ fn validate_analysis(analysis: &AudioAnalysis) -> Result<(), AudioSidecarError> 
     }
     for observation in &analysis.observations {
         if observation.end_offset_ms <= observation.start_offset_ms
-            || observation.end_offset_ms > 60_000
+            || observation.end_offset_ms > MAX_AUDIO_DURATION_MS
             || !observation.confidence.is_finite()
             || !(0.0..=1.0).contains(&observation.confidence)
         {
@@ -621,6 +626,43 @@ mod tests {
         validate_analysis, AudioAnalysis, AudioFailureReason, AudioObservation, AudioProfile,
         AudioSidecarError, SidecarCapacity, SpeechEngine,
     };
+
+    #[test]
+    fn trickled_audio_response_expires_and_releases_connection() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; super::REQUEST_HEADER_BYTES];
+            stream.read_exact(&mut request).unwrap();
+            let mut text = [0; 5];
+            stream.read_exact(&mut text).unwrap();
+            let mut response = [0; super::RESPONSE_HEADER_BYTES];
+            response[..4].copy_from_slice(&super::RESPONSE_MAGIC);
+            response[4] = super::PROTOCOL_VERSION;
+            for byte in response {
+                if stream.write_all(&[byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+        });
+        let mut client = super::AudioSidecarClient::new(&address.to_string(), 100).unwrap();
+        let error = client.synthesize("hello").unwrap_err();
+        assert!(
+            matches!(error, AudioSidecarError::Io(error) if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock))
+        );
+        assert!(client.stream.is_none());
+        assert!(matches!(
+            client.synthesize("hello"),
+            Err(AudioSidecarError::BackingOff)
+        ));
+        server.join().unwrap();
+    }
 
     #[test]
     fn wire_enums_have_stable_values() {

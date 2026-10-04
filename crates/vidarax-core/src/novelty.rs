@@ -433,7 +433,8 @@ pub(crate) fn quantize_unit_into(src: &[f32], dst: &mut [i8]) -> f32 {
     scale
 }
 
-/// Generic semantic-novelty gate. One instance per stream; not `Sync`.
+/// Generic semantic-novelty gate. Each stream owns its state and scratch;
+/// evaluation and commit require an exclusive borrow.
 pub struct NoveltyGate {
     cfg: NoveltyConfig,
     ring: KeptRing,

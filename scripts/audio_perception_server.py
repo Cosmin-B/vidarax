@@ -61,6 +61,7 @@ STATUS_INFERENCE_ERROR = 2
 STATUS_OVERLOADED = 3
 
 MAX_AUDIO_BYTES = 4 * 1024 * 1024
+MAX_AUDIO_DURATION_MS = 60_000
 MAX_TEXT_BYTES = 16 * 1024
 MAX_METADATA_BYTES = 512 * 1024
 MAX_SYNTHESIZED_AUDIO_BYTES = 16 * 1024 * 1024
@@ -105,11 +106,19 @@ def _elapsed_ms(started: float) -> int:
     return round((time.perf_counter() - started) * 1000)
 
 
-def _read_exact(sock: socket.socket, length: int) -> bytes | None:
+def _set_deadline_timeout(sock: socket.socket, deadline: float) -> None:
+    remaining = deadline - time.perf_counter()
+    if remaining <= 0:
+        raise socket.timeout("audio request deadline exceeded")
+    sock.settimeout(remaining)
+
+
+def _read_exact(sock: socket.socket, length: int, deadline: float) -> bytes | None:
     data = bytearray(length)
     view = memoryview(data)
     offset = 0
     while offset < length:
+        _set_deadline_timeout(sock, deadline)
         received = sock.recv_into(view[offset:])
         if received == 0:
             return None
@@ -118,16 +127,33 @@ def _read_exact(sock: socket.socket, length: int) -> bytes | None:
 
 
 def _decode_pcm_wav(data: bytes) -> tuple[np.ndarray, int]:
+    if len(data) > MAX_AUDIO_BYTES:
+        raise DecodeError("WAV exceeds audio byte limit")
     try:
         with wave.open(io.BytesIO(data), "rb") as wav:
             channels = wav.getnchannels()
             sample_rate = wav.getframerate()
             sample_width = wav.getsampwidth()
-            frames = wav.readframes(wav.getnframes())
+            if channels != 1 or sample_width != 2 or sample_rate <= 0:
+                raise DecodeError("audio must be mono 16-bit PCM WAV with a positive sample rate")
+            declared_frames = wav.getnframes()
+            # ffmpeg writes 0xffffffff data size to nonseekable WAV output.
+            # Such a header has no finite frame count; the payload still has
+            # the same byte and duration limits as a seekable WAV.
+            unknown_frames = 0xffffffff // 2
+            max_frames = min(MAX_AUDIO_BYTES // 2, sample_rate * MAX_AUDIO_DURATION_MS // 1000)
+            if declared_frames != unknown_frames and declared_frames > max_frames:
+                raise DecodeError("audio duration exceeds 60 seconds")
+            frames = wav.readframes(max_frames + 1)
+            if len(frames) % 2 != 0:
+                raise DecodeError("audio contains an incomplete PCM frame")
+            actual_frames = len(frames) // 2
+            if actual_frames > max_frames:
+                raise DecodeError("audio duration exceeds 60 seconds")
+            if declared_frames != unknown_frames and actual_frames != declared_frames:
+                raise DecodeError("WAV frame count differs from its payload")
     except (EOFError, wave.Error) as error:
         raise DecodeError(f"invalid PCM WAV: {error}") from error
-    if channels != 1 or sample_width != 2:
-        raise DecodeError("audio must be mono 16-bit PCM WAV")
     samples = np.frombuffer(frames, dtype="<i2").astype(np.float32)
     return samples / 32768.0, sample_rate
 
@@ -959,7 +985,8 @@ class AudioRequestHandler(socketserver.BaseRequestHandler):
 
     def handle(self) -> None:
         while True:
-            raw_header = _read_exact(self.request, REQUEST_HEADER.size)
+            self.deadline = time.perf_counter() + self.server.request_timeout_s
+            raw_header = _read_exact(self.request, REQUEST_HEADER.size, self.deadline)
             if raw_header is None:
                 return
             (
@@ -1020,13 +1047,11 @@ class AudioRequestHandler(socketserver.BaseRequestHandler):
                 )
                 return
 
-            audio = _read_exact(self.request, audio_len)
-            text = _read_exact(self.request, text_len)
-            if audio is None or text is None:
-                return
+            # Admission owns payload storage through the response. A rejected
+            # request closes this connection because its body is still unread.
             try:
                 queue_wait_ms = self.server.admission.acquire(
-                    self.server.request_timeout_s
+                    max(0.0, self.deadline - time.perf_counter())
                 )
             except OverflowError as error:
                 self._respond_error(STATUS_OVERLOADED, "overloaded", str(error))
@@ -1035,6 +1060,15 @@ class AudioRequestHandler(socketserver.BaseRequestHandler):
                 self._respond_error(STATUS_INFERENCE_ERROR, "timeout", str(error))
                 return
             try:
+                try:
+                    audio = _read_exact(self.request, audio_len, self.deadline)
+                    text = _read_exact(self.request, text_len, self.deadline)
+                except OSError:
+                    # A partial body has no frame boundary from which to
+                    # recover. Release admission and close the connection.
+                    return
+                if audio is None or text is None:
+                    return
                 if operation == OP_ANALYZE:
                     metadata = self.server.engine.analyze(
                         audio,
@@ -1071,6 +1105,7 @@ class AudioRequestHandler(socketserver.BaseRequestHandler):
         packed = msgpack.packb(metadata, use_bin_type=True)
         if len(packed) > MAX_METADATA_BYTES or len(audio) > MAX_SYNTHESIZED_AUDIO_BYTES:
             raise RuntimeError("response payload exceeds protocol limit")
+        _set_deadline_timeout(self.request, self.deadline)
         self.request.sendall(
             RESPONSE_HEADER.pack(
                 RESPONSE_MAGIC,
@@ -1081,7 +1116,9 @@ class AudioRequestHandler(socketserver.BaseRequestHandler):
                 len(audio),
             )
         )
+        _set_deadline_timeout(self.request, self.deadline)
         self.request.sendall(packed)
+        _set_deadline_timeout(self.request, self.deadline)
         self.request.sendall(audio)
 
     def _respond_error(self, status: int, reason: str, message: str) -> None:
@@ -1093,6 +1130,7 @@ class AudioRequestHandler(socketserver.BaseRequestHandler):
             },
             use_bin_type=True,
         )
+        _set_deadline_timeout(self.request, self.deadline)
         self.request.sendall(
             RESPONSE_HEADER.pack(
                 RESPONSE_MAGIC,
@@ -1103,6 +1141,7 @@ class AudioRequestHandler(socketserver.BaseRequestHandler):
                 0,
             )
         )
+        _set_deadline_timeout(self.request, self.deadline)
         self.request.sendall(payload)
 
 

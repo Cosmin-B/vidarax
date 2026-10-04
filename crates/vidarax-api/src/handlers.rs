@@ -1528,6 +1528,68 @@ fn marker_to_emit_event_request(
     }
 }
 
+fn spawn_semantic_journal(
+    state: AppState,
+    run_id: String,
+    request_id: String,
+    stream_id: String,
+    index_name: Option<String>,
+    overlap_ms: u64,
+    mut semantic_event_rx: tokio::sync::mpsc::Receiver<(usize, ChunkSemanticResult)>,
+) -> tokio::task::JoinHandle<Result<(), String>> {
+    // The journal owns its receiver through active window completion. An
+    // append error closes it so a sender cannot wait for an exited consumer.
+    tokio::spawn(async move {
+        let mut seen_moments = Vec::new();
+        let mut pending = std::collections::BTreeMap::new();
+        let mut next_chunk = 0;
+        while let Some((chunk_idx, result)) = semantic_event_rx.recv().await {
+            pending.insert(chunk_idx, result);
+            while let Some(mut result) = pending.remove(&next_chunk) {
+                let chunk_idx = next_chunk;
+                next_chunk += 1;
+                if overlap_ms > 0 {
+                    crate::semantic_infer::deduplicate_source_moments(
+                        &mut result.moments,
+                        &mut seen_moments,
+                    );
+                }
+                append_semantic_chunk_event(
+                    &state,
+                    &run_id,
+                    &request_id,
+                    &stream_id,
+                    &index_name,
+                    chunk_idx,
+                    &result,
+                )
+                .await?;
+            }
+        }
+        // Cancellation can leave a chunk without a sender after a task
+        // panic. Completed later chunks still require their WAL append.
+        for (chunk_idx, mut result) in pending {
+            if overlap_ms > 0 {
+                crate::semantic_infer::deduplicate_source_moments(
+                    &mut result.moments,
+                    &mut seen_moments,
+                );
+            }
+            append_semantic_chunk_event(
+                &state,
+                &run_id,
+                &request_id,
+                &stream_id,
+                &index_name,
+                chunk_idx,
+                &result,
+            )
+            .await?;
+        }
+        Ok::<(), String>(())
+    })
+}
+
 async fn append_semantic_chunk_event(
     state: &AppState,
     run_id: &str,
@@ -1542,8 +1604,8 @@ async fn append_semantic_chunk_event(
     };
     if result
         .error
-        .as_deref()
-        .is_some_and(|error| error.starts_with("media_extraction_"))
+        .as_ref()
+        .is_some_and(|error| error.is_media_extraction())
     {
         state.pipeline_metrics().inc_media_clip_extraction_failure();
     }
@@ -1634,7 +1696,7 @@ async fn append_semantic_chunk_event(
             object.insert("pts_end_ms".to_string(), json!(media.source_end_ms));
             object.insert(
                 "timestamp_resolution_ms".to_string(),
-                json!(if result.provider.as_deref() == Some("gemini") {
+                json!(if result.provider == Some("gemini") {
                     1_000
                 } else {
                     1
@@ -1714,7 +1776,7 @@ async fn append_semantic_chunk_event(
                     "end_offset_ms": moment.end_offset_ms,
                     "start_pts_ms": moment.start_pts_ms,
                     "end_pts_ms": moment.end_pts_ms,
-                    "timestamp_resolution_ms": if result.provider.as_deref() == Some("gemini") { 1_000 } else { 1 },
+                    "timestamp_resolution_ms": if result.provider == Some("gemini") { 1_000 } else { 1 },
                     "provider_sampling_interval_ms": result.media.as_ref().and_then(|media| media.video_fps).map(|fps| (1000.0 / fps).ceil() as u64),
                     "provider_sampling_status": result.media.as_ref().and_then(|media| media.video_fps).map(|_| "requested_unverified"),
                     "modalities": &moment.modalities,
@@ -1723,7 +1785,7 @@ async fn append_semantic_chunk_event(
                     "intent": moment.intent.as_deref(),
                     "audio_visual_relation": moment.audio_visual_relation.as_deref(),
                     "confidence": moment.confidence,
-                    "provider": result.provider.as_deref(),
+                    "provider": result.provider,
                     "index_name": index_name,
                     "evidence": evidence.as_ref(),
                 }),
@@ -2414,7 +2476,7 @@ pub async fn reason_realtime_run(
             Arc::clone(state.inference_metrics_arc()),
             Arc::clone(state.pipeline_metrics_arc()),
         )));
-    let (semantic_event_tx, mut semantic_event_rx) = tokio::sync::mpsc::channel(vlm_concurrency);
+    let (semantic_event_tx, semantic_event_rx) = tokio::sync::mpsc::channel(vlm_concurrency);
     let semantic_dispatch = run_semantic_dispatch(
         &chunk_preps,
         providers,
@@ -2431,41 +2493,19 @@ pub async fn reason_realtime_run(
         Some(state.inference_dispatch()),
         Some(semantic_event_tx),
     );
-    // The journal owns its receiver: an append error must close the channel
-    // so dispatch cannot wait forever sending to a consumer that has exited.
-    let semantic_journal = {
-        let state = &state;
-        let run_id = &run_id;
-        let request_id = &request_id;
-        let stream_id = &stream_id;
-        let index_name = &index_name;
-        let overlap_ms = media.overlap_ms;
-        async move {
-            let mut seen_moments = Vec::new();
-            let mut pending = std::collections::BTreeMap::new();
-            let mut next_chunk = 0;
-            while let Some((chunk_idx, result)) = semantic_event_rx.recv().await {
-                pending.insert(chunk_idx, result);
-                while let Some(mut result) = pending.remove(&next_chunk) {
-                    let chunk_idx = next_chunk;
-                    next_chunk += 1;
-                    if overlap_ms > 0 {
-                        crate::semantic_infer::deduplicate_source_moments(
-                            &mut result.moments,
-                            &mut seen_moments,
-                        );
-                    }
-                    append_semantic_chunk_event(
-                        state, run_id, request_id, stream_id, index_name, chunk_idx, &result,
-                    )
-                    .await?;
-                }
-            }
-            Ok::<(), String>(())
-        }
-    };
+    let semantic_journal = spawn_semantic_journal(
+        state.clone(),
+        run_id.clone(),
+        request_id.clone(),
+        stream_id.clone(),
+        index_name.clone(),
+        media.overlap_ms,
+        semantic_event_rx,
+    );
     let ((semantic_results, task_end_times), semantic_journal_result) =
         tokio::join!(semantic_dispatch, semantic_journal);
+    let semantic_journal_result = semantic_journal_result
+        .unwrap_or_else(|error| Err(format!("semantic journal join failure: {error}")));
     if let Err(err) = semantic_journal_result {
         return internal_error(
             &state,
@@ -3121,11 +3161,6 @@ async fn execute_infer_request(
             message: "inference providers are not configured".to_string(),
         })?;
 
-    let request_id = state.next_request_id();
-    let started = Instant::now();
-    state.pipeline_metrics().inc_vlm_inferences();
-    let primary_provider_for_metrics = prepared.primary_provider;
-    let request_for_provider = prepared.request.clone();
     let dispatch_permit =
         state
             .try_acquire_inference_dispatch()
@@ -3133,14 +3168,46 @@ async fn execute_infer_request(
                 code: "provider_saturated",
                 message,
             })?;
-    let result = match tokio::task::spawn_blocking(move || {
-        let _dispatch_permit = dispatch_permit;
-        provider.infer(&request_for_provider)
-    })
+    // The admitted call owns completion and its WAL append through provider
+    // exit. Dropping the HTTP waiter only releases the response handle.
+    tokio::spawn(
+        async move { complete_infer_request(state, prepared, provider, dispatch_permit).await },
+    )
     .await
-    {
-        Ok(result) => match result {
-            Ok(result) => result,
+    .map_err(|err| InferExecutionError {
+        code: "internal_error",
+        message: format!("inference transaction join failure: {err}"),
+    })?
+}
+
+async fn complete_infer_request(
+    state: AppState,
+    prepared: PreparedInferRequest,
+    provider: Arc<dyn InferenceProvider + Send + Sync>,
+    dispatch_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<InferResponse, InferExecutionError> {
+    let _dispatch_permit = dispatch_permit;
+    let request_id = state.next_request_id();
+    let started = Instant::now();
+    state.pipeline_metrics().inc_vlm_inferences();
+    let primary_provider_for_metrics = prepared.primary_provider;
+    let request_for_provider = prepared.request.clone();
+    let result =
+        match tokio::task::spawn_blocking(move || provider.infer(&request_for_provider)).await {
+            Ok(result) => match result {
+                Ok(result) => result,
+                Err(err) => {
+                    state
+                        .pipeline_metrics()
+                        .vlm_latency_ms
+                        .record(started.elapsed().as_millis() as u64);
+                    state.inference_metrics().record_error(
+                        primary_provider_for_metrics,
+                        started.elapsed().as_millis() as u64,
+                    );
+                    return Err(map_provider_execution_error(err));
+                }
+            },
             Err(err) => {
                 state
                     .pipeline_metrics()
@@ -3150,24 +3217,12 @@ async fn execute_infer_request(
                     primary_provider_for_metrics,
                     started.elapsed().as_millis() as u64,
                 );
-                return Err(map_provider_execution_error(err));
+                return Err(InferExecutionError {
+                    code: "internal_error",
+                    message: format!("inference worker join failure: {err}"),
+                });
             }
-        },
-        Err(err) => {
-            state
-                .pipeline_metrics()
-                .vlm_latency_ms
-                .record(started.elapsed().as_millis() as u64);
-            state.inference_metrics().record_error(
-                primary_provider_for_metrics,
-                started.elapsed().as_millis() as u64,
-            );
-            return Err(InferExecutionError {
-                code: "internal_error",
-                message: format!("inference worker join failure: {err}"),
-            });
-        }
-    };
+        };
     state.inference_metrics().record_success(
         result.provider,
         started.elapsed().as_millis() as u64,
@@ -3729,6 +3784,150 @@ mod tests {
         let schema = prepared.request.guided_json.as_deref().unwrap();
         let value: serde_json::Value = serde_json::from_str(schema).unwrap();
         assert_eq!(value["properties"]["ok"]["type"].as_str(), Some("boolean"));
+    }
+
+    #[tokio::test]
+    async fn semantic_journal_finishes_after_waiter_drop_and_chunk_gap() {
+        let state = test_state("semantic-journal-cancel-gap");
+        let run_id = "run-00000000000000bb";
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let journal = super::spawn_semantic_journal(
+            state.clone(),
+            run_id.to_string(),
+            "request-test".to_string(),
+            "stream-primary".to_string(),
+            Some("review-test".to_string()),
+            0,
+            rx,
+        );
+        drop(journal);
+        tx.send((
+            1,
+            super::ChunkSemanticResult {
+                attempted: true,
+                raw_output: Some(json!({"description":"completed"})),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let events = state.read_run_events(run_id).unwrap();
+                if let Some(event) = events
+                    .iter()
+                    .find(|event| event.kind == "semantic_chunk_inferred")
+                {
+                    let payload: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+                    assert_eq!(payload["chunk_index"], 1);
+                    assert_eq!(payload["index_name"], "review-test");
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| event.kind == "semantic_chunk_inferred")
+                            .count(),
+                        1
+                    );
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed later chunk must append after journal waiter exits");
+    }
+
+    #[tokio::test]
+    async fn cancelled_infer_waiter_keeps_completion_durable() {
+        use std::sync::{mpsc, Arc, Mutex};
+        use vidarax_core::provider::{
+            InferenceProvider, InferenceRequest, InferenceResult, ProviderError, TokenUsage,
+        };
+
+        struct BlockingProvider {
+            started: tokio::sync::Notify,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl InferenceProvider for BlockingProvider {
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::Vllm
+            }
+
+            fn infer(&self, request: &InferenceRequest) -> Result<InferenceResult, ProviderError> {
+                self.started.notify_one();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| ProviderError::Transport(error.to_string()))?;
+                Ok(InferenceResult {
+                    provider: ProviderKind::Vllm,
+                    model: Arc::clone(&request.model),
+                    output_text: "completed".to_string(),
+                    fallback_used: false,
+                    finish_reason: Some("stop".to_string()),
+                    inference_latency_ms: 1,
+                    usage: TokenUsage::default(),
+                })
+            }
+        }
+
+        let (release_tx, release_rx) = mpsc::channel();
+        let provider = Arc::new(BlockingProvider {
+            started: tokio::sync::Notify::new(),
+            release: Mutex::new(release_rx),
+        });
+        let directory = std::env::temp_dir().join(format!(
+            "vidarax-infer-cancel-{}-{}",
+            std::process::id(),
+            WAL_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let state = AppState::with_wal_for_tests_and_endpoints(
+            directory.join("timeline.wal"),
+            Some(provider.clone()),
+        );
+        let run_id = "run-00000000000000aa";
+        state
+            .append_run_event(run_id, "run_created", json!({"principal_key":"public"}))
+            .unwrap();
+        let mut payload = infer_request(json!({"type":"object"}));
+        payload.run_id = Some(run_id.to_string());
+        let prepared =
+            validate_infer_request(&state, &HeaderMap::new(), payload, "invalid infer payload")
+                .await
+                .unwrap();
+        let state_for_waiter = state.clone();
+        let waiter = tokio::spawn(super::execute_infer_request(state_for_waiter, prepared));
+        tokio::time::timeout(Duration::from_secs(1), provider.started.notified())
+            .await
+            .unwrap();
+        let available = state.inference_dispatch().available_permits();
+        waiter.abort();
+        assert!(matches!(waiter.await, Err(error) if error.is_cancelled()));
+        assert_eq!(state.inference_dispatch().available_permits(), available);
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let completions = state
+                    .read_run_events(run_id)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|event| event.kind == "inference_completed")
+                    .count();
+                if completions == 1
+                    && state.inference_dispatch().available_permits() == available + 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accepted inference must append after its waiter exits");
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

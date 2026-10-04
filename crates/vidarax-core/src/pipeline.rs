@@ -1,4 +1,4 @@
-use crate::gate::{FrameSignal, GateConfig, GateEngine, GateEvent, GateEventType, GateReasonCode};
+use crate::gate::{FrameSignal, GateConfig, GateEngine, GateEventType, GateReasonCode};
 
 pub const TWO_PASS_CONFIDENCE_NOVELTY_WEIGHT: f32 = 0.45;
 pub const TWO_PASS_CONFIDENCE_INSTABILITY_WEIGHT: f32 = 0.35;
@@ -48,7 +48,6 @@ pub struct TwoPassPipeline {
     window_len: usize,
     cursor: usize,
     previous_hash: Option<u64>,
-    pass1_buf: Vec<GateEvent>,
     out_buf: Vec<FrameMetadata>,
 }
 
@@ -66,7 +65,6 @@ impl TwoPassPipeline {
             window_len: 0,
             cursor: 0,
             previous_hash: None,
-            pass1_buf: Vec::new(),
             out_buf: Vec::new(),
         }
     }
@@ -88,24 +86,14 @@ impl TwoPassPipeline {
         frames: &[FrameSignal],
         commit_kept_keyframes: bool,
     ) -> &[FrameMetadata] {
-        // Pass 1: compute deterministic gate events; reuse allocation.
-        self.pass1_buf.clear();
+        // Gate state and the context window are independent. Finish both
+        // phases for each frame without retaining an intermediate event batch.
+        self.out_buf.clear();
         for frame in frames {
             let event = self.gate.process(*frame);
             if commit_kept_keyframes && event.event_type == GateEventType::KeepKeyframe {
                 self.gate.commit_keyframe(*frame);
             }
-            self.pass1_buf.push(event);
-        }
-
-        // Pass 2: derive contextual metadata from a bounded sliding window.
-        // Index-based loop avoids holding a borrow on pass1_buf across mutable
-        // calls to window_metrics / push_window.
-        self.out_buf.clear();
-        for (i, frame) in frames.iter().enumerate() {
-            // Both fields are Copy enums — no reference retained.
-            let event_type = self.pass1_buf[i].event_type;
-            let reason_code = self.pass1_buf[i].reason_code;
 
             let (novelty, stability) = self.window_metrics(frame.perceptual_hash, frame.luma_mean);
             let motion = self.motion_score(frame.perceptual_hash);
@@ -121,9 +109,9 @@ impl TwoPassPipeline {
             self.out_buf.push(FrameMetadata {
                 frame_index: frame.frame_index,
                 pts_ms: frame.pts_ms,
-                gate_event: event_type,
-                scene_cut: reason_code == GateReasonCode::SceneCut,
-                suspect_artifact: event_type == GateEventType::SuspectArtifact,
+                gate_event: event.event_type,
+                scene_cut: event.reason_code == GateReasonCode::SceneCut,
+                suspect_artifact: event.event_type == GateEventType::SuspectArtifact,
                 novelty_score: novelty,
                 temporal_stability: stability,
                 motion_score: motion,

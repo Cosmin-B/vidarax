@@ -635,7 +635,9 @@ impl InferenceProvider for GeminiProvider {
         };
         let result = self.attempt(model, &body, started, deadline);
         let outcome = match result {
-            Ok(result) if !reserve && is_thinking_starved(&result) => {
+            Ok(result)
+                if !reserve && is_thinking_starved(&result, request.guided_json.is_some()) =>
+            {
                 self.learn_thinking(model);
                 let retry_started = Instant::now();
                 let retry_body = payload_with_max_output_tokens(
@@ -728,13 +730,14 @@ fn payload_with_max_output_tokens(body: &str, max_tokens: u32) -> Result<String,
 
 /// Whether a completed response shows the model was starved by its own hidden
 /// "thinking": it hit the output-token limit, spent thinking tokens, and left
-/// the visible answer empty. This is deduced from the provider's own
+/// the visible answer empty or structured JSON incomplete. This is deduced from the provider's own
 /// `usageMetadata` — no model-name matching — so it holds for any current or
 /// future thinking model (Gemini 2.5/3, Gemma, and beyond).
-fn is_thinking_starved(result: &InferenceResult) -> bool {
+fn is_thinking_starved(result: &InferenceResult, structured_output: bool) -> bool {
     result.finish_reason.as_deref() == Some("length")
         && result.usage.thinking_tokens > 0
-        && result.output_text.trim().is_empty()
+        && (result.output_text.trim().is_empty()
+            || (structured_output && serde_json::from_str::<Value>(&result.output_text).is_err()))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -976,7 +979,7 @@ mod tests {
         );
         assert_eq!(result.usage.thinking_tokens, 89);
         assert_eq!(result.finish_reason.as_deref(), Some("stop"));
-        assert!(!is_thinking_starved(&result));
+        assert!(!is_thinking_starved(&result, false));
     }
 
     #[test]
@@ -986,7 +989,7 @@ mod tests {
             .parse_response(raw, "gemini-3.8-flash", Instant::now())
             .unwrap();
         assert!(result.output_text.is_empty());
-        assert!(is_thinking_starved(&result));
+        assert!(is_thinking_starved(&result, false));
     }
 
     #[test]
@@ -1035,15 +1038,14 @@ mod tests {
                 total_tokens: 129,
             },
         };
-        assert!(is_thinking_starved(&starved));
+        assert!(is_thinking_starved(&starved, false));
 
-        // Same length cutoff but visible text present → not starved (real
-        // truncation of a genuine answer, must not trigger a headroom retry).
+        // Free-form visible text keeps its existing truncation policy.
         let truncated = InferenceResult {
             output_text: "{\"event".to_string(),
             ..starved.clone()
         };
-        assert!(!is_thinking_starved(&truncated));
+        assert!(!is_thinking_starved(&truncated, false));
 
         // Clean stop with no thinking → not starved.
         let clean = InferenceResult {
@@ -1052,7 +1054,7 @@ mod tests {
             usage: TokenUsage::default(),
             ..starved.clone()
         };
-        assert!(!is_thinking_starved(&clean));
+        assert!(!is_thinking_starved(&clean, false));
 
         // Empty + length but zero thinking tokens (non-thinking model that just
         // produced nothing) → not starved; retrying with headroom won't help.
@@ -1064,7 +1066,39 @@ mod tests {
             },
             ..starved.clone()
         };
-        assert!(!is_thinking_starved(&no_thoughts));
+        assert!(!is_thinking_starved(&no_thoughts, false));
+    }
+
+    #[test]
+    fn structured_thinking_cutoff_retries_only_incomplete_json() {
+        let p = provider();
+        let raw = serde_json::json!({
+            "candidates": [{"content": {"parts": [{"text": "{\"defect\":false,\"end_ms"}]}, "finishReason": "MAX_TOKENS"}],
+            "usageMetadata": {"promptTokenCount": 326, "candidatesTokenCount": 30, "thoughtsTokenCount": 980, "totalTokenCount": 1336}
+        });
+        let result = p
+            .parse_response(&raw.to_string(), "gemini-3.8-flash", Instant::now())
+            .unwrap();
+        assert!(is_thinking_starved(&result, true));
+        assert!(!is_thinking_starved(&result, false));
+        let complete = InferenceResult {
+            output_text: "{\"defect\":false}".into(),
+            ..result.clone()
+        };
+        assert!(!is_thinking_starved(&complete, true));
+        let stopped = InferenceResult {
+            finish_reason: Some("stop".into()),
+            ..result.clone()
+        };
+        assert!(!is_thinking_starved(&stopped, true));
+        let no_thoughts = InferenceResult {
+            usage: TokenUsage {
+                thinking_tokens: 0,
+                ..result.usage
+            },
+            ..result
+        };
+        assert!(!is_thinking_starved(&no_thoughts, true));
     }
 
     #[test]
@@ -1163,7 +1197,7 @@ mod tests {
         assert_eq!(result.usage.thinking_tokens, 89);
         assert_eq!(result.usage.total_tokens, 132);
         // This exact shape must read as thinking-starvation.
-        assert!(is_thinking_starved(&result));
+        assert!(is_thinking_starved(&result, false));
     }
 
     #[test]

@@ -684,31 +684,43 @@ export function useMetrics(intervalMs = 2000) {
   const loading = ref(false)
 
   let timer: ReturnType<typeof setInterval> | null = null
+  let request: AbortController | null = null
 
   async function fetchMetrics() {
+    if (request) return
+    const controller = new AbortController()
+    request = controller
+    const deadline = setTimeout(() => controller.abort(), 4000)
     loading.value = true
     error.value = null
     try {
       const auth = useAuthStore()
       const res = await fetch(`${auth.apiEndpoint}/v1/metrics`, {
         headers: { ...auth.defaultHeaders(), Accept: 'text/plain' },
-        signal: AbortSignal.timeout(4000),
+        signal: controller.signal,
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const text = await res.text()
+      if (request !== controller) return
       const map = parsePrometheus(text)
       const histograms = parseHistograms(text)
       metrics.value = buildMetrics(map, histograms)
     } catch (e) {
+      if (request !== controller) return
       const detail = e instanceof Error ? e.message : 'unknown error'
       error.value = `Metrics unavailable: ${detail}`
     } finally {
-      loading.value = false
+      clearTimeout(deadline)
+      if (request === controller) {
+        request = null
+        loading.value = false
+      }
     }
   }
 
   function start() {
-    fetchMetrics()
+    if (timer !== null) return
+    void fetchMetrics()
     timer = setInterval(fetchMetrics, intervalMs)
   }
 
@@ -717,6 +729,9 @@ export function useMetrics(intervalMs = 2000) {
       clearInterval(timer)
       timer = null
     }
+    request?.abort()
+    request = null
+    loading.value = false
   }
 
   onUnmounted(stop)

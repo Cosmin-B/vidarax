@@ -90,8 +90,8 @@ pub fn decode_output_pool_slots(gpu_available: bool, codec: VideoCodec) -> usize
     let backend = DecoderBackend::select(gpu_available, codec);
     match backend {
         DecoderBackend::NvDec | DecoderBackend::FfmpegSw => {
-            // Full bounded ffmpeg reader queue, steady-state decoder pending
-            // FIFO, one reader-constructed frame, and one decode-consumer frame.
+            // Full bounded ffmpeg reader queue, newest
+            // and replacing frames, one constructing frame, and one consumer frame.
             DECODE_OUTPUT_POOL_SLOTS_PER_WORKER
         }
         #[cfg(feature = "vp8")]
@@ -929,10 +929,14 @@ pub fn spawn_decode_workers(params: DecodeWorkerParams) -> std::io::Result<Stage
                             height: decode_height,
                             output_pool_slots,
                         };
-                        let entry = (
-                            frame.codec,
-                            Decoder::new_with_metrics(&config, Arc::clone(&metrics)),
-                        );
+                        let dec = match Decoder::new_with_metrics(&config, Arc::clone(&metrics)) {
+                            Ok(dec) => dec,
+                            Err(error) => {
+                                tracing::error!(%error, "decoder startup failed");
+                                return;
+                            }
+                        };
+                        let entry = (frame.codec, dec);
                         &mut slot.insert(entry).1
                     }
                 };

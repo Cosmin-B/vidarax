@@ -69,32 +69,39 @@ The channel holds `FFMPEG_YUV_READER_QUEUE_CAPACITY` (16) frames. The send is bl
 
 ## The drain-before-write rule
 
-The decode side owns stdin and follows one ordering rule, implemented in `decode_ffmpeg_pipe`: drain everything ready, then write, then answer from the pending FIFO. The reader exits when ffmpeg closes stdout or the receiver disappears. It has no separate shutdown signal.
+The decode side owns stdin. Each call receives at most 16 ready frames,
+retains the newest received frame, then writes and flushes the encoded payload.
+Each replacement recycles the older frame and increments the dropped-frame
+count. A reader that refills the channel cannot extend the drain indefinitely.
 
 ```rust
-let reader_exited = drain_ready_yuv_frames(frame_rx, pending);
-observe_pending_depth(pending.len(), metrics, pending_warned, codec, width, height);
-
+let (reader_exited, shed) = drain_ready_yuv_frames(frame_rx, pending);
+if let Some(metrics) = metrics {
+    metrics.inc_frames_dropped_by(shed as u64);
+}
 stdin.write_all(payload).map_err(DecodeError::WriteError)?;
 stdin.flush().map_err(DecodeError::FlushError)?;
-
-if let Some(frame) = pending.pop_back() {
-    let shed = pending.len();
-    if shed != 0 {
-        metrics.inc_frames_dropped_by(shed as u64);
-        pending.clear();
-    }
+if let Some(frame) = pending.take() {
     return Ok(frame);
 }
 ```
 
-`drain_ready_yuv_frames` is a non-blocking `try_recv` loop that moves every ready frame from the channel into the decoder-local `pending: VecDeque<YuvFrame>` and reports whether the reader has exited.
+`pending` is an `Option<YuvFrame>`. While a new frame replaces an old frame,
+the decoder briefly owns both. The pool reserves those two positions. The
+reader channel retains its blocking, lossless handoff.
 
-The rule targets one specific hazard: the parent entering a blocking stdin write while decoded output is already waiting. Draining first gives the reader up to 16 frames of handoff capacity before the write. It does not make the two-pipe topology deadlock-proof. If one input can cause more output than the available channel and pipe capacity before ffmpeg resumes consuming stdin, the reader can still park and the pipes can still form a cycle. No decoded output is dropped by the handoff itself, but a complete proof needs a measured or enforced per-input output-burst bound.
+The drain makes room for output already waiting before the parent writes
+stdin. This ordering does not prove that the two pipes cannot deadlock. One
+input could produce more output than the channel and pipe can hold before
+ffmpeg reads more input. The maximum output burst per input remains unknown.
 
-The freshness policy can drop decoded output after the write. `pop_back` returns the newest pending frame, then sheds and counts older entries through `inc_frames_dropped_by`. Under real-time backlog this keeps downstream labels close to the current RTP timestamp and avoids replaying a growing latency queue. The label is best-effort because the raw pipe has no metadata channel. A returned frame is attributed to the current access unit.
+The returned frame uses the current RTP access unit's label. Raw YUV output
+has no timestamp channel, so that label remains an approximation.
 
-Two bounds watch the pending FIFO. `FFMPEG_YUV_PENDING_FIFO_CAPACITY` pre-sizes the `VecDeque` to 20 entries. `FFMPEG_YUV_PENDING_SANITY_BOUND` sets a diagnostic ceiling of 64. Exceeding that ceiling fires a `debug_assert`, a one-shot warning, and the `inc_decode_pending_sanity_violations` metric. It never evicts frames because a breach indicates a broken upstream invariant and the frames are useful for diagnosis.
+On destruction, the decoder disconnects the channel, kills and reaps ffmpeg,
+then joins the reader. Disconnecting first releases a reader blocked on send.
+A failed child or reader startup returns an error to the worker, which faults
+the generation through the existing supervisor.
 
 ## Return contract
 

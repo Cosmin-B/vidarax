@@ -104,7 +104,15 @@ const DECODE_OUTPUT_POOL_SLOTS_PER_WORKER: usize = FFMPEG_READER_CONSTRUCTING_YU
     + DECODE_CONSUMER_YUV_FRAMES;
 ```
 
-Reading the sum as positions: one frame the reader thread is currently assembling from ffmpeg stdout, plus a full reader handoff channel (`FFMPEG_YUV_READER_QUEUE_CAPACITY`, 16), plus the decoder-local pending FIFO's steady-state allowance (`FFMPEG_YUV_PENDING_POOL_ALLOWANCE`, 4), plus one frame held by the decode consumer. Total: 22 slots. The same figure appears in `decode.rs` as `FFMPEG_YUV_READER_POOL_MIN_SLOTS`, and `spawn_frame_reader` clamps up to it, so a caller cannot under-provision the reader path. Live H.264 and H.265 both use the ffmpeg process boundary. The retained direct openh264 decoder path has no reader thread or pending FIFO and needs only `SOFTWARE_YUV_POOL_MIN_SLOTS` (2), but live backend selection does not choose it.
+Each ffmpeg frame occupies one of 20 pool positions: 16 reader-channel
+positions, one constructing frame, one consumer frame, one newest decoded
+frame and one received replacement. `FFMPEG_YUV_PENDING_POOL_ALLOWANCE` is 2.
+`FFMPEG_YUV_READER_POOL_MIN_SLOTS` applies the same count in `decode.rs`.
+The reader clamps an undersized pool request to that minimum. Live H.264 and
+H.265 both use the ffmpeg process boundary. The direct openh264 path has no
+reader thread and needs two positions. Live backend selection does not choose
+that path. Admission counts the rounded plane capacities, including unused
+capacity inside each buffer.
 
 ### The JPEG pool
 
@@ -135,7 +143,7 @@ Workers report results only through the `EventSink` trait (`emit_event_sync`, `e
 ## Edge cases and limits
 
 - A malformed frame (planes shorter than the declared dimensions) is dropped by `check_frame` before it can update `prev_signal`, so one corrupt decode cannot poison the temporal deltas of every following frame.
-- Compressed RTP access units larger than 2 MiB are dropped before the pipeline-owned queue copy, and JPEGs larger than 2 MiB are recycled before they can enter downstream work. Those payload limits make the process reservation a byte bound, not a queue-item estimate.
+- Compressed RTP access units larger than 2 MiB are dropped before the pipeline-owned queue copy, and the JPEG writer stops before encoded output exceeds 2 MiB. Those payload limits make the process reservation a byte bound, not a queue-item estimate.
 - The process reserves the full per-generation byte envelope and fixed worker count before workers start. `VIDARAX_MEDIA_MEMORY_BUDGET_BYTES` and `VIDARAX_MEDIA_WORKER_THREAD_BUDGET` bound total admitted generations even across principals.
 - A frame the gate keeps but whose JPEG encode fails or comes back empty is dropped entirely. An empty payload would waste a VLM call.
 - While the loop detector reports the stream stuck (`loop_active`), the VLM worker skips inference for kept keyframes and counts them as dropped. The `loop_detected` event was already emitted by the gate side.

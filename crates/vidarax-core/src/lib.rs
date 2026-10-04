@@ -1,8 +1,7 @@
-// The core engine is memory-safe Rust. The only unsafe in the crate is the
-// libvpx FFI in webrtc::decode, which is compiled solely under `--features vp8`
-// and carries a scoped allow at its module boundary. Denying unsafe everywhere
-// else keeps that boundary the one audited place a raw pointer can appear, so a
-// new unsafe block anywhere else fails the build instead of slipping in.
+// Unsafe operations stay within two platform boundaries: libvpx FFI under
+// `--features vp8` and macOS durable file synchronization in timeline. Each
+// boundary has a scoped allow and documents its pointer or descriptor lifetime.
+// A new unsafe operation elsewhere fails the build.
 #![deny(unsafe_code)]
 
 pub mod admission;
@@ -16,10 +15,12 @@ pub mod gate;
 pub mod gemini;
 pub mod ingest;
 pub mod loop_detector;
+mod media_process;
 pub mod metrics;
 pub mod novelty;
 pub mod pipeline;
 pub mod provider;
+mod sidecar_io;
 pub mod tiered_vlm;
 pub mod timeline;
 pub mod trigger;

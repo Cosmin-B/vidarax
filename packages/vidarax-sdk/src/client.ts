@@ -91,8 +91,17 @@ const DEFAULT_MODEL = "Qwen/Qwen3-VL-2B-Instruct";
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
 /** Sleep for `ms` milliseconds. */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal?.addEventListener("abort", finish, { once: true });
+  });
 }
 
 interface ParsedSseEvent {
@@ -107,18 +116,19 @@ const MAX_SSE_EVENT_BYTES = 4 * 1024 * 1024;
 async function* decodeSse(body: ReadableStream<Uint8Array>): AsyncGenerator<ParsedSseEvent> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
   let buffer = "";
   try {
     while (true) {
       const { done, value } = await reader.read();
-      buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, "\n");
-      if (buffer.length > MAX_SSE_EVENT_BYTES) {
-        throw new ParseError("SSE event exceeded the 4 MiB SDK limit", buffer.slice(0, 256));
-      }
+      buffer = (buffer + decoder.decode(value, { stream: !done })).replace(/\r\n/g, "\n");
       let boundary: number;
       while ((boundary = buffer.indexOf("\n\n")) >= 0) {
         const block = buffer.slice(0, boundary);
         buffer = buffer.slice(boundary + 2);
+        if (encoder.encode(block).length > MAX_SSE_EVENT_BYTES) {
+          throw new ParseError("SSE event exceeded the 4 MiB SDK limit", block.slice(0, 256));
+        }
         let id = "";
         let event = "message";
         const data: string[] = [];
@@ -134,10 +144,14 @@ async function* decodeSse(body: ReadableStream<Uint8Array>): AsyncGenerator<Pars
         }
         if (data.length > 0) yield { id, event, data: data.join("\n") };
       }
+      if (encoder.encode(buffer).length > MAX_SSE_EVENT_BYTES) {
+        throw new ParseError("SSE event exceeded the 4 MiB SDK limit", buffer.slice(0, 256));
+      }
       if (done) break;
     }
   } finally {
     await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
   }
 }
 
@@ -253,60 +267,49 @@ export class Vidarax {
     const controller = new AbortController();
     const timerId = setTimeout(() => controller.abort(), this.timeoutMs);
 
-    let response: Response;
     try {
-      response = await fetch(url, {
+      const response = await fetch(url, {
         method,
         headers: this.headers(extraHeaders),
         body: body !== undefined ? JSON.stringify(body) : null,
         signal: controller.signal,
       });
-    } catch (err: unknown) {
-      const message =
-        err instanceof Error
-          ? err.name === "AbortError"
-            ? `Request to ${path} timed out after ${this.timeoutMs}ms`
-            : `Network error on ${path}: ${err.message}`
-          : `Network error on ${path}`;
-      throw new NetworkError(message, err);
-    } finally {
-      clearTimeout(timerId);
-    }
-
-    if (!response.ok) {
-      let apiError: ApiErrorBody | null = null;
-      let text = "";
-      try {
-        text = await response.text();
-        const parsed = JSON.parse(text) as { error?: ApiErrorBody };
-        apiError = parsed.error ?? null;
-      } catch {
-        // not JSON; leave apiError null
+      const text = await response.text();
+      if (!response.ok) {
+        let apiError: ApiErrorBody | null = null;
+        try {
+          apiError = (JSON.parse(text) as { error?: ApiErrorBody }).error ?? null;
+        } catch {
+          // Error routes can return plain text.
+        }
+        throw new HttpError(
+          response.status,
+          apiError?.message ?? `HTTP ${response.status} ${response.statusText} on ${method} ${path}`,
+          apiError,
+        );
       }
-      const message =
-        apiError?.message ??
-        `HTTP ${response.status} ${response.statusText} on ${method} ${path}`;
-      throw new HttpError(response.status, message, apiError);
-    }
-
-    // Handle 204 / empty bodies.
-    const contentLength = response.headers.get("content-length");
-    if (response.status === 204 || contentLength === "0") {
-      return undefined as unknown as T;
-    }
-
-    let text = "";
-    try {
-      text = await response.text();
-      if (text.trim() === "") {
+      if (response.status === 204 || text.trim() === "") {
         return undefined as unknown as T;
       }
-      return JSON.parse(text) as T;
-    } catch (err) {
-      throw new ParseError(
-        `Failed to parse response from ${method} ${path}: ${String(err)}`,
-        text,
+      try {
+        return JSON.parse(text) as T;
+      } catch (err) {
+        throw new ParseError(
+          `Failed to parse response from ${method} ${path}: ${String(err)}`,
+          text,
+        );
+      }
+    } catch (err: unknown) {
+      if (err instanceof VidaraxError) throw err;
+      throw new NetworkError(
+        controller.signal.aborted
+          ? `Request to ${path} timed out after ${this.timeoutMs}ms`
+          : `Network error on ${path}: ${err instanceof Error ? err.message : String(err)}`,
+        err,
       );
+    } finally {
+      // The response body belongs to the same request deadline as its headers.
+      clearTimeout(timerId);
     }
   }
 
@@ -824,7 +827,7 @@ export class Vidarax {
       } catch (err) {
         if (options.signal?.aborted) return;
         if (!reconnect) throw new NetworkError(`Event subscription failed: ${String(err)}`, err);
-        await sleep(reconnectDelayMs);
+        await sleep(reconnectDelayMs, options.signal);
         continue;
       }
       if (!response.ok) {
@@ -843,32 +846,38 @@ export class Vidarax {
       if (response.body === null) {
         throw new ParseError("Event subscription response had no body", "");
       }
-      for await (const message of decodeSse(response.body)) {
-        const sequence = Number(message.id);
-        if (!Number.isSafeInteger(sequence) || sequence <= cursor) continue;
-        let envelope: {
-          sequence?: number;
-          pts_ms?: number;
-          data?: Record<string, unknown>;
-        };
-        try {
-          envelope = JSON.parse(message.data) as typeof envelope;
-        } catch (err) {
-          throw new ParseError(`Failed to parse SSE event: ${String(err)}`, message.data);
+      try {
+        for await (const message of decodeSse(response.body)) {
+          const sequence = Number(message.id);
+          if (!Number.isSafeInteger(sequence) || sequence <= cursor) continue;
+          let envelope: {
+            sequence?: number;
+            pts_ms?: number;
+            data?: Record<string, unknown>;
+          };
+          try {
+            envelope = JSON.parse(message.data) as typeof envelope;
+          } catch (err) {
+            throw new ParseError(`Failed to parse SSE event: ${String(err)}`, message.data);
+          }
+          if (envelope.sequence !== sequence || typeof envelope.pts_ms !== "number") {
+            throw new ParseError("SSE event identity did not match its envelope", message.data);
+          }
+          cursor = sequence;
+          yield {
+            seq: sequence,
+            pts_ms: envelope.pts_ms,
+            kind: message.event,
+            payload: envelope.data ?? {},
+          };
         }
-        if (envelope.sequence !== sequence || typeof envelope.pts_ms !== "number") {
-          throw new ParseError("SSE event identity did not match its envelope", message.data);
-        }
-        cursor = sequence;
-        yield {
-          seq: sequence,
-          pts_ms: envelope.pts_ms,
-          kind: message.event,
-          payload: envelope.data ?? {},
-        };
+      } catch (err) {
+        if (options.signal?.aborted) return;
+        if (err instanceof ParseError) throw err;
+        if (!reconnect) throw new NetworkError(`Event subscription failed: ${String(err)}`, err);
       }
       if (!reconnect || options.signal?.aborted) return;
-      await sleep(reconnectDelayMs);
+      await sleep(reconnectDelayMs, options.signal);
     } while (true);
   }
 
@@ -970,6 +979,7 @@ export class Vidarax {
       return new Promise<UploadResponse>((resolve, reject) => {
         const xhr = new XMLHttpRequest();
         xhr.open("POST", url);
+        xhr.timeout = this.timeoutMs;
         if (this.apiKey !== undefined) {
           xhr.setRequestHeader("x-api-key", this.apiKey);
         }
@@ -1013,6 +1023,9 @@ export class Vidarax {
         xhr.addEventListener("abort", () => {
           reject(new NetworkError("Upload aborted"));
         });
+        xhr.addEventListener("timeout", () => {
+          reject(new NetworkError(`Upload timed out after ${this.timeoutMs}ms`));
+        });
 
         xhr.send(formData);
       });
@@ -1036,7 +1049,27 @@ export class Vidarax {
         body: formData,
         signal: controller.signal,
       });
+
+      if (!response.ok) {
+        let apiError: ApiErrorBody | null = null;
+        try {
+          const parsed = (await response.json()) as { error?: ApiErrorBody };
+          apiError = parsed.error ?? null;
+        } catch (err) {
+          if (controller.signal.aborted) throw err;
+          // Error routes can return plain text.
+        }
+        throw new UploadError(apiError?.message ?? `Upload failed with HTTP ${response.status}`);
+      }
+
+      try {
+        return (await response.json()) as UploadResponse;
+      } catch (err) {
+        if (controller.signal.aborted) throw err;
+        throw new ParseError("Failed to parse upload response", String(err));
+      }
     } catch (err: unknown) {
+      if (err instanceof VidaraxError) throw err;
       throw new NetworkError(
         err instanceof Error && err.name === "AbortError"
           ? `Upload timed out after ${this.timeoutMs}ms`
@@ -1045,23 +1078,6 @@ export class Vidarax {
       );
     } finally {
       clearTimeout(timerId);
-    }
-
-    if (!response.ok) {
-      let apiError: ApiErrorBody | null = null;
-      try {
-        const parsed = (await response.json()) as { error?: ApiErrorBody };
-        apiError = parsed.error ?? null;
-      } catch {
-        // ignore
-      }
-      throw new UploadError(apiError?.message ?? `Upload failed with HTTP ${response.status}`);
-    }
-
-    try {
-      return (await response.json()) as UploadResponse;
-    } catch (err) {
-      throw new ParseError("Failed to parse upload response", String(err));
     }
   }
 
@@ -1258,7 +1274,30 @@ export class Vidarax {
         body: sdpOffer,
         signal: controller.signal,
       });
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new HttpError(
+          response.status,
+          `WHIP offer failed with HTTP ${response.status}: ${text}`,
+        );
+      }
+
+      const answerSdp = await response.text();
+      const location = response.headers.get("Location") ?? "";
+      const runId = response.headers.get("x-vidarax-run-id") ?? undefined;
+      const resourceUrl = location.startsWith("http")
+        ? location
+        : `${this.baseUrl}${location}`;
+
+      // Extract session ID from the Location path.
+      const sessionId = location.split("/").pop() ?? "";
+
+      return runId === undefined
+        ? { sessionId, answerSdp, resourceUrl }
+        : { sessionId, runId, answerSdp, resourceUrl };
     } catch (err: unknown) {
+      if (err instanceof VidaraxError) throw err;
       throw new NetworkError(
         err instanceof Error && err.name === "AbortError"
           ? `WHIP offer timed out after ${this.timeoutMs}ms`
@@ -1268,28 +1307,6 @@ export class Vidarax {
     } finally {
       clearTimeout(timerId);
     }
-
-    if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      throw new HttpError(
-        response.status,
-        `WHIP offer failed with HTTP ${response.status}: ${text}`,
-      );
-    }
-
-    const answerSdp = await response.text();
-    const location = response.headers.get("Location") ?? "";
-    const runId = response.headers.get("x-vidarax-run-id") ?? undefined;
-    const resourceUrl = location.startsWith("http")
-      ? location
-      : `${this.baseUrl}${location}`;
-
-    // Extract session ID from the Location path.
-    const sessionId = location.split("/").pop() ?? "";
-
-    return runId === undefined
-      ? { sessionId, answerSdp, resourceUrl }
-      : { sessionId, runId, answerSdp, resourceUrl };
   }
 
   /**

@@ -454,9 +454,23 @@ fn read_keyframe(data_dir: &Path, sha: &str, expected_bytes: u64) -> ArchiveResu
             "keyframe is not a regular file of the declared size",
         ));
     }
-    let bytes = fs::read(path)?;
+    // Metadata does not keep another process from growing the file. Retain the
+    // declared bound through the read and use one extra byte to detect growth.
+    let bytes = read_keyframe_bytes(File::open(path)?, expected_bytes)?;
     if bytes.len() as u64 != expected_bytes || sha256_hex(&bytes) != sha {
         return Err(invalid("keyframe bytes do not match event metadata"));
+    }
+    Ok(bytes)
+}
+
+fn read_keyframe_bytes(source: impl Read, expected_bytes: u64) -> ArchiveResult<Vec<u8>> {
+    if expected_bytes > MAX_BLOB_BYTES as u64 {
+        return Err(invalid("keyframe exceeds 16 MiB archive limit"));
+    }
+    let mut bytes = Vec::new();
+    source.take(expected_bytes + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != expected_bytes {
+        return Err(invalid("keyframe size changed while reading"));
     }
     Ok(bytes)
 }
@@ -727,6 +741,17 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::fs;
     use vidarax_core::timeline::{TimelineEvent, WalWriter};
+
+    #[test]
+    fn keyframe_read_stops_at_declared_size_even_if_source_grows() {
+        let mut source = io::Cursor::new(vec![0; 1024]);
+        assert!(read_keyframe_bytes(&mut source, 4).is_err());
+        assert_eq!(source.position(), 5);
+
+        let mut source = io::Cursor::new(vec![0; 4]);
+        assert_eq!(read_keyframe_bytes(&mut source, 4).unwrap(), vec![0; 4]);
+        assert!(read_keyframe_bytes(io::empty(), MAX_BLOB_BYTES as u64 + 1).is_err());
+    }
 
     fn event(seq: u64, kind: &str, payload: String) -> TimelineEvent {
         TimelineEvent {
