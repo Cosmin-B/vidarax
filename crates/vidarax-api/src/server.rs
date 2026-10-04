@@ -141,6 +141,8 @@ struct OwnedH3Driver {
     cancellations: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
     finished: Option<tokio::sync::oneshot::Sender<io::Result<()>>>,
     close_result: Option<io::Result<()>>,
+    #[cfg(test)]
+    cancellation_complete: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 #[cfg(feature = "h3-experimental")]
@@ -171,12 +173,18 @@ impl OwnedH3Driver {
         // frame has finished writing. STOP_SENDING during a partial final write
         // then reaches a debug assertion. Its public ShutdownStream command
         // removes that stream before the regular write path can revisit it.
+        // It removes the entire context, so stop reads in the same command:
+        // later in-flight upload DATA must not reach a nonexistent H3 stream.
         for (stream_id, error_code) in stopped {
             self.cancellations.lock().unwrap().insert(stream_id);
             self.commands
                 .send(H3Command::ShutdownStream {
                     stream_id,
-                    shutdown: StreamShutdown::Write { error_code },
+                    shutdown: StreamShutdown::Both {
+                        read_error_code: tokio_quiche::quiche::h3::WireErrorCode::RequestCancelled
+                            as u64,
+                        write_error_code: error_code,
+                    },
                 })
                 .map_err(|_| {
                     io::Error::new(
@@ -208,6 +216,10 @@ impl OwnedH3Driver {
                 .ok_or_else(|| {
                     io::Error::other("H3 cancellation commands did not become ready")
                 })??;
+        }
+        #[cfg(test)]
+        if let Some(completed) = &self.cancellation_complete {
+            completed.notify_one();
         }
         Ok(())
     }
@@ -621,6 +633,8 @@ pub async fn serve_h3_experimental(config: &ServerConfig, app: Router) -> io::Re
                 cancellations: cancellations.clone(),
                 finished: Some(finished_tx),
                 close_result: None,
+                #[cfg(test)]
+                cancellation_complete: None,
             });
             let app = app.clone();
             let stop = h3_stop.clone();
@@ -1335,6 +1349,7 @@ mod tests {
             h3: h3::Connection,
             body: Vec<u8>,
             fin: bool,
+            cancellation_complete: Arc<tokio::sync::Notify>,
         }
 
         impl Client {
@@ -1428,6 +1443,8 @@ mod tests {
             )
             .unwrap();
             let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            let cancellation_complete = Arc::new(tokio::sync::Notify::new());
+            let driver_cancellation_complete = cancellation_complete.clone();
             let task = tokio::spawn(async move {
                 let conn = listeners[0]
                     .next()
@@ -1444,6 +1461,7 @@ mod tests {
                     cancellations: cancellations.clone(),
                     finished: Some(finished_tx),
                     close_result: None,
+                    cancellation_complete: Some(driver_cancellation_complete),
                 });
                 let result = server::serve_h3_connection(
                     app,
@@ -1510,6 +1528,7 @@ mod tests {
                     h3,
                     body: Vec::new(),
                     fin: false,
+                    cancellation_complete,
                 },
                 stop_tx,
                 task,
@@ -1656,6 +1675,110 @@ mod tests {
                 client.body.len() < BODY_LEN,
                 "cancelled response was unexpectedly delivered in full"
             );
+        }
+
+        #[tokio::test]
+        async fn cancelled_upload_data_does_not_interrupt_another_response() {
+            use axum::routing::post;
+            const BODY_LEN: usize = 512 * 1024;
+            let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let controls = Arc::new(Mutex::new(Some((admitted_tx, release_rx))));
+            let app = Router::new()
+                .route("/upload", post(|| async { "uploaded" }))
+                .route(
+                    "/finite",
+                    get(move || {
+                        let (admitted, release) = controls.lock().unwrap().take().unwrap();
+                        async move {
+                            let _ = admitted.send(());
+                            let _ = release.await;
+                            vec![b'x'; BODY_LEN]
+                        }
+                    }),
+                );
+            let (mut client, stop, server) = fixture(app).await;
+            let upload = client
+                .h3
+                .send_request(
+                    &mut client.conn,
+                    &[
+                        h3::Header::new(b":method", b"POST"),
+                        h3::Header::new(b":scheme", b"https"),
+                        h3::Header::new(b":authority", b"localhost"),
+                        h3::Header::new(b":path", b"/upload"),
+                    ],
+                    false,
+                )
+                .unwrap();
+            client
+                .h3
+                .send_body(&mut client.conn, upload, b"first", false)
+                .unwrap();
+            client
+                .h3
+                .send_request(
+                    &mut client.conn,
+                    &[
+                        h3::Header::new(b":method", b"GET"),
+                        h3::Header::new(b":scheme", b"https"),
+                        h3::Header::new(b":authority", b"localhost"),
+                        h3::Header::new(b":path", b"/finite"),
+                    ],
+                    true,
+                )
+                .unwrap();
+            client
+                .conn
+                .stream_shutdown(
+                    upload,
+                    quiche::Shutdown::Read,
+                    h3::WireErrorCode::RequestCancelled as u64,
+                )
+                .unwrap();
+            // Keep initial headers, upload DATA, and STOP_SENDING in the same
+            // QUIC flush so cancellation is visible on the first write pass.
+            client.flush().await;
+            tokio::time::timeout(Duration::from_secs(2), admitted_rx)
+                .await
+                .expect("second request was not admitted")
+                .unwrap();
+            // Observe the real driver's cancellation-command barrier while
+            // leaving incoming UDP packets unread. The client has not received
+            // STOP_SENDING and can still send in-flight upload DATA afterward.
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                client.cancellation_complete.notified(),
+            )
+            .await
+            .expect("upload cancellation did not reach the driver barrier");
+            client
+                .h3
+                .send_body(&mut client.conn, upload, b"later", false)
+                .unwrap();
+            client.flush().await;
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !client.fin {
+                    assert!(
+                        !server.is_finished(),
+                        "cancelled upload terminated the healthy response worker"
+                    );
+                    client.step().await;
+                }
+            })
+            .await
+            .expect("cancelled upload interrupted the second response");
+            assert_eq!(client.body, vec![b'x'; BODY_LEN]);
+            stop.send(true).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !server.is_finished() {
+                    client.step().await;
+                }
+            })
+            .await
+            .expect("connection did not drain after the second response completed");
+            server.await.unwrap().unwrap();
         }
 
         #[tokio::test]
