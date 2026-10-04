@@ -272,7 +272,10 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::process::{Command, Stdio};
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tower::ServiceExt;
@@ -393,11 +396,16 @@ mod tests {
         stream_ttl_secs: u64,
         active_stream_limit: usize,
     ) -> AppState {
+        static NEXT_WAL: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let wal_path = std::env::temp_dir().join(format!("vidarax-api-test-{nanos}.wal"));
+        let wal_path = std::env::temp_dir().join(format!(
+            "vidarax-api-test-{nanos}-{}-{}.wal",
+            std::process::id(),
+            NEXT_WAL.fetch_add(1, Ordering::Relaxed)
+        ));
         AppState::with_wal_for_tests_runtime(
             wal_path,
             provider,
