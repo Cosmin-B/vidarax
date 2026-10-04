@@ -1303,13 +1303,15 @@ fn validate_realtime_reason_params(
     } else {
         let legacy_video = payload.video_clip_mode.unwrap_or(false);
         let duration_s = payload.video_clip_duration_s.unwrap_or(0.5);
-        if legacy_video && (!duration_s.is_finite() || duration_s <= 0.0 || duration_s > 60.0) {
+        // Reject sub-millisecond windows before conversion: a positive float
+        // can otherwise round to zero and become a zero scheduling stride.
+        if legacy_video && (!duration_s.is_finite() || !(0.001..=60.0).contains(&duration_s)) {
             return Err(validation_error(
                 state,
                 "invalid realtime reason request",
                 vec![field_error(
                     "video_clip_duration_s",
-                    "video_clip_duration_s must be in (0, 60]".to_string(),
+                    "video_clip_duration_s must be finite and in [0.001, 60]".to_string(),
                 )],
             ));
         }
@@ -3324,6 +3326,95 @@ mod tests {
         let n = WAL_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("vidarax-handlers-{tag}-{n}.wal"));
         AppState::with_wal_for_tests(path)
+    }
+
+    #[test]
+    fn legacy_clip_duration_rejects_invalid_and_submillisecond_values_before_source_validation() {
+        let state = test_state("legacy-duration-invalid");
+        let mut payload: crate::models::RealtimeReasonRequest = serde_json::from_value(json!({
+            "source_uri": "/nonexistent-unit-test-source.mp4",
+            "model": "Qwen/Qwen3-VL-2B-Instruct",
+            "video_clip_mode": true,
+            "semantic_inference": false
+        }))
+        .unwrap();
+        for duration in [
+            f32::NEG_INFINITY,
+            -1.0,
+            -0.0,
+            0.0,
+            f32::from_bits(1),
+            0.0001,
+            0.00049,
+            0.0005,
+            0.000999,
+            f32::from_bits(0.001_f32.to_bits() - 1),
+            f32::NAN,
+            f32::INFINITY,
+            60.00001,
+            f32::from_bits(60.0_f32.to_bits() + 1),
+            f32::MAX,
+        ] {
+            payload.video_clip_duration_s = Some(duration);
+            let (status, axum::Json(body)) =
+                match super::validate_realtime_reason_params(&state, &payload) {
+                    Ok(_) => panic!("invalid legacy duration accepted: {duration:?}"),
+                    Err(error) => error,
+                };
+            assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(body["error"]["code"], "validation_error");
+            assert_eq!(
+                body["error"]["details"][0]["field"], "video_clip_duration_s",
+                "duration={duration:?}, body={body}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_clip_duration_keeps_boundary_rounding_nonzero_and_default_unchanged() {
+        let state = test_state("legacy-duration-valid");
+        let sequence = WAL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let source = std::env::temp_dir().join(format!(
+            "vidarax-duration-unit-{}-{sequence}.mp4",
+            std::process::id()
+        ));
+        // Validation only: no media decoder or inference is invoked.
+        std::fs::write(&source, b"unit-test path fixture").unwrap();
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _fixture = Fixture(source.clone());
+        let mut payload: crate::models::RealtimeReasonRequest = serde_json::from_value(json!({
+            "source_uri": source.to_string_lossy(),
+            "model": "Qwen/Qwen3-VL-2B-Instruct",
+            "video_clip_mode": true,
+            "semantic_inference": false
+        }))
+        .unwrap();
+        for (duration, expected_ms) in [
+            (0.001, 1),
+            (0.00149, 1),
+            (0.0015, 2),
+            (0.00151, 2),
+            (0.5, 500),
+            (60.0, 60_000),
+        ] {
+            payload.video_clip_duration_s = Some(duration);
+            let params = super::validate_realtime_reason_params(&state, &payload).unwrap_or_else(
+                |(status, axum::Json(body))| {
+                    panic!("duration={duration}, status={status}, body={body}")
+                },
+            );
+            assert_eq!(params.media.window_ms, expected_ms);
+            assert!(params.media.window_ms > params.media.overlap_ms);
+        }
+        payload.video_clip_duration_s = None;
+        let params = super::validate_realtime_reason_params(&state, &payload)
+            .unwrap_or_else(|(_, axum::Json(body))| panic!("{body}"));
+        assert_eq!(params.media.window_ms, 500);
     }
 
     #[tokio::test]
